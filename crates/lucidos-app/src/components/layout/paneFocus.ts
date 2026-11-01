@@ -360,24 +360,41 @@ export function isContentPaneIframeFocus(el: Element | null): boolean {
   return !!el && el.tagName === 'IFRAME' && !!el.closest?.('.pane-content');
 }
 
-/** Move the content-pane focus marker when keyboard focus lands inside a
- *  content-pane iframe (see `isContentPaneIframeFocus`). `window`'s `blur` fires
- *  as focus crosses into an iframe; the host's `document.activeElement` updates to
- *  the `<iframe>` a tick later, so the check is deferred a macrotask. Desktop-only
- *  — the focus marker is a desktop affordance and mobile navigates panes rather
- *  than focusing them (`focusedPane` is inert there). Marker-only + idempotent (a
- *  Preact signal write dedupes on an unchanged value), so it never steals DOM
- *  focus from the iframe. Returns a cleanup that removes the listener. */
-export function installContentPaneIframeFocusTracking(): () => void {
+/** Move the focused-pane marker onto the pane that keyboard focus lands in.
+ *  Then the per-pane Tab trap never pulls focus out of the user's pane.
+ *
+ *  - `focusin` covers focus that enters a pane with no pointer-down and no app
+ *    helper: a screen reader's cursor, find-in-page, a script's `.focus()`.
+ *  - `window` `blur` covers a content-pane iframe (`isContentPaneIframeFocus`).
+ *    The host's `activeElement` becomes the `<iframe>` a tick after the blur.
+ *
+ *  A later marker write (a pane click, a navigation) still wins until focus
+ *  moves again. A returning window refocuses the element it left, and that
+ *  `focusin` is no move, so it leaves the marker alone. Desktop-only, since
+ *  mobile navigates panes rather than focusing them. Marker-only, so it never
+ *  moves DOM focus. Returns the cleanup. */
+export function installPaneFocusTracking(): () => void {
+  let leftByWindowBlur: Element | null = null;
+  const onFocusIn = (e: FocusEvent): void => {
+    const refocus = e.target === leftByWindowBlur;
+    leftByWindowBlur = null;
+    if (refocus || isMobile() || !(e.target instanceof Element)) return;
+    const pane = paneHolding(e.target);
+    if (pane) focusedPane.value = pane;
+  };
   const onBlur = (): void => {
+    leftByWindowBlur = document.activeElement;
     if (isMobile()) return;
-    // activeElement is not the <iframe> synchronously on blur — defer one macrotask.
     setTimeout(() => {
       if (isContentPaneIframeFocus(document.activeElement)) focusedPane.value = 'content';
     }, 0);
   };
+  document.addEventListener('focusin', onFocusIn, true);
   window.addEventListener('blur', onBlur);
-  return () => window.removeEventListener('blur', onBlur);
+  return () => {
+    document.removeEventListener('focusin', onFocusIn, true);
+    window.removeEventListener('blur', onBlur);
+  };
 }
 
 /** Per-pane Tab trap. Runs after `handleOverlayTab`, so no open overlay owns
@@ -386,7 +403,8 @@ export function installContentPaneIframeFocusTracking(): () => void {
  *  user's intent), not `document.activeElement.closest()`: a pane click sets the
  *  focused pane signal-only and never moves DOM focus, so keying off the active
  *  element let Tab escape to document order (or cycle the wrong pane) after a
- *  click. Switch panes with the ⌘⇧ pane shortcuts or a click. Returns `true`
+ *  click. Focus that lands in a pane moves the marker with it
+ *  (`installPaneFocusTracking`). Switch panes with the ⌘⇧ pane shortcuts or a click. Returns `true`
  *  when it moved focus (caller preventDefaults). Desktop-only. */
 export function handlePaneTab(e: KeyboardEvent): boolean {
   if (isMobile()) return false;

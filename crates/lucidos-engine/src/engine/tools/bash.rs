@@ -187,15 +187,42 @@ async fn drain_until_quiet(
     }
 }
 
+/// SIGKILLs the shell's whole process group when dropped while armed: on a
+/// timeout, or when a cancel drops the tool future mid-wait. `kill_on_drop`
+/// reaches only the shell, so a pipeline stage or `&` child it started would
+/// keep running. It disarms once the shell is reaped, since the group id can
+/// then be recycled. A detached survivor of a normal exit is left alone
+/// (ADR 0100).
+struct ShellGroupGuard(Option<u32>);
+
+impl Drop for ShellGroupGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            crate::runtime::spawn_env::kill_child_process_group_now(pid);
+        }
+    }
+}
+
+/// Spawn the `run_bash` shell as the leader of its own process group, below
+/// the engine's priority, so [`ShellGroupGuard`] can reach every process in it.
+fn spawn_shell(cmd: &mut tokio::process::Command) -> std::io::Result<tokio::process::Child> {
+    crate::runtime::spawn_env::spawn_below_engine(cmd)
+}
+
 /// Wait for `child` to exit while draining both pipes concurrently.
 ///
 /// Concurrent draining is load-bearing, not tidiness: `child.wait()` alone
 /// deadlocks against a child that fills a pipe buffer, which is the trap
 /// `wait_with_output()` used to cover for us.
+///
+/// `child` must come from [`spawn_shell`], so its pid names its group.
 async fn wait_for_shell(
     mut child: tokio::process::Child,
     timeout: Duration,
 ) -> Result<ShellWait, Box<dyn std::error::Error + Send + Sync>> {
+    // Declared after `child`, so it drops first and signals the group while
+    // the shell is still unreaped.
+    let mut group = ShellGroupGuard(child.id());
     let out_sink = PipeSink::new();
     let err_sink = PipeSink::new();
     let mut readers: Vec<Option<tokio::task::JoinHandle<()>>> = Vec::with_capacity(2);
@@ -215,11 +242,14 @@ async fn wait_for_shell(
     };
 
     let status = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(status) => status.map_err(|e| format!("executing command: {}", e))?,
+        Ok(status) => {
+            // `wait` returned, so the group id may be recycled from here on.
+            group.0 = None;
+            status.map_err(|e| format!("executing command: {}", e))?
+        }
         Err(_) => {
             release(&out_sink, &err_sink);
-            // Dropping `child` here fires the `kill_on_drop` the caller set,
-            // so the shell is SIGKILLed before this function returns.
+            // `group` drops on return and SIGKILLs the shell's whole group.
             return Ok(ShellWait::TimedOut);
         }
     };
@@ -325,11 +355,10 @@ impl LucidosEngine {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            // Two callers can drop this Command future:
-            // 1. The agent loop's run_tool_with_cancel wrapper on user cancel.
-            // 2. The tokio::time::timeout below when the per-tool timeout fires.
-            // Without kill_on_drop both leak the shell child. With it set,
-            // both paths SIGKILL the child correctly.
+            // Two callers can drop the wait on this child: a user cancel
+            // through run_tool_with_cancel, and the per-tool timeout.
+            // `wait_for_shell` kills the shell's group on both; kill_on_drop
+            // also covers a drop before the wait starts.
             .kill_on_drop(true);
         crate::core::apply_to_subprocess_env(
             &mut cmd,
@@ -343,9 +372,7 @@ impl LucidosEngine {
             &log_command[..log_command.floor_char_boundary(200)]
         );
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to spawn command: {}", e))?;
+        let child = spawn_shell(&mut cmd).map_err(|e| format!("Failed to spawn command: {}", e))?;
 
         // Wait on the SHELL, not on pipe EOF. A command that detaches a
         // process keeps the pipes open after the shell is gone. Waiting on EOF
@@ -354,7 +381,7 @@ impl LucidosEngine {
         let (detached, outcome, raw_stdout, raw_stderr, stdout_total, stderr_total) = match waited {
             ShellWait::TimedOut => {
                 // The shell itself never exited. `wait_for_shell` has already
-                // dropped it, so the OS has SIGKILLed it by now.
+                // SIGKILLed its whole process group.
                 return Err(format!("command timed out after {}s", timeout_secs).into());
             }
             ShellWait::Completed {
@@ -1000,14 +1027,12 @@ mod tests {
     /// Spawn through the same shell and pipe setup `execute_bash_tool` uses,
     /// so these exercise the real fd topology rather than a simplified one.
     fn spawn_like_the_tool(command: &str) -> tokio::process::Child {
-        command_shell()
-            .command(command)
-            .stdin(std::process::Stdio::null())
+        let mut cmd = command_shell().command(command);
+        cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn")
+            .kill_on_drop(true);
+        spawn_shell(&mut cmd).expect("spawn")
     }
 
     /// Output and status for the ordinary case, and promptly.
@@ -1182,9 +1207,8 @@ mod tests {
     /// real timeout, and must not be softened into a success.
     ///
     /// It must also STOP the work, not just stop waiting for it.
-    /// `wait_for_shell` drops the child, and the caller's `kill_on_drop` turns
-    /// that into a SIGKILL. The marker file is the proof: a surviving shell
-    /// would create it a second later.
+    /// `wait_for_shell` SIGKILLs the shell's process group. The marker file is
+    /// the proof: a surviving shell would create it a second later.
     #[tokio::test]
     async fn a_timeout_reports_a_timeout_and_kills_the_shell() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1205,6 +1229,57 @@ mod tests {
             !marker.exists(),
             "the shell survived the timeout and kept working"
         );
+    }
+
+    /// A timeout stops the shell's children too. `kill_on_drop` alone reached
+    /// only the shell, so a `&` child kept running and created the marker.
+    #[tokio::test]
+    async fn a_timeout_kills_the_shells_background_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("marker");
+
+        let child = spawn_like_the_tool(&format!(
+            "(sleep 1; touch '{}') >/dev/null 2>&1 & sleep 30",
+            marker.display()
+        ));
+        let waited = wait_for_shell(child, Duration::from_millis(200))
+            .await
+            .unwrap();
+        assert!(
+            matches!(waited, ShellWait::TimedOut),
+            "expected TimedOut, got {waited:?}"
+        );
+
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(
+            !marker.exists(),
+            "the background child survived the timeout"
+        );
+    }
+
+    /// A user cancel drops the wait mid-flight. That must stop the shell's
+    /// children as well, not just the shell.
+    #[tokio::test]
+    async fn a_cancel_kills_the_shells_background_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("marker");
+
+        let child = spawn_like_the_tool(&format!(
+            "(sleep 1; touch '{}') >/dev/null 2>&1 & sleep 30",
+            marker.display()
+        ));
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(200),
+            wait_for_shell(child, Duration::from_secs(30)),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the wait must still be running at the cancel"
+        );
+
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(!marker.exists(), "the background child survived the cancel");
     }
 
     /// Dropping `wait_with_output()` for `child.wait()` reopens the classic

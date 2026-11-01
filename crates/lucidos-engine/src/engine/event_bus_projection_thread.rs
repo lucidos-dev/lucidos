@@ -1536,6 +1536,8 @@ impl EventBus {
                 .await?;
                 Vec::new()
             }
+            // The keep-alive reads the newest one from the events table.
+            ThreadEvent::WakeExpected { .. } => Vec::new(),
             ThreadEvent::EventWaitCanceled { wait_id, .. } => {
                 sqlx::query(EVENT_WAIT_CANCEL_SQL.as_str())
                     .bind(thread_id)

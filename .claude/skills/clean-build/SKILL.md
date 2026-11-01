@@ -164,8 +164,8 @@ git ls-files '*.ts' '*.tsx' | xargs grep -l '@ts-expect-error' | grep -vE '\.tes
 (cd packages/lucidos-sdk && npx tsc --noEmit -p tsconfig.json); echo "SDK EXIT: $?"
 ```
 
-The currently-accepted categories, re-counted on 2026-10-27. That run
-removed six allow attributes that silenced nothing:
+The currently-accepted categories, re-counted on 2026-10-31. The
+2026-10-27 run removed six allow attributes that silenced nothing:
 
 - three `too_many_arguments` allows in `agent_session/apply_now.rs`, each on
   a function with seven parameters, `self` included;
@@ -202,7 +202,7 @@ silencers from the gateway's slowness watcher, which the first grep above
 had missed. The cfg_attr grep now covers that form.
 Anything not on this list is fair game to remove and re-fix:
 
-- **`#[allow(clippy::too_many_arguments)]`**, 80 sites across 54 files,
+- **`#[allow(clippy::too_many_arguments)]`**, 81 sites across 54 files,
   by far the largest category. Internal helpers that legitimately need
   that many parameters (event constructors, runtime spawn helpers,
   scheduler entry points, `LucidosEngine::new`'s boot wiring). The
@@ -210,9 +210,12 @@ Anything not on this list is fair game to remove and re-fix:
   the justification is the function's role, and the strongest form of it,
   which `LucidosEngine::new` carries, is that no two parameters share a
   type, so the argument swap the lint guards against cannot compile.
-  One of the 80 shares an attribute with `format_in_format_args`, which is
+  One of the 81 shares an attribute with `format_in_format_args`, which is
   the same site that entry counts. Grepping the bare form alone therefore
-  reports 79 across 53 files. Both numbers here count the shared attribute.
+  reports 80 across 53 files. Both numbers here count the shared attribute.
+  The newest is `follow_redirects` in `api/proxy.rs`, nine parameters,
+  split out of `forward_with_redirects` so every upstream reply leaves
+  with its injected credentials masked.
 - **`#[allow(dead_code)]`**, 3 sites, all test scaffolding
   (`thread_lifecycle_tests/scenario_tests.rs`,
   `change_ops_engine_origin_stamping_tests.rs`, `tools/plugins/mod.rs`).
@@ -448,6 +451,13 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   which took the entry to 554.98 kB. `exchange-grouping.ts` stays, since
   `computeExchanges` is the store's own derivation. The set held at
   1328.83 kB, because the code moved between two first-paint chunks.
+  On 2026-10-31 it measured 574.51 kB and the set 1332.16 kB. The store's
+  startup installed the macOS View menu, whose accelerators read
+  `utils/shortcuts.ts`. That pulled the shortcut table, `keybindings.ts` and
+  the SDK tooltip into the entry. `startShell` now installs it, which took
+  the entry to 555.87 kB. `__tests__/shortcut-table-stays-out-of-the-entry.test.ts`
+  keeps the three out. A dominator tree over the static graph found no other
+  UI module that one cut frees: what remains is the store's own data layer.
 
   The entry chunk is the data layer and startup. The UI is the shell chunk,
   loaded beside it under the boot splash.

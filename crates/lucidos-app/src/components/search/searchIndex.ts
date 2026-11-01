@@ -85,7 +85,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'accounts', label: 'Accounts', subview: 'accounts', path: 'Settings' },
   { id: 'locale', label: 'Locale', subview: 'locale', path: 'Settings', keywords: 'language timezone region locale time zone' },
   { id: 'marketplaces', label: 'Marketplaces', subview: 'marketplaces', path: 'Settings', keywords: 'marketplace plugin catalog install source registry' },
-  { id: 'access', label: 'Access', subview: 'access', path: 'Settings', keywords: 'mobile access remote phone tailscale tailnet connect url network bind lan pairing code add device' },
+  { id: 'access', label: 'Access', subview: 'access', path: 'Settings', keywords: 'mobile access remote phone tailscale tailnet connect url network bind lan pairing code pair device add' },
   { id: 'webhooks', label: 'Webhooks', subview: 'webhooks', path: 'Settings', keywords: 'webhook inbound hook endpoint github stripe slack signature hmac token funnel event' },
   { id: 'devices', label: 'Devices', subview: 'devices', path: 'Settings', keywords: 'device phone laptop push notifications rename remove last seen' },
   // Pairing lives on the same row as push now, so Revoke is found on the
@@ -113,7 +113,6 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
 
   // System → Debugging rows
   { id: 'debugging:capture-context', label: 'Capture context per step', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:capture-context', keywords: 'capture context step debug llm prompt' },
-  { id: 'debugging:cache-cards', label: 'Cache cards', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:cache-cards', keywords: 'cache cards warm line kept warm keep-alive prompt cache countdown time left hide show' },
   { id: 'debugging:perf', label: 'Perf instrumentation', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:perf', keywords: 'perf performance instrumentation telemetry lag latency profiling thread open render linkify' },
   { id: 'debugging:animation-speed', label: 'Animation speed', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:animation-speed', keywords: 'animation speed transition duration slow motion multiplier' },
   { id: 'debugging:autocorrect', label: 'Autocorrect', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:autocorrect', keywords: 'autocorrect auto-correct autocorrection keyboard typing spelling send button submit button tap dead nothing happens iphone ipad', iosOnly: true },
@@ -142,7 +141,10 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // Coding Agents subview
   { id: 'coding-agents:binaries', label: 'Binaries', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:binaries', keywords: 'coding agent claude codex binary path cli override auto-detect' },
   { id: 'coding-agents:permissions', label: 'Permissions', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:permissions', keywords: 'permission mode claude code auto accept edits classifier approve prompt card ask' },
-  { id: 'models:cache-keep-alive', label: 'Cache keep-alive', subview: 'models', path: 'Settings → Models', anchor: 'models:cache-keep-alive', keywords: 'cache keep-alive keep warm prompt cache rewrite ping beat prefill give up break-even tuned workspace data off cost claude code lucidos agent' },
+  { id: 'models:cache-keep-alive', label: 'Cache keep-alive', subview: 'models', path: 'Settings → Models', anchor: 'models:cache-keep-alive', keywords: 'cache keep-alive keep warm prompt cache reread rewrite ping beat prefill give up reread cap on off cost claude code lucidos agent' },
+  // Like Region below: the Cache cards row renders only while the keep-alive
+  // is on, so this lands on the section title that carries its switch.
+  { id: 'models:cache-cards', label: 'Cache cards', subview: 'models', path: 'Settings → Models → Cache keep-alive', anchor: 'models:cache-keep-alive', keywords: 'cache cards warm line kept warm keep-alive prompt cache countdown time left hide show' },
   { id: 'coding-agents:intelligence', label: 'Intelligence ladders', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:intelligence', keywords: 'intelligence ladder claude code codex link' },
   { id: 'intelligence:prices', label: 'Prices', subview: 'intelligence', path: 'Settings → Intelligence', anchor: 'intelligence:prices', keywords: 'price prices price table checked keep prices current trigger daily weekly cost' },
   { id: 'intelligence:ladder-chat', label: 'Intelligence ladder · Lucidos Agent', subview: 'intelligence', path: 'Settings → Intelligence', anchor: 'intelligence:ladder-chat', keywords: 'intelligence ladder rung model effort default picker chat lucidos agent trigger cost time band opus sonnet haiku gpt gemini grok enable disable list customised reset sort order' },
@@ -155,8 +157,8 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // Ungated on purpose: the section renders in any browser now, deriving its
   // tailnet rows from two plain-HTTP reads. Gating it hid the address the
   // browser user came looking for, from behind the section showing it.
-  { id: 'access:urls', label: 'Connect URLs', subview: 'access', path: 'Settings → Access', anchor: 'access:urls', keywords: 'connect url localhost lan tailnet magicdns address phone open elsewhere' },
-  { id: 'access:add-device', label: 'Add a device', subview: 'access', path: 'Settings → Access', anchor: 'access:add-device', keywords: 'pair pairing code qr scan phone new device enrol add' },
+  { id: 'access:addresses', label: 'Other addresses', subview: 'access', path: 'Settings → Access', anchor: 'access:addresses', keywords: 'other addresses connect url lan tailnet magicdns address phone open elsewhere' },
+  { id: 'access:pair-device', label: 'Pair a device', subview: 'access', path: 'Settings → Access', anchor: 'access:pair-device', keywords: 'pair pairing code qr scan phone new device enrol add' },
   { id: 'access:pair-gateway', label: 'Pair a gateway', subview: 'access', path: 'Settings → Access', anchor: 'access:pair-gateway', keywords: 'pair gateway code another gateway let in unpair relay remote' },
   { id: 'access:remote-gateways', label: 'Remote gateways', subview: 'access', path: 'Settings → Access', anchor: 'access:remote-gateways', keywords: 'remote gateway add another machine cloud server workspaces elsewhere pair' },
   { id: 'access:tailscale', label: 'Tailscale', subview: 'access', path: 'Settings → Access', anchor: 'access:tailscale', keywords: 'tailscale tailnet vpn magicdns serve https sign in' },
@@ -189,6 +191,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'models:conversation-summary', label: 'Conversation summary', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:conversation-summary' },
   { id: 'models:read-decision', label: 'Read decision', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:read-decision', keywords: 'read decision review worth reading typesafe jev openai decisions openrouter system one judgment' },
   { id: 'models:wake-decision', label: 'Wake decision', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:wake-decision', keywords: 'wake decision sub-thread child parent filed report typesafe jev openai decisions openrouter system one judgment' },
+  { id: 'models:expected-wake-decision', label: 'Expected wake', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:expected-wake-decision', keywords: 'expected wake decision cache keep-alive waiting estimate when the thread wakes typesafe jev openai decisions openrouter system one judgment' },
   // Lands on the Vertex header, not on the Region row itself. That row sits
   // inside the provider's block, which renders only while Vertex is switched
   // on. An anchor pointing at it scrolls to nothing whenever it is off. The

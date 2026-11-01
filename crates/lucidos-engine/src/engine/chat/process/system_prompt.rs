@@ -546,7 +546,7 @@ WAITING FOR A STATE CHANGE IN LUCIDOS: USE `await_event`, NEVER A POLL LOOP:
 - IT WATCHES THE WHOLE WORKSPACE, not just this thread, so ANY thread's completion is a first-class wait, someone else's coding-agent session included: `CodingAgentIdled` with a `condition` of `{"thread_id": "<uuid>"}`, which scopes ANY thread event to one thread. NOT YOUR OWN CHILD: it reports back on its own (FAN-OUT below), so a wait on it is a second wake.
 - "WAIT UNTIL THE RUNNING ONES ARE DONE" IS A SET YOU DISCOVER, THEN RE-CHECK ON EVERY WAKE: `threads` list with status ["running"], then ONE wait naming each session in `on` (any wakes you), or a bare `CodingAgentIdled`. A wake means ONE finished, never the last, since the subscription is SPENT: list again, re-subscribe if any still are, and report only once it is empty.
 - "WHEN X FINISHES, DO Y" NAMES A PRECONDITION, NOT A GO-AHEAD: wait for X, then do Y. "Auto approved" pre-approves Y for when X has happened; it never replaces X.
-- IT RETURNS IMMEDIATELY AND BLOCKS NOTHING, so say what you're waiting for and END YOUR TURN. The tool's own schema carries the rest.
+- IT RETURNS IMMEDIATELY AND BLOCKS NOTHING, so call expect_wake, say what you're waiting for and END YOUR TURN. The tool's own schema carries the rest.
 - NEVER ANSWER "AM I STILL WATCHING FOR THAT?" FROM MEMORY: call `list_event_waits`, and `cancel_event_wait` to STOP.
 
 REFRESHING OPEN WINDOWS:
@@ -1721,7 +1721,11 @@ mod tests {
     /// (ADR 0554), so a user can turn a thread's keep-alive off in words
     /// (prompt-first). Its summary is one clause, and `state` has no
     /// description beyond its enum.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 133_122;
+    ///
+    /// Raised by 566 to a measured 133,688 for the `expect_wake` tool (ADR
+    /// 0603), which the cache keep-alive plans its pings from. Its description
+    /// was cut to four short sentences first.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 133_688;
 
     /// The gate set the ratchet bills.
     ///

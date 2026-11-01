@@ -21,7 +21,7 @@ test.use({ viewport: { width: 390, height: 844 } });
  * These are layout properties: the emitted HTML was always correct, so no
  * amount of unit testing on `renderMarkdown` output can see them. The
  * transform's own contract (`data-stack` / `data-label`) is covered in
- * src/utils/renderMarkdown.test.ts.
+ * src/utils/markdownEngine.test.ts.
  *
  * Markup is injected into a real `.response-content.markdown-content` host so
  * the live app cascade applies, the same technique as

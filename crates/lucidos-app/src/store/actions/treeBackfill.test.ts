@@ -9,8 +9,10 @@ import {
   loadTreeBackfill,
   treeBackfill,
   treeBackfillStarted,
+  treeBackfillVersion,
 } from './treeBackfill';
 import { summaryTreesVersion } from '../store';
+import { repairGapState } from '../eventGap';
 
 // Hoisted by vitest, so the module under test sees the stub.
 const mockGet = vi.fn();
@@ -31,6 +33,12 @@ describe('the Tree backfill store', () => {
     treeBackfill.value = { status: 'not-loaded' };
     forgetTreeBackfillOrder();
     mockGet.mockReset();
+  });
+
+  it('is told of an event gap, which can swallow the frame that ended the backfill', () => {
+    const before = treeBackfillVersion.value;
+    repairGapState();
+    expect(treeBackfillVersion.value).toBe(before + 1);
   });
 
   it('loads the snapshot', async () => {
@@ -78,6 +86,19 @@ describe('the Tree backfill store', () => {
     handleGlobalEvent('TreeBackfillCompleted', { total: 10 });
     resolve(RUNNING);
     await inFlight;
+    expect(treeBackfill.value).toEqual({ status: 'loaded', data: { state: 'ready' } });
+  });
+
+  /** A gap re-reads while the mount read is still open. The older reply
+   *  can land last, and must not undo the newer one. */
+  it('keeps a newer snapshot over an older read that lands after it', async () => {
+    let resolveOlder: (v: TreeBackfill) => void = () => {};
+    mockGet.mockReturnValueOnce(new Promise<TreeBackfill>((r) => { resolveOlder = r; }));
+    const older = loadTreeBackfill();
+    mockGet.mockResolvedValueOnce({ state: 'ready' });
+    await loadTreeBackfill();
+    resolveOlder(RUNNING);
+    await older;
     expect(treeBackfill.value).toEqual({ status: 'loaded', data: { state: 'ready' } });
   });
 

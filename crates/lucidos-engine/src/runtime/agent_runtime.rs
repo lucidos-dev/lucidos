@@ -415,15 +415,13 @@ pub struct SpawnArgs<'a> {
     /// `engine::repo_directory_grants::resolve`. Each becomes one
     /// `--add-dir`. Claude Code only: Codex does not read those settings.
     pub additional_directories: &'a [PathBuf],
-    /// Whether the text this session's model writes before a tool call reaches
-    /// the user (`claude_code_provider`). The stream parser reads it. Claude
-    /// Code only: Codex ignores it. A probe or side question parses no notes
-    /// and passes `Hidden`.
-    pub notes: super::claude_code_provider::NotesVisibility,
     /// The auto-compact trial's setting for this spawn, from
     /// `engine::auto_compact_trial::resolve`. `None` when the trial is off.
     /// Claude Code only: Codex compacts on its own terms and ignores it.
     pub auto_compact: Option<crate::engine::auto_compact_trial::AutoCompactSetting>,
+    /// True when the first input is a cache keep-alive nudge, which the
+    /// runtime sends verbatim. Codex ignores it.
+    pub keep_alive: bool,
     /// The agent run marker the spawn stamps, and what the driver's end does
     /// with the processes carrying it (ADR 0391, 0478).
     pub(crate) agent_run: super::agent_run_marker::AgentRun,
@@ -433,6 +431,84 @@ impl SpawnArgs<'_> {
     /// The session context this spawn owes its first input.
     pub(crate) fn owed_session_context(&self) -> SessionContextDue {
         SessionContextDue::for_spawn(self.resume_session_id, self.session_context)
+    }
+}
+
+impl SpawnArgs<'_> {
+    /// The notes reminder this spawn owes its first input, if any.
+    pub(crate) fn owed_notes_reminder(&self) -> NotesReminderDue {
+        let mut due = NotesReminderDue::for_spawn(self.resume_session_id, self.model);
+        if self.keep_alive {
+            due.skip_first_input();
+        }
+        due
+    }
+}
+
+/// What a driver still owes its agent about whether its notes reach the user.
+/// A resumed session on a model that starts hidden owes a reset, because its
+/// transcript may hold an earlier promotion. The first note that arrives owes
+/// a promotion in its place. Like [`SessionContextDue`], it leads the next
+/// input that takes a prefix.
+#[derive(Debug, Default)]
+pub(crate) struct NotesReminderDue {
+    owed: Option<&'static str>,
+    /// The input that carried the last reminder, until the agent reads it.
+    carried: Option<(uuid::Uuid, &'static str)>,
+    skip_first_input: bool,
+}
+
+impl NotesReminderDue {
+    pub(crate) fn for_spawn(resume_session_id: Option<&str>, model: Option<&str>) -> Self {
+        use super::claude_code_notes::{notes_visibility, NotesVisibility};
+        match (resume_session_id, notes_visibility(model)) {
+            (Some(_), NotesVisibility::Hidden) => Self {
+                owed: Some(crate::engine::agent_session::NOTES_HIDDEN_AGAIN_REMINDER),
+                ..Self::default()
+            },
+            _ => Self::default(),
+        }
+    }
+
+    /// The first input goes verbatim, as a keep-alive nudge must.
+    pub(crate) fn skip_first_input(&mut self) {
+        self.skip_first_input = true;
+    }
+
+    /// The first note arrived. A reset owed now is stale, so this replaces it.
+    pub(crate) fn promoted(&mut self) {
+        self.owed = Some(crate::engine::agent_session::NOTES_NOW_SHOWN_REMINDER);
+        self.carried = None;
+    }
+
+    /// The agent dropped `input_uuid`. Its reminder is owed again, unless a
+    /// newer one is owed already.
+    pub(crate) fn withdrawn(&mut self, input_uuid: uuid::Uuid) {
+        if let Some((uuid, reminder)) = self.carried {
+            if uuid == input_uuid {
+                self.carried = None;
+                self.owed.get_or_insert(reminder);
+            }
+        }
+    }
+
+    /// `input` behind the reminder when one is owed and `input` takes a
+    /// prefix. A verbatim input, such as a slash command, passes it on.
+    pub(crate) fn lead(&mut self, mut input: AgentInput) -> AgentInput {
+        if std::mem::take(&mut self.skip_first_input)
+            || crate::engine::agent_session::forwards_verbatim(&input.text)
+        {
+            return input;
+        }
+        if let Some(reminder) = self.owed.take() {
+            input.text = if input.text.is_empty() {
+                reminder.to_string()
+            } else {
+                format!("{reminder}\n\n{}", input.text)
+            };
+            self.carried = Some((input.uuid, reminder));
+        }
+        input
     }
 }
 
@@ -574,7 +650,10 @@ pub trait AgentRuntime: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{AccountPin, AgentInput, CodingAgent, SessionContextBlock, SessionContextDue};
+    use super::{
+        AccountPin, AgentInput, CodingAgent, NotesReminderDue, SessionContextBlock,
+        SessionContextDue,
+    };
     use crate::api::ChatImage;
 
     fn input(text: &str) -> AgentInput {
@@ -633,6 +712,72 @@ mod tests {
         assert_eq!(taken.text, "CTX\n\nagain");
         due.delivered(&taken);
         assert_eq!(due.lead(input("later")).text, "later");
+    }
+
+    /// A resumed session on a model that starts hidden owes a reset. A fresh
+    /// one, or one on a model that starts shown, owes nothing.
+    #[test]
+    fn only_a_resumed_hidden_session_owes_a_notes_reset() {
+        let hidden = Some("claude-opus-5-5");
+        let mut fresh = NotesReminderDue::for_spawn(None, hidden);
+        assert_eq!(fresh.lead(input("go")).text, "go");
+        let mut shown = NotesReminderDue::for_spawn(Some("sid"), Some("claude-opus-5"));
+        assert_eq!(shown.lead(input("go")).text, "go");
+        let mut resumed = NotesReminderDue::for_spawn(Some("sid"), hidden);
+        let led = resumed.lead(input("go")).text;
+        assert!(
+            led.starts_with("<system-reminder>") && led.ends_with("\n\ngo"),
+            "{led}"
+        );
+        assert_eq!(resumed.lead(input("next")).text, "next");
+    }
+
+    /// The reminder never rides a verbatim input, and a note that arrives
+    /// replaces a reset that is still owed.
+    #[test]
+    fn a_promotion_replaces_the_reset_and_skips_verbatim_inputs() {
+        let mut due = NotesReminderDue::for_spawn(Some("sid"), Some("claude-opus-5-5"));
+        due.promoted();
+        assert_eq!(due.lead(input("/cost")).text, "/cost");
+        let led = due.lead(input("go")).text;
+        assert!(led.contains("now reach the user"), "{led}");
+        assert!(!led.contains("hidden again"), "{led}");
+        assert_eq!(due.lead(input("next")).text, "next");
+    }
+
+    /// A keep-alive nudge goes verbatim, so the reset waits for the next input.
+    #[test]
+    fn a_keep_alive_spawn_passes_the_reset_on() {
+        let mut due = NotesReminderDue::for_spawn(Some("sid"), Some("claude-opus-5-5"));
+        due.skip_first_input();
+        assert_eq!(due.lead(input("keep warm")).text, "keep warm");
+        let led = due.lead(input("go")).text;
+        assert!(led.contains("hidden again"), "{led}");
+    }
+
+    /// An input the agent dropped gives its reminder back, and only that one.
+    #[test]
+    fn a_withdrawn_input_gives_its_reminder_back() {
+        let mut due = NotesReminderDue::default();
+        due.promoted();
+        let carrier = due.lead(input("go"));
+        due.withdrawn(uuid::Uuid::new_v4());
+        assert_eq!(due.lead(input("other")).text, "other");
+        due.withdrawn(carrier.uuid);
+        let led = due.lead(input("again")).text;
+        assert!(led.contains("now reach the user"), "{led}");
+    }
+
+    /// A promotion owed since the withdrawn input stays owed, and wins.
+    #[test]
+    fn a_withdraw_never_brings_back_a_superseded_reset() {
+        let mut due = NotesReminderDue::for_spawn(Some("sid"), Some("claude-opus-5-5"));
+        let carrier = due.lead(input("go"));
+        due.promoted();
+        due.withdrawn(carrier.uuid);
+        let led = due.lead(input("again")).text;
+        assert!(led.contains("now reach the user"), "{led}");
+        assert_eq!(due.lead(input("next")).text, "next");
     }
 
     const HOME_CLAUDE: &str = "/home/u/.claude";

@@ -1,6 +1,6 @@
 import { render } from 'preact';
 import { useLayoutEffect, useState } from 'preact/hooks';
-import { COPY_ID_NONCE, WIDGET_EMBED_ATTR, WIDGET_EMBED_ERROR_ATTR, WIDGET_EMBED_SLOT_ATTR } from '../../utils/markedConfig';
+import { COPY_ID_NONCE, WIDGET_EMBED_ATTR, WIDGET_EMBED_ERROR_ATTR, WIDGET_EMBED_SLOT_ATTR } from '../../utils/markdownMarkers';
 import type { WidgetEmbed } from '../../generated/thread-event-wire';
 import { InlineWidget, UnavailableWidget } from './InlineWidget';
 import { embedRefusal } from '../../utils/widgetEmbed';

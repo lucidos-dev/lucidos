@@ -1,30 +1,46 @@
-import { describe, it, expect } from 'vitest';
-import {
-  CACHE_KEEP_ALIVE_OPTIONS,
-  isCacheKeepAliveMode,
-} from './CacheKeepAliveSection';
-import { CACHE_KEEP_ALIVE_MODES } from '../../store/actions/preferences';
-import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
+/** The cache cards are a sub-setting of the keep-alive: they draw only while
+ *  the keep-alive is on, whatever their own switch says. */
+import { describe, it, expect, afterEach } from 'vitest';
+import { currentCacheCards, currentCacheKeepAliveOn } from '../../store/actions/preferences';
+import { preferences } from '../../store/store';
 
-describe('cache keep-alive mode', () => {
-  it('puts the default first', () => {
-    expect(CACHE_KEEP_ALIVE_OPTIONS[0].value)
-      .toBe(PREFERENCE_CATALOG.cache_keep_alive_mode.fallback);
+function setPrefs(data: Record<string, string>) {
+  preferences.value = { status: 'loaded', data };
+}
+
+afterEach(() => {
+  preferences.value = { status: 'not-loaded' };
+});
+
+describe('cache keep-alive switch', () => {
+  it('is off by default', () => {
+    setPrefs({});
+    expect(currentCacheKeepAliveOn()).toBe(false);
   });
 
-  it('offers every catalog value once, with a label and a trade-off line', () => {
-    expect(CACHE_KEEP_ALIVE_OPTIONS.map((o) => o.value).sort())
-      .toEqual([...CACHE_KEEP_ALIVE_MODES].sort());
-    for (const option of CACHE_KEEP_ALIVE_OPTIONS) {
-      expect(option.label.length).toBeGreaterThan(0);
-      expect(option.description?.length ?? 0).toBeGreaterThan(0);
-    }
+  it('reads on only for the on value', () => {
+    setPrefs({ cache_keep_alive_mode: 'on' });
+    expect(currentCacheKeepAliveOn()).toBe(true);
+    setPrefs({ cache_keep_alive_mode: 'off' });
+    expect(currentCacheKeepAliveOn()).toBe(false);
+  });
+});
+
+describe('cache cards', () => {
+  it('draw while the keep-alive and the cards are both on', () => {
+    setPrefs({ cache_keep_alive_mode: 'on', cache_cards: 'true' });
+    expect(currentCacheCards()).toBe(true);
   });
 
-  it('refuses a value outside the accepted set', () => {
-    for (const mode of CACHE_KEEP_ALIVE_MODES) expect(isCacheKeepAliveMode(mode)).toBe(true);
-    for (const rejected of ['', 'workspace_data', 'on', 'Default']) {
-      expect(isCacheKeepAliveMode(rejected)).toBe(false);
-    }
+  it('never draw while the keep-alive is off', () => {
+    setPrefs({ cache_keep_alive_mode: 'off', cache_cards: 'true' });
+    expect(currentCacheCards()).toBe(false);
+    setPrefs({ cache_cards: 'true' });
+    expect(currentCacheCards()).toBe(false);
+  });
+
+  it('stay hidden while their own switch is off', () => {
+    setPrefs({ cache_keep_alive_mode: 'on', cache_cards: 'false' });
+    expect(currentCacheCards()).toBe(false);
   });
 });

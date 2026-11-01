@@ -1,8 +1,8 @@
 import { useLayoutEffect, useMemo, useRef } from 'preact/hooks';
-import { renderMarkdown } from '../../utils/renderMarkdown';
+import { markdownEngine, renderMarkdown } from '../../utils/renderMarkdown';
 import type { MarkdownDocumentLocation } from '../../utils/markdownImageSource';
 import { splitFrontmatter, type Frontmatter } from '../../utils/frontmatter';
-import { COPY_ID_NONCE, TASK_CHECKBOX_ATTR } from '../../utils/markedConfig';
+import { COPY_ID_NONCE, TASK_CHECKBOX_ATTR } from '../../utils/markdownMarkers';
 import { countTaskListItems } from '../../utils/taskListToggle';
 
 /** A markdown file as a document: its frontmatter as a properties card, then
@@ -30,10 +30,11 @@ export function MarkdownDocument({ content, location, onClick, editable = false,
 }) {
   // By value: a caller builds a fresh location object on every render.
   const locationKey = JSON.stringify(location);
+  const markdown = markdownEngine.value;
   const { frontmatter, html } = useMemo(() => {
     const split = splitFrontmatter(content);
     return { frontmatter: split.frontmatter, html: renderMarkdown(split.body, { document: location }) };
-  }, [content, locationKey]);
+  }, [content, locationKey, markdown]);
   const bodyRef = useRef<HTMLDivElement>(null);
   // The latest callback, read inside the click handler rather than closed
   // over by the effect below. A caller re-rendering with a fresh function

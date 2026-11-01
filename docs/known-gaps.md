@@ -25,7 +25,7 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
 - **Where:** `crates/lucidos-app/src/components/files/UrlPreviewInline.tsx` (Tauri
   branch → native overlay webview via `create_panel_webview` in
   `crates/lucidos-app/src/lib.rs`); the host focus tracker
-  `installContentPaneIframeFocusTracking` in
+  `installPaneFocusTracking` in
   `crates/lucidos-app/src/components/layout/paneFocus.ts`.
 - **Gap:** Clicking the internal browser in the packaged Tauri desktop app does
   not move the focused-pane marker to `content` — the marker stays on the
@@ -492,7 +492,9 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
 - **Where:** `crates/lucidos-engine/src/engine/command_guard.rs` (`fallback_classify`), against the entry above, which fixed the same predicate on the coding-agent lane
 - **Gap:** `JudgeInput.fast_path_refused` says the Safe fast path actively REFUSED this text, rather than merely missing its head: a command substitution, a code-injecting `VAR=` preamble, a path-qualified head, or a write outside the workspace. `cc_permission` reads that flag and denies. `fallback_classify` ignores it, so with the judge off, `bash -c "$(cat data/payload.sh)"` runs with no card on chat and auto-allows on a trigger. A judge that errors no longer reaches this path: it asks (ADR 0002, 2026-10-09 addendum). One predicate, two answers.
 - **Why:** Not an oversight, and not cheap to close. `static_classify` makes EVERY python decline a Refusal, so returning `IrreversibleDanger` for the flag deletes the `ReversibleDanger` checkpoint lane for `run_python` outright and leaves `python_destruction_scope` dead. On bash it moves `echo "$(date +%F)" >> data/artifacts/report.md`, `./scripts/collect.sh` and `cmd > /tmp/out` from Safe to a permission card. It fails any trigger granted less than `Other`, including one granted exactly what the command does, since the derived category goes with it. That was written and reverted, unreviewed, on 2026-09-08.
-- **Status:** Open, and it needs a decision rather than a patch: which REFUSAL REASONS deserve which lane. A substitution body can be anything, so distrusting its derived category is right. A `>/tmp` redirect or a path-qualified head is a KNOWN head with a path problem, and treating those alike is what produces the blast radius. The e2e test `a_command_destroying_only_ignored_content_leaves_no_undo_card` runs this path with the judge off and is the tripwire for any attempt.
+- **Status:** **Closed (2026-11-01)** by the owner's decision in ADR 0002 § Addendum (2026-11-01): a refusal asks, as `IrreversibleDanger` with category `Other`. Harmless refusals asking while the judge is off is the accepted cost. A temp-dir redirect is an omission since the 2026-10-24 addendum, so it still runs. A Python destruction call that is the whole refusal keeps the checkpoint lane, which keeps `a_command_destroying_only_ignored_content_leaves_no_undo_card` valid. **Two residuals remain open:**
+  - **A derived category outranks the refusal.** `static_side_effect_category` runs first, so `echo $(sh data/payload.sh) && curl -X POST …` carries `ExternalApi`. A trigger granted `external_api` runs the substitution body unattended. The coding-agent lane puts the refusal first. Flipping it fails `curl -H "Authorization: Bearer $(cat data/token)"` on such a trigger, so it needs a decision.
+  - **A Python destruction on a variable path checkpoints.** `shutil.rmtree(os.environ['HOME'])` resolves no literal outside, so `python_destruction_scope` reads it as in-workspace and the checkpoint cannot restore it. This predates the fix, and only the judge catches it.
 
 ### AskUserQuestion is capped at 4 options and 4 questions
 - **Where:** `docs/adr/0017-ask-user-question-four-option-cap.md`, `crates/lucidos-engine/src/llm/tools/misc.rs` (`maxItems: 4`)

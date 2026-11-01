@@ -1312,87 +1312,131 @@ fn messages(events: &[AgentEvent]) -> Vec<&str> {
         .collect()
 }
 
-/// A note is its own event, never `Message` prose: the card gate must tell
-/// the summary the user read from text they read in full.
-#[test]
-fn a_relayed_note_from_an_always_thinking_model_is_a_progress_note() {
-    for model in ["claude-opus-5-5", "claude-fable-5-1"] {
-        let mut state = CcStreamState::with_notes_relayed(true);
-        let events = parse_line(&mut state, &assistant_thinking(model, "  Found it.  "));
-        assert!(
-            matches!(&events[..], [AgentEvent::ProgressNote { text }] if text == "Found it."),
-            "{model}: {events:?}"
-        );
-    }
+const NOTE_MODEL: &str = "claude-opus-5-5";
+
+fn thought_delta(text: &str) -> String {
+    serde_json::json!({
+        "type": "stream_event",
+        "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": text},
+        },
+    })
+    .to_string()
 }
 
-/// Without the relay, or on a model whose thinking is not a note, the text is
-/// reasoning and must never reach the transcript.
-#[test]
-fn thinking_text_stays_hidden_unless_the_relay_asked_for_notes() {
-    let mut unrelayed = CcStreamState::default();
-    let events = parse_line(&mut unrelayed, &assistant_thinking("claude-opus-5-5", "x"));
-    assert!(messages(&events).is_empty());
-
-    let mut relayed = CcStreamState::with_notes_relayed(true);
-    for model in ["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"] {
-        let events = parse_line(&mut relayed, &assistant_thinking(model, "reasoning"));
-        assert!(messages(&events).is_empty(), "{model}");
-    }
+fn model_message_start(model: &str) -> String {
+    serde_json::json!({
+        "type": "stream_event",
+        "event": {"type": "message_start", "message": {"model": model}},
+    })
+    .to_string()
 }
 
-/// The verdict decides both the prompt and the parser. A session told its
-/// notes are hidden never turns reasoning into transcript text, and the
-/// reverse.
-#[test]
-fn the_stream_state_follows_the_notes_verdict() {
-    use crate::runtime::claude_code_provider::NotesVisibility::{Hidden, Shown};
-    let thinking = assistant_thinking("claude-opus-5-5", "Found it.");
-    let mut shown = stream_state_for(Shown);
-    assert_eq!(messages(&parse_line(&mut shown, &thinking)), ["Found it."]);
-    let mut hidden = stream_state_for(Hidden);
-    assert!(messages(&parse_line(&mut hidden, &thinking)).is_empty());
+fn sub_agent_thinking(model: &str, thinking: &str) -> String {
+    let mut frame: serde_json::Value =
+        serde_json::from_str(&assistant_thinking(model, thinking)).expect("the helper writes JSON");
+    frame["parent_tool_use_id"] = "toolu_parent".into();
+    frame.to_string()
 }
 
+/// A signature-only block before a tool call is what Claude Code sends whether
+/// or not notes are shown, so it must never prove anything.
 #[test]
-fn an_empty_note_and_the_interrupted_sentinel_render_nothing() {
-    let mut state = CcStreamState::with_notes_relayed(true);
+fn an_empty_thinking_block_never_proves_notes() {
+    let mut state = CcStreamState::default();
     for text in [
         "",
         "   ",
         "This part of the response was interrupted before it finished.",
     ] {
-        let events = parse_line(&mut state, &assistant_thinking("claude-opus-5-5", text));
-        assert!(messages(&events).is_empty(), "{text:?}");
+        let events = parse_line(&mut state, &assistant_thinking(NOTE_MODEL, text));
+        assert!(events.is_empty(), "{text:?}: {events:?}");
+    }
+    assert!(!state.take_promotion());
+    parse_line(&mut state, &model_message_start(NOTE_MODEL));
+    assert!(matches!(
+        &parse_line(&mut state, &thought_delta("x"))[..],
+        [AgentEvent::Thought { .. }, AgentEvent::StreamActivity]
+    ));
+}
+
+/// The first note already streamed as a Thought, so its frame adds no second
+/// copy. Promotion is owed to the agent exactly once.
+#[test]
+fn the_first_note_promotes_without_a_second_copy() {
+    for model in [NOTE_MODEL, "claude-fable-5-1"] {
+        let mut state = CcStreamState::default();
+        let events = parse_line(&mut state, &assistant_thinking(model, "  Found it.  "));
+        assert!(events.is_empty(), "{model}: {events:?}");
+        assert!(state.take_promotion(), "{model}");
+        assert!(!state.take_promotion(), "{model}");
     }
 }
 
-/// The complete frame carries the whole note, so its streamed delta must not
-/// also become a Thought, or the note shows twice.
+/// A note is its own event, never `Message` prose: the card gate must tell
+/// the summary the user read from text they read in full. Proof is one-way.
 #[test]
-fn a_relayed_notes_delta_yields_no_thought_but_keeps_liveness() {
-    let start = |model: &str| {
-        serde_json::json!({
-            "type": "stream_event",
-            "event": {"type": "message_start", "message": {"model": model}},
-        })
-        .to_string()
-    };
-    let delta = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Found it."}}}"#;
+fn a_proven_note_is_a_progress_note_and_stays_proven() {
+    let mut state = CcStreamState::default();
+    parse_line(&mut state, &assistant_thinking(NOTE_MODEL, "First."));
+    let events = parse_line(&mut state, &assistant_thinking(NOTE_MODEL, ""));
+    assert!(events.is_empty(), "{events:?}");
+    let events = parse_line(&mut state, &assistant_thinking(NOTE_MODEL, "  Found it.  "));
+    assert!(
+        matches!(&events[..], [AgentEvent::ProgressNote { text }] if text == "Found it."),
+        "{events:?}"
+    );
+}
 
-    let mut relayed = CcStreamState::with_notes_relayed(true);
-    parse_line(&mut relayed, &start("claude-opus-5-5"));
-    assert!(matches!(
-        &parse_line(&mut relayed, delta)[..],
-        [AgentEvent::StreamActivity]
-    ));
+/// Another model's thinking is reasoning, so it never proves notes.
+#[test]
+fn thinking_from_other_models_never_proves_notes() {
+    let mut state = CcStreamState::default();
+    for model in ["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"] {
+        let events = parse_line(&mut state, &assistant_thinking(model, "reasoning"));
+        assert!(messages(&events).is_empty(), "{model}");
+    }
+    assert!(!state.take_promotion());
+}
 
-    // A model whose thinking is reasoning keeps its Thought, relay or not.
-    parse_line(&mut relayed, &start("claude-opus-5"));
-    assert!(matches!(
-        &parse_line(&mut relayed, delta)[..],
-        [AgentEvent::Thought { .. }, AgentEvent::StreamActivity]
-    ));
+/// A sub-agent's deltas never stream, so the note that proves notes is also
+/// the only place the user could read it.
+#[test]
+fn a_sub_agent_note_promotes_and_still_shows() {
+    let mut state = CcStreamState::default();
+    let events = parse_line(&mut state, &sub_agent_thinking(NOTE_MODEL, "Reading."));
+    assert!(
+        matches!(&events[..], [AgentEvent::SubAgentMessage { text, .. }] if text == "Reading."),
+        "{events:?}"
+    );
+    assert!(state.take_promotion());
+}
+
+/// Over a delta plus frame stream, each note reaches the user once.
+#[test]
+fn a_note_shows_once_across_its_delta_and_frame() {
+    let mut state = CcStreamState::default();
+    let mut shown = Vec::new();
+    for note in ["First.", "Second."] {
+        let lines = [
+            model_message_start(NOTE_MODEL),
+            thought_delta(note),
+            assistant_thinking(NOTE_MODEL, note),
+        ];
+        for line in &lines {
+            for event in parse_line(&mut state, line) {
+                match event {
+                    AgentEvent::Thought { text } | AgentEvent::ProgressNote { text } => {
+                        shown.push(text)
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert_eq!(shown, ["First.", "Second."]);
 }
 
 #[test]

@@ -1162,24 +1162,15 @@ impl LucidosEngine {
         };
         let binary_override = binary_override_pref.read(self.pool()).await;
         // Whether the text the model writes before a tool call reaches the
-        // user. Decided once per spawn, so the prompt stays fixed and the
-        // stream parser agrees with it. Claude Code only: Codex streams its
-        // own summary.
+        // user, as far as the spawn knows. Claude Code starts hidden and the
+        // stream promotes it (`claude_code_notes`). Codex streams its own
+        // summary.
         let notes = match coding_agent {
             crate::runtime::CodingAgent::ClaudeCode => {
-                crate::runtime::claude_code_provider::notes_visibility(
-                    &crate::runtime::claude_code_provider::ProviderInputs {
-                        binary_override: binary_override.as_deref(),
-                        user_env_vars: &user_env_vars,
-                        account_pin: injected_pin.as_ref(),
-                        worktree_path: &cwd,
-                        thread_id,
-                    },
-                )
-                .await
+                crate::runtime::claude_code_notes::notes_visibility(cc_model.as_deref())
             }
             crate::runtime::CodingAgent::Codex => {
-                crate::runtime::claude_code_provider::NotesVisibility::Shown
+                crate::runtime::claude_code_notes::NotesVisibility::Shown
             }
         };
         let system_prompt =
@@ -1252,8 +1243,8 @@ impl LucidosEngine {
                 permission_mode: permission_mode.as_deref(),
                 account_pin: injected_pin.as_ref(),
                 additional_directories: &repo_directory_grants,
-                notes,
                 auto_compact,
+                keep_alive: matches!(first_prompt, PromptFor::KeepAlive(_)),
                 agent_run: crate::runtime::agent_run_marker::AgentRun::for_thread(
                     self.workspace_path(),
                     thread_id,

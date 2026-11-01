@@ -1369,6 +1369,15 @@ export function SettingsView() {
             nested
             background={background}
           />
+          {/* Also at the turn end: when a waiting thread wakes, for the cache
+              keep-alive. The System One rows are among its models. */}
+          <JudgmentModelRow
+            site="expected-wake-decision"
+            label="Expected wake"
+            anchor="models:expected-wake-decision"
+            nested
+            background={background}
+          />
           {/* The compactor runs only under Tree, so the row shows only then. */}
           <Disclosure open={currentMemoryModule() === 'tree'}>
             <BackgroundModelRow

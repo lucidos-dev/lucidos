@@ -28,6 +28,9 @@ import {
   PREF_JUDGMENT_QUERY_CLASSIFICATION,
   PREF_JUDGMENT_READ_DECISION,
   PREF_JUDGMENT_WAKE_DECISION,
+  PREF_JUDGMENT_EXPECTED_WAKE_DECISION,
+  PREF_MODEL_EXPECTED_WAKE_DECISION,
+  PREF_REASONING_EXPECTED_WAKE_DECISION,
   PREF_MODEL_WAKE_DECISION,
   PREF_REASONING_WAKE_DECISION,
 } from '@lucidos/preference-catalog';
@@ -176,7 +179,8 @@ export type JudgmentSite =
   | 'command-guard'
   | 'query-classification'
   | 'read-decision'
-  | 'wake-decision';
+  | 'wake-decision'
+  | 'expected-wake-decision';
 
 /** Every site with a control, in the order the provider rows list them. */
 export const JUDGMENT_SITES: readonly JudgmentSite[] = [
@@ -184,6 +188,7 @@ export const JUDGMENT_SITES: readonly JudgmentSite[] = [
   'query-classification',
   'read-decision',
   'wake-decision',
+  'expected-wake-decision',
 ];
 
 export const JUDGMENT_PREFERENCE_KEY: Record<JudgmentSite, string> = {
@@ -191,6 +196,7 @@ export const JUDGMENT_PREFERENCE_KEY: Record<JudgmentSite, string> = {
   'query-classification': PREF_JUDGMENT_QUERY_CLASSIFICATION.key,
   'read-decision': PREF_JUDGMENT_READ_DECISION.key,
   'wake-decision': PREF_JUDGMENT_WAKE_DECISION.key,
+  'expected-wake-decision': PREF_JUDGMENT_EXPECTED_WAKE_DECISION.key,
 };
 
 /** The model half of the site's *model selection*, used while it runs on chat.
@@ -200,6 +206,7 @@ export const JUDGMENT_MODEL_KEY: Record<JudgmentSite, BackgroundModelKey> = {
   'query-classification': 'model_query_classification',
   'read-decision': 'model_read_decision',
   'wake-decision': PREF_MODEL_WAKE_DECISION.key,
+  'expected-wake-decision': PREF_MODEL_EXPECTED_WAKE_DECISION.key,
 };
 
 /** The effort half, written with the model and never on its own. */
@@ -208,6 +215,7 @@ export const JUDGMENT_REASONING_KEY: Record<JudgmentSite, BackgroundReasoningKey
   'query-classification': 'reasoning_query_classification',
   'read-decision': 'reasoning_read_decision',
   'wake-decision': PREF_REASONING_WAKE_DECISION.key,
+  'expected-wake-decision': PREF_REASONING_EXPECTED_WAKE_DECISION.key,
 };
 
 /** What each site is called on screen. */
@@ -216,6 +224,7 @@ export const JUDGMENT_SITE_LABEL: Record<JudgmentSite, string> = {
   'query-classification': 'Query classification',
   'read-decision': 'Read decision',
   'wake-decision': 'Wake decision',
+  'expected-wake-decision': 'Expected wake',
 };
 
 /** Where its control is, for a provider row to point at. */
@@ -224,6 +233,7 @@ export const JUDGMENT_SITE_LOCATION: Record<JudgmentSite, string> = {
   'query-classification': 'Models → Background tasks',
   'read-decision': 'Models → Background tasks',
   'wake-decision': 'Models → Background tasks',
+  'expected-wake-decision': 'Models → Background tasks',
 };
 
 /** The row an unset preference runs on. Mirrors the engine's

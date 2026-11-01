@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
+use super::expected_wake_decision::TurnStart;
 use super::wake_decision::{OwedReport, TurnFinish};
 use crate::engine::model_call::AuxCapture;
 use crate::engine::read_request::{record_read_decision, ReadDecision};
@@ -38,8 +39,45 @@ pub(crate) const READ_QUESTION_ID: &str = "read";
 /// A missed must-read costs more than a reply read for nothing, so a tie reads.
 pub(crate) const READ_THRESHOLD: f64 = 0.5;
 
+/// What still makes a report to a parent agent worth the user's read. The
+/// judge's instructions and a sub-thread's own read rule share it, so the two
+/// cannot disagree about what the parent's reply drops.
+macro_rules! must_see_criteria {
+    () => {
+        "a failure, a gap the user must know about, or something only the user can do or \
+         decide, such as a payment, a sign-in or an approval"
+    };
+}
+
+/// The sentences of a sub-thread's own read rule, after its heading.
+macro_rules! parent_acts_read_guidance {
+    () => {
+        concat!(
+            "Your report goes to your parent agent, which acts on it, and the user reads your \
+             parent. A routine result (a pass, nothing found, already fixed, a ready change, a \
+             status) is a no, because your parent carries the read. That replaces the yes for \
+             an answer and no change. Say yes only for ",
+            must_see_criteria!(),
+            ". A turn the user opens in this thread is answered as usual."
+        )
+    };
+}
+
+/// The read rule of a sub-thread whose spawn declared a wake mode that wakes
+/// its parent, so every report reaches the parent agent (ADR 0607).
+pub(crate) const PARENT_ACTS_READ_RULE: &str =
+    concat!("SUB-THREAD READ DECISION: ", parent_acts_read_guidance!());
+
+/// The read rule of a sub-thread that decides its own wake. It acts on the
+/// reports that wake the parent, and the rest are filed.
+pub(crate) const PARENT_MAY_ACT_READ_RULE: &str = concat!(
+    "SUB-THREAD READ DECISION, only when you wake your parent: ",
+    parent_acts_read_guidance!()
+);
+
 /// What the question asks. The turn arrives as the state.
-pub(crate) const READ_DECISION_INSTRUCTIONS: &str = "Should the user read the agent's reply? \
+pub(crate) const READ_DECISION_INSTRUCTIONS: &str = concat!(
+    "Should the user read the agent's reply? \
     The state is one turn.\n\n\
     A heading says what opened the turn: the user's message, a child thread's report, a trigger \
     run, or another agent's prompt. A report or prompt that opened the turn is not the user \
@@ -61,12 +99,13 @@ pub(crate) const READ_DECISION_INSTRUCTIONS: &str = "Should the user read the ag
     only when the reply holds something the user should read before the work finishes, such as \
     a failure, a finding or a decision.\n\n\
     When a closing note says the parent agent acts on this reply now, a routine result for it \
-    is not worth the user's read. It is still worth reading when it holds a failure, a gap the \
-    user must know about, or something only the user can do or decide, such as a payment, a \
-    sign-in or an approval. The parent agent seeing it does not make it the parent's to settle.\n\n\
+    is not worth the user's read. It is still worth reading when it holds ",
+    must_see_criteria!(),
+    ". The parent agent seeing it does not make it the parent's to settle.\n\n\
     When a closing note says the turn already sent the user a notification, the reply is not \
     worth reading. The notification is how the user hears, and they do not need both. The one \
-    exception is a failure the notification does not mention.";
+    exception is a failure the notification does not mention."
+);
 
 /// What a yes means.
 const READ_YES: &str = "The reply holds findings, research, an answer to the user's question, \
@@ -670,8 +709,9 @@ impl Opening {
 impl crate::engine::LucidosEngine {
     /// The chat turn end's gate, just before `ResponseGenerated`: force the
     /// read decision when the turn made none, and the wake decision when the
-    /// thread owes its parent a report without one. `reply` is the draft the
-    /// turn ends on, and it stays the reply.
+    /// thread owes its parent a report without one. Beside them runs the
+    /// expected wake decision. `reply` is the draft the turn ends on, and it
+    /// stays the reply.
     pub(crate) async fn gate_chat_turn_end(
         &self,
         thread_id: Uuid,
@@ -680,45 +720,57 @@ impl crate::engine::LucidosEngine {
         reply: &str,
         finish: TurnFinish,
     ) {
-        let owed = OwedReport::of_thread(&self.pool, thread_id).await;
-        if read_decided && owed.is_none() {
-            return;
-        }
-        let turn = chat_turn_read(&self.pool, thread_id, origin_id, reply).await;
-        self.force_turn_end_decisions(thread_id, &turn, read_decided, owed, finish)
-            .await;
+        let decisions = async {
+            let owed = OwedReport::of_thread(&self.pool, thread_id).await;
+            if read_decided && owed.is_none() {
+                return;
+            }
+            let turn = chat_turn_read(&self.pool, thread_id, origin_id, reply).await;
+            self.force_turn_end_decisions(thread_id, &turn, read_decided, owed, finish)
+                .await;
+        };
+        let expected_wake =
+            self.force_expected_wake_decision(thread_id, TurnStart::Opened(origin_id), reply);
+        tokio::join!(decisions, expected_wake);
     }
 
     /// The coding-agent turn end's gate, before `CodingAgentIdled`: force the
-    /// read decision and the wake decision the turn did not make. A coding
-    /// agent cannot be forced inside its own session, so both read the turn's
-    /// events. `has_changes` is the idle's own, which names the report's
-    /// status.
+    /// read decision and the wake decision the turn did not make, with the
+    /// expected wake decision beside them. A coding agent cannot be forced
+    /// inside its own session, so all three read the turn's events.
+    /// `has_changes` is the idle's own, which names the report's status.
     pub(crate) async fn gate_coding_agent_turn_end(&self, thread_id: Uuid, has_changes: bool) {
         let owed = OwedReport::of_thread(&self.pool, thread_id).await;
-        let turn = match coding_agent_turn_read(&self.pool, thread_id).await {
-            Ok(turn) => turn,
-            Err(e) => {
-                // The wake decision stays unset, which wakes the parent.
-                let unread = format!("the turn's events were unreadable: {e}");
-                record_forced_decision(&self.event_bus, thread_id, Err(unread.into())).await;
-                return;
-            }
+        let turn = coding_agent_turn_read(&self.pool, thread_id).await;
+        let reply = turn.as_ref().map(|t| t.reply.clone()).unwrap_or_default();
+        let decisions = async {
+            let turn = match turn {
+                Ok(turn) => turn,
+                Err(e) => {
+                    // The wake decision stays unset, which wakes the parent.
+                    let unread = format!("the turn's events were unreadable: {e}");
+                    record_forced_decision(&self.event_bus, thread_id, Err(unread.into())).await;
+                    return;
+                }
+            };
+            let status = if has_changes {
+                ChildCompletionStatus::Success
+            } else {
+                ChildCompletionStatus::NoChanges
+            };
+            let read_decided = turn.decided;
+            self.force_turn_end_decisions(
+                thread_id,
+                &turn,
+                read_decided,
+                owed,
+                TurnFinish::Finished(status),
+            )
+            .await;
         };
-        let status = if has_changes {
-            ChildCompletionStatus::Success
-        } else {
-            ChildCompletionStatus::NoChanges
-        };
-        let read_decided = turn.decided;
-        self.force_turn_end_decisions(
-            thread_id,
-            &turn,
-            read_decided,
-            owed,
-            TurnFinish::Finished(status),
-        )
-        .await;
+        let expected_wake =
+            self.force_expected_wake_decision(thread_id, TurnStart::SinceLastIdle, &reply);
+        tokio::join!(decisions, expected_wake);
     }
 
     /// Force whichever of the two decisions `turn` lacks. They run

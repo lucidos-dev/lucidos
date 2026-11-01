@@ -6,6 +6,7 @@ import {
   shouldReconcilePaneFocus, PANE_FOCUS_REGION,
   isContentPaneIframeFocus, navigationFocusTarget,
   visibleFocusables, focusIntoPane, tabTargetWithin,
+  installPaneFocusTracking, handlePaneTab,
 } from './paneFocus';
 
 // jsdom never lays out, so `getClientRects()` is empty on every real element.
@@ -201,8 +202,8 @@ describe('navigationFocusTarget', () => {
   });
 
   it('falls back to the explainer when it is the only focusable', () => {
-    // A section title whose sole focusable IS its icon (Repositories, Connect
-    // URLs) should still take focus rather than leaving the landing unfocused.
+    // A section title whose sole focusable IS its icon (Repositories)
+    // should still take focus rather than leaving the landing unfocused.
     const icon = fake('explainer-btn');
     expect(navigationFocusTarget([icon])).toBe(icon);
   });
@@ -275,6 +276,82 @@ describe('focusIntoPane', () => {
     focusedPane.value = 'drawer';
     focusIntoPane(null);
     expect(focusedPane.value).toBe('drawer');
+  });
+});
+
+// Focus can enter a pane with no pointer and no app helper: a screen reader's
+// cursor, find-in-page, a test's `.focus()`. The marker must follow, or the next
+// Tab pulls focus out of the pane the reader is in.
+describe('installPaneFocusTracking', () => {
+  let stop: (() => void) | null = null;
+
+  afterEach(() => {
+    stop?.();
+    stop = null;
+    document.body.innerHTML = '';
+    focusedPane.value = 'thread';
+  });
+
+  function panes(): { pin: HTMLButtonElement; menu: HTMLButtonElement } {
+    document.body.innerHTML = `
+      <div class="pane-thread"><button>Follow</button><textarea></textarea></div>
+      <div class="pane-content"><button data-id="pin">Pin</button><button data-id="menu">Actions</button></div>`;
+    for (const el of document.querySelectorAll<HTMLElement>('button, textarea')) stubVisible(el);
+    return {
+      pin: document.querySelector('[data-id="pin"]')!,
+      menu: document.querySelector('[data-id="menu"]')!,
+    };
+  }
+
+  it('moves the marker onto the pane that focus enters', () => {
+    const { pin } = panes();
+    stop = installPaneFocusTracking();
+    pin.focus();
+    expect(focusedPane.value).toBe('content');
+  });
+
+  it('keeps a Tab from that focus inside its own pane', () => {
+    const { pin, menu } = panes();
+    stop = installPaneFocusTracking();
+    pin.focus();
+    // `false` hands the step to the browser, which goes on to the next control
+    // in the same pane. Before the fix the trap pulled focus into the thread.
+    expect(handlePaneTab(new KeyboardEvent('keydown', { key: 'Tab' }))).toBe(false);
+    expect(document.activeElement).toBe(pin);
+    menu.focus();
+    expect(handlePaneTab(new KeyboardEvent('keydown', { key: 'Tab' }))).toBe(true);
+    expect(document.activeElement).toBe(pin);
+  });
+
+  it('leaves the marker alone for focus outside every pane', () => {
+    panes();
+    stop = installPaneFocusTracking();
+    focusedPane.value = 'content';
+    const loose = document.createElement('button');
+    document.body.appendChild(loose);
+    loose.focus();
+    expect(focusedPane.value).toBe('content');
+  });
+
+  // A shortcut can move the marker while focus stays in a field. Coming back
+  // to the window refocuses that field, and must not undo the shortcut.
+  it('ignores the refocus a returning window gives the retained element', () => {
+    const { pin, menu } = panes();
+    stop = installPaneFocusTracking();
+    pin.focus();
+    focusedPane.value = 'thread';
+    window.dispatchEvent(new FocusEvent('blur'));
+    pin.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+    expect(focusedPane.value).toBe('thread');
+    menu.focus();
+    expect(focusedPane.value).toBe('content');
+  });
+
+  it('stops tracking after cleanup', () => {
+    const { pin } = panes();
+    installPaneFocusTracking()();
+    pin.focus();
+    expect(focusedPane.value).toBe('thread');
   });
 });
 

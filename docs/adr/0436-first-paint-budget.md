@@ -111,6 +111,10 @@ warning.
 - **A trim leaves at least 25 kB below the soft line**, about a day of
   growth. Less, and the next day's growth turns the nightly red again, which
   is the failure this budget replaced.
+- ADR 0611 moved the markdown engine off the first frame. The same change
+  built for ES2022 and took the thread family graph out of the entry. The set
+  then measured 1227.18 kB and the entry 539.37 kB, only 0.63 kB under its
+  soft line.
 - ADR 0454 adds a per-change growth check: each change reports what it adds to
   the set, and growth over 2 kB needs a stated reason.
 - These on-demand surfaces moved behind dynamic imports, each idle-prefetched:

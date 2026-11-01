@@ -3,8 +3,8 @@ use super::*;
 use crate::engine::agent_session::InPlaceMergeStart;
 use crate::engine::git_ops::{
     auto_commit_safe_files_if_dirty, bounded_fix_refusal_for, branch_changed_files_checked,
-    branch_head_sha, catchup_and_ff_to_main, commit_worktree_or_err, commits_in_range,
-    ff_main_to_branch, files_have_client_update, find_branch_merge_in_main,
+    branch_head_sha, catchup_and_ff_to_main, clear_temp_merge_state, commit_worktree_or_err,
+    commits_in_range, ff_main_to_branch, files_have_client_update, find_branch_merge_in_main,
     find_worktree_for_branch, git_ran_ok, has_branch_commits, has_full_harden_marker,
     push_main_in_background, recover_no_commits_branch, worktree_add, worktree_dirty_files,
     worktrees_dir, BoundedFixInputs, NoCommitsRecovery, PlanMarkerState, WorktreeLookup,
@@ -552,7 +552,7 @@ impl LucidosEngine {
             .await
             .with_landing(landing.as_deref().unwrap_or_default());
         match floor {
-            PlanFloor::Exempt | PlanFloor::PlanOnly => {}
+            PlanFloor::Exempt => {}
             PlanFloor::Held(hold) => {
                 let msg = hold.apply_refusal();
                 log!(
@@ -1432,8 +1432,27 @@ impl LucidosEngine {
             worktrees_dir(self.workspace_path()).join(format!("merge-{}", change_id.as_simple()));
         let wt_path_str = wt_path.to_string_lossy().into_owned();
 
-        let _ = git_cmd(&["worktree", "remove", "--force", &wt_path_str], repo_root).await;
-        let _ = git_cmd(&["branch", "-D", &temp_branch], repo_root).await;
+        // The in-flight guard sees only a LIVE resolver, so one whose turn
+        // ended can leave its half-done merge in this pair.
+        if let Err(msg) = clear_temp_merge_state(
+            repo_root,
+            &wt_path,
+            &temp_branch,
+            &change.branch_name,
+            "[Changes]",
+        )
+        .await
+        {
+            log!("[Changes] Apply refused for {}: {}", change_id, msg);
+            self.emit_apply_failed(
+                change.thread_id.unwrap_or(change_id),
+                change_id,
+                &msg,
+                actor.clone(),
+            )
+            .await;
+            return Err(msg.into());
+        }
 
         match worktree_add(repo_root, &wt_path, &["-b", &temp_branch]).await {
             Ok(o) if o.status.success() => {}

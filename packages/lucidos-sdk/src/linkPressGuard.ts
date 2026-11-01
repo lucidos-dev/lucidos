@@ -23,7 +23,15 @@ export interface SwallowedLinkClick {
   heldMs: number;
 }
 
+/** What the guard knew when a touch that started on a link ended, tap or not. */
+export interface LinkTouch extends SwallowedLinkClick {
+  tap: boolean;
+}
+
 export interface LinkPressGuardOptions {
+  /** Called once per touch that started on a link (a touchend's target), for
+   *  the breadcrumb. */
+  onLinkTouch?: (info: LinkTouch) => void;
   /** Called once per cancelled click, for the breadcrumb. */
   onSwallowed?: (info: SwallowedLinkClick) => void;
   /** Injected clock, so the click window is testable. */
@@ -119,6 +127,16 @@ export function installLinkPressGuard(
       heldMs,
       endedAt,
     };
+    const anchor = (raw.target as Element | null)?.closest?.('a[href]');
+    if (anchor) {
+      opts.onLinkTouch?.({
+        href: anchor.getAttribute('href') ?? '',
+        tap: verdict.tap,
+        movedPx: verdict.movedPx,
+        fingers: verdict.fingers,
+        heldMs,
+      });
+    }
   }
 
   function onClick(e: Event): void {

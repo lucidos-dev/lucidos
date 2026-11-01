@@ -2,7 +2,8 @@
 //! cache stays warm, and what the keep-alive does about it. `warmth` is
 //! `warm`, `cold` or `unknown`: a cache whose lifetime no evidence gives is
 //! never called either (ADR 0575). `remaining_secs` is set only when warm.
-//! `keep_alive` is null when cold. The status carries its own prices.
+//! `keep_alive` is null when cold. The status carries its own prices. `ttl`
+//! names the lifetime a warm cache was measured on, and what says so.
 
 use axum::{
     extract::{Path, State},
@@ -13,7 +14,8 @@ use uuid::Uuid;
 
 use crate::api::error::ApiError;
 use crate::api::AppState;
-use crate::engine::switch_estimate::{cache_remaining, CacheRemaining};
+use crate::engine::cache_ttl::{CacheLifetime, CacheTtl};
+use crate::engine::switch_estimate::{cache_remaining_and_ttl, CacheRemaining};
 use crate::engine::thread_events::CacheKeepAliveStatus;
 
 #[derive(Debug, Serialize)]
@@ -21,6 +23,35 @@ pub(in crate::api) struct CacheWarmth {
     warmth: Warmth,
     remaining_secs: Option<i64>,
     keep_alive: Option<CacheKeepAliveStatus>,
+    /// Set only when warm.
+    ttl: Option<WarmthTtl>,
+}
+
+/// The lifetime a warm cache was measured on, and its evidence (ADR 0575).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct WarmthTtl {
+    lifetime: CacheLifetime,
+    evidence: TtlEvidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum TtlEvidence {
+    /// The response split the cache write by lifetime.
+    Reported,
+    /// The request asked for it, on a route that honours it.
+    Requested,
+}
+
+impl WarmthTtl {
+    fn of(ttl: CacheTtl) -> Option<Self> {
+        let (lifetime, evidence) = match ttl {
+            CacheTtl::Reported(lifetime) => (lifetime, TtlEvidence::Reported),
+            CacheTtl::Requested(lifetime) => (lifetime, TtlEvidence::Requested),
+            CacheTtl::Unknown => return None,
+        };
+        Some(Self { lifetime, evidence })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -48,13 +79,13 @@ pub(in crate::api) async fn get_cache_warmth(
             "Thread {thread_id} does not exist"
         )));
     }
-    let (warmth, remaining_secs) = match cache_remaining(&state.pool, thread_id)
+    let (remaining, ttl) = cache_remaining_and_ttl(&state.pool, thread_id)
         .await
-        .map_err(ApiError::db)?
-    {
-        CacheRemaining::Warm(secs) => (Warmth::Warm, Some(secs)),
-        CacheRemaining::Cold => (Warmth::Cold, None),
-        CacheRemaining::Unknown => (Warmth::Unknown, None),
+        .map_err(ApiError::db)?;
+    let (warmth, remaining_secs, ttl) = match remaining {
+        CacheRemaining::Warm(secs) => (Warmth::Warm, Some(secs), WarmthTtl::of(ttl)),
+        CacheRemaining::Cold => (Warmth::Cold, None, None),
+        CacheRemaining::Unknown => (Warmth::Unknown, None, None),
     };
     let keep_alive = match warmth {
         Warmth::Warm | Warmth::Unknown => Some(
@@ -70,5 +101,6 @@ pub(in crate::api) async fn get_cache_warmth(
         warmth,
         remaining_secs,
         keep_alive,
+        ttl,
     }))
 }

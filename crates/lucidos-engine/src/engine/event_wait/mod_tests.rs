@@ -288,6 +288,29 @@ fn the_registration_result_says_nothing_is_blocking() {
     );
 }
 
+/// The expected wake request names the call each agent can make, and the
+/// history when there is one (ADR 0603).
+#[test]
+fn the_expected_wake_request_names_each_agents_call_and_the_history() {
+    use super::keep_alive::WaitAgent;
+    use super::register::expected_wake_request_text;
+    use super::wait_durations::WaitHistory;
+    let history = WaitHistory {
+        samples: 4,
+        median_secs: 540.0,
+        high_secs: 1800.0,
+    };
+    let lucidos = expected_wake_request_text(WaitAgent::Lucidos, Some(&history));
+    assert!(lucidos.contains("call expect_wake"), "{lucidos}");
+    assert!(
+        lucidos.contains("Half ended within about 9 min"),
+        "{lucidos}"
+    );
+    let cc = expected_wake_request_text(WaitAgent::ClaudeCode, None);
+    assert!(cc.contains("`lucidos expect-wake <duration>"), "{cc}");
+    assert!(cc.contains("No past waits like this one"), "{cc}");
+}
+
 /// Delivery is the only resolution that CONSUMES the subscription, and it used
 /// to be the only one whose text said nothing about that. Silence read as
 /// agreement with its neighbours, which say "do not register again": on

@@ -210,6 +210,9 @@ pub const CANCEL_EVENT_WAIT: &str = "cancel_event_wait";
 /// drawer lists the thread under Review until they have seen it (ADR 0409).
 /// Scoped to the calling thread, like the event-wait tools.
 pub const REQUEST_READ: &str = "request_read";
+/// State when this thread expects to wake next, from the event waits and
+/// children it leaves pending (ADR 0603). Scoped to the calling thread.
+pub const EXPECT_WAKE: &str = "expect_wake";
 /// A child thread's *wake decision*: whether its parent must act on this
 /// turn's report. Offered only to a thread with a parent it reports to, and
 /// scoped to the calling thread.

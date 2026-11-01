@@ -11,7 +11,8 @@ use super::{
     CaptureFormat, ChildCompletionStatus, CodingAgentExit, Dashboard, EventWaitCancelCause,
     FireRetry, FormRequestOutcome, HandoffConsent, LegacyArrangedTile, McpEnablementSource,
     MessageOrigin, OwnerApproval, QuestionOption, RecalledMemory, RetryOf, SessionEndReason,
-    TodoItem, TriggerInvocation, UnproposedReason, UnqueueReason, VoiceSessionEndReason, WakeMode,
+    TodoItem, TriggerInvocation, UnproposedReason, UnqueueReason, VoiceSessionEndReason,
+    WakeBucket, WakeMode, WakeSource,
 };
 
 /// Replay default for events persisted before the `agent` field existed —
@@ -1934,6 +1935,19 @@ pub enum ThreadEvent {
     /// The user turned the cache keep-alive back on for this thread. It clears
     /// `thread_summaries.cache_keep_alive_off_at`.
     CacheKeepAliveTurnedOn,
+
+    /// The thread's *expected wake*: when it expects to wake next, from any
+    /// event wait or child it holds (ADR 0603). The newest one stands, and
+    /// the keep-alive plans its pings from it. Metadata: it moves nothing.
+    WakeExpected {
+        at: chrono::DateTime<chrono::Utc>,
+        /// The odds per time bucket, when a System One model estimated it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        distribution: Vec<WakeBucket>,
+        source: WakeSource,
+        /// What the thread waits for, and why it should come by `at`.
+        reason: String,
+    },
 
     /// A voice session opened on this thread (ADR 0148).
     ///

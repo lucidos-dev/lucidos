@@ -30,7 +30,8 @@ export type BridgeOp =
   | 'storage.set'
   | 'storage.remove'
   | 'storage.clear'
-  | 'ui.focused-thread';
+  | 'ui.focused-thread'
+  | 'log.app-link';
 
 /** Host to app, on every change: the thread the user has open, as
  *  `{ threadId: string | null }`. The host imports this name. */

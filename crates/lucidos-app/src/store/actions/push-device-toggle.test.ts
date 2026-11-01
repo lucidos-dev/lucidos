@@ -37,8 +37,9 @@ vi.mock('../../utils/devServerBundle', async (importOriginal) => ({
 vi.mock('../../api/client', () => ({
   API: '/api/v1',
   json: async () => ({ public_key: 'BPk-test-vapid-key' }),
-  mutatingFetch: async () => new Response('{}', { status: 200 }),
+  mutatingFetch: async () => new Response('{"success":true}', { status: 200 }),
   throwIfNotOk: async () => {},
+  throwIfRefused: <T,>(result: T) => result,
   registerDevice: vi.fn(),
   listDevices: (...args: unknown[]) => listDevices(...args),
   renameDevice: vi.fn(),

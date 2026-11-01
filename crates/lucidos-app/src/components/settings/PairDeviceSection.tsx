@@ -1,5 +1,5 @@
 /**
- * "Add a device" on Settings -> Access: a pairing QR a phone can scan.
+ * "Pair a device" on Settings -> Access: a pairing QR a phone can scan.
  *
  * The gateway answers no device it has not been paired with (ADR 0094), and
  * pairing means an eight-digit code. Typing one off a laptop screen into a
@@ -26,7 +26,7 @@
 // - **It does not name the device.** The phone names itself on the pairing
 //   screen, and that name wins over one minted here.
 // - **It does not hide when the gateway is out of reach.** The shell and its
-//   search anchor render either way, for the reason Connect URLs records: an
+//   search anchor render either way, for the reason Other addresses records: an
 //   absent section drops a Search Everywhere hit at the top of the page.
 
 import { useCallback, useState } from 'preact/hooks';
@@ -83,7 +83,7 @@ export function targetSentence(target: PairTarget): ComponentChildren {
     case 'resolving':
       return 'Working out which address a new device should open.';
     case 'unknown':
-      return 'Could not work out an address for a QR, so this will mint the code alone. The error above says why.';
+      return 'Could not work out an address for a QR, so this will mint the code alone. The error under Other addresses says why.';
     case 'none':
       return 'Creates a one-time code. No address here reaches another device, so there is nothing to put in a QR: open Lucidos on the other device and type the code in.';
     case 'origin':
@@ -121,7 +121,7 @@ export function expiryLabel(left: number): string {
  * true exactly while we are served under `/<slug>/`. `target` is where a new
  * device should point, in one of the four states above.
  */
-export function AddDeviceSection({
+export function PairDeviceSection({
   canMint,
   target,
 }: {
@@ -199,9 +199,9 @@ export function AddDeviceSection({
 
   return (
     <div class="settings-section">
-      <div class="settings-section-title" data-search-anchor="access:add-device">
-        Add a device
-        <Explainer title="Add a device">
+      <div class="settings-section-title" data-search-anchor="access:pair-device">
+        Pair a device
+        <Explainer title="Pair a device">
           <p>
             Lucidos answers only devices you have paired. This mints a one-time code
             and draws it as a QR, so a phone scans instead of typing eight digits.

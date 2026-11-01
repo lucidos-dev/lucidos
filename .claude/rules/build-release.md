@@ -11,6 +11,7 @@ paths:
   - "scripts/lib/install*.sh"
   - "scripts/lib/service*.sh"
   - "scripts/lib/release_*.sh"
+  - "scripts/lib/github_auth*.sh"
   - "scripts/*onnxruntime*.sh"
   - "scripts/block-ort-upstream.sh"
   - "scripts/lib/onnxruntime_*.sh"
@@ -21,8 +22,7 @@ paths:
   - "crates/lucidos-app/tauri.conf.json"
   - "scripts/lib/updater_payload*.sh"
   - "scripts/lib/codesign.sh"
-  # The release gate on the one version source, described under "One source of
-  # truth for the version" below.
+  # The version-source release gate: see "One source of truth for the version".
   - "scripts/lib/version_sources_test.sh"
   - "install.sh"
   - "uninstall.sh"

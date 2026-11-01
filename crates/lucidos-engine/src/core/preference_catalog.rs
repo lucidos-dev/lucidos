@@ -699,6 +699,34 @@ pub const REASONING_WAKE_DECISION: Pref<Text> = Pref::text(PrefSpec {
     side_effect: PrefSideEffect::None,
 });
 
+pub const MODEL_EXPECTED_WAKE_DECISION: Pref<Text> = Pref::text(PrefSpec {
+    key: "model_expected_wake_decision",
+    label: "Expected-wake model",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::Text,
+    default: PrefDefault::Value(BACKGROUND_MODEL),
+    description: concat!(
+        "Background model that estimates when a waiting thread wakes next, when its turn ended with something pending and the agent stated no expected wake. It runs only while cache_keep_alive_mode is on, and never for Codex. It sees what each event wait and sub-thread waits for, the latest output of running background tasks, the agent's reply and how long past waits like these lasted, and picks one time bucket. The keep-alive plans its pings from the answer. A failed call records nothing, and the keep-alive falls back to the reread cap. Settings offers the System One models in the same control, which write judgment_expected_wake_decision instead. It follows no other key.",
+        aux_fallback_note!()
+    ),
+    side_effect: PrefSideEffect::None,
+});
+
+pub const REASONING_EXPECTED_WAKE_DECISION: Pref<Text> = Pref::text(PrefSpec {
+    key: "reasoning_expected_wake_decision",
+    label: "Expected-wake reasoning",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::Enum(REASONING_EFFORTS),
+    default: PrefDefault::Value("none"),
+    description: concat!(
+        "Thinking budget for the expected wake decision, one pick of a time bucket. A forced call on Claude runs without thinking whatever this says.",
+        task_tier_note!()
+    ),
+    side_effect: PrefSideEffect::None,
+});
+
 pub const MODEL_MEMORY: Pref<Text> = Pref::text(PrefSpec {
     key: "model_memory",
     label: "Memory model",
@@ -1181,7 +1209,7 @@ pub const CACHE_KEEP_ALIVE_MODE: Pref<Text> = Pref::text(PrefSpec {
     scope: PrefScope::Global,
     value: PrefValue::Enum(crate::engine::event_wait::keep_alive::CACHE_KEEP_ALIVE_MODES),
     default: PrefDefault::Value("off"),
-    description: "When the cache keep-alive gives up on a waiting Claude Code session or Lucidos Agent thread. 'off' (the default) sends no beats, so every wait past the cache lifetime pays its rewrite. 'break-even' beats an event wait or working children until the beats cost one cache rewrite, and a thread parked on a question card or permission prompt until half of that. 'workspace-data' gives up at the point that would have cost least over this workspace's last 30 days, per wait type, and keeps break-even for a type with under 50 waits.",
+    description: "Whether the cache keep-alive pings a waiting Claude Code session or Lucidos Agent thread to keep its prompt cache warm. 'off' (the default) sends no pings, so every wait past the cache lifetime pays a full reread. 'on' pings an event wait or working children until the pings cost one reread (the reread cap), and a thread parked on a question card or permission prompt until half of that.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1574,6 +1602,19 @@ pub const JUDGMENT_WAKE_DECISION: Pref<Optional> = Pref::optional(PrefSpec {
     side_effect: PrefSideEffect::None,
 });
 
+pub const JUDGMENT_EXPECTED_WAKE_DECISION: Pref<Optional> = Pref::optional(PrefSpec {
+    key: "judgment_expected_wake_decision",
+    label: "Expected-wake backend",
+    access: PrefAccess::Human {
+        hint: "which backend estimates when a waiting thread wakes next (chat, or a System One model such as jev or openai): picking a System One model sends what the thread waits on to that vendor, so only the user decides, in Settings → Models (Background tasks), never via set_preference",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::Text,
+    default: PrefDefault::Unset("the expected wake decision runs on its chat model"),
+    description: "The System One model that estimates when a waiting thread wakes next, by id, or chat for model_expected_wake_decision. A System One model answers with a probability per time bucket, the chat model with one bucket. Unset runs on model_expected_wake_decision.",
+    side_effect: PrefSideEffect::None,
+});
+
 pub const MAX_TOOL_CALLS: Pref<Number> = Pref::number(PrefSpec {
     key: "max_tool_calls",
     label: "Tool calls per turn",
@@ -1604,12 +1645,12 @@ pub const CACHE_CARDS: Pref<Flag> = Pref::flag(PrefSpec {
     key: "cache_cards",
     label: "Cache cards",
     access: PrefAccess::Human {
-        hint: "the cache cards are a display switch; the user changes it in Settings → System → Debugging",
+        hint: "the cache cards are a display switch; the user changes it in Settings → Models → Cache keep-alive",
     },
     scope: PrefScope::Global,
     value: PrefValue::Bool,
     default: PrefDefault::Value("false"),
-    description: "Whether a thread draws its prompt-cache cards: the Cache kept warm card and the cache-warm line. Off hides both, and skips the read behind the line. Pings and costs never change.",
+    description: "Whether a thread draws its prompt-cache cards: the Cache kept warm card and the cache-warm line. A sub-setting of the cache keep-alive: the cards draw only while cache_keep_alive_mode is 'on' and this is on. Off hides both, and skips the read behind the line. Pings and costs never change.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1980,6 +2021,8 @@ pub const CATALOG: &[&PrefSpec] = &[
     &REASONING_READ_DECISION.spec,
     &MODEL_WAKE_DECISION.spec,
     &REASONING_WAKE_DECISION.spec,
+    &MODEL_EXPECTED_WAKE_DECISION.spec,
+    &REASONING_EXPECTED_WAKE_DECISION.spec,
     &MODEL_MEMORY.spec,
     &REASONING_MEMORY.spec,
     &MODEL_QUERY_CLASSIFICATION.spec,
@@ -2051,6 +2094,7 @@ pub const CATALOG: &[&PrefSpec] = &[
     &JUDGMENT_MEMORY_FIND.spec,
     &JUDGMENT_READ_DECISION.spec,
     &JUDGMENT_WAKE_DECISION.spec,
+    &JUDGMENT_EXPECTED_WAKE_DECISION.spec,
     &MAX_TOOL_CALLS.spec,
     &CAPTURE_CONTEXT.spec,
     &CACHE_CARDS.spec,

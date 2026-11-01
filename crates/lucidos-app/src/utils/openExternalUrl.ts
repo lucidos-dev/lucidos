@@ -4,16 +4,8 @@ import { hasDangerousScheme } from './dangerousUrlScheme';
 import { currentExternalLinkTarget } from '../store/actions/preferences';
 import { postClientLog } from './clientLog';
 import { showToast, dismissToast } from '../store/store';
-
-/** iOS's only escape hatch from a standalone PWA to the real Safari app.
- *  Navigating the document to `x-safari-https://…` hands the URL to Safari;
- *  WebKit treats the prefixed string as a scheme it doesn't own and passes it to
- *  the system.
- *
- *  Temporary measure (undocumented Apple scheme, workaround for a WebKit gap):
- *  `docs/temporary-measures.md` § "`x-safari-` scheme prefix to escape an iOS
- *  standalone PWA" carries the removal condition. */
-const SAFARI_SCHEME_PREFIX = 'x-safari-';
+// The SDK owns the prefix: its frames hand off to Safari with the same string.
+import { SAFARI_SCHEME_PREFIX } from '../../../../packages/lucidos-sdk/src/externalLinks';
 
 /** Only http(s) is ever rewritten. `mailto:`, `tel:`, `file:` and `data:` have
  *  their own handlers and must reach them untouched, in every mode. */

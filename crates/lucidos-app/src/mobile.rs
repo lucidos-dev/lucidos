@@ -963,7 +963,7 @@ fn control_server_lacks_feature(output: &str) -> bool {
 const CONTROL_SERVER_LACKS_FEATURE: &str = "Your tailnet's control server cannot turn on \
      HTTPS certificates, so Tailscale cannot serve an HTTPS address for this Mac. Self-hosted \
      servers such as Headscale do not support it. Use the plain-HTTP tailnet address under \
-     Connect URLs instead. It needs Network access set to your tailnet address or to all \
+     Other addresses instead. It needs Network access set to your tailnet address or to all \
      interfaces.";
 
 /// Drop Tailscale's client/daemon version-skew warning.

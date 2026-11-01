@@ -438,7 +438,7 @@ fn source_checkout(roots: &ScanRoots, running: &RunningProcess) -> Vec<Install> 
         .as_deref()
         .and_then(|r| r.file_name())
         .map(|n| format!("Source checkout \"{}\"", n.to_string_lossy()))
-        .unwrap_or_else(|| "Source checkout (path not recorded)".to_string());
+        .unwrap_or_else(|| "Source checkout".to_string());
     vec![Install {
         kind: InstallKind::SourceCheckout,
         name,

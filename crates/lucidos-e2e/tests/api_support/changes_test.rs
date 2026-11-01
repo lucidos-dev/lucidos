@@ -1563,11 +1563,12 @@ async fn archive_sets_aside_unproposed_branch_work_but_never_a_decided_one() {
     pool.close().await;
 }
 
-/// A branch that lands only an implementation plan applies with no hardening,
-/// whether its plan awaits approval or is approved. Plans have no tests, and
-/// hardening runs on the branch that implements the plan.
+/// A branch that lands only an implementation plan applies once the plan is
+/// approved, with no hardening: plans have no tests, and hardening runs on the
+/// branch that implements the plan. While the plan awaits approval, Apply
+/// refuses it (ADR 0604).
 #[tokio::test]
-async fn a_plan_only_change_applies_without_hardening_under_either_marker() {
+async fn a_plan_only_change_applies_only_once_its_plan_is_approved() {
     let client = user_client().await;
     let ws = workspace_path();
     let repo_root = ws.to_str().unwrap();
@@ -1615,6 +1616,23 @@ async fn a_plan_only_change_applies_without_hardening_under_either_marker() {
             mark.status()
         );
 
+        if state == "proposed" {
+            let resp = client
+                .post(format!("{}/api/v1/changes/{}/apply", base_url(), change_id))
+                .send()
+                .await
+                .expect("apply request failed");
+            let status = resp.status().as_u16();
+            let body: serde_json::Value = resp.json().await.expect("apply non-JSON");
+            assert_eq!(status, 400, "an unapproved plan must be refused: {body:?}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("awaiting approval")),
+                "the refusal must name the pending approval: {body:?}"
+            );
+            continue;
+        }
         apply_ok(&client, change_id).await;
         let hardening: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM events \

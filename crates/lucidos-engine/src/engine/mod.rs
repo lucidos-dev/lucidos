@@ -39,6 +39,7 @@ pub mod engine_version;
 pub(crate) mod eval_capture;
 pub mod event_bus;
 pub mod event_wait;
+pub(crate) mod expected_wake;
 mod follow_main;
 pub mod form_requests;
 pub mod frontend_preview;
@@ -920,9 +921,11 @@ pub struct LucidosEngine {
     /// only: it stops a second beat while the first one's request is still
     /// on its way. The schedule itself derives from persisted events.
     pub(crate) keep_alive_beats: event_wait::KeepAliveBeats,
-    /// How long this workspace's keep-alive waits ran, for the
-    /// `workspace-data` give-up rule. A cache, rebuilt hourly from events.
+    /// How long this workspace's keep-alive waits ran, for the odds a
+    /// status shows. A cache, rebuilt hourly from events.
     pub(crate) keep_alive_durations: Arc<event_wait::WaitDurationsCache>,
+    /// The keep-alive's re-estimates asked for when a ping plan ran out.
+    pub(crate) keep_alive_re_estimates: event_wait::ReEstimates,
     /// Each Lucidos Agent thread's last request, for its prefill beats. A
     /// cache: a restart loses it, and the thread pays one rewrite.
     pub(crate) remembered_requests: Arc<event_wait::RememberedRequests>,

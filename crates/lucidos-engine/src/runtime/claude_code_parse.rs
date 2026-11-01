@@ -14,12 +14,15 @@ pub struct CcStreamState {
     /// the turn now in flight. See the dedup comment in the `"assistant"` arm
     /// of [`parse_line`], and [`CcStreamState::end_turn`] for the lifetime.
     usage_reported_message_ids: HashSet<String>,
-    /// The session's Vertex calls go through the relay, which asks an
-    /// always-thinking model for its notes. Only then is `thinking` text a
-    /// note for the user; anywhere else it is reasoning. A temporary measure:
-    /// `docs/temporary-measures.md` § "Claude Code's Vertex calls go through
-    /// the Vertex relay".
-    notes_relayed: bool,
+    /// An always-thinking model's `thinking` text has proven to be a note for
+    /// the user, by arriving non-empty. One-way: a later empty block does not
+    /// undo it. Until then the text counts as reasoning. A temporary measure:
+    /// `docs/temporary-measures.md` § "Claude Code's progress notes start
+    /// hidden" (ADR 0608).
+    notes_proven: bool,
+    /// The first note has proven itself and the driver has not yet told the
+    /// agent. See [`CcStreamState::take_promotion`].
+    pending_promotion: bool,
     /// The model of the message now streaming, from its `message_start`. Its
     /// deltas carry no model of their own.
     streaming_model: Option<String>,
@@ -30,6 +33,11 @@ pub struct CcStreamState {
     /// nothing (a `thinking` block). It is released after the same message's
     /// next frame, so the capture follows the step it belongs to.
     held_sub_agent_usage: Vec<(String, AgentEvent)>,
+}
+
+fn is_always_thinking(model: Option<&str>) -> bool {
+    model.and_then(crate::llm::anthropic_wire::thinking_mode)
+        == Some(crate::llm::anthropic_wire::ThinkingMode::AlwaysOn)
 }
 
 /// One API call's token counts, from a frame's `usage` block.
@@ -59,18 +67,23 @@ impl OpenCall {
 }
 
 impl CcStreamState {
-    pub fn with_notes_relayed(notes_relayed: bool) -> Self {
-        Self {
-            notes_relayed,
-            ..Self::default()
-        }
-    }
-
     /// Whether `model`'s `thinking` text is a progress note for the user.
     fn thinking_is_a_note(&self, model: Option<&str>) -> bool {
-        self.notes_relayed
-            && model.and_then(crate::llm::anthropic_wire::thinking_mode)
-                == Some(crate::llm::anthropic_wire::ThinkingMode::AlwaysOn)
+        self.notes_proven && is_always_thinking(model)
+    }
+
+    /// Record that a note arrived. `true` only for the first one, which also
+    /// owes the agent a reminder that its notes now reach the user.
+    fn prove_notes(&mut self) -> bool {
+        let first = !std::mem::replace(&mut self.notes_proven, true);
+        self.pending_promotion |= first;
+        first
+    }
+
+    /// Whether the first note arrived since the last call. The driver tells
+    /// the agent once, then this reads `false` again.
+    pub fn take_promotion(&mut self) -> bool {
+        std::mem::take(&mut self.pending_promotion)
     }
 
     /// Claim the one `Usage` event this assistant message is entitled to.
@@ -394,7 +407,8 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                 .and_then(|m| m.get("model"))
                 .and_then(|v| v.as_str());
             let message_id = message.and_then(|m| m.get("id")).and_then(|v| v.as_str());
-            let notes_are_text = state.thinking_is_a_note(model);
+            // The first note streamed as a Thought before this frame proved it.
+            let mut first_note_streamed = false;
             if let Some(content) = message
                 .and_then(|m| m.get("content"))
                 .and_then(|c| c.as_array())
@@ -407,18 +421,20 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                                 events.push(prose(text.to_string()));
                             }
                         }
-                        "thinking" if notes_are_text && !is_api_error_banner => {
+                        "thinking" if is_always_thinking(model) && !is_api_error_banner => {
                             if let Some(note) = block
                                 .get("thinking")
                                 .and_then(|v| v.as_str())
                                 .and_then(crate::llm::anthropic_wire::progress_note)
                             {
-                                events.push(match &parent_tool_use_id {
-                                    Some(_) => prose(note.to_string()),
-                                    None => AgentEvent::ProgressNote {
+                                first_note_streamed |= state.prove_notes();
+                                match &parent_tool_use_id {
+                                    Some(_) => events.push(prose(note.to_string())),
+                                    None if first_note_streamed => {}
+                                    None => events.push(AgentEvent::ProgressNote {
                                         text: note.to_string(),
-                                    },
-                                });
+                                    }),
+                                }
                             }
                         }
                         "tool_use" => {
@@ -650,20 +666,16 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
         // duplicate it. The StreamActivity ping is always emitted regardless, so
         // the watchdog contract is unchanged.
         //
-        // DORMANT TODAY — and NOT provider-specific (corrected 2026-07-02). For the
-        // current models (Fable 5, Opus 4.8/4.7, Sonnet 5) Anthropic's
-        // `thinking.display` defaults to "omitted", so thinking blocks stream with
-        // EMPTY text (encrypted signature only) and no `thinking_delta` ever
-        // arrives — this branch produces nothing. That holds on BOTH Vertex AND the
-        // first-party Anthropic API (verified empirically on `.claude-personal`:
-        // one `signature_delta`, zero `thinking_delta`), and even
-        // `--thinking-display summarized` does not populate it through Claude Code's
-        // headless `--output-format stream-json` path (an upstream CC limitation —
-        // GitHub anthropics/claude-code#7840, #56356; and the raw chain of thought
-        // is never returned regardless — a summary is the most any display mode
-        // yields). So `CodingAgentThoughtStreamed` stays empty for these models
-        // regardless of provider or flag; switching CC's provider does NOT fix it.
-        // See the `cc-reasoning-dormant` investigation in docs/temporary-measures.md.
+        // The text a thinking block carries depends on `thinking.display`. With
+        // "omitted" the block streams EMPTY (a signature only) and this branch
+        // yields nothing. Claude Code sends "updates" for current models, so an
+        // always-thinking model streams its short notes before a tool call here.
+        // Until a note has arrived (`notes_proven`) the delta is a Thought, and
+        // the note that proves it is not repeated from its frame. After that the
+        // complete assistant frame carries each note as a message instead. Any
+        // other model's `thinking_delta` stays a Thought. The raw chain of thought is never returned: a summary is
+        // the most any display mode yields (the `cc-reasoning-dormant`
+        // investigation in docs/temporary-measures.md).
         "stream_event" => {
             let mut events = Vec::new();
             let event = val.get("event");
@@ -712,7 +724,7 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                 }
                 _ => {}
             }
-            // A relayed note arrives whole as a message, from the complete
+            // A note arrives whole as a message, from the complete
             // assistant frame. Streaming it as a Thought too would show it twice.
             let note_arrives_as_message =
                 state.thinking_is_a_note(state.streaming_model.as_deref());

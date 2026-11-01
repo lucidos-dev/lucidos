@@ -546,6 +546,46 @@ describe('the installed router', () => {
     });
   });
 
+  describe('log.app-link', () => {
+    const send = (args: unknown) => deliver(frame.contentWindow, { type: BRIDGE_TYPE, id: '', op: 'log.app-link', args });
+    /** The client-log bodies the host posted, parsed. */
+    const logged = () => fetchMock.mock.calls
+      .filter(([url]) => String(url).endsWith('/internal/client-log'))
+      .map(([, init]) => JSON.parse((init as RequestInit).body as string) as { category: string; message: string; data: Record<string, unknown> });
+
+    it('writes the frame step to the engine log under the app the HOST mounted', async () => {
+      send({ step: 'route', href: 'https://example.com/a', app: 'forged' });
+
+      await vi.waitFor(() => expect(logged()).toHaveLength(1));
+      expect(logged()[0]).toEqual({
+        category: 'app-link',
+        message: 'route',
+        data: { app: 'habit-tracker', href: 'https://example.com/a' },
+      });
+    });
+
+    it('drops an oversized detail rather than lose the line to the engine 4 KB cap', async () => {
+      send({ step: 'route', href: 'x'.repeat(5000) });
+
+      await vi.waitFor(() => expect(logged()).toHaveLength(1));
+      expect(logged()[0].data).toEqual({ app: 'habit-tracker', detailDropped: true });
+    });
+
+    it('measures the detail in UTF-8 bytes, as the engine cap does', async () => {
+      send({ step: 'route', href: '漢'.repeat(1000) });
+
+      await vi.waitFor(() => expect(logged()).toHaveLength(1));
+      expect(logged()[0].data).toEqual({ app: 'habit-tracker', detailDropped: true });
+    });
+
+    it('survives malformed args', async () => {
+      send(null);
+
+      await vi.waitFor(() => expect(logged()).toHaveLength(1));
+      expect(logged()[0].message).toBe('unknown');
+    });
+  });
+
   it('answers the focused thread from the shell, null included', async () => {
     const posted: unknown[] = [];
     const win = frame.contentWindow as Window;

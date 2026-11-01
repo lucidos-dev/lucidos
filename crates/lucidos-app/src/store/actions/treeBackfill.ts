@@ -2,11 +2,16 @@ import { signal } from '@preact/signals';
 import { getTreeBackfill, raiseTreeBackfillCap } from '../../api/client';
 import { showToast } from '../store';
 import type { BackfillProgress, TreeBackfill } from '../../api/types';
+import { gapRefreshedVersion } from '../eventGap';
 import { toFailed, type Loadable } from '../types';
 
 /** Where the Tree memory module's backfill has got. The Memory page loads the
  *  snapshot; the `TreeBackfill*` SSE frames move it after that. */
 export const treeBackfill = signal<Loadable<TreeBackfill>>({ status: 'not-loaded' });
+
+/** Bumped by an event gap. Frames lost in it can include the one that ended
+ *  the backfill, so a page showing the count reads the snapshot again. */
+export const treeBackfillVersion = gapRefreshedVersion();
 
 /** A backfill that has counted nothing yet. */
 export const NO_BACKFILL_PROGRESS: BackfillProgress = {
@@ -38,6 +43,11 @@ let shownSeq: number | null = null;
  *  carry a restarted engine's old order, so it shows but sets no order. */
 let orderResets = 0;
 
+/** Snapshot reads started, and the newest one shown. Replies can land out of
+ *  order, so a read older than the one shown is dropped. */
+let readsStarted = 0;
+let newestReadShown = 0;
+
 function show(data: TreeBackfill, takeOrder = true): void {
   treeBackfill.value = { status: 'loaded', data };
   const progress = data.state === 'running' ? data.progress : data.state === 'ready' ? data.filling : undefined;
@@ -47,10 +57,14 @@ function show(data: TreeBackfill, takeOrder = true): void {
 export async function loadTreeBackfill(): Promise<void> {
   const before = framesApplied;
   const resetsBefore = orderResets;
+  const read = ++readsStarted;
   if (treeBackfill.value.status !== 'loaded') treeBackfill.value = { status: 'loading' };
   try {
     const data = await getTreeBackfill();
-    if (before === framesApplied) show(data, resetsBefore === orderResets);
+    if (before === framesApplied && read > newestReadShown) {
+      newestReadShown = read;
+      show(data, resetsBefore === orderResets);
+    }
   } catch (e) {
     // A live state stays: SSE is the newer truth, and the read only refreshes it.
     if (before === framesApplied && treeBackfill.value.status !== 'loaded') {

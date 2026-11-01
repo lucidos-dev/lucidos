@@ -34,7 +34,7 @@ const STYLES_ROOT = resolve(here, '..');
  *  Both current entries are `<button>`-shaped: the property INHERITS, so what
  *  matters is the subtree, not the element. An `<a>` inside a `<button>` is
  *  interactive-in-interactive and invalid, which the markdown renderer already
- *  enforces (`inlineLinkStripRenderer` in `utils/renderMarkdown.ts` exists for
+ *  enforces (`inlineLinkStripRenderer` in `utils/markdownEngine.ts` exists for
  *  exactly that reason), so no link can inherit from these. */
 const ALLOWED: ReadonlyArray<readonly [selector: string, why: string]> = [
   ['button, [role="button"], label',

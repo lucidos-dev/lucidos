@@ -34,9 +34,11 @@
 //!   keep-alive status* per waiting thread, only on a change (`sync_status`),
 //!   a parked thread included. A run ends with an `ended` status, pinged or not.
 //!   The cache-warm line reads the same status.
-//! - **Every run gives up.** `cache_keep_alive_mode` picks the rule, off by
-//!   default: break-even (half of it for a parked wait) or this workspace's
-//!   cheapest cap.
+//! - **Every run gives up.** With `cache_keep_alive_mode` on (it is off by
+//!   default), a run pings until its ping plan ends, never past the reread
+//!   cap. A parked wait pings to the cap learned from the cards asked near its
+//!   local hour, or half the reread cap without one. Its first status freezes
+//!   the cap.
 //! - **The user can turn it off for one thread.** The switch holds until the
 //!   thread's next real request, and acts on that thread alone.
 //!
@@ -44,7 +46,8 @@
 //! the reported TTL: ADR 0479, and why an unknown one gets none: ADR 0575. Why the budget follows the model's prices:
 //! ADR 0489. Why it shows one status: ADR 0529. Why a copy beat: ADR 0547.
 //! Why a per-thread switch: ADR 0554. Why prefill beats: ADR 0556. Why one
-//! status grammar for every surface: ADR 0563.
+//! status grammar for every surface: ADR 0563. Why the plan follows the
+//! expected wake: ADR 0603. Why a parked wait learns its cap: ADR 0606.
 
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
@@ -53,8 +56,9 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use super::ping_plan::{plan_wait, Plan, PlanEnd, ReEstimate, WakeEstimate};
 use super::remembered_requests::Remembered;
-use super::wait_durations::WaitDurations;
+use super::wait_durations::{HourWindow, LearnedCap, WaitDurations};
 use super::LiveWait;
 use crate::engine::cache_ttl::{CacheLifetime, CacheTtl, WriteSplit};
 use crate::engine::event_bus::{BusEvent, EventBus};
@@ -62,7 +66,7 @@ use crate::engine::successor::{
     last_cache_refresh_started_sql, last_real_request_started_sql, last_turn_started_sql,
 };
 use crate::engine::thread_events::{
-    ActorMode, CacheKeepAliveNotKeptReason, CacheKeepAliveStatus, CapOdds, EngineReason,
+    ActorMode, CacheKeepAliveNotKeptReason, CacheKeepAliveStatus, CapOdds, CapSource, EngineReason,
     EventChannel, EventMeta, MessageOrigin, ThreadEvent, WakeMode, CACHE_KEEP_ALIVE_REASON_KIND,
     KEEP_ALIVE_IDLE_REASON,
 };
@@ -141,29 +145,26 @@ impl CacheLifetime {
 
 /// The values of `cache_keep_alive_mode`, as the catalog lists them.
 pub const CACHE_KEEP_ALIVE_MODES: &[&str] = &[
-    CacheKeepAliveMode::BreakEven.as_str(),
-    CacheKeepAliveMode::WorkspaceData.as_str(),
+    CacheKeepAliveMode::On.as_str(),
     CacheKeepAliveMode::Off.as_str(),
 ];
 
-/// The `cache_keep_alive_mode` preference, parsed: when a keep-alive run gives up.
+/// The `cache_keep_alive_mode` preference, parsed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheKeepAliveMode {
-    /// Break-even for an event wait, half of it for a parked one.
-    BreakEven,
-    /// The cap that would have cost least over this workspace's last 30 days.
-    WorkspaceData,
-    /// No beats and no status.
+    /// Beats until the ping plan ends, never past the reread cap. A parked
+    /// wait's plan ends at its learned cap, or half the reread cap.
+    On,
+    /// No beats.
     Off,
 }
 
 impl CacheKeepAliveMode {
-    const ALL: [Self; 3] = [Self::BreakEven, Self::WorkspaceData, Self::Off];
+    const ALL: [Self; 2] = [Self::On, Self::Off];
 
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::BreakEven => "break-even",
-            Self::WorkspaceData => "workspace-data",
+            Self::On => "on",
             Self::Off => "off",
         }
     }
@@ -196,7 +197,7 @@ impl KeepWarmKinds {
     }
 
     /// What working children wait for.
-    fn child_finish() -> Self {
+    pub(super) fn child_finish() -> Self {
         Self::of(["ChildThreadCompleted"]).expect("a keep-warm kind")
     }
 }
@@ -235,8 +236,7 @@ pub(crate) enum WaitAgent {
     Lucidos,
 }
 
-/// What a wait waits for. Waits of one type share one give-up point under
-/// `workspace-data`.
+/// What a wait waits for. Past waits of one type give a status its odds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum WaitType {
     /// A live session parked on a card.
@@ -245,58 +245,84 @@ pub(crate) enum WaitType {
     Events(KeepWarmKinds),
 }
 
-/// What decides when a keep-alive run gives up: the preference, with what
-/// `workspace-data` reads.
+/// What decides when a keep-alive run gives up.
 #[derive(Debug, Clone, Copy)]
-pub(super) enum GiveUpRule<'a> {
-    BreakEven,
-    /// The cheapest cap over these durations. A type with too few waits keeps
-    /// break-even.
-    WorkspaceData(&'a WaitDurations),
+pub(super) enum GiveUpRule {
+    /// The *ping plan*: toward the expected wake, priced by the reread cap.
+    /// A parked wait gets its [`ParkedCap`].
+    PingPlan,
     Off,
 }
 
-impl<'a> GiveUpRule<'a> {
-    pub(super) fn of(mode: CacheKeepAliveMode, durations: &'a WaitDurations) -> Self {
+impl GiveUpRule {
+    pub(super) fn of(mode: CacheKeepAliveMode) -> Self {
         match mode {
-            CacheKeepAliveMode::BreakEven => Self::BreakEven,
-            CacheKeepAliveMode::WorkspaceData => Self::WorkspaceData(durations),
+            CacheKeepAliveMode::On => Self::PingPlan,
             CacheKeepAliveMode::Off => Self::Off,
         }
     }
 }
 
-/// How many beats a run may spend before it gives up, or `None` when it
-/// spends none. [`decide`] and [`status`] both read it (I3).
-fn budget_beats(c: &Candidate, rule: GiveUpRule) -> Option<f64> {
+/// How long the run pings, or `None` when it pings at all under no rule.
+/// [`decide`] and [`status`] both read it (I3). A parked wait follows its
+/// [`ParkedCap`]: no model can estimate when a person answers.
+fn plan(c: &Candidate, rule: GiveUpRule) -> Option<Plan> {
+    if c.agent == Agent::Codex || matches!(rule, GiveUpRule::Off) {
+        return None;
+    }
     let lifetime = c.cache_ttl.lifetime()?;
-    let break_even = lifetime.rewrite_in_beats(c.cache);
-    let agent = c.agent.wait_agent()?;
-    let wait_type = wait_type(c)?;
-    let break_even_cap = match wait_type {
-        WaitType::Parked(_) => break_even / 2.0,
-        WaitType::Events(_) => break_even,
-    };
-    match rule {
-        GiveUpRule::Off => None,
-        GiveUpRule::BreakEven => Some(break_even_cap),
-        GiveUpRule::WorkspaceData(durations) => Some(
-            durations
-                .cap_beats(
-                    agent,
-                    wait_type,
-                    lifetime.beat_every_secs(c.agent.beat_start()),
-                    break_even,
-                )
-                .map_or(break_even_cap, f64::from),
-        ),
+    let reread_cap = lifetime.rewrite_in_beats(c.cache);
+    let every = c.beat_every_secs()?;
+    if let Some(parked) = parked_wait(c) {
+        return Some(match parked.cap {
+            ParkedCap::HalfReread => Plan {
+                give_up_after_secs: reread_cap / 2.0 * every,
+                end: PlanEnd::HalfReread,
+            },
+            // Beats drift late, so a learned cap counts its pings (I6). The
+            // give-up falls a window's width after the last ping is due. With
+            // every ping out it is the last refresh, so a ping that lands late
+            // never reopens a stopped run (I5).
+            ParkedCap::Learned(cap) => {
+                let last_refresh = parked.secs - c.secs_since_request.unwrap_or(0.0);
+                let left = cap.pings.saturating_sub(parked.pings_sent);
+                let tail = if left == 0 {
+                    0.0
+                } else {
+                    let window = lifetime.beat_window(c.agent.beat_start());
+                    f64::from(left) * every + (window.end() - window.start())
+                };
+                Plan {
+                    give_up_after_secs: last_refresh.max(0.0) + tail,
+                    end: PlanEnd::Learned(cap),
+                }
+            }
+        });
+    }
+    wait_type(c)?;
+    Some(plan_wait(
+        reread_cap,
+        every,
+        c.timeout_secs,
+        c.wake.as_ref(),
+    ))
+}
+
+/// The pings `plan` allows at one per `every` seconds: a learned cap's own
+/// count, else the beats that fit before its give-up time.
+fn plan_pings(plan: Plan, every: f64) -> u32 {
+    match plan.end {
+        PlanEnd::Learned(cap) => cap.pings,
+        _ => (plan.give_up_after_secs / every).floor() as u32,
     }
 }
 
-/// How long after the wait began the engine gives up, in seconds: the budget
-/// at one beat per window.
-fn give_up_after_secs(c: &Candidate, rule: GiveUpRule) -> Option<f64> {
-    Some(budget_beats(c, rule)? * c.beat_every_secs()?)
+/// Whether a plan that ran out still waits on its one re-estimate.
+fn awaits_re_estimate(c: &Candidate, plan: Plan) -> bool {
+    matches!(plan.end, PlanEnd::Estimate(_))
+        && c.wake
+            .as_ref()
+            .is_some_and(|wake| wake.asked_again != ReEstimate::Asked)
 }
 
 /// What the agent reads. It must answer without a tool call, or the turn costs
@@ -341,6 +367,11 @@ pub(super) struct Candidate {
     /// The kinds that newest wait watches.
     pub keep_warm_kinds: KeepWarmKinds,
     pub children: ActiveChildren,
+    /// The newest expected wake, while it covers the wait on events or
+    /// children: the turn that stated it ended after the wait began.
+    pub wake: Option<WakeEstimate>,
+    /// Seconds from the wait start until the earliest keep-warm wait times out.
+    pub timeout_secs: Option<f64>,
     /// Seconds since the last turn request started. `None` when it never ran.
     pub secs_since_request: Option<f64>,
     /// Seconds since this engine last beat for the thread, from the cache.
@@ -360,6 +391,9 @@ pub(super) struct Candidate {
     /// A trigger thread no person has written in, so nobody reads a warm cache.
     pub unattended_trigger: bool,
     pub beat_missed: bool,
+    /// The odds a parked wait's first status recorded beside its cap, so a
+    /// rebuild never recounts them (I8).
+    pub frozen_odds: Option<CapOdds>,
 }
 
 /// The agent that runs a thread, as the keep-alive weighs it.
@@ -397,9 +431,54 @@ pub(super) struct Parked {
     /// Seconds since the turn request that asked started. The turn never
     /// idles while parked, so the wait's clock starts there.
     pub secs: f64,
+    /// The pings this wait has sent: copy or prefill beats since the ask.
+    pub pings_sent: u32,
     /// The engine remembers what the session's spawn appended. Without it a
     /// copy misses the session's cached prefix. Only Claude Code reads it.
     pub copy_ready: bool,
+    pub cap: ParkedCap,
+}
+
+/// What caps a parked wait's pings. It is resolved at the wait's first status
+/// and read back from the statuses after, so a history rebuild never moves a
+/// running wait (I5).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum ParkedCap {
+    /// Below the learning floor: half the reread cap.
+    HalfReread,
+    Learned(LearnedCap),
+}
+
+/// The `kind` of each cap source a parked plan reports, as a status stores
+/// it. [`ParkedCap::of_source`] accepts exactly these.
+const PARKED_CAP_KINDS: [&str; 2] = ["half_reread", "learned"];
+
+/// One beat's call: a call may record several capture frames.
+const BEAT_CALL: &str = "COALESCE(e.payload->>'api_call_id', e.id::text)";
+
+impl ParkedCap {
+    /// The cap a status recorded, or `None` for a source no parked plan has.
+    fn of_source(source: CapSource) -> Option<Self> {
+        match source {
+            CapSource::HalfReread => Some(Self::HalfReread),
+            CapSource::Learned {
+                pings,
+                samples,
+                from_hour,
+                to_hour,
+                utc_offset_mins,
+            } => Some(Self::Learned(LearnedCap {
+                pings,
+                samples,
+                hours: HourWindow {
+                    from: from_hour,
+                    to: to_hour,
+                },
+                utc_offset_mins,
+            })),
+            CapSource::RereadCap | CapSource::Timeout | CapSource::Estimate { .. } => None,
+        }
+    }
 }
 
 /// The thread's active child threads, as the keep-alive weighs them. An active
@@ -462,6 +541,11 @@ pub(super) enum SkipReason {
     OnlyNoWakeChildren,
     NothingToWaitFor,
     PastCutOff,
+    /// The plan ran out with no wake, and its one re-estimate is due or under
+    /// way.
+    PlanRanOut,
+    /// The expected wake lies past what pings may cost.
+    WakePastCap,
     NoRequestYet,
     OutsideWindow,
     BeatInFlight,
@@ -510,14 +594,21 @@ pub(super) fn decide(c: &Candidate, rule: GiveUpRule) -> Beat {
     let Some(lifetime) = c.cache_ttl.lifetime() else {
         return Beat::Skip(UnknownTtl);
     };
-    let Some(give_up_after) = give_up_after_secs(c, rule) else {
+    let Some(plan) = plan(c, rule) else {
         return Beat::Skip(Disabled);
     };
     if model_changed(c) {
         return Beat::Skip(ModelChanged);
     }
-    if waiting_secs > give_up_after {
-        return Beat::Skip(PastCutOff);
+    if matches!(plan.end, PlanEnd::WakePastCap(_)) {
+        return Beat::Skip(WakePastCap);
+    }
+    if waiting_secs > plan.give_up_after_secs {
+        return Beat::Skip(if awaits_re_estimate(c, plan) {
+            PlanRanOut
+        } else {
+            PastCutOff
+        });
     }
     if let Some(reason) = forgotten(c) {
         return Beat::Skip(reason);
@@ -659,6 +750,8 @@ pub(super) struct Anchors {
     pub keep_warm_armed_at: Option<DateTime<Utc>>,
     /// When the agent last went idle for real.
     pub idle_at: Option<DateTime<Utc>>,
+    /// When the wait on working children began.
+    pub children_wait_began_at: Option<DateTime<Utc>>,
     /// When the last turn request started.
     pub request_started_at: Option<DateTime<Utc>>,
     /// When the last turn request started, ignoring copy beats. A parked wait
@@ -717,7 +810,7 @@ pub(super) fn status(
         return not_kept(Reason::UnattendedTrigger);
     }
     let turned_off = c.turned_off_at.map(|at| {
-        let (beat_every_secs, odds) = run_math(c, rule, history);
+        let math = run_math(c, rule, history);
         CacheKeepAliveStatus::TurnedOff {
             at,
             beats: spent.beats,
@@ -725,8 +818,9 @@ pub(super) fn status(
             context_tokens: spent.context_tokens,
             ping_usd: spent.ping_usd,
             reread_usd: spent.reread_usd,
-            beat_every_secs,
-            odds,
+            beat_every_secs: math.beat_every_secs,
+            odds: math.odds,
+            cap_source: math.cap_source,
         }
     });
     let waiting_secs = match waiting_secs(c) {
@@ -744,23 +838,26 @@ pub(super) fn status(
     let Some(beat_every_secs) = c.beat_every_secs() else {
         return not_kept(Reason::UnknownTtl);
     };
-    let (Some(since), Some(budget), Some(give_up_after)) = (
-        wait_began_at(c, at),
-        budget_beats(c, rule),
-        give_up_after_secs(c, rule),
-    ) else {
+    let (Some(wait_began), Some(since), Some(plan)) =
+        (wait_began_at(c, at), run_began_at(c, at), plan(c, rule))
+    else {
         return not_kept(Reason::NothingPending);
     };
     if model_changed(c) {
         return not_kept(Reason::ModelChanged);
     }
-    let past_budget = waiting_secs > give_up_after;
+    let wake_past_cap = matches!(plan.end, PlanEnd::WakePastCap(_));
+    let cap_source = plan.end.cap_source();
+    // A plan awaiting its re-estimate still warms: the next estimate either
+    // extends this run or stops it.
+    let past_budget =
+        wake_past_cap || (waiting_secs > plan.give_up_after_secs && !awaits_re_estimate(c, plan));
     if parked_wait(c).is_some_and(|parked| !beside_the_turn(c, parked, past_budget)) {
         return not_kept(Reason::Restarted);
     }
-    let give_up_at = since + chrono::Duration::milliseconds((give_up_after * 1000.0) as i64);
+    let give_up_at = wait_began + secs_duration(plan.give_up_after_secs);
     if past_budget && spent.beats > 0 {
-        let (beat_every_secs, odds) = run_math(c, rule, history);
+        let math = run_math(c, rule, history);
         return CacheKeepAliveStatus::Stopped {
             at: give_up_at,
             beats: spent.beats,
@@ -768,24 +865,38 @@ pub(super) fn status(
             context_tokens: spent.context_tokens,
             ping_usd: spent.ping_usd,
             reread_usd: spent.reread_usd,
-            beat_every_secs,
-            odds,
+            beat_every_secs: math.beat_every_secs,
+            odds: math.odds,
+            cap_source: math.cap_source,
         };
     }
-    // A provider-wide reason holds either way. Past a budget under one beat
-    // no ping was ever due, whatever the thread's own memory says.
+    // A provider-wide reason holds either way. Past a budget under one beat,
+    // or a plan of none, no ping was ever due, whatever the thread's own
+    // memory says.
     if let Agent::Lucidos(remembered) = c.agent {
         if let Some((status, provider_wide)) = forgotten_status(remembered) {
-            if provider_wide || !past_budget || budget >= 1.0 {
-                return status;
+            if provider_wide
+                || !past_budget
+                || (!wake_past_cap && plan_pings(plan, beat_every_secs) >= 1)
+            {
+                return with_cap_source(status, cap_source);
             }
         }
     }
-    if past_budget {
-        return not_kept(Reason::PastGiveUpTime);
+    if wake_past_cap {
+        return CacheKeepAliveStatus::past_cap(Reason::WakePastRereadCap, cap_source);
     }
-    let window_start = chrono::Duration::milliseconds((beat_every_secs * 1000.0) as i64);
-    let budget_beats = budget.floor() as u32;
+    if past_budget {
+        return CacheKeepAliveStatus::past_cap(Reason::PastGiveUpTime, cap_source);
+    }
+    let window_start = secs_duration(beat_every_secs);
+    // The run counts its pings from its own start, and history from the wait's.
+    // A learned cap is a count already.
+    let run_secs = (give_up_at - since).num_milliseconds().max(0) as f64 / 1000.0;
+    let budget_beats = match plan.end {
+        PlanEnd::Learned(cap) => cap.pings,
+        _ => (run_secs / beat_every_secs).floor() as u32,
+    };
     CacheKeepAliveStatus::Warming {
         since,
         beats: spent.beats,
@@ -797,41 +908,71 @@ pub(super) fn status(
         give_up_at,
         ping_usd: spent.ping_usd,
         reread_usd: spent.reread_usd,
-        odds: cap_odds(c, history, budget_beats),
+        odds: cap_odds(c, history, plan),
+        expected_wake: c.wake.as_ref().map(|wake| wake.shown),
+        cap_source: Some(cap_source),
     }
 }
 
-/// The ping interval and cap odds a run reports on every state, so its math
-/// table reads alike from the first ping on. The odds are absent for a rule
-/// that sets no cap, and both for an unknown TTL.
-fn run_math(
-    c: &Candidate,
-    rule: GiveUpRule,
-    history: &WaitDurations,
-) -> (Option<u32>, Option<CapOdds>) {
-    let cap = budget_beats(c, rule).map(|budget| budget.floor() as u32);
-    (
-        c.beat_every_secs().map(|secs| secs as u32),
-        cap.and_then(|cap| cap_odds(c, history, cap)),
-    )
+/// `status` with the cap source that set its give-up time, when it is a
+/// give-up the plan set. Any other status names no cap.
+fn with_cap_source(status: CacheKeepAliveStatus, source: CapSource) -> CacheKeepAliveStatus {
+    use CacheKeepAliveNotKeptReason as Reason;
+    match status {
+        CacheKeepAliveStatus::NotKept {
+            reason: reason @ (Reason::PastGiveUpTime | Reason::WakePastRereadCap),
+            ..
+        } => CacheKeepAliveStatus::past_cap(reason, source),
+        status => status,
+    }
+}
+
+fn secs_duration(secs: f64) -> chrono::Duration {
+    chrono::Duration::milliseconds((secs * 1000.0).round() as i64)
+}
+
+/// The ping interval, cap odds and cap source a closed run reports, so its
+/// math table reads alike from the first ping on.
+struct RunMath {
+    /// Absent for an unknown TTL.
+    beat_every_secs: Option<u32>,
+    /// Past waits counted against the plan's pings. Absent for a rule that
+    /// sets no plan, or an unknown TTL.
+    odds: Option<CapOdds>,
+    /// Absent like `odds`.
+    cap_source: Option<CapSource>,
+}
+
+fn run_math(c: &Candidate, rule: GiveUpRule, history: &WaitDurations) -> RunMath {
+    let plan = plan(c, rule);
+    RunMath {
+        beat_every_secs: c.beat_every_secs().map(|secs| secs as u32),
+        odds: plan.and_then(|plan| cap_odds(c, history, plan)),
+        cap_source: plan.map(|plan| plan.end.cap_source()),
+    }
 }
 
 /// The longest cap a status counts odds for. Only a near-free cache read
 /// prices a budget past it, and its odds would be one slot per ping.
 const MOST_PINGS_WITH_ODDS: u32 = 1000;
 
-/// How past waits like `c`'s ended against a cap of `cap` beats: the same
-/// count [`cheapest_cap`](super::wait_durations::cheapest_cap) weighs.
-fn cap_odds(c: &Candidate, history: &WaitDurations, cap: u32) -> Option<CapOdds> {
+/// How past waits like `c`'s ended against the pings `plan` allows. A learned
+/// cap counts the hours that set it, so its odds explain it (I8). Once a
+/// parked wait's status recorded them, they stay as recorded.
+fn cap_odds(c: &Candidate, history: &WaitDurations, plan: Plan) -> Option<CapOdds> {
+    if let (PlanEnd::Learned(_) | PlanEnd::HalfReread, Some(odds)) = (plan.end, &c.frozen_odds) {
+        return Some(odds.clone());
+    }
+    let every = c.beat_every_secs()?;
+    let cap = plan_pings(plan, every);
     if cap > MOST_PINGS_WITH_ODDS {
         return None;
     }
-    history.odds(
-        c.agent.wait_agent()?,
-        wait_type(c)?,
-        c.beat_every_secs()?,
-        cap,
-    )
+    let hours = match plan.end {
+        PlanEnd::Learned(learned) => Some(learned.hours),
+        _ => None,
+    };
+    history.odds(c.agent.wait_agent()?, wait_type(c)?, every, cap, hours)
 }
 
 /// Whether a beat can reach the cache beside a parked turn: Claude Code needs
@@ -854,11 +995,22 @@ fn wait_began_at(c: &Candidate, at: &Anchors) -> Option<DateTime<Utc>> {
         return at.turn_started_at;
     }
     match (c.keep_warm_wait_secs, c.children) {
-        (Some(_), ActiveChildren::Working { .. }) => at.keep_warm_armed_at.max(at.idle_at),
+        (Some(_), ActiveChildren::Working { .. }) => {
+            at.keep_warm_armed_at.max(at.children_wait_began_at)
+        }
         (Some(_), _) => at.keep_warm_armed_at,
-        (None, ActiveChildren::Working { .. }) => at.idle_at,
+        (None, ActiveChildren::Working { .. }) => at.children_wait_began_at,
         (None, _) => None,
     }
+}
+
+/// When the keep-alive run began: the wait start, or the agent's last real idle
+/// when that came later. It names the run and dates its spend. A real turn
+/// mid-wait so opens a new run, while the give-up time stays dated from
+/// [`wait_began_at`].
+fn run_began_at(c: &Candidate, at: &Anchors) -> Option<DateTime<Utc>> {
+    let wait = wait_began_at(c, at)?;
+    Some(at.idle_at.map_or(wait, |idle| wait.max(idle)))
 }
 
 /// What rewriting `tokens` to a cache of `lifetime` costs at `model`'s list
@@ -899,22 +1051,42 @@ fn list_price(usage: crate::engine::ApiUsage, model: &str) -> Option<f64> {
         .map(round_usd)
 }
 
-/// The newest of `waits` that watch keep-warm kinds only: when it was armed,
-/// and what it watches.
-pub(super) fn newest_keep_warm_wait<'a>(
-    waits: impl IntoIterator<Item = &'a LiveWait>,
-) -> Option<(DateTime<Utc>, KeepWarmKinds)> {
-    waits
-        .into_iter()
-        .filter_map(|w| {
-            let kinds = KeepWarmKinds::of(w.on.iter().map(|s| s.event_type.as_str()))?;
-            Some((w.armed_at, kinds))
-        })
-        .max_by_key(|(armed_at, _)| *armed_at)
+/// A thread's live waits that watch keep-warm kinds only, as the keep-alive
+/// reads them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct KeepWarmWait {
+    /// When the newest was armed.
+    pub armed_at: DateTime<Utc>,
+    /// What the newest watches.
+    pub kinds: KeepWarmKinds,
+    /// When the earliest times out, which wakes the thread.
+    pub expires_at: DateTime<Utc>,
 }
 
-/// Each thread's newest keep-warm wait, from a snapshot of the live waits.
-fn newest_keep_warm_waits(snapshot: &[LiveWait]) -> HashMap<Uuid, (DateTime<Utc>, KeepWarmKinds)> {
+/// The keep-warm waits among `waits`, or `None` when none watches keep-warm
+/// kinds only.
+pub(super) fn newest_keep_warm_wait<'a>(
+    waits: impl IntoIterator<Item = &'a LiveWait>,
+) -> Option<KeepWarmWait> {
+    let kept: Vec<(&LiveWait, KeepWarmKinds)> = waits
+        .into_iter()
+        .filter_map(|w| {
+            Some((
+                w,
+                KeepWarmKinds::of(w.on.iter().map(|s| s.event_type.as_str()))?,
+            ))
+        })
+        .collect();
+    let (newest, kinds) = kept.iter().max_by_key(|(w, _)| w.armed_at)?;
+    Some(KeepWarmWait {
+        armed_at: newest.armed_at,
+        kinds: *kinds,
+        expires_at: kept.iter().map(|(w, _)| w.expires_at).min()?,
+    })
+}
+
+/// Each thread's keep-warm waits, from a snapshot of the live waits.
+fn newest_keep_warm_waits(snapshot: &[LiveWait]) -> HashMap<Uuid, KeepWarmWait> {
     let mut by_thread: HashMap<Uuid, Vec<&LiveWait>> = HashMap::new();
     for wait in snapshot {
         by_thread.entry(wait.thread_id).or_default().push(wait);
@@ -935,15 +1107,26 @@ struct CandidateRow {
     has_active_children: bool,
     has_working_children: bool,
     has_no_wake_working_children: bool,
-    /// The event of its latest parking, when it waits on the user.
+    /// The event of its latest parking, when it waits on the user, and when
+    /// it was written.
     parked_by: Option<String>,
+    parked_at: Option<DateTime<Utc>>,
+    /// The cap source and odds of the first status written since that
+    /// parking which names a parked cap. An `ended` status closed an earlier
+    /// run, so it never counts.
+    frozen_cap: Option<sqlx::types::Json<CapSource>>,
+    frozen_odds: Option<sqlx::types::Json<CapOdds>>,
+    /// The beats sent since that parking.
+    pings_sent: i64,
     /// Since the last refresh: a turn request or a copy beat.
     secs_since_request: Option<f64>,
     request_started_at: Option<DateTime<Utc>>,
     turn_started_at: Option<DateTime<Utc>>,
     secs_since_turn_request: Option<f64>,
-    secs_since_idle: Option<f64>,
     idle_at: Option<DateTime<Utc>>,
+    /// When its wait on working children began, after its last real idle.
+    children_wait_began_at: Option<DateTime<Utc>>,
+    secs_since_children_wait: Option<f64>,
     /// The usage block of its latest turn cache write.
     last_write_usage: Option<sqlx::types::Json<WriteSplit>>,
     last_write_model: Option<String>,
@@ -953,6 +1136,20 @@ struct CandidateRow {
     /// When the user turned the keep-alive off, while that switch holds.
     turned_off_at: Option<DateTime<Utc>>,
     unattended_trigger: bool,
+    /// The newest `WakeExpected`: when it was stated, what it says, and when
+    /// the turn that stated it ended. `None` while that turn runs.
+    wake_stated_at: Option<DateTime<Utc>>,
+    wake: Option<sqlx::types::Json<StatedWake>>,
+    wake_turn_ended_at: Option<DateTime<Utc>>,
+}
+
+/// What a `WakeExpected` says, as the plan reads it.
+#[derive(serde::Deserialize)]
+struct StatedWake {
+    at: DateTime<Utc>,
+    #[serde(default)]
+    distribution: Vec<crate::engine::thread_events::WakeBucket>,
+    source: crate::engine::thread_events::WakeSource,
 }
 
 #[derive(serde::Deserialize)]
@@ -989,21 +1186,71 @@ impl CandidateRow {
         ParkedCard::of_event_type(self.parked_by.as_deref()?)
     }
 
+    /// The cap of `agent`'s wait on `card`: the one a status of this wait
+    /// recorded, else the one `history` learned for the ask's hour, else half
+    /// the reread cap.
+    fn parked_cap(&self, agent: Agent, card: ParkedCard, history: &WaitDurations) -> ParkedCap {
+        if let Some(frozen) = self
+            .frozen_cap
+            .as_ref()
+            .and_then(|source| ParkedCap::of_source(source.0))
+        {
+            return frozen;
+        }
+        let learned = || {
+            let lifetime = self.cache_ttl().lifetime()?;
+            history.learned_cap(
+                agent.wait_agent()?,
+                card,
+                self.parked_at?,
+                lifetime.beat_every_secs(agent.beat_start()),
+                lifetime.rewrite_in_beats(self.cache()),
+            )
+        };
+        learned().map_or(ParkedCap::HalfReread, ParkedCap::Learned)
+    }
+
     /// The database stamps the status reports its times from.
-    fn anchors(&self, wait: Option<(DateTime<Utc>, KeepWarmKinds)>) -> Anchors {
+    fn anchors(&self, wait: Option<KeepWarmWait>) -> Anchors {
         Anchors {
-            keep_warm_armed_at: wait.map(|(at, _)| at),
+            keep_warm_armed_at: wait.map(|w| w.armed_at),
             idle_at: self.idle_at,
+            children_wait_began_at: self.children_wait_began_at,
             request_started_at: self.request_started_at,
             turn_started_at: self.turn_started_at,
         }
+    }
+
+    /// The newest expected wake, timed from `wait_began`. One whose turn ended
+    /// before the wait began was stated for an earlier wait, so it says
+    /// nothing of this one.
+    fn wake_estimate(
+        &self,
+        wait_began: DateTime<Utc>,
+        asked_again: ReEstimate,
+    ) -> Option<WakeEstimate> {
+        let (stated_at, wake) = (self.wake_stated_at?, self.wake.as_ref()?);
+        if self
+            .wake_turn_ended_at
+            .is_some_and(|ended| ended < wait_began)
+        {
+            return None;
+        }
+        Some(WakeEstimate::new(
+            stated_at,
+            wake.at,
+            &wake.distribution,
+            wake.source,
+            wait_began,
+            asked_again,
+        ))
     }
 
     fn active_children(&self) -> ActiveChildren {
         match (
             self.has_active_children,
             self.has_working_children,
-            self.secs_since_idle,
+            self.secs_since_children_wait,
         ) {
             (false, _, _) if self.has_no_wake_working_children => ActiveChildren::OnlyNoWake,
             (false, _, _) => ActiveChildren::None,
@@ -1015,6 +1262,18 @@ impl CandidateRow {
     }
 }
 
+/// True for a trigger thread no person has written in: the summary aliased
+/// `alias` names a trigger, and no human message reached the thread.
+pub(super) fn unattended_trigger_sql(alias: &str) -> String {
+    format!(
+        "({alias}.trigger_id IS NOT NULL \
+          AND NOT EXISTS (SELECT 1 FROM events m \
+                           WHERE m.thread_id = {alias}.thread_id \
+                             AND m.event_type = 'MessageReceived' \
+                             AND COALESCE(m.payload->>'mode', 'human') = 'human'))"
+    )
+}
+
 /// Every thread that holds a live wait or active children, and every
 /// non-Codex thread parked on the user, with what the selection reads. Ages of
 /// database rows are computed in SQL (ADR 0053).
@@ -1022,9 +1281,16 @@ impl CandidateRow {
 /// - The latest real idle is the latest `CodingAgentIdled` no keep-alive turn
 ///   wrote, or for a Lucidos Agent thread its latest `ResponseGenerated`. A
 ///   prefill beat writes neither. [`read_candidates`] binds the reason.
+/// - A wait on children began at the first real idle after the newest working
+///   child was spawned. A later real turn moves the run start, never this.
 /// - The last refresh is [`last_cache_refresh_started_sql`], the one
 ///   definition the cache-warm line shares.
 /// - Only a real request re-arms the per-thread switch or a missed beat.
+/// - The newest expected wake comes with the end of the turn that stated it,
+///   the first real idle after it.
+/// - A parked wait's frozen cap and odds come from the first status after
+///   the parking that names a parked cap, by sequence rather than clock. Its
+///   pings are the beats since the parking.
 /// - The TTL and the model come from the latest capture of the session's own
 ///   that wrote to the cache. A cache hit keeps an entry's lifetime, and a
 ///   sub-agent may run on another TTL or model. A Codex thread never writes
@@ -1038,35 +1304,51 @@ fn candidates_sql() -> String {
         "e.payload->'usage'->>'input_tokens'",
     );
     let beat_purpose = crate::engine::ContextPurpose::CacheKeepAlive.wire();
-    // A handed-off session is ending, so there is no cache worth keeping.
-    let handoff_pending = crate::engine::successor::pending_handoff_sql("ts.thread_id");
+    let capture_started = crate::engine::successor::CAPTURE_STARTED;
+    // A handed-off session is ending, so there is no cache worth keeping. The
+    // `handed_off` CTE computes that set once per query.
+    let handed_off = crate::engine::successor::pending_handoff_threads_sql();
+    let handoff_pending = "ts.thread_id IN (SELECT thread_id FROM handed_off)";
     let in_session =
         crate::engine::session_scope::in_current_session_sql("ts.thread_id", "e.sequence");
+    let unattended_trigger = unattended_trigger_sql("ts");
+    // A child idles for seconds between two successor sessions, and still works.
+    let working_child = format!(
+        "(c.status = $4 OR (c.status = {} AND {}))",
+        ThreadStatus::Idle.sql_literal(),
+        "c.thread_id IN (SELECT thread_id FROM handed_off)",
+    );
     format!(
         r#"
+WITH handed_off AS MATERIALIZED ({handed_off})
 SELECT ts.thread_id,
        ts.is_coding_agent,
        ts.coding_agent,
        ts.status = $3 AS awaiting_user,
        p.event_type AS parked_by,
+       p.created AS parked_at,
+       f.cap_source AS frozen_cap,
+       f.odds AS frozen_odds,
+       COALESCE(pc.pings, 0) AS pings_sent,
        EXISTS (SELECT 1 FROM thread_summaries c
                 WHERE c.parent_thread_id = ts.thread_id
                   AND c.wake_mode IS DISTINCT FROM $6
-                  AND c.status IN ($3, $4)) AS has_active_children,
+                  AND (c.status = $3 OR {working_child})) AS has_active_children,
        EXISTS (SELECT 1 FROM thread_summaries c
                 WHERE c.parent_thread_id = ts.thread_id
                   AND c.wake_mode IS DISTINCT FROM $6
-                  AND c.status = $4) AS has_working_children,
+                  AND {working_child}) AS has_working_children,
        EXISTS (SELECT 1 FROM thread_summaries c
                 WHERE c.parent_thread_id = ts.thread_id
                   AND c.wake_mode = $6
-                  AND c.status = $4) AS has_no_wake_working_children,
+                  AND {working_child}) AS has_no_wake_working_children,
        EXTRACT(EPOCH FROM now() - r.refresh_started)::float8 AS secs_since_request,
        r.refresh_started AS request_started_at,
        r.turn_started AS turn_started_at,
        EXTRACT(EPOCH FROM now() - r.turn_started)::float8 AS secs_since_turn_request,
-       EXTRACT(EPOCH FROM now() - i.created)::float8 AS secs_since_idle,
        i.created AS idle_at,
+       k.began AS children_wait_began_at,
+       EXTRACT(EPOCH FROM now() - k.began)::float8 AS secs_since_children_wait,
        w.usage AS last_write_usage,
        w.model AS last_write_model,
        w.effort AS last_write_effort,
@@ -1084,24 +1366,40 @@ SELECT ts.thread_id,
             WHEN ts.cache_keep_alive_off_at
                  > COALESCE(r.real_started, '-infinity'::timestamptz)
             THEN ts.cache_keep_alive_off_at END AS turned_off_at,
-       ts.trigger_id IS NOT NULL
-         AND NOT EXISTS (SELECT 1 FROM events m
-                          WHERE m.thread_id = ts.thread_id
-                            AND m.event_type = 'MessageReceived'
-                            AND COALESCE(m.payload->>'mode', 'human') = 'human')
-         AS unattended_trigger
+       {unattended_trigger} AS unattended_trigger,
+       x.created AS wake_stated_at,
+       x.payload AS wake,
+       x.turn_ended_at AS wake_turn_ended_at
   FROM thread_summaries ts
   LEFT JOIN LATERAL (
        SELECT {turn_started} AS turn_started,
               {refresh_started} AS refresh_started,
               {real_request_started} AS real_started) r ON true
   LEFT JOIN LATERAL (
-       SELECT e.event_type
+       SELECT e.event_type, e.created, e.sequence
          FROM events e
         WHERE ts.status = $3
           AND e.thread_id = ts.thread_id
           AND e.event_type = ANY($7)
         ORDER BY e.sequence DESC LIMIT 1) p ON true
+  LEFT JOIN LATERAL (
+       SELECT e.payload->'status'->'cap_source' AS cap_source,
+              e.payload->'status'->'odds' AS odds
+         FROM events e
+        WHERE e.thread_id = ts.thread_id
+          AND e.sequence > p.sequence
+          AND e.event_type = 'CacheKeepAliveStatusChanged'
+          AND e.payload->'status'->>'state' <> 'ended'
+          AND e.payload->'status'->'cap_source'->>'kind' = ANY($8)
+        ORDER BY e.sequence LIMIT 1) f ON true
+  LEFT JOIN LATERAL (
+       SELECT count(DISTINCT {BEAT_CALL}) AS pings
+         FROM events e
+        WHERE e.thread_id = ts.thread_id
+          AND e.sequence > p.sequence
+          AND e.event_type = 'ContextCaptured'
+          AND e.payload->>'purpose' = '{beat_purpose}'
+          AND e.payload->'usage' IS NOT NULL) pc ON true
   LEFT JOIN LATERAL (
        SELECT e.created
          FROM events e
@@ -1110,6 +1408,38 @@ SELECT ts.thread_id,
                                   THEN 'CodingAgentIdled' ELSE 'ResponseGenerated' END
           AND COALESCE(e.payload->>'reason', '') <> $2
         ORDER BY e.sequence DESC LIMIT 1) i ON true
+  LEFT JOIN LATERAL (
+       SELECT COALESCE(
+                (SELECT e.created
+                   FROM events e
+                  WHERE e.thread_id = ts.thread_id
+                    AND e.event_type = CASE WHEN ts.is_coding_agent
+                                            THEN 'CodingAgentIdled' ELSE 'ResponseGenerated' END
+                    AND COALESCE(e.payload->>'reason', '') <> $2
+                    AND e.created >= s.spawned
+                  ORDER BY e.sequence LIMIT 1),
+                s.spawned) AS began
+         FROM (SELECT max(c.created_at) AS spawned
+                 FROM thread_summaries c
+                WHERE c.parent_thread_id = ts.thread_id
+                  AND c.wake_mode IS DISTINCT FROM $6
+                  AND {working_child}) s
+        WHERE i.created IS NOT NULL) k ON true
+  LEFT JOIN LATERAL (
+       SELECT e.created, e.payload,
+              (SELECT n.created
+                 FROM events n
+                WHERE n.thread_id = e.thread_id
+                  AND n.sequence > e.sequence
+                  AND n.event_type = CASE WHEN ts.is_coding_agent
+                                          THEN 'CodingAgentIdled' ELSE 'ResponseGenerated' END
+                  AND COALESCE(n.payload->>'reason', '') <> $2
+                ORDER BY n.sequence LIMIT 1) AS turn_ended_at
+         FROM events e
+        WHERE ts.coding_agent IS DISTINCT FROM $5
+          AND e.thread_id = ts.thread_id
+          AND e.event_type = 'WakeExpected'
+        ORDER BY e.sequence DESC LIMIT 1) x ON true
   LEFT JOIN LATERAL (
        SELECT e.payload->'usage' AS usage,
               e.payload->>'model' AS model,
@@ -1138,9 +1468,8 @@ SELECT ts.thread_id,
                  AND newer.event_type = 'ContextCaptured'
                  AND newer.sequence > e.sequence
                  AND COALESCE(newer.payload->>'api_call_id', newer.id::text)
-                     = COALESCE(e.payload->>'api_call_id', e.id::text))
-          AND e.created - make_interval(secs => COALESCE((e.payload->>'duration_ms')::float8, 0) / 1000)
-              > COALESCE(r.real_started, '-infinity'::timestamptz)
+                     = {BEAT_CALL})
+          AND {capture_started} > COALESCE(r.real_started, '-infinity'::timestamptz)
           AND (e.payload->>'purpose' = '{beat_purpose}'
                OR (COALESCE(e.payload->>'purpose', 'turn') = 'turn'
                    AND EXISTS (SELECT 1 FROM events a
@@ -1151,13 +1480,15 @@ SELECT ts.thread_id,
  WHERE NOT {handoff_pending}
    AND (ts.thread_id = ANY($1)
         OR ts.active_children_count > 0
+        OR EXISTS (SELECT 1 FROM thread_summaries c
+                    WHERE c.parent_thread_id = ts.thread_id AND {working_child})
         OR (ts.status = $3 AND ts.coding_agent IS DISTINCT FROM $5))
 "#
     )
 }
 
 /// What the pings since `$2` spent. A call may record several frames, so each
-/// call counts once, at its last frame, priced on the day of that frame. `$2` is the wait start, from the engine's clock or the database's.
+/// call counts once, at its last frame, priced on the day of that frame. `$2` is the run start, from the engine's clock or the database's.
 /// The first ping comes minutes later, so their drift moves no ping across it.
 const SPENT_SQL: &str = r#"
 WITH anchors AS (
@@ -1212,6 +1543,27 @@ async fn read_run_spent(
     }
 }
 
+/// When the thread's newest run closed with an `ended` status.
+const LAST_RUN_ENDED_SQL: &str = "SELECT max(created) FROM events \
+     WHERE thread_id = $1 \
+       AND event_type = 'CacheKeepAliveStatusChanged' \
+       AND payload->'status'->>'state' = 'ended'";
+
+/// Where a run that began at `began` starts counting its pings. A run that
+/// ended reported its pings there, so a wait that resumes with no real turn
+/// counts only the pings sent after that end.
+async fn counted_since(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    began: DateTime<Utc>,
+) -> Result<DateTime<Utc>, sqlx::Error> {
+    let ended: Option<DateTime<Utc>> = sqlx::query_scalar(LAST_RUN_ENDED_SQL)
+        .bind(thread_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(ended.map_or(began, |ended| began.max(ended)))
+}
+
 /// What the status reports of the run: its pings, and the context a reply
 /// after the cache goes cold rereads, which a thread with the switch off but
 /// no wait still has. The model that wrote the cache prices it.
@@ -1221,8 +1573,11 @@ async fn read_status_spent(
     c: &Candidate,
     anchors: &Anchors,
 ) -> Result<Spent, sqlx::Error> {
-    let spent = match wait_began_at(c, anchors) {
-        Some(since) => read_run_spent(pool, thread_id, c, since).await?,
+    let spent = match run_began_at(c, anchors) {
+        Some(began) => {
+            let since = counted_since(pool, thread_id, began).await?;
+            read_run_spent(pool, thread_id, c, since).await?
+        }
         None if c.turned_off_at.is_some() => Spent {
             context_tokens: crate::engine::successor::thread_context(pool, thread_id)
                 .await?
@@ -1328,7 +1683,7 @@ async fn sync_status(
     bus: &EventBus,
     thread_id: Uuid,
     candidate: &Candidate,
-    rule: GiveUpRule<'_>,
+    rule: GiveUpRule,
     history: &WaitDurations,
     anchors: &Anchors,
     stored: Option<CacheKeepAliveStatus>,
@@ -1430,8 +1785,8 @@ struct RunWake {
 /// start, `$3` the beat purpose and `$4` the anchor reason kind.
 fn run_end_sql() -> String {
     use crate::engine::successor::MAIN_SESSION_CAPTURE;
-    let started = "e.created - make_interval(secs => COALESCE((e.payload->>'duration_ms')::float8, 0) / 1000)";
-    let call = "COALESCE(e.payload->>'api_call_id', e.id::text)";
+    let started = crate::engine::successor::CAPTURE_STARTED;
+    let call = BEAT_CALL;
     format!(
         r#"
 WITH first_ping AS (
@@ -1575,6 +1930,7 @@ async fn ended_status(
         reread_usd,
         beat_every_secs,
         ref odds,
+        cap_source,
         ..
     } = *stored
     else {
@@ -1582,7 +1938,8 @@ async fn ended_status(
     };
     // The stored status predates a beat that landed after the last tick,
     // such as the beat whose miss ended the run. A run's count only grows.
-    let fresh = read_closing_spent(pool, thread_id, since).await?;
+    let counted = counted_since(pool, thread_id, since).await?;
+    let fresh = read_closing_spent(pool, thread_id, counted).await?;
     let (beats, cost_usd) = if fresh.beats > beats {
         (fresh.beats, fresh.cost_usd)
     } else {
@@ -1596,7 +1953,7 @@ async fn ended_status(
             saved_usd: None,
         }
     } else {
-        read_run_end(pool, thread_id, since, context_tokens).await?
+        read_run_end(pool, thread_id, counted, context_tokens).await?
     };
     if end.at.is_none() && running && beats > 0 {
         return Ok(RunClose::WakeInFlight);
@@ -1612,6 +1969,7 @@ async fn ended_status(
         reread_usd,
         beat_every_secs: Some(beat_every_secs),
         odds: odds.clone(),
+        cap_source,
     }))
 }
 
@@ -1635,7 +1993,11 @@ async fn read_candidates(
     pool: &sqlx::PgPool,
     waiting: &[Uuid],
 ) -> Result<Vec<CandidateRow>, sqlx::Error> {
-    sqlx::query_as(&candidates_sql())
+    let mut tx = pool.begin().await?;
+    // The planner prices the query high, so JIT compiles it for over a second
+    // on every run, to return a couple of rows.
+    sqlx::query("SET LOCAL jit = off").execute(&mut *tx).await?;
+    let rows = sqlx::query_as(&candidates_sql())
         .bind(waiting)
         .bind(KEEP_ALIVE_IDLE_REASON)
         .bind(ThreadStatus::WaitingForUserAnswer.as_str())
@@ -1643,8 +2005,11 @@ async fn read_candidates(
         .bind(CodingAgent::Codex.as_str())
         .bind(WakeMode::NoWake.as_str())
         .bind(WAITING_FOR_USER_ANSWER_EVENTS)
-        .fetch_all(pool)
-        .await
+        .bind(PARKED_CAP_KINDS)
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(rows)
 }
 
 /// The user's per-thread keep-alive switch, as a request names it (ADR 0554).
@@ -1701,7 +2066,7 @@ impl LucidosEngine {
             }
         };
         let durations = self.keep_alive_durations.current();
-        let rule = GiveUpRule::of(self.keep_alive_mode().await, &durations);
+        let rule = GiveUpRule::of(self.keep_alive_mode().await);
         let anchors = row.anchors(wait);
         let stored = row.stored_status.map(|s| s.0);
         sync_status(
@@ -1727,10 +2092,10 @@ impl LucidosEngine {
         let waiting: Vec<Uuid> = newest.keys().copied().collect();
         let mode = self.keep_alive_mode().await;
         if mode != CacheKeepAliveMode::Off {
-            self.refresh_wait_durations_when_due();
+            self.refresh_wait_durations_when_due().await;
         }
         let durations = self.keep_alive_durations.current();
-        let rule = GiveUpRule::of(mode, &durations);
+        let rule = GiveUpRule::of(mode);
         let rows = match read_candidates(&self.pool, &waiting).await {
             Ok(rows) => rows,
             Err(e) => {
@@ -1745,6 +2110,7 @@ impl LucidosEngine {
             .collect();
         self.remembered_requests
             .prune(&waiting_ttls, std::time::Instant::now());
+        self.keep_alive_re_estimates.retain(&candidates);
         for row in rows {
             let wait = newest.get(&row.thread_id).copied();
             let candidate = self.candidate_of(&row, wait, now).await;
@@ -1783,6 +2149,11 @@ impl LucidosEngine {
                 Beat::Skip(SkipReason::PastCutOff) => {
                     self.remembered_requests.give_up(row.thread_id)
                 }
+                Beat::Skip(SkipReason::PlanRanOut) => {
+                    if let Some(wake) = &candidate.wake {
+                        self.ask_for_a_new_wake(row.thread_id, wake.stated_at);
+                    }
+                }
                 Beat::Skip(_) => {}
             }
             let anchors = row.anchors(wait);
@@ -1801,7 +2172,7 @@ impl LucidosEngine {
         close_stale_statuses(&self.event_bus, &candidates).await;
     }
 
-    async fn keep_alive_mode(&self) -> CacheKeepAliveMode {
+    pub(super) async fn keep_alive_mode(&self) -> CacheKeepAliveMode {
         CacheKeepAliveMode::parse(
             &crate::core::prefs::CACHE_KEEP_ALIVE_MODE
                 .read(&self.pool)
@@ -1814,7 +2185,7 @@ impl LucidosEngine {
     async fn candidate_of(
         &self,
         row: &CandidateRow,
-        wait: Option<(DateTime<Utc>, KeepWarmKinds)>,
+        wait: Option<KeepWarmWait>,
         now: DateTime<Utc>,
     ) -> Candidate {
         let agent = if !row.is_coding_agent {
@@ -1843,14 +2214,17 @@ impl LucidosEngine {
                 .unwrap_or_default(),
             Agent::Codex => (None, None),
         };
-        Candidate {
+        let mut candidate = Candidate {
             agent,
             claim: self.keep_alive_claim(row.thread_id).await,
             awaiting_user: row.awaiting_user,
-            parked: self.parked_of(row),
-            keep_warm_wait_secs: wait.map(|(at, _)| (now - at).num_milliseconds() as f64 / 1000.0),
-            keep_warm_kinds: wait.map(|(_, kinds)| kinds).unwrap_or_default(),
+            parked: self.parked_of(row, agent),
+            keep_warm_wait_secs: wait
+                .map(|w| (now - w.armed_at).num_milliseconds() as f64 / 1000.0),
+            keep_warm_kinds: wait.map(|w| w.kinds).unwrap_or_default(),
             children: row.active_children(),
+            wake: None,
+            timeout_secs: None,
             secs_since_request: row.secs_since_request,
             secs_since_beat: self.secs_since_keep_alive_beat(row.thread_id),
             cache_ttl: row.cache_ttl(),
@@ -1862,7 +2236,21 @@ impl LucidosEngine {
             turned_off_at: row.turned_off_at,
             unattended_trigger: row.unattended_trigger,
             beat_missed: row.missed_beat.is_some(),
+            frozen_odds: row.frozen_odds.as_ref().map(|odds| odds.0.clone()),
+        };
+        // The plan's times count from the wait start's database stamp, so
+        // every tick reads the same plan. A parked wait plans from no estimate.
+        let wait_began = wait_began_at(&candidate, &row.anchors(wait))
+            .filter(|_| matches!(wait_type(&candidate), Some(WaitType::Events(_))));
+        if let Some(wait_began) = wait_began {
+            let asked_again = |stated_at| self.re_estimate_of(row.thread_id, stated_at);
+            candidate.wake = row
+                .wake_stated_at
+                .and_then(|stated_at| row.wake_estimate(wait_began, asked_again(stated_at)));
+            candidate.timeout_secs =
+                wait.map(|w| (w.expires_at - wait_began).num_milliseconds() as f64 / 1000.0);
         }
+        candidate
     }
 
     /// One thread as the tick reads it: its row, its newest keep-warm wait and
@@ -1871,14 +2259,7 @@ impl LucidosEngine {
         &self,
         thread_id: Uuid,
         pick: CandidatePick,
-    ) -> Result<
-        Option<(
-            CandidateRow,
-            Option<(DateTime<Utc>, KeepWarmKinds)>,
-            Candidate,
-        )>,
-        sqlx::Error,
-    > {
+    ) -> Result<Option<(CandidateRow, Option<KeepWarmWait>, Candidate)>, sqlx::Error> {
         let wait = newest_keep_warm_waits(&self.live_waits.snapshot().await).remove(&thread_id);
         let waiting = match (pick, wait) {
             (CandidatePick::AsTheTick, None) => vec![],
@@ -1911,7 +2292,7 @@ impl LucidosEngine {
             ));
         };
         let durations = self.keep_alive_durations.current();
-        let rule = GiveUpRule::of(self.keep_alive_mode().await, &durations);
+        let rule = GiveUpRule::of(self.keep_alive_mode().await);
         let anchors = row.anchors(wait);
         let spent = read_status_spent(&self.pool, thread_id, &candidate, &anchors).await?;
         Ok(status(&candidate, rule, &durations, &anchors, spent))
@@ -1935,12 +2316,33 @@ impl LucidosEngine {
 
     /// The card the row's session is parked on, timed from the turn request
     /// that asked.
-    fn parked_of(&self, row: &CandidateRow) -> Option<Parked> {
+    fn parked_of(&self, row: &CandidateRow, agent: Agent) -> Option<Parked> {
+        let card = row.parked_card()?;
         Some(Parked {
-            card: row.parked_card()?,
+            card,
             secs: row.secs_since_turn_request?,
+            pings_sent: u32::try_from(row.pings_sent).unwrap_or(u32::MAX),
             copy_ready: self.remembers_cc_system_prompt(row.thread_id),
+            cap: row.parked_cap(agent, card, &self.keep_alive_durations.current()),
         })
+    }
+
+    fn re_estimate_of(&self, thread_id: Uuid, stated_at: DateTime<Utc>) -> ReEstimate {
+        self.keep_alive_re_estimates.of(thread_id, stated_at)
+    }
+
+    /// Ask the expected wake decision again, once, for a plan from the
+    /// estimate stated at `stated_at` that ran out with no wake. A new
+    /// estimate plans forward. Without one the old plan stops.
+    fn ask_for_a_new_wake(self: &Arc<Self>, thread_id: Uuid, stated_at: DateTime<Utc>) {
+        if !self.keep_alive_re_estimates.claim(thread_id, stated_at) {
+            return;
+        }
+        let engine = Arc::clone(self);
+        tokio::spawn(async move {
+            engine.re_estimate_expected_wake(thread_id).await;
+            engine.keep_alive_re_estimates.finish(thread_id, stated_at);
+        });
     }
 
     fn secs_since_keep_alive_beat(&self, thread_id: Uuid) -> Option<f64> {

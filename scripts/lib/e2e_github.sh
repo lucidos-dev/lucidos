@@ -21,6 +21,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/e2e_warm.sh"
 # shellcheck source=scripts/lib/host_busy_exits.sh
 source "$(dirname "${BASH_SOURCE[0]}")/host_busy_exits.sh"
 
+# shellcheck source=scripts/lib/github_auth.sh
+source "$(dirname "${BASH_SOURCE[0]}")/github_auth.sh"
+
 E2E_GITHUB_REPO="lucidos-dev/lucidos"
 E2E_GITHUB_REMOTE="lucidos"
 E2E_GITHUB_WORKFLOW="e2e.yml"
@@ -40,6 +43,17 @@ E2E_GITHUB_NO_VERDICT_EXIT=76
 # main check asks for the engine suite (ADR 0386's limits, as amended).
 # shellcheck disable=SC2034 # read by scripts/e2e-github.sh after it sources this
 E2E_GITHUB_MAIN_CHECK_SUITES=(engine api wasm embedder browser)
+
+# Each call resolves the configured identity, including standalone downloads.
+e2e_github_gh() (
+    if [ -z "${GH_ACCOUNT_GITHUB_COM:-}" ]; then
+        echo 'ERROR: GH_ACCOUNT_GITHUB_COM is required; refusing gh active-account fallback.' >&2
+        return 1
+    fi
+    GH_TOKEN=''
+    github_auth || return 1
+    GH_TOKEN="$GH_TOKEN" gh "$@"
+)
 
 e2e_github_now() { date +%s; }
 
@@ -298,6 +312,8 @@ e2e_github_unavailable_reason() {
         echo "there is no '$E2E_GITHUB_REMOTE' remote for $E2E_GITHUB_REPO"
     elif ! command -v gh >/dev/null 2>&1; then
         echo "the gh CLI is not installed"
+    elif [ -z "${GH_ACCOUNT_GITHUB_COM:-}" ]; then
+        echo "GH_ACCOUNT_GITHUB_COM must name a GitHub account for gh"
     fi
 }
 
@@ -405,7 +421,7 @@ e2e_github_delete_branch() {
 # e2e_github_unfinished_runs <branch>: how many of the branch's runs have not
 # completed. Prints nothing when the API cannot answer.
 e2e_github_unfinished_runs() {
-    gh run list --repo "$E2E_GITHUB_REPO" --branch "$1" --limit 20 \
+    e2e_github_gh run list --repo "$E2E_GITHUB_REPO" --branch "$1" --limit 20 \
         --json status --jq 'map(select(.status != "completed")) | length' 2>/dev/null
 }
 
@@ -430,21 +446,34 @@ EOF
 }
 
 # e2e_github_find_run <branch> <commit>: print the workflow run the push
-# started. Waits up to E2E_GITHUB_START_WAIT_SECS (default 180).
+# started. Waits up to E2E_GITHUB_START_WAIT_SECS (default 180). A refused
+# lookup is not a run that never started, so the refusal names gh's last error.
 e2e_github_find_run() {
-    local branch="$1" commit="$2" waited=0 limit="${E2E_GITHUB_START_WAIT_SECS:-180}" id
+    local branch="$1" commit="$2" waited=0 limit="${E2E_GITHUB_START_WAIT_SECS:-180}" id err="" errf
+    errf="$(mktemp)" || return 1
     while [ "$waited" -lt "$limit" ]; do
-        id="$(gh run list --repo "$E2E_GITHUB_REPO" --workflow "$E2E_GITHUB_WORKFLOW" \
+        if id="$(e2e_github_gh run list --repo "$E2E_GITHUB_REPO" --workflow "$E2E_GITHUB_WORKFLOW" \
             --branch "$branch" --limit 5 --json databaseId,headSha \
-            --jq ".[] | select(.headSha == \"$commit\") | .databaseId" 2>/dev/null | head -1)"
-        if [ -n "$id" ]; then
-            printf '%s\n' "$id"
-            return 0
+            --jq ".[] | select(.headSha == \"$commit\") | .databaseId" 2>"$errf")"; then
+            err=""
+            id="$(printf '%s\n' "$id" | head -1)"
+            if [ -n "$id" ]; then
+                rm -f "$errf"
+                printf '%s\n' "$id"
+                return 0
+            fi
+        else
+            err="$(head -3 "$errf" | paste -sd ' ' -)"
         fi
         sleep 5
         waited=$((waited + 5))
     done
-    echo "ERROR: no $E2E_GITHUB_WORKFLOW run started for $branch within ${limit}s" >&2
+    rm -f "$errf"
+    if [ -n "$err" ]; then
+        echo "ERROR: gh could not list the runs for $branch within ${limit}s: $err" >&2
+    else
+        echo "ERROR: no $E2E_GITHUB_WORKFLOW run started for $branch within ${limit}s" >&2
+    fi
     return 1
 }
 
@@ -467,11 +496,11 @@ e2e_github_run_url() { printf 'https://github.com/%s/actions/runs/%s\n' "$E2E_GI
 
 # e2e_github_run_state <run-id>: one JSON object with the run's status,
 # conclusion and jobs, plus `rate_remaining`, the lower X-RateLimit-Remaining
-# of the two answers. Fails when either call fails.
+# of the two answers. Fails when either call fails, leaving gh's error on stderr.
 e2e_github_run_state() {
     local run jobs
-    run="$(gh api --include "repos/$E2E_GITHUB_REPO/actions/runs/$1" 2>/dev/null)" || return 1
-    jobs="$(gh api --include "repos/$E2E_GITHUB_REPO/actions/runs/$1/jobs?per_page=100" 2>/dev/null)" || return 1
+    run="$(e2e_github_gh api --include "repos/$E2E_GITHUB_REPO/actions/runs/$1")" || return 1
+    jobs="$(e2e_github_gh api --include "repos/$E2E_GITHUB_REPO/actions/runs/$1/jobs?per_page=100")" || return 1
     python3 -c '
 import json, sys
 
@@ -523,26 +552,40 @@ print(fast if started and (remaining is None or remaining >= floor) else slow)
 # stdout. Polls adaptively (e2e_github_poll_secs), and a failed gh call waits
 # the slow interval. Gives up after E2E_GITHUB_RUN_WAIT_SECS (default 6 hours)
 # with the no-verdict exit. The default sits above the longest chain of
-# timeout-minutes in e2e.yml, with room for queueing.
+# timeout-minutes in e2e.yml, with room for queueing. A refused read is not a
+# run still going, so each new gh error is printed, and the give-up names it.
 e2e_github_wait() {
     local run_id="$1" limit="${E2E_GITHUB_RUN_WAIT_SECS:-21600}"
-    local state status line last="" deadline poll
+    local state status line last="" err="" deadline poll errf
     deadline=$(($(e2e_github_now) + limit))
+    errf="$(mktemp)" || return "$E2E_GITHUB_NO_VERDICT_EXIT"
     echo "[e2e-github] watching $(e2e_github_run_url "$run_id")" >&2
     while :; do
         poll="$E2E_GITHUB_POLL_SLOW_SECS"
-        if state="$(e2e_github_run_state "$run_id")"; then
+        if state="$(e2e_github_run_state "$run_id" 2>"$errf")"; then
+            err=""
             line="$(e2e_github_run_progress "$state")"
             [ "$line" = "$last" ] || { echo "[e2e-github] $line" >&2; last="$line"; }
             status="$(printf '%s' "$state" | python3 -c 'import json, sys; print(json.load(sys.stdin)["status"])')"
             if [ "$status" = "completed" ]; then
+                rm -f "$errf"
                 printf '%s\n' "$state"
                 return 0
             fi
             poll="$(e2e_github_poll_secs "$state")"
+        else
+            line="$(head -3 "$errf" | paste -sd ' ' -)"
+            line="${line:-gh printed nothing}"
+            [ "$line" = "$err" ] || echo "[e2e-github] gh could not read run $run_id: $line" >&2
+            err="$line"
         fi
         if [ "$(e2e_github_now)" -ge "$deadline" ]; then
-            echo "ERROR: run $run_id did not complete within ${limit}s, so it produced no verdict." >&2
+            rm -f "$errf"
+            if [ -n "$err" ]; then
+                echo "ERROR: gh could not read run $run_id within ${limit}s: $err" >&2
+            else
+                echo "ERROR: run $run_id did not complete within ${limit}s, so it produced no verdict." >&2
+            fi
             return "$E2E_GITHUB_NO_VERDICT_EXIT"
         fi
         sleep "$poll"
@@ -634,7 +677,7 @@ PY
 }
 
 e2e_github_cancel() {
-    gh run cancel "$1" --repo "$E2E_GITHUB_REPO" >/dev/null 2>&1 || true
+    e2e_github_gh run cancel "$1" --repo "$E2E_GITHUB_REPO" >/dev/null 2>&1 || true
 }
 
 # e2e_github_stop_run <repo> <branch> <unfinished-run-id> <pushed> [<detached>]:
@@ -671,7 +714,7 @@ e2e_github_download() {
     local run_id="$1" dir="$2"
     mkdir -p "$dir"
     rm -rf "$dir"/e2e-out-* "$dir"/e2e-plan
-    gh run download "$run_id" --repo "$E2E_GITHUB_REPO" -D "$dir" -p 'e2e-out-*' -p 'e2e-plan'
+    e2e_github_gh run download "$run_id" --repo "$E2E_GITHUB_REPO" -D "$dir" -p 'e2e-out-*' -p 'e2e-plan'
 }
 
 # e2e_github_record_coverage_map <root> <out-dir> <commit> <run-url>: merge the

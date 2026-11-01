@@ -1,5 +1,5 @@
 import { useState } from 'preact/hooks';
-import { currentAutocorrect, currentCacheCards, currentCaptureContext, setAutocorrect, setCacheCards, setCaptureContext } from '../../store/actions/preferences';
+import { currentAutocorrect, currentCaptureContext, setAutocorrect, setCaptureContext } from '../../store/actions/preferences';
 import { isPerfEnabled, setPerfEnabled } from '../../utils/perfQueue';
 import { isIOS } from '../../utils/platform';
 import { animationSpeed, enginePackaged, preferences, speedMultiplier } from '../../store/store';
@@ -17,8 +17,6 @@ import { LoadableToggle } from '../shared/LoadableToggle';
  *    moved here from the former Models → Debugging group so all diagnostics share
  *    one home. Calling `currentCaptureContext()` in render subscribes to
  *    preference updates (it reads `preferences.value`), same as LocaleSection.
- *  - "Cache cards" is the server preference `cache_cards`, off by default.
- *    It hides the prompt-cache cards: Cache kept warm and the cache-warm line.
  *  - "Perf instrumentation" toggles the per-device `lucidos:perf` localStorage
  *    flag that gates `recordPerfSample` (see utils/perfQueue.ts). It's NOT a
  *    server preference — device-local by design, read live, takes effect on the
@@ -90,28 +88,6 @@ export function DebuggingSection() {
           />
           <span class="toggle-slider" />
         </label>
-      </div>
-      <div class="settings-row" data-search-anchor="debugging:cache-cards">
-        <span class="settings-row-label">
-          Cache cards
-          <Explainer title="Cache cards">
-            <p>
-              Show the cards about a waiting thread's prompt cache: Cache kept
-              warm, and the cache-warm line with how long the cache stays warm.
-              Reply before the time runs out and the next turn reads the cache
-              cheaply.
-            </p>
-            <p>
-              On by default. Turn it off to hide both cards. Pings and costs do
-              not change.
-            </p>
-          </Explainer>
-        </span>
-        <LoadableToggle
-          loaded={preferences.value.status === 'loaded'}
-          checked={currentCacheCards()}
-          onChange={(c) => void setCacheCards(c)}
-        />
       </div>
       <div class="settings-row" data-search-anchor="debugging:perf">
         <span class="settings-row-label">

@@ -62,6 +62,8 @@ how often a surface is used. The permission and question cards stay in the
 shell chunk, because a cold open onto a waiting thread draws them at once. So
 does the thread filter panel, whose open state survives a reload. An idle
 prefetch starts after the splash lifts, so any of those would flash.
+ADR 0611 narrows this: a surface with an honest plain form, such as markdown,
+may draw that form first and load the rest lazily.
 
 The guard reports rather than fails under the dev build-watch. It serves the
 workspace, and a failed rebuild keeps serving the old `dist/`. So one overrun

@@ -1746,7 +1746,7 @@ html[data-theme-mode="dark"] .split-button.open::before {
 }
 
 /* Authored HTML: every host element that receives sanitizer output
-   (`renderMarkdown.ts`). The clip confines the paint and hit-testing of every
+   (`markdownEngine.ts`). The clip confines the paint and hit-testing of every
    descendant, fixed ones included, to the box plus a little room. It also
    makes a stacking context. So no authored style or host class can cover
    the app chrome (ADR 0570).
@@ -1783,7 +1783,7 @@ html[data-theme-mode="dark"] .split-button.open::before {
 
 /* A picture with a size hint holds its loaded box before its bytes arrive, so
    nothing below it moves when it lands. HOST ONLY: the host renderer stamps the
-   hint (`renderMarkdown.ts` `applySizeHintsIn`), never an app iframe. The width
+   hint (`markdownEngine.ts` `applySizeHintsIn`), never an app iframe. The width
    is what the shared cap gives the loaded picture: its natural width, or less
    when that would put it over the cap. Once loaded, the picture's own ratio
    wins (`auto`) and `contain` letterboxes it, so a wrong hint never stretches

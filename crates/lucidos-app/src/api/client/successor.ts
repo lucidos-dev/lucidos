@@ -108,10 +108,17 @@ export async function fetchSwitchEstimate(
  *  keep-alive status carries its own prices. */
 export type CacheWarmth =
   /** A cold cache, or nothing cached. */
-  | { warmth: 'cold'; remaining_secs: null; keep_alive: null }
+  | { warmth: 'cold'; remaining_secs: null; keep_alive: null; ttl: null }
   /** No evidence gives the cache's lifetime, so it may be warm or cold. */
-  | { warmth: 'unknown'; remaining_secs: null; keep_alive: CacheKeepAliveStatus }
-  | { warmth: 'warm'; remaining_secs: number; keep_alive: CacheKeepAliveStatus };
+  | { warmth: 'unknown'; remaining_secs: null; keep_alive: CacheKeepAliveStatus; ttl: null }
+  | { warmth: 'warm'; remaining_secs: number; keep_alive: CacheKeepAliveStatus; ttl: WarmthTtl | null };
+
+/** The lifetime a warm cache was measured on, and what says so: the
+ *  response's split of the write, or the lifetime the request asked for. */
+export interface WarmthTtl {
+  lifetime: '5m' | '30m' | '1h' | '12h';
+  evidence: 'reported' | 'requested';
+}
 
 export async function fetchCacheWarmth(threadId: string): Promise<CacheWarmth> {
   return json<CacheWarmth>(`${API}/threads/${encodeURIComponent(threadId)}/cache-warmth`);

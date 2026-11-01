@@ -369,6 +369,11 @@ fn every_proposal_hold_maps_to_its_own_reason() {
     .into_iter()
     .map(UnproposedReason::from)
     .collect();
+    assert_eq!(
+        UnproposedReason::from(ProposalHold::Plan(PlanHold::PlanOnlyAwaitingApproval)),
+        UnproposedReason::PlanAwaitingApproval,
+        "a plan-only hold shares the awaiting-approval reason"
+    );
     let expected: Vec<UnproposedReason> = UnproposedReason::ALL
         .into_iter()
         .filter(|r| {

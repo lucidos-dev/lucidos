@@ -1,7 +1,7 @@
 /**
  * Seconds left on a minted pairing code, ticking while it lives.
  *
- * Shared by "Add a device" and "Pair a gateway", which mint the same kind of
+ * Shared by "Pair a device" and "Pair a gateway", which mint the same kind of
  * five-minute code. A countdown is the honest version of "expires in five
  * minutes": a code left on screen stops working silently.
  */

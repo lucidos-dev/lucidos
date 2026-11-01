@@ -81,6 +81,11 @@ E2E_ENGINE_HOLDER_RELEASE="$HOLDER_RELEASE"
 # so unset it. Same posture as webkit_reaper_test.sh and e2e_lock_test.sh.
 unset PLAYWRIGHT_BROWSERS_PATH
 
+# The floor knobs move the build gate's line and the running guard's floor, so a
+# value exported by the test host would change verdicts the tests pin. A test
+# that wants one sets it itself.
+unset LUCIDOS_E2E_FREE_FLOOR_MIN_GB LUCIDOS_E2E_FREE_FLOOR_PCT
+
 # Pressure is now a stop condition, so it must be pinned for the WHOLE file or
 # every test inherits the CI host's mood: a host sitting at critical would stop
 # the floor and swap cases on the wrong reason. Normal is the neutral value; the
@@ -2554,6 +2559,36 @@ test_the_build_gate_waits_for_recovery_then_refuses_at_the_deadline() {
     assert_eq "0" "$(wc -l < "$BG_WAITS" | tr -d ' ')" "a zero wait cap never sleeps"
 }
 
+# A 7 GB GitHub macOS runner after its engine build: 4.36 GB available and a
+# trace of swap. The flat 8 GB line refused codegen there for 900 s, so the
+# build job lowers it through the floor knob, as the test jobs do.
+test_the_build_gate_line_follows_the_floor_knob() {
+    echo "test: the build gate's available line is LUCIDOS_E2E_FREE_FLOOR_MIN_GB, 8 GB by default"
+    local rc knob
+    reset_state
+    for knob in 1 unset banana; do
+        (
+            if [ "$knob" != unset ]; then export LUCIDOS_E2E_FREE_FLOOR_MIN_GB="$knob"; fi
+            LUCIDOS_BUILD_MEMORY_WAIT_SECS=0 HOST_PRESSURE_LEVEL_OVERRIDE=1 \
+                HOST_AVAIL_GB_OVERRIDE=4.36 HOST_SWAP_USED_GB_OVERRIDE=0.01 \
+                HOST_COMPRESSOR_GB_OVERRIDE=1 HOST_PHYSMEM_GB_OVERRIDE=7 \
+                host_memory_build_gate "codegen"
+        ) >"$OUT/bg-knob-$knob.out" 2>&1
+        rc=$?
+        case "$knob" in
+            1) assert_eq "0" "$rc" "a 1 GB floor lets the runner build" ;;
+            *) assert_eq "72" "$rc" "the floor knob $knob leaves the 8 GB line standing"
+               assert_says "$OUT/bg-knob-$knob.out" "available 4.36 GB under 8 GB" "the refusal names the 8 GB line" ;;
+        esac
+    done
+    env -u LUCIDOS_BUILD_MEMORY_GATE_PASSED_AT LUCIDOS_E2E_FREE_FLOOR_MIN_GB=1 HOST_PRESSURE_LEVEL_OVERRIDE=1 \
+        HOST_AVAIL_GB_OVERRIDE=4.36 HOST_SWAP_USED_GB_OVERRIDE=0.01 \
+        HOST_COMPRESSOR_GB_OVERRIDE=1 HOST_PHYSMEM_GB_OVERRIDE=7 \
+        bash "$BUILD_GATE" --once >"$OUT/bg-knob-once.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "a single reading honours the same knob"
+}
+
 # A pass holds for 60 s in the process tree, so a nested build skips the
 # readings. An older pass does not.
 test_a_recent_pass_holds_and_an_old_one_does_not() {
@@ -3006,6 +3041,7 @@ test_attribution_classifies_by_run_membership_not_name
 test_the_build_gate_agrees_with_the_preflight_gate
 test_the_build_gate_fails_open_on_an_unreadable_host
 test_the_build_gate_waits_for_recovery_then_refuses_at_the_deadline
+test_the_build_gate_line_follows_the_floor_knob
 test_a_recent_pass_holds_and_an_old_one_does_not
 
 test_the_ceiling_interrupts_a_runner_that_outlives_it

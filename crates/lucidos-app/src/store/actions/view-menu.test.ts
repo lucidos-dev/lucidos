@@ -32,7 +32,7 @@ import { drawnSplitRatio, layoutGeometry } from '../../components/layout/drawnLa
 import { viewportIsMobile } from '../../utils/viewport';
 import { KEYBINDINGS_PREF_KEY } from './keybindings';
 import { VIEW_MENU_ITEM_CLICKED_EVENT, type ViewMenuItemState, type ViewMenuPane } from '../../utils/tauri';
-import { handleViewMenuClick, setupViewMenu, viewMenuItems } from './view-menu';
+import { handleViewMenuClick, installViewMenu, setupViewMenu, viewMenuItems } from './view-menu';
 
 const FLOORS = paneFloors();
 const DIVIDER = dividerBandPx();
@@ -309,6 +309,35 @@ describe('the View menu items', () => {
       expect(stopListening).toHaveBeenCalled();
       dashboardRailShown.value = false;
       expect(setViewMenuState).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('installViewMenu', () => {
+    const settled = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+    beforeEach(() => {
+      setViewMenuState.mockClear();
+      listen.mockClear();
+      stopListening.mockClear();
+    });
+
+    it('ends a setup that resolves after its stop', async () => {
+      const stop = installViewMenu();
+      stop();
+      expect(stopListening).not.toHaveBeenCalled();
+      await settled();
+      expect(stopListening).toHaveBeenCalledTimes(1);
+      dashboardRailShown.value = !dashboardRailShown.value;
+      expect(setViewMenuState).toHaveBeenCalledTimes(1);
+    });
+
+    it('stops a setup that already resolved', async () => {
+      const stop = installViewMenu();
+      await settled();
+      expect(listen).toHaveBeenCalledTimes(1);
+      expect(stopListening).not.toHaveBeenCalled();
+      stop();
+      expect(stopListening).toHaveBeenCalledTimes(1);
     });
   });
 });

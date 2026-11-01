@@ -23,12 +23,13 @@ import {
 import { registerFontsInUse } from './fontFaces';
 import { servedPrefs } from './boot/appearanceBoot';
 import { preferences as prefsModule } from './preferences';
-import { isIOSAgent } from './platform';
+import { inIOSStandalone } from './platform';
 import { applyAutocorrectPreference } from './autocorrectStamp';
 import { sse } from './sse';
 import { Select, enhanceSelects } from './select';
 import { disableTooltips } from './tooltip';
 import { focusedThread, onFocusedThreadChange } from './focusedThread';
+import { pageOpensTabs, pageHandsOffToSafari, openTabNow, openSafariNow, traceAppLink } from './externalLinks';
 import type { NavigateTarget, NavigateUi } from './notifications';
 
 /** Params for `lucidos.ui.navigate`: the `NavigateUi` payload minus `target`,
@@ -370,15 +371,6 @@ export function primeDevicePreferences(): Promise<void> {
   return primingDevicePreferences;
 }
 
-/** Whether this frame is inside an installed iOS PWA. The app iframe inherits
- *  the host's display mode, so the same check the host makes works here. */
-function inIOSStandalone(): boolean {
-  if (typeof navigator === 'undefined' || typeof window === 'undefined') return false;
-  if (!isIOSAgent()) return false;
-  return window.matchMedia?.('(display-mode: standalone)').matches === true
-    || (navigator as Navigator & { standalone?: boolean }).standalone === true;
-}
-
 const HTTP_SCHEME_RE = /^https?:\/\//i;
 
 /** Names this module currently has written. A name dropped from the map is
@@ -707,11 +699,12 @@ export const ui = {
    * delegates `<a href="https://…">` clicks automatically); this is the
    * programmatic equivalent for links opened from JS.
    *
-   * MUST be called synchronously from the user's click/tap handler. In the
-   * user's "Ask" mode this opens the OS share sheet via `navigator.share`, which
-   * the browser refuses without transient user activation, and any `await`
-   * before this call spends that activation. Do the async work first, then call
-   * this from a later gesture.
+   * MUST be called synchronously from the user's click/tap handler. In a
+   * plain browser tab this opens the page itself, and in the user's "Ask" mode
+   * it opens the OS share sheet via `navigator.share`. The browser refuses both
+   * without transient user activation, and any `await` before this call spends
+   * that activation. Do the async work first, then call this from a later
+   * gesture.
    *
    * Non-http(s) URLs (`mailto:`, `tel:`) are handed to the platform unchanged.
    * Resolves once the open has been dispatched; a user dismissing the share
@@ -719,6 +712,17 @@ export const ui = {
    */
   openExternal(url: string): Promise<void> {
     assertString('url', url);
+    // Inside the tap, before any await: WebKit gives a tab, or the hand-off to
+    // Safari, only to an open made there. A blocked open falls through to the
+    // host, which offers a retry.
+    const opens = pageOpensTabs() ? 'tab' : pageHandsOffToSafari() ? 'safari' : null;
+    if (opens && HTTP_SCHEME_RE.test(url)) {
+      if ((opens === 'tab' ? openTabNow : openSafariNow)(url)) {
+        traceAppLink('frame-opened', { href: url, opens });
+        return Promise.resolve();
+      }
+      traceAppLink('frame-open-blocked', { href: url, opens });
+    }
     // Share only where the preference can apply and only for a web page. Off
     // iOS, and for `mailto:` / `tel:`, the host path is always right.
     if (

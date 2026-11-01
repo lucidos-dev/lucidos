@@ -131,8 +131,7 @@ fn the_refusal_starts_with_the_marker_and_offers_the_escape() {
     assert!(!card_refusal().contains('\u{2014}'));
 }
 
-/// Every agent's notes arrive as text, the coding agents' through the Vertex
-/// relay. So the refusal asks for prose and never blames hidden reasoning.
+/// The refusal asks for prose and never blames hidden reasoning.
 #[test]
 fn the_refusal_asks_for_prose() {
     assert!(card_refusal().contains("plain prose"));

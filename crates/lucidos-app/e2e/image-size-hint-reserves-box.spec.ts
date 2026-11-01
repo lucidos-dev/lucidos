@@ -8,7 +8,7 @@ import { navigateToApp, assertHealthy } from './helpers';
  *
  * This is a layout property, so only a browser can see it. The markup matches
  * what `renderMarkdown` emits for `![alt](x.png#WxH)`, pinned in
- * src/utils/renderMarkdown.test.ts. It is injected into real surface hosts so
+ * src/utils/markdownEngine.test.ts. It is injected into real surface hosts so
  * the live app cascade applies, as markdown-table-columns-all.spec.ts does.
  */
 

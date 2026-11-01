@@ -173,6 +173,12 @@ describe('a cache keep-alive run', () => {
     expect((card.userEvent as { status: { state: string; beats: number } }).status).toMatchObject({ state: 'warming', beats: 3 });
   });
 
+  it('opens a new card when a real turn after a switch off starts the next run', () => {
+    const nextRun = warming(0, 9);
+    (nextRun as unknown as { status: { since: string } }).status.since = at(8);
+    expect(cards(withStatuses(warming(2, 6), turnedOff(7), nextRun))).toHaveLength(2);
+  });
+
   it('shows a run turned off as its card, until the engine clears it', () => {
     const [card] = cards(withStatuses(warming(2, 6), turnedOff(7)));
     expect((card.userEvent as { status: { state: string } }).status.state).toBe('turned_off');
@@ -394,5 +400,21 @@ describe('a keep-alive run that ended', () => {
 
   it('stays closed once the status clears', () => {
     expect(cards(withStatuses(warming(3, 6), ended(7), cleared(8), warming(4, 9)))).toHaveLength(2);
+  });
+
+  it('draws the next run below a message the user sent mid-wait', () => {
+    const events = withStatuses(warming(3, 6));
+    events.set(9, { type: 'MessageReceived', text: 'are we done yet', mode: 'human', created: at(7), _eventId: 'm2', channel: 'claude_code' } as StoredEvent);
+    events.set(10, { type: 'CodingAgentTextStreamed', text: 'still building', created: at(7), request_event_id: 'm2', channel: 'claude_code' } as StoredEvent);
+    events.set(11, { type: 'CodingAgentIdled', created: at(7), request_event_id: 'm2', channel: 'claude_code' } as StoredEvent);
+    events.set(12, ended(8));
+    events.set(13, sinceAt(warming(0, 8), 7));
+    const exchanges = groupIntoExchanges(events);
+    expect(exchanges.map((ex) => ex.userEvent.type)).toEqual([
+      'MessageReceived', 'CacheKeepAliveStatusChanged', 'MessageReceived', 'CacheKeepAliveStatusChanged',
+    ]);
+    const states = exchanges.slice(1).filter((_, i) => i !== 1)
+      .map((ex) => (ex.userEvent as { status: { state: string } }).status.state);
+    expect(states).toEqual(['ended', 'warming']);
   });
 });

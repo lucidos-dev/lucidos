@@ -154,6 +154,7 @@ export type CacheKeepAliveNotKeptReason =
   | 'cache_expired'
   | 'restarted'
   | 'past_give_up_time'
+  | 'wake_past_reread_cap'
   | 'nothing_pending'
   | 'unattended_trigger'
   | 'unknown_ttl'
@@ -163,14 +164,16 @@ export type CacheKeepAliveNotKeptReason =
 /** The keep-alive's state for one thread, in the one grammar every surface
  *  speaks: Warming, Stopped, Ended, Turned off, or Not kept. */
 export type CacheKeepAliveStatus =
-  /** The engine pings the session, within its break-even budget. */
+  /** The engine pings the session, within its reread cap. */
   | {
       state: 'warming';
-      /** When the wait it keeps warm began. */
+      /** When the run began: the wait start, or the agent's last real idle
+       *  when that came later. A real turn mid-wait starts a new run. */
       since: string;
       /** The pings sent since then. */
       beats: number;
-      /** The pings that cost as much as one cache rewrite. */
+      /** The pings the plan allows this run, from `since` to `give_up_at`:
+       *  at most the reread cap. */
       budget_beats: number;
       /** How often a ping goes out, in seconds. */
       beat_every_secs: number;
@@ -191,8 +194,14 @@ export type CacheKeepAliveStatus =
       /** How past waits like this one ended, against the give-up cap.
        *  Absent with no past wait to count. */
       odds?: CapOdds;
+      /** The expected wake the plan follows. Absent with none, when the
+       *  bare reread cap applies. */
+      expected_wake?: PlannedWake;
+      /** What set the run's give-up time. Absent on statuses stored before
+       *  it. */
+      cap_source?: CapSource;
     }
-  /** The engine stopped pinging at the give-up time set when the wait began. */
+  /** The engine stopped pinging at the end of its plan. */
   | {
       state: 'stopped';
       at: string;
@@ -207,11 +216,14 @@ export type CacheKeepAliveStatus =
       beat_every_secs?: number;
       /** The odds the run's cap was chosen on. Absent like `beat_every_secs`. */
       odds?: CapOdds;
+      /** What set the run's give-up time. Absent on statuses stored before
+       *  it. */
+      cap_source?: CapSource;
     }
   /** The wait ended while the engine kept it warm. */
   | {
       state: 'ended';
-      /** When the wait it kept warm began. */
+      /** When the run began, as `Warming` named it. */
       since: string;
       /** When the wait ended. */
       at: string;
@@ -230,6 +242,9 @@ export type CacheKeepAliveStatus =
       beat_every_secs?: number;
       /** The odds the run's cap was chosen on. Absent like `beat_every_secs`. */
       odds?: CapOdds;
+      /** What set the run's give-up time. Absent on statuses stored before
+       *  it. */
+      cap_source?: CapSource;
     }
   /** The user turned the keep-alive off for this thread at `at`. */
   | {
@@ -246,6 +261,9 @@ export type CacheKeepAliveStatus =
       beat_every_secs?: number;
       /** The odds the run's cap was chosen on. Absent like `beat_every_secs`. */
       odds?: CapOdds;
+      /** What set the run's give-up time. Absent on statuses stored before
+       *  it. */
+      cap_source?: CapSource;
     }
   /** The thread waits, and the engine does not keep it warm. */
   | {
@@ -253,6 +271,10 @@ export type CacheKeepAliveStatus =
       reason: CacheKeepAliveNotKeptReason;
       /** When paused pings start again. Set for `pings_paused` only. */
       until?: string;
+      /** What set the give-up time the wait passed, or the cap the expected
+       *  wake lies past. Set for `past_give_up_time` and
+       *  `wake_past_reread_cap` only. */
+      cap_source?: CapSource;
     };
 
 /** A lifetime a provider's cache offers. Every number a reader times or
@@ -297,6 +319,34 @@ export interface CapOdds {
   /** The waits that outlasted the cap: they paid every ping and the reread. */
   after_cap: number;
 }
+
+/** *Cap source*: what set a keep-alive run's give-up time, so every surface
+ *  can say where the estimate came from. */
+export type CapSource =
+  /** Half the reread cap: the parked card's fallback (ADR 0547). */
+  | { kind: 'half_reread' }
+  /** The reread cap: an event wait with no expected wake inside it. */
+  | { kind: 'reread_cap' }
+  /** The event wait's own timeout, which wakes the thread. */
+  | { kind: 'timeout' }
+  /** The expected wake, as `by` stated it. */
+  | {
+      kind: 'estimate';
+      by: WakeSource;
+    }
+  /** A parked card's cap of `pings`, learned from the `samples` cards like
+   *  it asked from `from_hour` up to `to_hour`, in the `timezone`
+   *  preference's zone. The window may wrap past midnight.
+   *  `utc_offset_mins` is that zone's offset at the ask, so a reader can
+   *  show the hours on its own clock. */
+  | {
+      kind: 'learned';
+      pings: number;
+      samples: number;
+      from_hour: number;
+      to_hour: number;
+      utc_offset_mins: number;
+    };
 
 /** The file format a saved app capture is encoded in. The save path's
  *  extension picks it, and the app frame encodes the picture to match. */
@@ -382,6 +432,7 @@ export type ContextPurpose =
   | 'proxy'
   | 'read_decision'
   | 'wake_decision'
+  | 'expected_wake_decision'
   | 'cache_keep_alive'
   | 'prefill_probe';
 
@@ -780,6 +831,12 @@ export interface OwnerApproval {
   target_thread_id?: string;
 }
 
+/** The expected wake a keep-alive run plans from, as its status shows it. */
+export interface PlannedWake {
+  at: string;
+  source: WakeSource;
+}
+
 /** What made a plugin update run setup. */
 export type PluginSetupCause =
   /** The `setup` text differs from the installed version's. */
@@ -1024,6 +1081,13 @@ export type VoiceSessionEndReason =
   | 'provider_failed'
   | 'engine_shutdown';
 
+/** One time bucket of an expected wake's distribution: the odds the thread
+ *  wakes by `by`, and after the bucket before it. */
+export interface WakeBucket {
+  by: string;
+  probability: number;
+}
+
 /** What a child's clean finish does to its parent, declared by the spawn: the
  *  child's *wake mode* (ADR 0451). A failure wakes the parent under every mode
  *  but `NoWake`, which files every report (ADR 0545).
@@ -1032,6 +1096,11 @@ export type WakeMode =
   | 'no-wake'
   | 'wake'
   | 'wake-when-all-done';
+
+/** Who stated an expected wake. */
+export type WakeSource =
+  | 'agent'
+  | 'decision';
 
 /** A *widget embed*, `![label](app:<id>?params={...})`, as the engine reads
  *  it: the widget, its params, and the alt text as its label. */
@@ -3242,6 +3311,24 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
+  /** The thread's *expected wake*: when it expects to wake next, from any
+   *  event wait or child it holds (ADR 0603). The newest one stands, and
+   *  the keep-alive plans its pings from it. Metadata: it moves nothing. */
+  | {
+      type: 'WakeExpected';
+      at: string;
+      /** The odds per time bucket, when a System One model estimated it. */
+      distribution?: WakeBucket[];
+      source: WakeSource;
+      /** What the thread waits for, and why it should come by `at`. */
+      reason: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
   /** A voice session opened on this thread (ADR 0148).
    *  Full reasoning is on the Rust variant. */
   | {
@@ -3748,6 +3835,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   CacheKeepAliveStatusChanged: true,
   CacheKeepAliveTurnedOff: true,
   CacheKeepAliveTurnedOn: true,
+  WakeExpected: true,
   VoiceSessionStarted: true,
   VoiceSessionEnded: true,
   SpokenReplyGenerated: true,

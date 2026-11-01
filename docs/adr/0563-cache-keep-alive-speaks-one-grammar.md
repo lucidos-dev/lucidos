@@ -11,6 +11,8 @@
   Only a warm wake that held the context claims a saving.
 - **Amended by**: [0580](0580-keep-alive-missed-ping-is-thread-scoped.md).
   `not_kept` gains `pings_paused` and `cache_expired`.
+- **Amended by**: [0603](0603-keep-alive-follows-the-expected-wake.md).
+  The cache cards are a sub-setting of the keep-alive.
 
 ## Context
 

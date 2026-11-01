@@ -2,7 +2,7 @@
 //! single domain family: navigate_ui, git_clone, get_backup_status,
 //! request_credential, connect_oauth_account,
 //! ask_user_question, await_event, list_event_waits, cancel_event_wait,
-//! request_read, todo_write.
+//! request_read, expect_wake, todo_write.
 //!
 //! (manage_repositories / manage_models moved to the capability parity manifest —
 //! domains `repositories` / `models` — and are built by `capability_manifest`.)
@@ -519,6 +519,33 @@ pub(super) fn request_read_tools() -> Vec<ToolDefinition> {
                 }
             },
             "required": [READ_ARG]
+        }),
+    }]
+}
+
+/// The arguments `expect_wake` takes.
+pub(crate) const EXPECT_WAKE_MINUTES_ARG: &str = "minutes";
+pub(crate) const EXPECT_WAKE_REASON_ARG: &str = "reason";
+
+/// The *expected wake* (ADR 0603). Scoped to the calling thread and takes no
+/// thread id, like `request_read`.
+pub(super) fn expect_wake_tools() -> Vec<ToolDefinition> {
+    vec![ToolDefinition {
+        name: tn::EXPECT_WAKE.to_string(),
+        description: "When this thread will next wake: the earliest event wait or child thread you leave pending. Call it before ending a turn that leaves one, beside your read decision. The await_event result shows how long past waits like it lasted. A later call replaces it.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                (EXPECT_WAKE_MINUTES_ARG): {
+                    "type": "number",
+                    "description": "Minutes from now until you expect to wake."
+                },
+                (EXPECT_WAKE_REASON_ARG): {
+                    "type": "string",
+                    "description": "What you wait for, and why it should come by then."
+                }
+            },
+            "required": [EXPECT_WAKE_MINUTES_ARG, EXPECT_WAKE_REASON_ARG]
         }),
     }]
 }

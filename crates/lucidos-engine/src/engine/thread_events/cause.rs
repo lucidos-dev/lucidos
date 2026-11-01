@@ -339,7 +339,9 @@ impl From<ProposalHold> for UnproposedReason {
     fn from(hold: ProposalHold) -> Self {
         match hold {
             ProposalHold::Plan(PlanHold::Missing) => Self::PlanMissing,
-            ProposalHold::Plan(PlanHold::AwaitingApproval) => Self::PlanAwaitingApproval,
+            ProposalHold::Plan(PlanHold::AwaitingApproval | PlanHold::PlanOnlyAwaitingApproval) => {
+                Self::PlanAwaitingApproval
+            }
             ProposalHold::Plan(PlanHold::OutsideBound) => Self::OutsideBound,
             ProposalHold::HardeningMissing => Self::HardeningMissing,
             ProposalHold::IntegratedIntoParent => Self::IntegratedIntoParent,

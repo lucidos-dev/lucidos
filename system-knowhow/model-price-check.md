@@ -136,9 +136,11 @@ they have no price page.
 
 Write the whole file with `run_python`: `json.load` the override (or start
 from the shape above), change it, and `json.dump(..., indent=2,
-ensure_ascii=False)` to a temp file with a trailing newline. Then save it with
-`lucidos data write config/model-prices.json --from <temp file>`, which also
-commits it. Set `checked` to today whenever every source read.
+ensure_ascii=False)` to a temp file with a trailing newline. Then save it in a
+separate `run_bash` call, `lucidos data write config/model-prices.json --from
+<temp file>`, which also commits it. Keep the save out of the Python: a plain
+call needs no subprocess, so nothing has to be checked before it runs. Set
+`checked` to today whenever every source read.
 
 ## When a source cannot be read
 

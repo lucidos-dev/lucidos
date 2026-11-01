@@ -69,28 +69,28 @@ describe('Mobile Access reachability', () => {
     expect(page).toContain('if (showMachineHalf) return tailscaleActionRow();');
   });
 
-  it('renders Connect URLs everywhere, because a URL is reporting', () => {
-    // The third round of the same mistake. Connect URLs was gated whole, so a
+  it('renders Other addresses everywhere, because a URL is reporting', () => {
+    // The third round of the same mistake. The address list was gated whole, so a
     // browser saw no address at all. The MagicDNS URL is exactly what a user
     // copies to another device. It renders on every platform now, and what
     // varies is which rows it can fill.
-    expect(page).toContain('{connectUrlsSection()}');
-    expect(page).not.toContain('{showMachineHalf && connectUrlsSection()}');
+    expect(page).toContain('{otherAddressesSection()}');
+    expect(page).not.toContain('{showMachineHalf && otherAddressesSection()}');
     // The tailnet rows are derived from the two plain-HTTP reads, never from
     // the bridge, which is what lets them render with no Tauri at all.
     expect(page).toContain('tailnetConnectRows({');
     expect(page).toContain('workspaceServeUrl: status.workspace_serve_url');
   });
 
-  it('renders the Connect URLs anchor in every state, not only when loaded', () => {
+  it('renders the Other addresses anchor in every state, not only when loaded', () => {
     // Same rule `NetworkAccessPage` records for `access:network`: the anchor is
     // a navigation target, and `SettingsView` resolves it with ONE
     // `querySelector` on the mounting commit. An anchor that waits for a fetch
     // is missed on a cold open. Search Everywhere reaches this one from a
-    // browser now, so a shell that renders the title unconditionally is what
+    // browser now, so a shell that renders the toggle unconditionally is what
     // keeps the jump landing. Exactly one anchor: a per-branch copy is how it
     // drifts back to being conditional.
-    expect(page.match(/data-search-anchor="access:urls"/g) ?? []).toHaveLength(1);
+    expect(page.match(/data-search-anchor="access:addresses"/g) ?? []).toHaveLength(1);
     expect(page).toContain('const shell = (body: ComponentChildren) => (');
     // And the shell is what every branch returns, including the two that carry
     // no rows at all.
@@ -108,8 +108,7 @@ describe('Mobile Access reachability', () => {
     // wrong address to hand out, and it is what every row used to print.
     // `SCOPE_PATH` comes from the stamped `<base href>`, so this stays
     // slug-agnostic; a literal slug here would be the regression.
-    expect(page).toContain('workspaceUrlAt(connect.localhost_url, SCOPE_PATH)');
-    expect(page).toContain('workspaceUrlAt(lan.url, SCOPE_PATH)');
+    expect(page).toContain('workspaceUrlAt(lan, SCOPE_PATH)');
     expect(page).toContain('workspaceUrlAt(external, SCOPE_PATH)');
     expect(page).toContain('scope: SCOPE_PATH');
   });

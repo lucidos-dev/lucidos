@@ -295,9 +295,9 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
 - **Added:** 2026-09-19
 - **Lives in:** `stackLabelText` in
-  `crates/lucidos-app/src/utils/renderMarkdown.ts`, pinned by
+  `crates/lucidos-app/src/utils/markdownEngine.ts`, pinned by
   `a header's angle brackets never reach the stacked-card label` in
-  `renderMarkdown.test.ts`.
+  `markdownEngine.test.ts`.
 - **Impermanent because:** it compensates for a defect in another module.
   `renderMarkdown`'s own passes parse the document now, but its OUTPUT is a
   string that `utils/linkifyPaths.ts` re-scans with `html.split(/(<[^>]+>)/)`.
@@ -426,10 +426,12 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   status bar strip moving the page below an opaque bar, and the floor counting
   the inset twice (ADR 0551). It now confirms the header under the translucent
   bar: the raw `env()` insets, the floor, the viewport and where the header and
-  its first button land.
+  its first button land. It also carries the written `--app-height` and the CSS
+  viewport units, to tell a wrong write from a wrong WebKit reading (ADR 0610).
 - **Removal / resolution condition:** the user confirms the always-on dynamic
-  bars header on device (ADR 0553). Or two months pass with no `[Client/safe-area]` line read
-  by open work.
+  bars header on device (ADR 0553), and no iOS shell-height report is open
+  (ADR 0610). Or two months pass with no `[Client/safe-area]` line read by open
+  work.
   Verify by confirming no open work reads the line. Then delete the module, its
   test, both calls in `safeAreaFloor.ts`, and the `safe-area` entry in
   `docs/client-logs.md`.
@@ -1608,11 +1610,15 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 ### `x-safari-` scheme prefix to escape an iOS standalone PWA
 
 - **Added:** 2026-08-02
-- **Lives in:** `crates/lucidos-app/src/utils/openExternalUrl.ts`
-  (`SAFARI_SCHEME_PREFIX` and `handOffToSafari`, reached by the `safari` mode and
-  as the fallback from `ask`). Every external-link surface arrives through
-  `openUrl` (`store/actions/artifacts.ts`), including app iframes via
-  `lucidos.ui.openExternal`, so this one site is the whole measure.
+- **Lives in:** `packages/lucidos-sdk/src/externalLinks.ts`
+  (`SAFARI_SCHEME_PREFIX`, the one definition) and
+  `crates/lucidos-app/src/utils/openExternalUrl.ts` (`handOffToSafari`, reached
+  by the `safari` mode and as the fallback from `ask`). Every external-link
+  surface outside an app frame arrives through `openUrl`
+  (`store/actions/artifacts.ts`). An app frame in an iOS PWA set to `safari`
+  hands off itself, inside the tap, with `openSafariNow`
+  (`lucidos.ui.openExternal`), when the host pushes `frameOpens: 'safari'`
+  (`store/actions/app-external-links.ts`). In `ask` mode it takes the host route.
 - **Scope note (2026-08-02):** the `external_link_target` preference added the
   same day is **permanent** and is NOT part of this measure. `ask` (the OS share
   sheet) and `in-app` are ordinary platform behaviours that need no undocumented
@@ -1635,10 +1641,12 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   or Playwright's `mobile-webkit` project, where `isIOSPwa()` is false and the
   branch never runs): install the PWA to the home screen, tap an external link in
   a chat response, and confirm the address bar and tab bar are present and the
-  page shares the Safari session. Then delete `SAFARI_SCHEME_PREFIX` and
-  `handOffToSafari`, point the `safari` mode and the `ask` fallback at
-  `window.open`, and drop the `x-safari-` cases from `openExternalUrl.test.ts`
-  and `artifacts-open-url.test.ts`. **Keep everything else**, per the scope note
+  page shares the Safari session. Then delete `SAFARI_SCHEME_PREFIX`,
+  `openSafariNow`, the `safari` frame mode and `handOffToSafari`. Point the
+  `safari` mode and the `ask` fallback at `window.open`. Drop the `x-safari-`
+  cases from `openExternalUrl.test.ts`, `artifacts-open-url.test.ts` and the
+  SDK's `openExternal.test.ts`, and the `safari` mode cases from
+  `externalLinks.test.ts`, `appLinks.test.ts` and `app-external-links.test.ts`. **Keep everything else**, per the scope note
   above: the `external_link_target` preference and all three of its modes, the
   Settings row, `lucidos.ui.openExternal` plus its cache, and `openExternalUrl`
   itself even once it collapses to a lone `window.open`. It is the single choke
@@ -1860,7 +1868,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Status:** active
 - **Investigation:** `prompt-cache-first-of-turn-miss`
 
-### Claude Code prompt-cache probe (Vertex relay)
+### Claude Code prompt-cache probe (retired Vertex relay)
 
 - **Added:** 2026-10-18. Plan:
   `docs/plans/2026-10-18-claude-code-cache-probe.md`.
@@ -1892,7 +1900,8 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   open work still needs the `[VertexRelayProbe]` lines. Then delete every site
   in the "Lives in" list above. `grep -rE 'VertexRelayProbe|vertex_relay_probe|CallProbe'
   crates` must come back empty, and `make lint` must pass.
-- **Status:** active
+- **Status:** removed 2026-10-31. The retired Vertex relay it rode on is gone (ADR 0605).
+  The probe logged no line on a `gateway` session, which bypassed the relay.
 - **Investigation:** `prompt-cache-first-of-turn-miss`
 
 ### Movement distance in the discarded-tap toast
@@ -2130,12 +2139,12 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   the plan proposes ships. Then drop the prompt sentence and its test needles,
   point `api/internal.rs` back at `CARD_REFUSAL` and delete the coding-agent
   refusal, and drop the grill clause's reason.
-- **Status:** removed 2026-09-23. The Vertex relay below shipped, so the notes
+- **Status:** removed 2026-09-23. The now retired Vertex relay below shipped, so the notes
   arrive as the agent's messages. All three sites were removed in that change.
 - **Investigation:** `cc-reasoning-dormant`. Same upstream path: headless
   Claude Code returns thinking blocks empty.
 
-### Claude Code's Vertex calls go through the Vertex relay
+### Claude Code's Vertex calls go through the Vertex relay (retired)
 
 - **Added:** 2026-09-23. Plan:
   `docs/plans/2026-09-23-coding-agent-notes-hidden-on-opus-5-5.md`.
@@ -2161,45 +2170,46 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   The relay reaches Vertex only. Claude Code's `gateway`, Bedrock and Foundry
   routes ignore `ANTHROPIC_VERTEX_BASE_URL`, and the `gateway` route ignores
   `ANTHROPIC_BASE_URL` too, so no relay can reach them. § "Claude Code's
-  progress notes are hidden on other providers" covers those sessions.
+  progress notes start hidden" covers those sessions.
 - **Removal / resolution condition:** run the repro in the plan WITHOUT the
   relay, on the current Claude Code with Opus 5.5 on Vertex. When the note
   block before the `Bash` call carries text, delete the relay, its spawn stamp,
   its start in `main.rs` and the parser flag.
-- **Status:** active
+- **Status:** removed 2026-10-31. Claude Code 2.1.311 asks for the notes on every
+  provider. The relay, its spawn stamp, its start in `main.rs` and the cache
+  probe were deleted (ADR 0605). The parser flag stays, now `notes_proven`.
 - **Investigation:** n/a. An upstream gap with a checkable repro.
 
-### Claude Code's progress notes are hidden on other providers
+### Claude Code's progress notes start hidden
 
-- **Added:** 2026-10-16. Plan:
-  `docs/plans/2026-10-16-tell-the-agent-when-its-notes-are-hidden.md`.
+- **Added:** 2026-10-16, reworked 2026-10-31. Plans:
+  `docs/plans/2026-10-16-tell-the-agent-when-its-notes-are-hidden.md` and
+  `docs/plans/2026-10-31-claude-code-notes-hidden-until-one-arrives.md`.
 - **Lives in:** four sites.
-  - `crates/lucidos-engine/src/runtime/claude_code_provider.rs`: runs
-    `claude auth status` at spawn, keeps the answer for ten minutes, and
-    allows only `firstParty`, and `vertex` with the relay stamped.
-  - `with_notes_visibility` and `NOTES_HIDDEN_SENTENCE` in
+  - `crates/lucidos-engine/src/runtime/claude_code_notes.rs`: the spawn verdict
+    from the spawn model.
+  - `with_notes_visibility`, `NOTES_HIDDEN_SENTENCE` and the two reminders in
     `engine/agent_session/prompts.rs`, applied in
     `engine/agent_session/run_session/run.rs`.
-  - `SpawnArgs::notes`, read by `stream_state_for` in `runtime/claude_code.rs`.
-  - The `auth status` answer of the e2e fake,
-    `crates/lucidos-app/e2e/fake-claude-code/claude.mjs`.
-- **Impermanent because (works around):** an always-thinking model returns
-  its notes before a tool call as an empty `thinking` block unless the request
-  sets `thinking.display: "updates"`. Claude Code sets it on Anthropic's API
-  only. On the `gateway` route, all 45 blocks of one session were empty. The
-  same holds on Bedrock and Foundry: nothing sets it and no relay reaches them. The
-  agent's own context still holds the text, so it told the user a table was
-  "in my message just before this card".
+  - `CcStreamState::notes_proven` in `runtime/claude_code_parse.rs`.
+  - `NotesReminderDue` in `runtime/agent_runtime.rs`, led by `lead_input` in
+    `runtime/claude_code.rs`.
+- **Impermanent because (works around):** an always-thinking model returns its
+  notes before a tool call as an empty `thinking` block unless the request sets
+  `thinking.display: "updates"`. Nothing at spawn says whether Claude Code did.
+  An empty block is also the model's own reasoning, so the stream cannot prove
+  the notes hidden (ADR 0608). The engine starts hidden and promotes on the
+  first non-empty block. The agent's own context still holds the text. On a
+  shown-wrongly session it once told the user a table was "in my message just
+  before this card".
 
-  A session on such a route reads a hard rule in place of the "short note"
-  sentence: text in a message that also calls a tool may never be seen. It
-  says to write what the user must read once, in a message that calls no tool.
-  A real text block before a tool call still shows. So "never seen" alone made
-  agents repeat their whole answer after the call.
-- **Removal / resolution condition:** Claude Code requests `updates` on every
-  provider. Check: on the `gateway` route with Opus 5.5, a note before a `Bash`
-  call carries text. Then delete the module, the prompt swap, the `notes`
-  field and the fake's answer, and let every session's notes reach the user.
+  Known gap: a typed `/model` slash command goes to Claude Code verbatim. If it
+  switches a live process from a model that starts shown to an always-thinking
+  one, the shown sentence stays. Lucidos itself never switches a live process:
+  a picker change applies at the next spawn, and no `--fallback-model` is set.
+- **Removal / resolution condition:** Claude Code exposes the display mode it
+  sent, or always sends `updates` with no switch. Then read the mode, and delete
+  the prompt swap, the reminders and the parser flag.
 - **Status:** active
 - **Investigation:** n/a. An upstream gap with a checkable repro.
 
@@ -3885,11 +3895,15 @@ measure now eligible for removal** — search this file for the id to find them 
   stays regardless. The deferred alternative — an engine-driven elapsed
   "Thinking… (Ns)" indicator that needs no reasoning text — remains the fallback if
   CC never surfaces it.
-- **Progress notes are a separate channel.** Under the Vertex relay (§ 1), an
-  always-thinking model's notes arrive as `thinking` text. They render as the
-  agent's messages, not as `CodingAgentThoughtStreamed`. The relay asks for
-  notes, never reasoning, so this investigation stays open.
-- **Status:** open
+- **Progress notes are a separate channel.** On a session that shows notes (§ 1),
+  an always-thinking model's notes arrive as `thinking` text. They render as the
+  agent's messages, not as `CodingAgentThoughtStreamed`. They are notes, never
+  reasoning.
+- **Status:** resolved 2026-10-31 as notes only. Claude Code 2.1.311 asks for
+  `thinking.display: "updates"` on every provider, so an always-thinking model's
+  notes arrive and render as messages (ADR 0605). The real reasoning never comes
+  back, and the engine-driven elapsed "Thinking" indicator stays the fallback if
+  wanted.
 - **Measures referencing this investigation:** none (both the parser field-name
   correction and the `REASONING_NOT_VISIBLE_RULE` companion are permanent fixes,
   not removable measures).
@@ -4020,7 +4034,7 @@ measure now eligible for removal** — search this file for the id to find them 
   prompt are built once per turn in `engine::chat::process::run` and handed to
   `run_agentic_loop` frozen. So the cached prefix cannot move mid-turn, and is
   rebuilt from scratch between turns, which is exactly where the miss lives.
-- **The Vertex relay is RULED OUT** (probes on 2026-10-23, in
+- **The retired Vertex relay is RULED OUT** (probes on 2026-10-23, in
   `data/artifacts/token-cost/vertex-relay-cache-miss-probes.md` in the `dev`
   workspace). Byte-identical bodies hit every time, through the relay and
   direct, on `eu` and `global`. The keep-alive side finding that suggested the
@@ -4048,9 +4062,12 @@ measure now eligible for removal** — search this file for the id to find them 
   segment we changed, and the bug is ours. On close, flip every measure tagged
   `Investigation: prompt-cache-first-of-turn-miss` to `removed` per its own
   removal steps.
+- **Claude Code's probe is gone (2026-10-31).** It rode on the retired Vertex relay,
+  which Claude Code 2.1.311 made unneeded, and logged nothing on the `gateway`
+  route. A new probe would sit at a layer every route passes through.
 - **Status:** open
-- **Measures referencing this investigation:** Prompt-cache wire probe (§1),
-  Claude Code prompt-cache probe (Vertex relay) (§1).
+- **Measures referencing this investigation:** Prompt-cache wire probe (§1).
+  Claude Code prompt-cache probe (retired Vertex relay) (§1) was removed.
 
 ### `follow-ride-lands-short`: the ride's own write comes to rest short of the edge
 

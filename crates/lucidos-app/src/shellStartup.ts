@@ -15,12 +15,14 @@ import { installPressCoverWatch } from './components/chat/pressCover';
 import { installDeadKeystrokeProbe } from './components/chat/deadKeystrokeProbe';
 import { installToastPressProbe } from './components/shared/toastPressProbe';
 import { installAppKeybindingsSync } from './store/actions/app-keybindings';
+import { installAppExternalLinksSync } from './store/actions/app-external-links';
 import { installAppFocusedThreadSync } from './store/actions/app-focused-thread';
 import { installAppFrameMessages } from './store/actions/app-frame-messages';
 import { installPendingUploadRestore } from './store/actions/pendingUploadRestore';
 import { installUnsentMessageRestore } from './store/actions/unsentMessageRestore';
 import { installScaleWheel } from './components/shared/scaleWheelListener';
 import { installSeenTargetWatch } from './store/actions/seen-target';
+import { installViewMenu } from './store/actions/view-menu';
 import { startPageHealthLog } from './utils/pageHealthLog.report';
 import { installResumeClock } from './utils/resumeClock';
 import { installShellScrollGuard } from './utils/shellScrollGuard';
@@ -28,6 +30,9 @@ import { reportShellSnapBack } from './utils/shellScrollProbe';
 import { pushTrafficLightOffset } from './store/actions/trafficLights';
 import * as scrollState from './components/chat/scrollState';
 import { provideScrollState } from './components/chat/scrollStateHandle';
+import * as drawerOrder from './components/drawer/drawerOrder';
+import { provideDrawerOrder } from './store/drawerOrderHandle';
+import { rememberFocusedViewRows } from './store/actions/threads';
 import { watchTranscriptLiveness } from './store/transcriptLiveness';
 import { focusedThreadId, threadMap, isThreadStreaming } from './store/store';
 import { voiceCall } from './store/voiceCall';
@@ -38,6 +43,10 @@ export function startShell(): () => void {
   // FIRST, so the store's scroll calls queued during boot replay before
   // anything else here runs. See components/chat/scrollStateHandle.ts.
   provideScrollState(scrollState);
+  // The archive and drop hand-offs walk the drawer's order. See
+  // store/drawerOrderHandle.ts.
+  provideDrawerOrder(drawerOrder);
+  rememberFocusedViewRows();
   // Three diagnostics, not features: the composer's buttons, its textarea and
   // the toasts' buttons. See their headers and docs/temporary-measures.md.
   installPressCoverWatch();
@@ -55,6 +64,7 @@ export function startShell(): () => void {
   installSeenTargetWatch();
   const stops = [
     installAppKeybindingsSync(),
+    installAppExternalLinksSync(),
     installAppFocusedThreadSync(),
     installAppFrameMessages(),
     // Images a previous page load was still uploading come back as chips.
@@ -64,6 +74,9 @@ export function startShell(): () => void {
     installUnsentMessageRestore(),
     // Cmd/Ctrl + wheel steps the UI scale, as Cmd +/- does.
     installScaleWheel(),
+    // The macOS View menu's pane items mirror this window (Tauri only). Its
+    // accelerators read the shortcut table, which stays out of the entry.
+    installViewMenu(),
     // A diagnostic, not a feature: docs/temporary-measures.md § Page health log.
     startPageHealthLog(),
     // A diagnostic, not a feature: docs/temporary-measures.md § App frame load probe.

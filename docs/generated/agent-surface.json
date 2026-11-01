@@ -809,6 +809,16 @@
       },
       {
         "aliases": [],
+        "commands": [],
+        "flags": [
+          "help",
+          "reason"
+        ],
+        "hidden": false,
+        "name": "expect-wake"
+      },
+      {
+        "aliases": [],
         "commands": [
           {
             "aliases": [],
@@ -1471,6 +1481,13 @@
             "flags": [],
             "hidden": false,
             "name": "events"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [],
+            "hidden": false,
+            "name": "expect-wake"
           },
           {
             "aliases": [],
@@ -4637,6 +4654,7 @@
       "CacheKeepAliveStatusChanged",
       "CacheKeepAliveTurnedOff",
       "CacheKeepAliveTurnedOn",
+      "WakeExpected",
       "CumulativeTextUpdated",
       "LlmCallRetried",
       "PreambleCompleted",
@@ -4775,6 +4793,7 @@
       "edit_file",
       "env_vars",
       "events",
+      "expect_wake",
       "fetch_news",
       "follow_up_child_thread",
       "generate_image",

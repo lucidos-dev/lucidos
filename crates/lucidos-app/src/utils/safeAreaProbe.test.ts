@@ -26,16 +26,30 @@ describe('reportSafeAreaReading', () => {
     header.appendChild(document.createElement('button'));
     document.body.appendChild(header);
     reportSafeAreaReading(TOP_LOST, PORTRAIT);
+    vi.advanceTimersByTime(0);
     expect(postClientLog).toHaveBeenCalledWith('safe-area', 'reading', expect.objectContaining({
-      env: TOP_LOST, floor: PORTRAIT, header: [0, 0], firstButton: [0, 0],
+      env: TOP_LOST, floor: PORTRAIT, header: [0, 0], firstButton: [0, 0], cssViewport: [0, 0, 0],
     }));
     header.remove();
+  });
+
+  it('logs the height the shell wrote for the same event, after every listener ran', () => {
+    const root = document.documentElement.style;
+    root.setProperty('--app-height', '402px');
+    reportSafeAreaReading(PORTRAIT, null);
+    root.setProperty('--app-height', '874px');
+    vi.advanceTimersByTime(0);
+    expect(postClientLog).toHaveBeenCalledWith('safe-area', 'reading', expect.objectContaining({
+      appHeight: '874px',
+    }));
+    root.removeProperty('--app-height');
   });
 
   it('logs only when the state changes', () => {
     reportSafeAreaReading(PORTRAIT, null);
     reportSafeAreaReading(PORTRAIT, null);
     reportSafeAreaReading(TOP_LOST, PORTRAIT);
+    vi.advanceTimersByTime(0);
     expect(postClientLog).toHaveBeenCalledTimes(2);
   });
 
@@ -47,7 +61,7 @@ describe('reportSafeAreaReading', () => {
     const header = document.createElement('header');
     header.className = 'app-header';
     document.body.appendChild(header);
-    vi.advanceTimersByTime(3000);
+    vi.advanceTimersByTime(3001);
     expect(postClientLog).toHaveBeenLastCalledWith('safe-area', 'settled', expect.objectContaining({
       env: PORTRAIT, header: [0, 0],
     }));

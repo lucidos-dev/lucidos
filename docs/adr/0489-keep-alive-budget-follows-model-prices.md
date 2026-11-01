@@ -12,6 +12,8 @@
 
 - **Amended by**: [0581](0581-keep-alive-never-pings-a-cache-it-cannot-read.md).
   A beat needs the cache's model and effort; break-even stays.
+- **Amended by**: [0603](0603-keep-alive-follows-the-expected-wake.md).
+  Break-even is now the reread cap, which prices every plan.
 
 ## Context
 

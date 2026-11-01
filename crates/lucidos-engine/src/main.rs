@@ -1101,14 +1101,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The slot boots empty and the model is installed live once it lands, so
     // boot never waits on a multi-hundred-MB download.
     shared_engine.spawn_embedder_load();
-    // Before recovery below, which can resume a Claude Code session. A failed
-    // bind only costs those sessions their progress notes, so boot goes on.
-    // A temporary measure: `docs/temporary-measures.md` § "Claude Code's
-    // Vertex calls go through the Vertex relay".
-    if let Err(e) = lucidos_engine::runtime::vertex_relay::start().await {
-        log!("[Startup] WARNING: the Vertex relay did not start ({e}); Claude Code sessions on Vertex will show no progress notes");
-    }
-
     // The recovery sweeps below run before the HTTP server binds, so narrate
     // them on the boot splash.
     lucidos_engine::boot_report::report(lucidos_engine::boot_report::RECOVERING);
@@ -1783,7 +1775,6 @@ mod ownership_tests {
             .expect("run() takes the workspace's owner lock");
         for stateful in [
             "PgPoolOptions",
-            "vertex_relay::start",
             "boot_report::report",
             "recover_orphaned",
             "lucidos_engine_socket::bind",

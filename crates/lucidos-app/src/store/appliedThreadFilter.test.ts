@@ -139,9 +139,9 @@ describe('the surfaces behind the panel read the applied filter, never the live 
     // list is showing or the cursor drifts from the rows it extends, plus the
     // stamp of what the loaded window was fetched against.
     'store/actions/thread-loading.ts',
-    // The post-archive focus hand-off, which walks the drawer's visible rows to
-    // pick the next one: it has to offer a row the user can actually click.
-    'store/actions/threads.ts',
+    // The drawer's on-screen order, which the post-archive focus hand-off walks
+    // to pick the next row: it has to offer a row the user can actually click.
+    'components/drawer/drawerOrder.ts',
   ];
 
   const srcDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');

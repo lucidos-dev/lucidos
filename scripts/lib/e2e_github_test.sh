@@ -19,7 +19,15 @@ FAIL=0
 pass() { echo "  ok:   $*"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $*"; FAIL=$((FAIL + 1)); }
 
+stub_gh_token() {
+    [ "$1 ${2:-}" = "auth token" ] || return 1
+    echo e2e-github-test-token
+}
+
 unset LUCIDOS_E2E_LOCAL
+# A fixture account and stubbed token lookup isolate the caller's GitHub setup.
+export GH_TOKEN=e2e-github-test-token
+export GH_ACCOUNT_GITHUB_COM=fixture-account
 export E2E_WORKSPACE="$SANDBOX/e2e-test"
 mkdir -p "$E2E_WORKSPACE/.lucidos/worktrees"
 # The public mirror does not ship the release libraries, so the commit tests
@@ -189,7 +197,7 @@ test_stopping_a_run_survives_a_broken_stderr() {
     : >"$calls"
     mkfifo "$fifo"
     (
-        gh() { echo "gh $*" >>"$calls"; }
+        gh() { stub_gh_token "$@" && return 0; echo "gh $*" >>"$calls"; }
         release_tree_delete_ref() { echo "delete $3" >>"$calls"; }
         # A pipe whose only reader has gone, as the main check's log reader
         # does when engine shutdown signals its whole process group.
@@ -205,7 +213,7 @@ test_stopping_a_run_survives_a_broken_stderr() {
     fi
     : >"$calls"
     (
-        gh() { echo "gh $*" >>"$calls"; }
+        gh() { stub_gh_token "$@" && return 0; echo "gh $*" >>"$calls"; }
         release_tree_delete_ref() { echo "delete $3" >>"$calls"; }
         e2e_github_stop_run "$REPO" e2e/20261007-120000-ab12 "" "" 2>/dev/null
     )
@@ -216,7 +224,7 @@ test_stopping_a_run_survives_a_broken_stderr() {
     fi
     : >"$calls"
     (
-        gh() { echo "gh $*" >>"$calls"; }
+        gh() { stub_gh_token "$@" && return 0; echo "gh $*" >>"$calls"; }
         release_tree_delete_ref() { echo "delete $3" >>"$calls"; }
         e2e_github_stop_run "$REPO" e2e/20261007-120000-ab12 4242 1 1 2>/dev/null
     )
@@ -275,7 +283,7 @@ test_the_sweep_removes_only_old_finished_run_branches() {
             esac
         }
         release_tree_delete_ref() { echo "$*" >>"$deletes"; }
-        gh() {
+        gh() { stub_gh_token "$@" && return 0;
             case "$*" in
                 *20261006-090000-aaaa*) echo 0 ;;
                 *20261006-100000-bbbb*) echo 1 ;;
@@ -527,7 +535,7 @@ test_the_unavailable_reason_names_each_precondition() {
     echo "# stand-in" >"$repo/scripts/lib/release_tree.sh"
     git -C "$repo" add -A
     git -C "$repo" -c user.email=dev@example.com -c user.name=Dev commit -qm init
-    gh() { :; }
+    gh() { stub_gh_token "$@" && return 0; :; }
 
     expect_outcome "a mirror checkout lacks the release libraries" "*release_tree.sh*" \
         "$(e2e_github_unavailable_reason "$REPO")"
@@ -535,6 +543,10 @@ test_the_unavailable_reason_names_each_precondition() {
     git -C "$repo" remote add lucidos https://example.invalid/mirror.git
     out="$(e2e_github_unavailable_reason "$repo")"
     if [ -z "$out" ]; then pass "a clean maintainer checkout can use GitHub"; else fail "refused with: $out"; fi
+    expect_outcome "a gh that names no account is named" "*GH_ACCOUNT_GITHUB_COM*" \
+        "$(GH_TOKEN='' GH_ACCOUNT_GITHUB_COM='' e2e_github_unavailable_reason "$repo")"
+    out="$(GH_TOKEN='' GH_ACCOUNT_GITHUB_COM=maintainer e2e_github_unavailable_reason "$repo")"
+    if [ -z "$out" ]; then pass "a named account is enough"; else fail "refused with: $out"; fi
     echo "scratch" >"$repo/untracked.txt"
     expect_outcome "a dirty tree is named" "*uncommitted*" "$(e2e_github_unavailable_reason "$repo")"
     out="$(e2e_github_unavailable_reason "$repo" "$(git -C "$repo" rev-parse HEAD)")"
@@ -542,6 +554,19 @@ test_the_unavailable_reason_names_each_precondition() {
     expect_outcome "a commit that does not resolve is named" "*names no commit*" \
         "$(e2e_github_unavailable_reason "$repo" 0000000000000000000000000000000000000000)"
     unset -f gh
+}
+
+# Since the gh guard blocks a bare call, every main check reported "no run
+# started" for a run that had started. The lookup must say what gh said.
+test_the_run_lookup_reports_what_gh_said() {
+    echo "test: a run lookup that gh refuses names gh's error, not a run that never started"
+    local out
+    out="$(
+        gh() { stub_gh_token "$@" && return 0; echo "HTTP 401: Bad credentials" >&2; return 1; }
+        sleep() { :; }
+        E2E_GITHUB_START_WAIT_SECS=10 e2e_github_find_run e2e/20261031-000000-ab12 deadbeef 2>&1
+    )"
+    expect_outcome "the refusal carries gh's words" "*HTTP 401: Bad credentials*" "$out"
 }
 
 test_the_main_check_selection_has_no_fallback() {
@@ -732,7 +757,7 @@ test_the_run_state_reads_both_answers_and_the_rate_limit() {
     echo "test: the run state joins the run and its jobs, with the lower rate-limit remainder"
     local got
     got="$(
-        gh() {
+        gh() { stub_gh_token "$@" && return 0;
             case "$*" in
                 (*"/jobs?per_page=100"*) fake_api_answer 812 '{"jobs": [{"name": "plan", "status": "completed", "conclusion": "success", "started_at": "2026-01-01T00:00:00Z", "steps": []}]}' ;;
                 (*) fake_api_answer 813 '{"status": "in_progress", "conclusion": null, "updated_at": "2026-01-01T00:01:00Z"}' ;;
@@ -745,7 +770,7 @@ test_the_run_state_reads_both_answers_and_the_rate_limit() {
     else
         fail "state: $got"
     fi
-    if (gh() { return 1; }; e2e_github_run_state 4242 >/dev/null); then
+    if (gh() { stub_gh_token "$@" && return 0; return 1; }; e2e_github_run_state 4242 >/dev/null); then
         fail "a failed gh call still gave a state"
     else
         pass "a failed gh call gives no state"
@@ -774,7 +799,7 @@ test_the_wait_gives_up_with_no_verdict() {
     echo 1000 >"$clock"
     out="$(
         sleeps=0
-        gh() { return 1; }
+        gh() { stub_gh_token "$@" && return 0; echo "HTTP 401: Bad credentials" >&2; return 1; }
         e2e_github_now() { cat "$clock"; }
         # Each sleep moves the fake clock, so no time passes. A wait with no
         # deadline runs out of sleeps instead of hanging the suite.
@@ -785,10 +810,15 @@ test_the_wait_gives_up_with_no_verdict() {
         }
         E2E_GITHUB_RUN_WAIT_SECS=120 e2e_github_wait 4242 2>&1
     )"; rc=$?
-    if [ "$rc" = "$E2E_GITHUB_NO_VERDICT_EXIT" ] && [[ "$out" == *"ERROR: run 4242 did not complete within 120s"* ]]; then
-        pass "a gh that keeps failing ends in no verdict at the deadline"
+    if [ "$rc" = "$E2E_GITHUB_NO_VERDICT_EXIT" ] && [[ "$out" == *"ERROR: gh could not read run 4242 within 120s: HTTP 401: Bad credentials"* ]]; then
+        pass "a gh that keeps failing ends in no verdict at the deadline, naming gh's error"
     else
         fail "rc=$rc: $out"
+    fi
+    if [ "$(grep -c "Bad credentials" <<<"$out")" = 2 ]; then
+        pass "a repeated gh error is reported once while waiting, and again in the verdict"
+    else
+        fail "the gh error was not reported exactly twice: $out"
     fi
     echo 1000 >"$clock"
     out="$(
@@ -883,6 +913,46 @@ test_a_detach_leaves_a_found_run_going_and_cancels_one_not_found() {
     if [ "$got" = "detached=no exit=$E2E_GITHUB_NO_VERDICT_EXIT " ]; then pass "no run yet: the cleanup cancels"; else fail "no run: $got"; fi
 }
 
+# shellcheck disable=SC2031 # The gh stub checks the token assigned by its caller subprocess.
+test_download_requires_an_explicit_account() (
+    echo "test: downloads require a named account and pass its token"
+    local out rc value
+    gh() {
+        if [ "$*" = 'auth token -h github.com -u fixture-account' ]; then
+            echo fixture-token
+        elif [ "$1 $2" = 'run download' ] && [ "${GH_TOKEN:-}" = fixture-token ]; then
+            echo authenticated-download
+        else
+            echo "unexpected gh call or token" >&2
+            return 1
+        fi
+    }
+    for value in unset empty; do
+        unset GH_ACCOUNT_GITHUB_COM
+        [ "$value" != empty ] || export GH_ACCOUNT_GITHUB_COM=''
+        rc=0
+        out="$(e2e_github_download 1 "$SANDBOX/auth-download" 2>&1)" || rc=$?
+        if [ "$rc" -ne 0 ] && [[ "$out" == *GH_ACCOUNT_GITHUB_COM* ]]; then
+            pass "$value account fails loudly, even with an inherited token"
+        else
+            fail "$value account: rc=$rc out=$out"
+        fi
+    done
+    export GH_ACCOUNT_GITHUB_COM=fixture-account
+    out="$(e2e_github_download 1 "$SANDBOX/auth-download" 2>&1)"; rc=$?
+    if [ "$rc" -eq 0 ] && [ "$out" = authenticated-download ]; then
+        pass "download receives the named account's token"
+    else
+        fail "named account: rc=$rc out=$out"
+    fi
+    # Only the credential boundary may call gh directly.
+    if [ "$(sed -n '/^e2e_github_gh()/,/^)/!p' "$SCRIPT_DIR/e2e_github.sh" | grep -cE '(^[[:space:]]*gh |\$\(gh )')" -eq 0 ]; then
+        pass "all sibling GitHub calls use the credential boundary"
+    else
+        fail "bare GitHub call remains"
+    fi
+)
+
 test_a_second_download_replaces_a_partial_one() {
     echo "test: a reattached driver downloads over what a detached one left"
     local dir="$SANDBOX/redownload" rc
@@ -891,7 +961,7 @@ test_a_second_download_replaces_a_partial_one() {
     echo stale >"$dir/e2e-out-api/api.rc"
     echo kept >"$dir/e2e-request.json"
     # Like the real gh: it refuses to extract over a file it finds.
-    gh() {
+    gh() { stub_gh_token "$@" && return 0;
         [ ! -e "$dir/e2e-out-api/api.rc" ] || return 1
         mkdir -p "$dir/e2e-out-api" && echo 0 >"$dir/e2e-out-api/api.rc"
     }
@@ -1185,6 +1255,30 @@ test_the_runner_checkout_gets_a_main_and_an_existing_one_never_moves() {
         pass "an existing main is never moved"
     else
         fail "ensure_main_branch moved an existing main"
+    fi
+}
+
+# A 7 GB macOS runner after its engine build read 4.36 GB available with a
+# trace of swap. The build job's codegen gate refused that for 900 s, so every
+# macOS engine-cache miss failed and mobile-webkit never ran.
+test_the_build_job_stands_down_the_shared_host_guards() {
+    echo "test: the build and test jobs both lower the memory floor, so a runner build passes the gate"
+    local shard="$SCRIPT_DIR/../e2e-github-shard.sh" gate="$SCRIPT_DIR/../build-memory-gate.sh" fn
+    for fn in prepare_build cmd_run; do
+        if bash -c 'source "$1"; declare -f "$2"' _ "$shard" "$fn" | grep -q stand_down_shared_host_guards; then
+            pass "$fn stands down the shared-host guards"
+        else
+            fail "$fn leaves the shared-host guards armed on a runner"
+        fi
+    done
+    # shellcheck disable=SC2016 # the child bash expands its own arguments
+    if env -u LUCIDOS_BUILD_MEMORY_GATE_PASSED_AT -u LUCIDOS_E2E_FREE_FLOOR_MIN_GB \
+        HOST_PRESSURE_LEVEL_OVERRIDE=1 HOST_AVAIL_GB_OVERRIDE=4.36 HOST_SWAP_USED_GB_OVERRIDE=0.01 \
+        HOST_COMPRESSOR_GB_OVERRIDE=1 HOST_PHYSMEM_GB_OVERRIDE=7 \
+        bash -c 'source "$1"; stand_down_shared_host_guards; bash "$2" --once' _ "$shard" "$gate" >/dev/null 2>&1; then
+        pass "the runner's reading passes the build gate"
+    else
+        fail "the build gate still refuses a healthy 7 GB runner"
     fi
 }
 
@@ -1517,6 +1611,7 @@ test_the_local_leg_seam_reruns_the_script_with_the_leg_environment
 test_an_unreachable_github_keeps_its_waits
 test_an_unfiltered_run_still_goes_to_github
 test_the_unavailable_reason_names_each_precondition
+test_the_run_lookup_reports_what_gh_said
 test_the_main_check_selection_has_no_fallback
 test_attach_takes_a_run_and_its_branch_for_the_main_check_only
 test_the_report_matches_the_local_tally_and_exit_codes
@@ -1529,6 +1624,7 @@ test_the_wait_gives_up_with_no_verdict
 test_the_wait_polls_its_own_run_adaptively
 test_the_timings_record_reuse_and_job_times
 test_a_detach_leaves_a_found_run_going_and_cancels_one_not_found
+test_download_requires_an_explicit_account
 test_a_second_download_replaces_a_partial_one
 test_only_a_coverage_request_turns_coverage_on
 test_every_suite_sees_the_coverage_request
@@ -1541,6 +1637,7 @@ test_a_spec_file_among_playwright_args_is_a_selection
 test_the_plan_refuses_a_real_claude_code_spec
 test_the_fake_installs_only_on_a_runner_and_never_over_a_claude
 test_the_runner_checkout_gets_a_main_and_an_existing_one_never_moves
+test_the_build_job_stands_down_the_shared_host_guards
 test_the_pinned_postgres_versions_resolve
 test_the_engine_lookup_names_the_newest_matching_build
 test_a_failed_lookup_lets_the_build_run

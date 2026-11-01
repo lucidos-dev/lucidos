@@ -1079,6 +1079,13 @@ under Review. Say `no` too for a progress report while your sub-threads still
 run or your event wait is still armed. Say `yes` then only for something the
 user should read before the work finishes, such as a failure or a finding.
 
+A sub-thread whose parent acts on its report, a `wake` or `wake-when-all-done`
+child, says `no` for a routine result, because the user reads the parent. Say
+`yes` only for a failure, a gap the user must know about, or something only the
+user can do or decide. A child with no declared wake mode decides its own wake,
+and follows the same rule for a turn that wakes its parent. A turn the user
+opens in your thread is answered as usual (ADR 0607).
+
 ```bash
 $ lucidos request-read yes
 {"status":"requested","message":"Recorded. Once this turn ends, the thread is listed under Review until the user has read your reply. A ready change or a harden hold that lists it already takes its place."}
@@ -1095,6 +1102,29 @@ It does not notify. Run `lucidos notify` as well only when the user should
 hear now. A request clears once the end of your reply has been on screen for
 a second. The user's next message or an archive also clears it. A later `no`
 never clears it.
+
+### `lucidos expect-wake <duration> --reason <R>`
+
+State this thread's *expected wake*: when it will next wake, from the event
+waits and child threads you leave pending. Run it before you finish a turn that
+leaves any pending, for the earliest of them. The duration takes a unit:
+`90s`, `45m`, `2h` or `1h30m`. A bare number is refused. The reason says what
+you wait for and why it should come by then.
+
+It is the coding-agent counterpart of the chat agent's `expect_wake` tool, and
+records the same `WakeExpected` (ADR 0603). It takes the thread from
+`$LUCIDOS_THREAD_ID` and has no thread flag. The span runs from one second to
+24 hours, the longest event wait.
+
+```bash
+$ lucidos expect-wake 45m --reason "the release build, about 40 minutes per run"
+{"status":"recorded","message":"Recorded: you expect to wake in about 45 min. While the keep-alive is on, it keeps the prompt cache warm until then when that costs clearly less than one reread. A later statement replaces this one."}
+```
+
+Estimate from what you wait for. With the keep-alive on, `lucidos await-event`
+on a keep-warm event adds how long past waits like it lasted in this workspace,
+and asks for this statement. The newest statement stands, so run it again when
+you learn more. Nothing needs it while the keep-alive is off.
 
 ### `lucidos wake-parent yes|no`
 
@@ -1915,7 +1945,7 @@ A tapped fork is an approval too: revise the plan file to that variant, re-commi
 
 The card's question carries the plan summary, with the ask on its last line. A message that also calls a tool never reaches the user. A re-ask carries only what changed. `mark --simple` records `acknowledged_simple` directly, since local fixes need no approval.
 
-`approve` also rewrites the plan file's `- **Status**: Proposed` line to `Approved` and commits it. A plan with no such line is left alone. A branch that changes only `docs/plans/` files may propose and apply while its plan is still `proposed`. It records the plan and carries no implementation. Apply keeps the `proposed` marker, so `approve` still works afterwards. A branch with any other file waits for approval.
+`approve` also rewrites the plan file's `- **Status**: Proposed` line to `Approved` and commits it. A plan with no such line is left alone. A branch waits for approval while its plan is `proposed`, a branch of `docs/plans/` files alone included: Lucidos does not propose it and Apply refuses it, with the Not ready reason `plan_awaiting_approval`. Once approved, a plan-only branch proposes and applies with no hardening, and the plan lands on its own or with the work that implements it. A plan the user never approves stays on its branch.
 
 `mark --security-fix` is the **bounded security-fix lane**, for one case: a run nobody can be asked. An UNATTENDED session may commit a security fix with no prior plan decision. The fix must stay inside the files `--files` names, and ship a regression test. It records `bounded_security_fix`, which satisfies the gate at once.
 
@@ -2398,7 +2428,7 @@ ports. Pass `--port` to say which one the new device will reach.
 
 **Reach for it only when nothing is paired yet, and know where it lives.** The
 desktop app pairs its own window on launch. Any paired device can add the next
-one from **Settings → Access → Add a device**, which mints the same code and
+one from **Settings → Access → Pair a device**, which mints the same code and
 shows the same QR, with no terminal step. `lucidos` is on no `PATH` either: a
 desktop install keeps it at `Lucidos.app/Contents/Resources/lucidos`, and a
 headless one under the install prefix in `runtime/current/`.

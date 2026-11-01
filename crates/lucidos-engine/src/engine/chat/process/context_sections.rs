@@ -211,20 +211,10 @@ URL: {}\n\
                 }
             };
 
-            let remaining = MAX_THREAD_DEPTH - depth;
-            let guidance = if remaining <= 0 {
-                "You are at maximum thread depth. Do ALL work directly — no sub-threading available.".to_string()
-            } else if remaining == 1 {
-                "You have 1 level of sub-threading remaining. Use it only if absolutely necessary — strongly prefer doing work directly.".to_string()
-            } else {
-                format!("You have {} levels of sub-threading remaining. Prefer doing work directly; only delegate truly independent parallel tasks.", remaining)
-            };
-            format!(
-                "[THREAD CONTEXT]\n\
-                 You are a child thread at depth {} (max {}).\n\
-                 {}\n\
-                 [END THREAD CONTEXT]",
-                depth, MAX_THREAD_DEPTH, guidance
+            child_thread_context(
+                depth,
+                crate::engine::turn_end::wake_decision::WakeDuty::of_thread(&self.pool, thread_id)
+                    .await,
             )
         } else if self.is_home_thread_for_context(thread_id).await {
             HOME_THREAD_CONTEXT.to_string()
@@ -245,6 +235,34 @@ URL: {}\n\
             thread_depth_context,
         }
     }
+}
+
+/// The `[THREAD CONTEXT]` of a child thread at `depth` that owes `duty`: its
+/// place in the tree, and the read rule its parent's acting calls for.
+fn child_thread_context(
+    depth: i32,
+    duty: crate::engine::turn_end::wake_decision::WakeDuty,
+) -> String {
+    let remaining = MAX_THREAD_DEPTH - depth;
+    let guidance = if remaining <= 0 {
+        "You are at maximum thread depth. Do ALL work directly — no sub-threading available."
+            .to_string()
+    } else if remaining == 1 {
+        "You have 1 level of sub-threading remaining. Use it only if absolutely necessary — strongly prefer doing work directly.".to_string()
+    } else {
+        format!("You have {} levels of sub-threading remaining. Prefer doing work directly; only delegate truly independent parallel tasks.", remaining)
+    };
+    let read_rule = match duty.read_rule() {
+        "" => String::new(),
+        rule => format!("\n{rule}"),
+    };
+    format!(
+        "[THREAD CONTEXT]\n\
+         You are a child thread at depth {} (max {}).\n\
+         {}{}\n\
+         [END THREAD CONTEXT]",
+        depth, MAX_THREAD_DEPTH, guidance, read_rule
+    )
 }
 
 /// What the home thread's agent is told about the thread it runs in
@@ -417,9 +435,14 @@ mod tests {
     use super::super::workspace_prompt_footprint::{
         build_app_knowhow_listing, build_knowhow_section,
     };
-    use super::{active_app_ui_section, active_file_context_section, HOME_THREAD_CONTEXT};
+    use super::{
+        active_app_ui_section, active_file_context_section, child_thread_context,
+        HOME_THREAD_CONTEXT,
+    };
     use crate::core::knowhow::KnowhowDirs;
     use crate::core::{KnowhowListDepth, KnowhowStore};
+    use crate::engine::thread_events::WakeMode;
+    use crate::engine::turn_end::wake_decision::WakeDuty;
     use std::path::Path;
 
     /// The marker a body carries in these fixtures. It must never reach the
@@ -759,6 +782,29 @@ mod tests {
                 routing.contains(&format!("(id: `{}`", id)),
                 "'{id}' is in the app block but not the routing list:\n{routing}"
             );
+        }
+    }
+
+    /// ADR 0607: a chat sub-thread reads the same rule as a coding agent's,
+    /// under the same duties.
+    #[test]
+    fn a_child_thread_context_carries_the_read_rule_by_wake_duty() {
+        for duty in [
+            WakeDuty::Declared(WakeMode::Wake),
+            WakeDuty::Declared(WakeMode::WakeWhenAllDone),
+            WakeDuty::Decide,
+        ] {
+            let context = child_thread_context(1, duty);
+            assert!(context.contains(duty.read_rule()), "{duty:?}: {context}");
+            assert!(
+                context.ends_with(&format!("{}\n[END THREAD CONTEXT]", duty.read_rule())),
+                "{duty:?}: {context}"
+            );
+        }
+        for duty in [WakeDuty::Declared(WakeMode::NoWake), WakeDuty::NoParent] {
+            let context = child_thread_context(1, duty);
+            assert!(!context.contains("SUB-THREAD READ DECISION"), "{context}");
+            assert!(context.contains("You are a child thread at depth 1"));
         }
     }
 }

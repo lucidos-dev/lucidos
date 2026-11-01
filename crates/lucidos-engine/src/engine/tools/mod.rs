@@ -325,6 +325,7 @@ impl LucidosEngine {
                 self.execute_switch_cache_keep_alive(args, thread_id).await
             }
             tn::REQUEST_READ => self.execute_request_read(args, thread_id).await,
+            tn::EXPECT_WAKE => self.execute_expect_wake(args, thread_id).await,
             tn::WAKE_PARENT => self.execute_wake_parent(args, thread_id).await,
             tn::TRIAGE_THREADS => self.execute_triage_threads(thread_id).await,
             tn::APPLY_THREAD_TRIAGE => self.execute_apply_thread_triage(args, thread_id).await,
@@ -858,6 +859,23 @@ impl LucidosEngine {
             .await
             .map_err(|e| format!("Error: recording the read decision failed: {e}"))?;
         Ok(decision.ack().to_string())
+    }
+
+    /// LLM tool: the thread's *expected wake* (ADR 0603). The thread is the
+    /// ambient one, so the model cannot name another.
+    async fn execute_expect_wake(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        use crate::engine::expected_wake::{record_agent_expected_wake, ExpectedWake};
+        let now = chrono::Utc::now();
+        let wake = ExpectedWake::from_tool_args(args, now)?;
+        let ack = wake.ack(now);
+        record_agent_expected_wake(&self.event_bus, thread_id, wake)
+            .await
+            .map_err(|e| format!("Error: recording the expected wake failed: {e}"))?;
+        Ok(ack)
     }
 
     /// LLM tool: a child thread's *wake decision* on this turn's report. The

@@ -1,13 +1,10 @@
-import { showToast, showConfirm, threadMap, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, setFocusedThread, focusedThreadId, awaitedThreadId, drawerGrouping, selectedOngoingGroup, threadSearchQuery, threadSearchResults } from '../store';
-import { appliedThreadFilter } from '../appliedThreadFilter';
+import { showToast, showConfirm, threadMap, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, setFocusedThread, focusedThreadId, awaitedThreadId } from '../store';
 import { closeDashboardPanel } from '../dashboards';
 import { revealThreadPane } from './pane';
-import type { ThreadMeta, ThreadState } from '../thread-events';
+import type { ThreadMeta } from '../thread-events';
 import { deepLinkAnchorInThread, describeWaitSubscription, NO_CHANGE } from '../thread-events';
 import type { ConfirmDetailGroup, ConfirmDetails } from '../types';
-import { threadPassesChannelFilter } from '../threadFilter';
-import { computeFamilyGraph, filterByTopThread, ongoingFilter, orderedCurrentForReview, selectedOngoingRows } from '../../components/drawer/family-graph';
-import type { FamilyGraph } from '../../components/drawer/family-graph';
+import { activeViewKey, orderedVisibleThreadIds } from '../drawerOrderHandle';
 import { saveThread, unsaveThread, archiveThread, unarchiveThreads, type ArchiveSkippedMember } from '../../api/threads';
 import { ApiError, putComposeOnThread } from '../../api/client';
 import { threadQueueHolds } from './threadQueue';
@@ -519,61 +516,6 @@ export async function handleUnsaveThread(threadId: string): Promise<void> {
 // Archive (move waiting thread to archive)
 // ---------------------------------------------------------------------------
 
-/** Threads the user can actually see, given the active channel/trigger/repo/app
- *  filter — the SAME family-scoped predicate the drawer uses (`ThreadDrawer`'s
- *  ThreadList). The post-archive focus must land on a thread the user can click
- *  on in the list, so a thread hidden by the active filter is never offered as
- *  the next focus. Returns the filtered set plus the family graph (built over
- *  the full thread map so parent walks resolve) for the caller to order. */
-function visibleThreadsAndGraph(): { visible: ThreadState[]; graph: FamilyGraph } {
-  const all = Array.from(threadMap.value.values());
-  const graph = computeFamilyGraph(all);
-  // The *applied* selection, which is what the drawer is showing: while the
-  // thread filter panel is up it holds still, and the row the focus lands on
-  // has to be one the user can actually click (see `appliedThreadFilter`).
-  const { channels: filter, triggerIds: triggerSelection, repoIds: repoSelection, appIds: appSelection } = appliedThreadFilter.value;
-  // A trigger/repo/app sub-selection flips the gate to any-member matching,
-  // mirroring the drawer so a coding-agent thread in the selected repo/app surfaces with
-  // its family even when the root's channel is filtered out.
-  const subSelectionActive =
-    triggerSelection.size > 0 || repoSelection.size > 0 || appSelection.size > 0;
-  const visible = filterByTopThread(all, graph,
-    t => threadPassesChannelFilter(t, filter, triggerSelection, repoSelection, appSelection),
-    subSelectionActive,
-  );
-  return { visible, graph };
-}
-
-/** The visible thread ids of the drawer list the user is *currently looking
- *  at*, in the same order the drawer renders them. The post-archive focus
- *  walks this, so "next" is the next visible row of the list on screen: the
- *  selected ongoing group's listed rows under Ongoing, the filtered Current rows under
- *  Folders. Mirrors `ThreadDrawer`'s `activeView` resolution: a live search
- *  query overrides the grouping.
- *
- *  The Ongoing grouping deliberately bypasses the channel/trigger/repo/app
- *  filter, exactly as the drawer renders it. Only Folders is filter-aware,
- *  walking the visible Current section (`orderedCurrentForReview`) the same way
- *  the drawer does. */
-function orderedVisibleThreadIds(): string[] {
-  // Search overrides the grouping (mirrors ThreadDrawer's activeView).
-  if (threadSearchQuery.value.trim().length > 0) {
-    const results = threadSearchResults.value;
-    return results.status === 'loaded' ? results.data.map(r => r.thread_id) : [];
-  }
-  if (drawerGrouping.value === 'ongoing') return selectedOngoingRows.value.map(n => n.thread.meta.id);
-  const { visible, graph } = visibleThreadsAndGraph();
-  return orderedCurrentForReview(visible, graph).map(t => t.meta.id);
-}
-
-/** Which drawer list `orderedVisibleThreadIds` walks: a live search, the selected
- *  ongoing group, or Folders. */
-function activeViewKey(): string {
-  const query = threadSearchQuery.value.trim();
-  if (query.length > 0) return `search:${query}`;
-  return drawerGrouping.value === 'ongoing' ? `ongoing:${selectedOngoingGroup.value}:${ongoingFilter.value}` : 'folders';
-}
-
 /** The active view's rows as they stood when the focused thread was opened.
  *  A thread often leaves its view before it is archived: stopping a question
  *  leaves Blocked, applying a change leaves Review. Its row in this
@@ -585,6 +527,13 @@ function rememberOpenedViewRows(threadId: string): void {
   // Re-focusing a thread that already left its view keeps its last position.
   if (!ids.includes(threadId) && openedViewRows?.threadId === threadId) return;
   openedViewRows = { threadId, view: activeViewKey(), ids };
+}
+
+/** Called once, by `startShell`: a focus restored before the drawer order
+ *  existed recorded no rows. */
+export function rememberFocusedViewRows(): void {
+  const threadId = focusedThreadId.value;
+  if (threadId) rememberOpenedViewRows(threadId);
 }
 
 /** The rows below `idx`, nearest first, then the rows above it, nearest first. */

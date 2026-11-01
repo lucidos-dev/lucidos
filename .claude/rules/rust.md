@@ -72,7 +72,6 @@ An HTTP call between co-located Lucidos processes resolves its scheme through **
 - For a peer whose scheme might differ, use `peer_scheme_order()`: the resolved scheme first, the other second.
 - A self-signed dev cert on a loopback hop is accepted with `danger_accept_invalid_certs(true)` + `no_proxy()`.
 - **The gateway's hop to an engine has no scheme.** It uses the *engine socket* through `engine_hop` (ADR 0445).
-- **One exception: the Vertex relay** (`runtime/vertex_relay.rs`) never serves TLS, so its `http://` is fixed (ADR 0260).
 
 ## API URL Conventions
 

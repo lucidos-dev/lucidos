@@ -300,14 +300,10 @@ pub(super) async fn push_subscribe(
     Json(request): Json<PushSubscribeRequest>,
 ) -> Json<ApiResult> {
     // Refused BEFORE the store runs, because `subscribe` deletes the device's
-    // existing row before inserting: an endpoint we would not deliver to must
-    // not be able to take the real subscription down with it.
-    if !push_endpoint_is_deliverable(&request.endpoint) {
-        return ApiResult::err(
-            "A push endpoint must be an https URL on a public host. \
-             This one is not, so nothing was stored."
-                .to_string(),
-        );
+    // existing row before inserting: a refused request must not be able to take
+    // the real subscription down with it.
+    if let Some(reason) = subscribe_refusal(&headers, &request) {
+        return ApiResult::err(reason);
     }
     let scope_url = sanitize_push_scope_url(request.scope_url, &headers);
     let sub = PushSubscription {
@@ -320,6 +316,32 @@ pub(super) async fn push_subscribe(
     match PushSubscriptionStore::subscribe(&state.pool, &sub).await {
         Ok(()) => ApiResult::ok(),
         Err(e) => ApiResult::err(format!("Failed to store subscription: {}", e)),
+    }
+}
+
+/// Why this subscribe request must not reach the store, or `None` when it may.
+///
+/// Two refusals: an endpoint the engine would not deliver to, and a body
+/// naming a device other than the caller. The second would let one paired
+/// device point another's notifications at an endpoint it controls.
+fn subscribe_refusal(headers: &HeaderMap, request: &PushSubscribeRequest) -> Option<String> {
+    if !push_endpoint_is_deliverable(&request.endpoint) {
+        return Some(
+            "A push endpoint must be an https URL on a public host. \
+             This one is not, so nothing was stored."
+                .to_string(),
+        );
+    }
+    match request.device_id.as_deref() {
+        Some(device_id) => super::settings::claims_another_device(headers, device_id)
+            .map(|reason| format!("{reason}, so no push subscription was stored.")),
+        // A row with no device reaches every notification and no device's
+        // toggle can turn it off. Only an unidentified loopback caller keeps it.
+        None => super::settings::claims_another_device(headers, "").map(|_| {
+            "A paired device must name itself in device_id, \
+             so no push subscription was stored."
+                .to_string()
+        }),
     }
 }
 
@@ -524,21 +546,76 @@ mod tests {
     /// and then inserts. Checking after the call would still silence the
     /// phone, which is half the harm.
     #[test]
-    fn push_subscribe_refuses_the_endpoint_before_it_reaches_the_store() {
+    fn push_subscribe_refuses_before_it_reaches_the_store() {
         let src = production_src();
         let at = src
             .find("pub(super) async fn push_subscribe")
             .expect("push_subscribe is still here");
         let body = &src[at..];
         let guard = body
-            .find("push_endpoint_is_deliverable(&request.endpoint)")
-            .expect("push_subscribe must check the endpoint it is handed");
+            .find("subscribe_refusal(&headers, &request)")
+            .expect("push_subscribe must check the request it is handed");
         let store = body
             .find("PushSubscriptionStore::subscribe")
             .expect("push_subscribe still writes through the store");
         assert!(
             guard < store,
             "the refusal must precede the delete-then-insert"
+        );
+    }
+
+    fn subscribe_request(device_id: Option<&str>) -> PushSubscribeRequest {
+        PushSubscribeRequest {
+            endpoint: "https://fcm.googleapis.com/fcm/send/abc123".to_string(),
+            p256dh: "key".to_string(),
+            auth: "auth".to_string(),
+            device_id: device_id.map(str::to_string),
+            scope_url: None,
+        }
+    }
+
+    fn device_header(device_id: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            super::super::actor::HEADER_DEVICE_ID,
+            HeaderValue::from_str(device_id).unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn a_paired_device_cannot_subscribe_for_another_device() {
+        let reason = subscribe_refusal(&device_header("dev-a"), &subscribe_request(Some("dev-b")))
+            .expect("dev-a must not replace dev-b's push subscription");
+        assert!(reason.contains("dev-a"), "{reason}");
+        assert!(reason.contains("dev-b"), "{reason}");
+    }
+
+    #[test]
+    fn a_paired_device_cannot_subscribe_for_no_device() {
+        assert!(
+            subscribe_refusal(&device_header("dev-a"), &subscribe_request(None)).is_some(),
+            "a device-less row would reach every notification"
+        );
+        assert_eq!(
+            subscribe_refusal(&HeaderMap::new(), &subscribe_request(None)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_device_may_subscribe_for_itself() {
+        assert_eq!(
+            subscribe_refusal(&device_header("dev-a"), &subscribe_request(Some("dev-a"))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_loopback_caller_with_no_device_header_may_subscribe() {
+        assert_eq!(
+            subscribe_refusal(&HeaderMap::new(), &subscribe_request(Some("dev-a"))),
+            None
         );
     }
 

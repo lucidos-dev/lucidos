@@ -3,13 +3,12 @@
  *
  * The whole difficulty is that the machine minting a code is usually reading
  * the page over loopback, and a QR aimed at `127.0.0.1` helps nobody. So the
- * QR reuses the derivation the Connect URLs Tailscale row already had, and
+ * QR reuses the derivation the Other addresses Tailscale row already had, and
  * these tests pin the two together rather than testing them apart.
  */
 import { describe, it, expect } from 'vitest';
 import { tailnetOrigin, pairingOrigin, tailnetConnectRows } from './MobileAccessPage';
 import type { TailnetInput } from './MobileAccessPage';
-import type { LanRowState } from './MobileAccessPage';
 
 /** A laptop reading the page over loopback, on a machine that is on a tailnet
  *  and listening there. The case the whole feature exists for. */
@@ -103,7 +102,7 @@ describe('tailnetConnectRows agrees with tailnetOrigin', () => {
 });
 
 describe('pairingOrigin', () => {
-  const lan: LanRowState = { kind: 'url', url: 'http://192.168.1.5:5252' };
+  const lan = 'http://192.168.1.5:5252';
 
   it('takes the tailnet address ahead of the LAN one', () => {
     expect(pairingOrigin({ ...base, external: null, lan })).toBe('http://mymac.tailnet-name.ts.net:5252');
@@ -171,9 +170,7 @@ describe('pairingOrigin', () => {
     // The bug the whole derivation exists to avoid. Off any tailnet and bound
     // to loopback, this machine has no address to hand out. A QR aimed at the
     // reader's own `localhost` would be worse than no QR at all.
-    for (const lanState of [null, { kind: 'disabled' } as const, { kind: 'none' } as const]) {
-      expect(pairingOrigin({ ...base, external: null, tailnetIp: null, bind: 'loopback', lan: lanState })).toBeNull();
-    }
+    expect(pairingOrigin({ ...base, external: null, tailnetIp: null, bind: 'loopback', lan: null })).toBeNull();
   });
 
   it('never answers with a loopback address', () => {

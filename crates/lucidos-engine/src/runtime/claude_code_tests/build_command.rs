@@ -42,7 +42,7 @@ fn test_spawn_args<'a>(
         permission_mode: None,
         additional_directories: &[],
         auto_compact: None,
-        notes: crate::runtime::claude_code_provider::NotesVisibility::Hidden,
+        keep_alive: false,
         agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
     }
 }
@@ -73,7 +73,7 @@ fn test_spawn_args_with_event<'a>(
         permission_mode: None,
         additional_directories: &[],
         auto_compact: None,
-        notes: crate::runtime::claude_code_provider::NotesVisibility::Hidden,
+        keep_alive: false,
         agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
     }
 }
@@ -104,7 +104,7 @@ fn test_spawn_args_with_repo<'a>(
         permission_mode: None,
         additional_directories: &[],
         auto_compact: None,
-        notes: crate::runtime::claude_code_provider::NotesVisibility::Hidden,
+        keep_alive: false,
         agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
     }
 }
@@ -140,7 +140,7 @@ fn build_command_injects_user_env_vars_and_engine_wins() {
         permission_mode: None,
         additional_directories: &[],
         auto_compact: None,
-        notes: crate::runtime::claude_code_provider::NotesVisibility::Hidden,
+        keep_alive: false,
         agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
     };
     let cmd = session_command(&args, None);
@@ -1324,7 +1324,7 @@ fn the_disallowed_tools_never_name_a_tool_a_session_needs() {
     }
 }
 
-// ── The Vertex relay stamp (plan invariants 3 and 9) ───────────────────────
+// ── No spawn redirects Claude Code's Vertex calls ──────────────────────────
 
 fn vertex_base_url(cmd: &tokio::process::Command) -> Option<String> {
     collect_envs(cmd)
@@ -1332,25 +1332,17 @@ fn vertex_base_url(cmd: &tokio::process::Command) -> Option<String> {
         .map(|v| v.to_string_lossy().into_owned())
 }
 
+/// The engine runs no relay, so a stamped base URL would point Claude Code at a
+/// dead port and break every Vertex session.
 #[test]
-fn a_session_with_a_relay_sends_its_vertex_calls_through_it() {
-    crate::api::actor::init_agent_origin_secret("build-command-relay-secret".to_string());
+fn a_session_gets_no_vertex_base_url_from_the_engine() {
     let p = std::path::Path::new("/tmp");
     let args = test_spawn_args(p, p, uuid::Uuid::new_v4());
-    let mut cmd = tokio::process::Command::new("true");
-    stamp_vertex_relay(&mut cmd, &args, Some(4321));
-    let url = vertex_base_url(&cmd).expect("the relay URL is stamped");
-    assert!(
-        url.starts_with("http://127.0.0.1:4321/api/v1/vertex-relay/"),
-        "{url}"
-    );
+    assert_eq!(vertex_base_url(&session_command(&args, None)), None);
 }
 
-/// A workspace's own Vertex base URL must not bypass the relay. It rides the
-/// token as the upstream instead.
 #[test]
-fn a_workspace_vertex_url_becomes_the_relays_upstream() {
-    crate::api::actor::init_agent_origin_secret("build-command-relay-secret".to_string());
+fn a_workspace_vertex_url_reaches_the_session_untouched() {
     let p = std::path::Path::new("/tmp");
     let user_env = vec![(
         "ANTHROPIC_VERTEX_BASE_URL".to_string(),
@@ -1358,29 +1350,8 @@ fn a_workspace_vertex_url_becomes_the_relays_upstream() {
     )];
     let mut args = test_spawn_args(p, p, uuid::Uuid::new_v4());
     args.user_env_vars = &user_env;
-    let mut with_relay = tokio::process::Command::new("true");
-    with_relay.env("ANTHROPIC_VERTEX_BASE_URL", "https://proxy.example/v1");
-    stamp_vertex_relay(&mut with_relay, &args, Some(4321));
-    let url = vertex_base_url(&with_relay).unwrap();
-    let override_hex = crate::api::hex::hex_lower(b"https://proxy.example/v1");
-    assert!(url.contains(&override_hex), "{url}");
-}
-
-/// No relay running leaves the session exactly as it was.
-#[test]
-fn a_session_without_a_relay_keeps_its_own_vertex_url() {
-    let p = std::path::Path::new("/tmp");
-    let user_env = vec![(
-        "ANTHROPIC_VERTEX_BASE_URL".to_string(),
-        "https://proxy.example/v1".to_string(),
-    )];
-    let mut args = test_spawn_args(p, p, uuid::Uuid::new_v4());
-    args.user_env_vars = &user_env;
-    let mut cmd = tokio::process::Command::new("true");
-    cmd.env("ANTHROPIC_VERTEX_BASE_URL", "https://proxy.example/v1");
-    stamp_vertex_relay(&mut cmd, &args, None);
     assert_eq!(
-        vertex_base_url(&cmd).as_deref(),
+        vertex_base_url(&session_command(&args, None)).as_deref(),
         Some("https://proxy.example/v1")
     );
 }

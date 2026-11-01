@@ -651,6 +651,61 @@ mod db {
         teardown_test_db(&db).await;
     }
 
+    /// The set form and the per-thread form of "pending" never disagree: one
+    /// thread per way a handoff ends, one left pending, one never handed off.
+    #[tokio::test]
+    async fn the_pending_set_matches_the_per_thread_predicate() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let event = |value: serde_json::Value| -> ThreadEvent {
+            serde_json::from_value(value).expect("a thread event")
+        };
+        let cancel =
+            |cause: &str| event(serde_json::json!({"type": "ResponseCanceled", "cause": cause}));
+        let failure =
+            || event(serde_json::json!({"type": "ResponseFailed", "error": "spawn failed"}));
+        let message =
+            || event(serde_json::json!({"type": "MessageReceived", "text": "the opening"}));
+
+        let pending = coding_thread(&bus, None).await;
+        emit(&bus, pending, session_handed_off(None)).await;
+        let redirected = coding_thread(&bus, None).await;
+        emit(&bus, redirected, session_handed_off(None)).await;
+        emit(&bus, redirected, cancel("superseded_by_followup")).await;
+        emit(&bus, redirected, failure()).await;
+        let started = coding_thread(&bus, None).await;
+        emit(&bus, started, session_handed_off(None)).await;
+        start_successor(&bus, &pool, started).await;
+        let stopped = coding_thread(&bus, None).await;
+        emit(&bus, stopped, session_handed_off(None)).await;
+        emit(&bus, stopped, cancel("user_stop")).await;
+        let failed = coding_thread(&bus, None).await;
+        emit(&bus, failed, session_handed_off(None)).await;
+        emit(&bus, failed, message()).await;
+        emit(&bus, failed, failure()).await;
+        coding_thread(&bus, None).await;
+
+        let mut from_set: Vec<Uuid> = sqlx::query_scalar(&pending_handoff_threads_sql())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let mut from_predicate: Vec<Uuid> = sqlx::query_scalar(&format!(
+            "SELECT s.thread_id FROM thread_summaries s WHERE {}",
+            pending_handoff_sql("s.thread_id")
+        ))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        from_set.sort();
+        from_predicate.sort();
+        let mut expected = vec![pending, redirected];
+        expected.sort();
+        assert_eq!(from_predicate, expected);
+        assert_eq!(from_set, expected);
+
+        teardown_test_db(&db).await;
+    }
+
     /// I3 (parent unchanged): a child whose handoff is pending owes no
     /// decision and keeps its report armed. Its successor session owes both,
     /// and reports once at the real end.
@@ -1015,4 +1070,37 @@ fn the_first_message_reads_the_opening_then_the_request_once() {
     let both = successor_first_message(opening, Some(request), "Also fix the drawer");
     assert!(both.contains(framed), "{both}");
     assert!(both.ends_with("Also fix the drawer"), "{both}");
+}
+
+/// The partial index only serves a probe whose event types it lists, so the
+/// migration must name every type `HANDOFF_LIFECYCLE_EVENT_TYPES` does.
+#[test]
+fn the_handoff_lifecycle_index_lists_every_probed_event_type() {
+    const MIGRATION: &str =
+        include_str!("../../migrations/20261101113111_index_events_handoff_lifecycle.sql");
+    for event_type in HANDOFF_LIFECYCLE_EVENT_TYPES {
+        assert!(
+            MIGRATION.contains(&format!("'{event_type}'")),
+            "the index predicate lacks {event_type}"
+        );
+    }
+}
+
+/// `pending_handoff_threads_sql` filters end events to the lifecycle types, so
+/// a type `ends_handoff_sql` adds must join the const too.
+#[test]
+fn every_handoff_ending_event_type_is_a_lifecycle_type() {
+    let ends = ends_handoff_sql("end_row", "handoff");
+    let probed: Vec<&str> = ends
+        .split("end_row.event_type = '")
+        .skip(1)
+        .filter_map(|rest| rest.split('\'').next())
+        .collect();
+    assert!(!probed.is_empty(), "{ends}");
+    for event_type in probed {
+        assert!(
+            HANDOFF_LIFECYCLE_EVENT_TYPES.contains(&event_type),
+            "HANDOFF_LIFECYCLE_EVENT_TYPES lacks {event_type}"
+        );
+    }
 }

@@ -5,18 +5,22 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::{PlannedWake, WakeSource};
+
 /// The keep-alive's state for one thread, in the one grammar every surface
 /// speaks: Warming, Stopped, Ended, Turned off, or Not kept.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum CacheKeepAliveStatus {
-    /// The engine pings the session, within its break-even budget.
+    /// The engine pings the session, within its reread cap.
     Warming {
-        /// When the wait it keeps warm began.
+        /// When the run began: the wait start, or the agent's last real idle
+        /// when that came later. A real turn mid-wait starts a new run.
         since: DateTime<Utc>,
         /// The pings sent since then.
         beats: u32,
-        /// The pings that cost as much as one cache rewrite.
+        /// The pings the plan allows this run, from `since` to `give_up_at`:
+        /// at most the reread cap.
         budget_beats: u32,
         /// How often a ping goes out, in seconds.
         beat_every_secs: u32,
@@ -41,8 +45,16 @@ pub enum CacheKeepAliveStatus {
         /// Absent with no past wait to count.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         odds: Option<CapOdds>,
+        /// The expected wake the plan follows. Absent with none, when the
+        /// bare reread cap applies.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_wake: Option<PlannedWake>,
+        /// What set the run's give-up time. Absent on statuses stored before
+        /// it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cap_source: Option<CapSource>,
     },
-    /// The engine stopped pinging at the give-up time set when the wait began.
+    /// The engine stopped pinging at the end of its plan.
     Stopped {
         at: DateTime<Utc>,
         beats: u32,
@@ -60,10 +72,14 @@ pub enum CacheKeepAliveStatus {
         /// The odds the run's cap was chosen on. Absent like `beat_every_secs`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         odds: Option<CapOdds>,
+        /// What set the run's give-up time. Absent on statuses stored before
+        /// it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cap_source: Option<CapSource>,
     },
     /// The wait ended while the engine kept it warm.
     Ended {
-        /// When the wait it kept warm began.
+        /// When the run began, as `Warming` named it.
         since: DateTime<Utc>,
         /// When the wait ended.
         at: DateTime<Utc>,
@@ -88,6 +104,10 @@ pub enum CacheKeepAliveStatus {
         /// The odds the run's cap was chosen on. Absent like `beat_every_secs`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         odds: Option<CapOdds>,
+        /// What set the run's give-up time. Absent on statuses stored before
+        /// it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cap_source: Option<CapSource>,
     },
     /// The user turned the keep-alive off for this thread at `at`.
     TurnedOff {
@@ -107,6 +127,10 @@ pub enum CacheKeepAliveStatus {
         /// The odds the run's cap was chosen on. Absent like `beat_every_secs`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         odds: Option<CapOdds>,
+        /// What set the run's give-up time. Absent on statuses stored before
+        /// it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cap_source: Option<CapSource>,
     },
     /// The thread waits, and the engine does not keep it warm.
     NotKept {
@@ -114,6 +138,11 @@ pub enum CacheKeepAliveStatus {
         /// When paused pings start again. Set for `pings_paused` only.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         until: Option<DateTime<Utc>>,
+        /// What set the give-up time the wait passed, or the cap the expected
+        /// wake lies past. Set for `past_give_up_time` and
+        /// `wake_past_reread_cap` only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cap_source: Option<CapSource>,
     },
 }
 
@@ -151,6 +180,10 @@ pub enum CacheKeepAliveNotKeptReason {
     /// The wait passed its give-up time before the first ping was due, so no
     /// ping went out. A run that pinged and then gave up is `Stopped`.
     PastGiveUpTime,
+    /// The expected wake lies past what pings may cost: past the saving
+    /// margin of one reread, or past the reread cap from the wait start. So
+    /// no ping goes out, and the wake rereads.
+    WakePastRereadCap,
     /// Nothing waits that a keep-alive could serve.
     NothingPending,
     /// A trigger thread no person has written in, so nobody reads a warm cache.
@@ -170,6 +203,7 @@ impl CacheKeepAliveStatus {
         Self::NotKept {
             reason,
             until: None,
+            cap_source: None,
         }
     }
 
@@ -178,6 +212,17 @@ impl CacheKeepAliveStatus {
         Self::NotKept {
             reason: CacheKeepAliveNotKeptReason::PingsPaused,
             until: Some(until),
+            cap_source: None,
+        }
+    }
+
+    /// Not kept for `reason`, a give-up the plan set by `cap_source`:
+    /// `past_give_up_time` or `wake_past_reread_cap`.
+    pub fn past_cap(reason: CacheKeepAliveNotKeptReason, cap_source: CapSource) -> Self {
+        Self::NotKept {
+            reason,
+            until: None,
+            cap_source: Some(cap_source),
         }
     }
 
@@ -213,6 +258,33 @@ pub struct CapOdds {
     pub after_cap: u32,
 }
 
+/// *Cap source*: what set a keep-alive run's give-up time, so every surface
+/// can say where the estimate came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CapSource {
+    /// Half the reread cap: the parked card's fallback (ADR 0547).
+    HalfReread,
+    /// The reread cap: an event wait with no expected wake inside it.
+    RereadCap,
+    /// The event wait's own timeout, which wakes the thread.
+    Timeout,
+    /// The expected wake, as `by` stated it.
+    Estimate { by: WakeSource },
+    /// A parked card's cap of `pings`, learned from the `samples` cards like
+    /// it asked from `from_hour` up to `to_hour`, in the `timezone`
+    /// preference's zone. The window may wrap past midnight.
+    /// `utc_offset_mins` is that zone's offset at the ask, so a reader can
+    /// show the hours on its own clock.
+    Learned {
+        pings: u32,
+        samples: u32,
+        from_hour: u8,
+        to_hour: u8,
+        utc_offset_mins: i32,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +298,46 @@ mod tests {
             CacheKeepAliveStatus::not_kept(CacheKeepAliveNotKeptReason::PrefillPaused)
         );
         assert_eq!(serde_json::to_string(&status).unwrap(), stored);
+    }
+
+    #[test]
+    fn a_status_stored_before_cap_sources_still_reads() {
+        let stored = [
+            r#"{"state":"warming","since":"2026-10-01T10:00:00Z","beats":1,"budget_beats":12,"beat_every_secs":230,"cost_usd":0.1,"context_tokens":1000,"give_up_at":"2026-10-01T10:46:00Z"}"#,
+            r#"{"state":"stopped","at":"2026-10-01T10:46:00Z","beats":12,"cost_usd":1.2,"context_tokens":1000}"#,
+            r#"{"state":"ended","since":"2026-10-01T10:00:00Z","at":"2026-10-01T10:20:00Z","beats":5,"cost_usd":0.5}"#,
+            r#"{"state":"turned_off","at":"2026-10-01T10:20:00Z","beats":5,"cost_usd":0.5,"context_tokens":1000}"#,
+            r#"{"state":"not_kept","reason":"past_give_up_time"}"#,
+        ];
+        for json in stored {
+            let status: CacheKeepAliveStatus = serde_json::from_str(json).unwrap();
+            assert_eq!(serde_json::to_string(&status).unwrap(), json, "{json}");
+        }
+    }
+
+    #[test]
+    fn a_cap_source_is_tagged_by_kind() {
+        let source = CapSource::Estimate {
+            by: WakeSource::Agent,
+        };
+        assert_eq!(
+            serde_json::to_string(&source).unwrap(),
+            r#"{"kind":"estimate","by":"agent"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&CapSource::HalfReread).unwrap(),
+            r#"{"kind":"half_reread"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&CapSource::Learned {
+                pings: 3,
+                samples: 41,
+                from_hour: 22,
+                to_hour: 3,
+                utc_offset_mins: 60,
+            })
+            .unwrap(),
+            r#"{"kind":"learned","pings":3,"samples":41,"from_hour":22,"to_hour":3,"utc_offset_mins":60}"#
+        );
     }
 }

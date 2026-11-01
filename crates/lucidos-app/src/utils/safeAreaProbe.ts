@@ -6,8 +6,9 @@ import type { SafeAreaInsets } from './safeAreaFloor';
  *  A DIAGNOSTIC, registered in `docs/temporary-measures.md` § 1. It confirms
  *  the header's place under the status bar (ADR 0553): whether iOS moved the
  *  page below the bar, whether `env()` reports the inset, and whether the floor
- *  added it back. It lands in the gateway log
- *  (`docs/client-logs.md`).
+ *  added it back. It also logs the shell's written height beside WebKit's own
+ *  readings, for a shell drawn at the wrong height (ADR 0610). It lands in the
+ *  gateway log (`docs/client-logs.md`).
  *
  *  One line per change of the inset state, plus one snapshot once the header
  *  has painted, so a session costs a handful of lines. */
@@ -45,7 +46,7 @@ export function scheduleSafeAreaSnapshot(attemptsLeft = SETTLED_ATTEMPTS): void 
 
 function logGeometry(moment: string, reading: SafeAreaInsets, floor: SafeAreaInsets | null): void {
   const header = document.querySelector('.app-header');
-  postClientLog('safe-area', moment, {
+  const geometry = {
     env: reading,
     floor,
     viewport: [window.innerWidth, window.innerHeight],
@@ -53,10 +54,32 @@ function logGeometry(moment: string, reading: SafeAreaInsets, floor: SafeAreaIns
     visualViewport: window.visualViewport
       ? [window.visualViewport.offsetTop, window.visualViewport.height]
       : null,
+    cssViewport: cssViewportHeights(),
     header: rect(header),
     headerPaddingTop: header ? getComputedStyle(header).paddingTop : null,
     firstButton: rect(header?.querySelector('button')),
-  });
+  };
+  // The shell writes `--app-height` from its own listener for the same event,
+  // which runs after this one. So the write is read once every listener has run.
+  setTimeout(() => {
+    const appHeight = document.documentElement.style.getPropertyValue('--app-height');
+    postClientLog('safe-area', moment, { ...geometry, appHeight: appHeight || null });
+  }, 0);
+}
+
+/** What WebKit's CSS viewport units resolve to, in CSS pixels: `[svh, lvh,
+ *  dvh]` at 100 each. Tells a wrong `innerHeight` from a wrong CSS viewport
+ *  (ADR 0610). */
+function cssViewportHeights(): [number, number, number] {
+  const box = document.createElement('div');
+  box.style.cssText = 'position:fixed;top:0;left:0;width:0;visibility:hidden;pointer-events:none';
+  document.body.appendChild(box);
+  const heights = (['100svh', '100lvh', '100dvh'] as const).map((h) => {
+    box.style.height = h;
+    return Math.round(box.getBoundingClientRect().height);
+  }) as [number, number, number];
+  box.remove();
+  return heights;
 }
 
 /** An element's top and height, in CSS pixels. */

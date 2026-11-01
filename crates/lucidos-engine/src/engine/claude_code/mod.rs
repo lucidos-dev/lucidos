@@ -328,9 +328,13 @@ pub(crate) fn command_grant_head(
 }
 
 /// Tools every Claude Code session may run without a permission card. The
-/// engine's own prompt makes each turn run these, so a card would stall
-/// every turn in a workspace that has granted nothing yet.
-pub(crate) const ENGINE_ALLOWED_TOOLS: &[&str] = &["Bash(lucidos request-read:*)"];
+/// engine itself asks for each: `request-read` at every turn end, and
+/// `expect-wake` in an `await-event` result. A card would stall those turns
+/// in a workspace that has granted nothing yet.
+pub(crate) const ENGINE_ALLOWED_TOOLS: &[&str] = &[
+    "Bash(lucidos request-read:*)",
+    "Bash(lucidos expect-wake:*)",
+];
 
 /// Resolve the comma-separated tool allowlist for `claude --allowedTools`:
 /// [`ENGINE_ALLOWED_TOOLS`], then the user's grants.

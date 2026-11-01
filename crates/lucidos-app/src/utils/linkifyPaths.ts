@@ -7,7 +7,7 @@
  */
 
 import { makeInertBody } from './escapeHtml';
-import { escapeHtmlAttr } from './markedConfig';
+import { escapeHtmlAttr } from './escapeHtmlAttr';
 import { addLinkifyMs } from './renderPhaseTimers';
 import { parseRepoPath, type RepoLocator } from '../store/repoPath';
 import { DATA_PATH_PREFIXES, workspaceDataRoot } from './dataPathPrefixes';

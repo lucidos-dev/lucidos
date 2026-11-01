@@ -147,6 +147,9 @@ test.describe('the apps panel row actions', () => {
 
   test('the keyboard toggles the pin, opens the menu from the ⋯, and Escape hands focus back', async ({ page }) => {
     test.skip(isMobileViewport(page), 'a phone has no keyboard focus to rove');
+    // Leave the focused pane on the thread, then move focus with no pointer, as
+    // a screen reader does. The pane's Tab trap must follow focus.
+    await page.locator('[data-role="prompt-input"]:visible').first().click();
     await pin(page).focus();
     await page.keyboard.press('Space');
     await expect(pin(page)).toHaveAttribute('aria-pressed', 'true');

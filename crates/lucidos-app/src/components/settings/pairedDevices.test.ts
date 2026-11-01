@@ -100,10 +100,10 @@ describe('where the list sits', () => {
 
   it('is one list, on the Devices page', () => {
     // Two lists under one word made the same phone read as two devices. The
-    // Devices page joins the halves; Access keeps only Add a device.
+    // Devices page joins the halves; Access keeps only Pair a device.
     expect(settings).toMatch(/usePairedDevices/);
     expect(settings).toMatch(/buildDeviceRows/);
-    expect(page).toMatch(/<AddDeviceSection/);
+    expect(page).toMatch(/<PairDeviceSection/);
   });
 
   it('does not put a second device list back on Access', () => {
@@ -113,10 +113,10 @@ describe('where the list sits', () => {
 
   it('still points Access at where Revoke went', () => {
     // The list moved, so browsing has to be told. A search hit only helps
-    // somebody who already knows the word. The list was pulled up beside Add a
+    // somebody who already knows the word. The list was pulled up beside Pair a
     // device because people looking for Revoke did not find it.
     expect(page).toMatch(/openSettingsSubview\('devices'\)/);
-    const add = page.indexOf('<AddDeviceSection');
+    const add = page.indexOf('<PairDeviceSection');
     const pointer = page.indexOf("openSettingsSubview('devices')");
     expect(add).toBeGreaterThan(-1);
     expect(pointer).toBeGreaterThan(add);

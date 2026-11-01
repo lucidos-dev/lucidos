@@ -25,8 +25,8 @@ vi.mock('./basePath', async () => {
 });
 
 import { lucidos } from '@lucidos/sdk';
-import { renderMarkdown, renderMarkdownInline, sanitizeHtmlFragments } from './renderMarkdown';
-import { COPY_ID_NONCE, TASK_CHECKBOX_ATTR, taskCheckboxTag } from './markedConfig';
+import { renderMarkdown, renderMarkdownInline, sanitizeHtmlFragments } from './markdownEngine';
+import { COPY_ID_NONCE, TASK_CHECKBOX_ATTR, taskCheckboxTag } from './markdownMarkers';
 // The downstream consumer of this output, so one test can assert the pair.
 import { linkifyPaths } from './linkifyPaths';
 

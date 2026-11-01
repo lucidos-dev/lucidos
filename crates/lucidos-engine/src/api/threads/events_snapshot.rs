@@ -71,6 +71,12 @@ pub struct ThreadEventsSnapshot {
     /// refetch history and replay it through the live path.
     #[serde(rename = "maxSequence", skip_serializing_if = "Option::is_none")]
     pub max_sequence: Option<i64>,
+    /// The thread's pair stamps, sent only for a PAGE. The event that stamped
+    /// the model, effort or provider may sit behind the page. The chat rung
+    /// pill reads the pair from these, not the account default. An unpaged
+    /// read carries every event, so it sends none.
+    #[serde(rename = "pairStamps", skip_serializing_if = "Option::is_none")]
+    pub pair_stamps: Option<Vec<crate::core::PairStamp>>,
 }
 
 /// GET /api/v1/threads/:thread_id/events — snapshot of persisted thread events,
@@ -114,9 +120,17 @@ pub(in crate::api) async fn get_thread_events_snapshot(
 
     // Independent fetches against the same pool — run in parallel.
     let pool = state.engine.pool();
-    let (events_res, aggregate_res) = tokio::join!(
+    let (events_res, aggregate_res, pair_stamps_res) = tokio::join!(
         read_events(&state, thread_uuid, &query, before),
         crate::core::store::fetch_thread_aggregate(pool, thread_uuid),
+        async {
+            match query.limit {
+                Some(_) => crate::core::PreferenceStore::thread_pair_stamps(pool, thread_uuid)
+                    .await
+                    .map(Some),
+                None => Ok(None),
+            }
+        },
     );
 
     let EventsRead {
@@ -125,6 +139,15 @@ pub(in crate::api) async fn get_thread_events_snapshot(
         max_sequence,
     } = events_res.map_err(|e| {
         log!("[API] Failed to get thread events: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+    // Missing stamps would silently show the account default on the rung pill.
+    let pair_stamps = pair_stamps_res.map_err(|e| {
+        log!(
+            "[API] Failed to read pair stamps for {}: {}",
+            thread_uuid,
+            e
+        );
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
 
@@ -167,6 +190,7 @@ pub(in crate::api) async fn get_thread_events_snapshot(
         current_aggregate,
         has_more,
         max_sequence,
+        pair_stamps,
     }))
 }
 

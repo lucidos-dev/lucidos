@@ -156,6 +156,7 @@ const GATED_ROUTES: &[&str] = &[
     "/threads/:thread_id/event-waits",
     "/threads/:thread_id/event-waits/:wait_id/cancel",
     "/threads/:thread_id/event-waits/cancel",
+    "/threads/:thread_id/expected-wake",
     "/threads/:thread_id/harden",
     "/threads/:thread_id/mcp-servers/:id/disable",
     "/threads/:thread_id/mcp-servers/:id/enable",

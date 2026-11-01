@@ -269,6 +269,11 @@ pub(crate) fn model_source(purpose: ContextPurpose) -> AuxModelSource {
             reasoning: Some(&prefs::REASONING_WAKE_DECISION),
             needs_vision: false,
         },
+        ContextPurpose::ExpectedWakeDecision => AuxModelPrefs {
+            model: &prefs::MODEL_EXPECTED_WAKE_DECISION,
+            reasoning: Some(&prefs::REASONING_EXPECTED_WAKE_DECISION),
+            needs_vision: false,
+        },
         ContextPurpose::QueryClassification => AuxModelPrefs {
             model: &prefs::MODEL_QUERY_CLASSIFICATION,
             reasoning: Some(&prefs::REASONING_QUERY_CLASSIFICATION),
@@ -428,6 +433,7 @@ pub(crate) const BACKGROUND_ROWS: &[ContextPurpose] = &[
     ContextPurpose::CommandJudge,
     ContextPurpose::ReadDecision,
     ContextPurpose::WakeDecision,
+    ContextPurpose::ExpectedWakeDecision,
 ];
 
 /// The model preference key `purpose` reads, which names its Settings row.
@@ -536,7 +542,8 @@ pub(crate) fn budget_for(purpose: ContextPurpose) -> AuxBudget {
         | ContextPurpose::ImageGen
         | ContextPurpose::CommandJudge
         | ContextPurpose::ReadDecision
-        | ContextPurpose::WakeDecision => SHORT_CALL_BUDGET,
+        | ContextPurpose::WakeDecision
+        | ContextPurpose::ExpectedWakeDecision => SHORT_CALL_BUDGET,
         // Nine that never ask. None is an auxiliary HTTP call this module
         // times: a turn and the five `AgentModel` purposes run on the agent's
         // own provider and its timeout, and the talker holds a socket. Web
@@ -701,6 +708,7 @@ pub(crate) const ALL_PURPOSES: &[ContextPurpose] = &[
     ContextPurpose::Proxy,
     ContextPurpose::ReadDecision,
     ContextPurpose::WakeDecision,
+    ContextPurpose::ExpectedWakeDecision,
     ContextPurpose::CacheKeepAlive,
     ContextPurpose::PrefillProbe,
 ];
@@ -741,11 +749,12 @@ mod tests {
                 | ContextPurpose::Proxy
                 | ContextPurpose::ReadDecision
                 | ContextPurpose::WakeDecision
+                | ContextPurpose::ExpectedWakeDecision
                 | ContextPurpose::CacheKeepAlive
                 | ContextPurpose::PrefillProbe => {}
             }
         }
-        assert_eq!(ALL_PURPOSES.len(), 23);
+        assert_eq!(ALL_PURPOSES.len(), 24);
     }
 
     /// The key an unset handle inherits, if any.

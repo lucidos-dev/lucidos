@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.55.1 — 2026-11-01
+
+### Changed
+
+- The prompt cache keep-alive is Off or On, and Off by default. A stored Break-even or Tuned to this workspace choice turns Off. On stops pinging at the reread cap.
+- The Cache cards switch is under Settings > Models > Cache keep-alive, and shows only while the keep-alive is on. Cache cards turn Off on upgrade.
+- The keep-alive times its pings from when the thread expects to wake. It pings only when the pings cost less than one reread, and never past the wait's timeout.
+- A waiting agent states when it expects to wake. A coding agent states it with `lucidos expect-wake`. When an agent states none, a background call estimates it. Choose that call's model under Settings > Background tasks > Expected wake.
+- A parked question card's keep-alive cap is learned from the cards asked near the same hour of day. The keep-alive card names its cap, where the cap came from, and the expected wake.
+- Settings > Access opens on Pair a device. The Tailscale, LAN and external addresses fold under Other addresses.
+- Claude Code reasoning notes show on every provider, from Claude Code 2.1.311 with experimental betas on. The agent is told once when its notes start reaching you.
+- A sub-thread is told when its parent acts on its report.
+- A coding-agent branch that holds only a plan waits for the plan's approval before it offers Apply.
+- The command guard runs workspace-local `lucidos` calls (data, events query, knowhow read, model prices) and proven inline Python without a card.
+- The installs list shows removal steps only on rows that share a port.
+- The app paints sooner. Less code loads before first paint, and markdown formatting loads right after it.
+
+### Fixed
+
+- **Postgres no longer runs out of memory from the keep-alive sweep.** On v0.51.0 to v0.55.0, each sweep recompiled a costly query, and every pooled engine connection grew to 200 to 350 MB until Postgres was OOM-killed, as often as every 5 to 10 minutes. The query is now cheap and the connections stay small.
+- A coding-agent child between successor sessions no longer stacks identical keep-alive cards in its parent's transcript.
+- A message sent during a wait starts a new keep-alive card below it, and never moves a sub-thread wait's give-up time.
+- A resumed wait no longer shows an ended keep-alive run as stopped.
+- Web links in an app open on iPhone Safari from the tap. In Safari mode they hand off to Safari. A link that cannot open shows an error.
+- An app opened in its own tab opens web links.
+- On iPhone, the app fills the screen after it wakes in portrait from a landscape suspend.
+- The focused-pane marker follows keyboard focus into a pane.
+- The chat model pill shows the right model for a long thread.
+- The Memory page no longer stays on Building memory after a dropped connection.
+- Apply sets a leftover merge attempt that holds work aside on a kept branch. The work is never lost and Apply is not refused.
+- A paired device cannot replace another device's push subscription.
+- When the engine refuses a push subscription, the enable-push toast names the refusal.
+- A proxy error for an unusable redirect no longer shows the redirect address.
+- The gateway tells a caller with no credential no workspace name, release or bind address.
+- An agent cannot store a code-injecting environment variable such as `BASH_ENV`, `LD_PRELOAD` or `NODE_OPTIONS`. Such a line in `data/.env` waits until you set it in Settings.
+- An email attachment cannot follow a symlink out of the workspace data.
+- A `run_bash` timeout or cancel stops every command the shell started.
+- With the command judge off, a command the guard refuses asks first.
+- The trigger tools refuse a script path that leaves its folder.
+- Coding-agent worktrees run the repository's pre-commit and commit-msg hooks.
 ## v0.55.0 — 2026-10-30
 
 ### Added

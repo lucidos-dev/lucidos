@@ -18,6 +18,7 @@ import {
   PluginActions, PluginIcon, PluginMeta, PluginModifiedNotice, PluginSource, PluginTitle,
 } from './pluginCard';
 import { renderPluginReadme } from './pluginReadme';
+import { markdownEngine } from '../../utils/renderMarkdown';
 import { PluginDescription } from './PluginDescription';
 
 interface PluginDetailPageProps {
@@ -146,9 +147,10 @@ function MediaStrip({ plugin }: { plugin: MarketplacePlugin }) {
 }
 
 function Readme({ readme, showLoading }: { readme: Loadable<string>; showLoading: boolean }) {
+  const markdown = markdownEngine.value;
   const html = useMemo(
     () => (readme.status === 'loaded' ? renderPluginReadme(readme.data) : ''),
-    [readme],
+    [readme, markdown],
   );
   if (readme.status === 'failed') {
     return <LoadableError noun="plugin description" error={readme.error} />;

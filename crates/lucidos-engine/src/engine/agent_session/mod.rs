@@ -49,6 +49,7 @@ pub(crate) use parsing::{
 };
 pub(crate) use prompts::{
     build_lane_catch_up_prompt, build_lane_thread_prompt, build_merge_prompt, LaneMemberBrief,
+    NOTES_HIDDEN_AGAIN_REMINDER, NOTES_NOW_SHOWN_REMINDER,
 };
 pub(crate) use reconstruct::prepend_reconstruction;
 pub(crate) use resume::{

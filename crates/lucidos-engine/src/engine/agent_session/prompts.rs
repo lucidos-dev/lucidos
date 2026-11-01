@@ -646,13 +646,26 @@ const NOTES_HIDDEN_SENTENCE: &str = "Text you write in a message that also calls
     that calls no tool is shown in full. Put what they must read there, or on the question card, \
     once: never write it before a tool call and again after.";
 
+/// Tells a session its notes now reach the user, once the first has arrived.
+pub(crate) const NOTES_NOW_SHOWN_REMINDER: &str = concat!(
+    "<system-reminder>\nUpdate: your notes now reach the user. ",
+    notes_reach_user_sentence!(),
+    "\n</system-reminder>"
+);
+
+/// Tells a resumed session its earlier "notes reach the user" no longer holds
+/// until a note arrives again.
+pub(crate) const NOTES_HIDDEN_AGAIN_REMINDER: &str = "<system-reminder>\nUpdate: your notes count \
+    as hidden again until one arrives. Text you write in a message that also calls a tool may \
+    NEVER reach the user. Put what they must read in a message that calls no tool, or on the \
+    question card, once.\n</system-reminder>";
+
 /// Backend-independent teaching appended to every coding-agent prompt by
 /// [`append_backend_rules`], the chokepoint every flavor and both backends ride.
 ///
 /// Neither backend shows the user its reasoning. Claude Code returns thinking
 /// as a signature only, or on an always-thinking model as a short progress
-/// note when the request asks for one (`runtime/vertex_relay.rs`,
-/// `runtime/claude_code_provider.rs`). Codex streams a lossy summary
+/// note when the request asks for one (`runtime/claude_code_notes.rs`). Codex streams a lossy summary
 /// (`CODEX_REASONING_SUMMARY` in `runtime/codex.rs`). An agent that drafts
 /// user-facing content there and then points at it points at nothing. Two
 /// real cards: "Caption copy: do the six lines above work?", and later "the
@@ -678,9 +691,9 @@ const REASONING_NOT_VISIBLE_RULE: &str = concat!(
 /// verdict is read once per spawn, so the prompt holds still across its turns.
 pub(crate) fn with_notes_visibility(
     prompt: String,
-    notes: crate::runtime::claude_code_provider::NotesVisibility,
+    notes: crate::runtime::claude_code_notes::NotesVisibility,
 ) -> String {
-    use crate::runtime::claude_code_provider::NotesVisibility;
+    use crate::runtime::claude_code_notes::NotesVisibility;
     match notes {
         NotesVisibility::Shown => prompt,
         NotesVisibility::Hidden => prompt.replace(NOTES_REACH_USER_SENTENCE, NOTES_HIDDEN_SENTENCE),
@@ -877,16 +890,26 @@ const WAKE_DECISION_RULE: &str = "\n\n\
     decide. No when it only informs: the report is filed, and your parent reads it on its next \
     turn. A failure always wakes it. Unsure, skip it: Lucidos decides.";
 
-/// The [`WAKE_DECISION_RULE`] section for a session on `thread_id`, or empty
-/// when the thread has no parent, or its spawn declared a wake mode.
-pub(super) async fn wake_decision_section(
-    pool: &sqlx::PgPool,
-    thread_id: uuid::Uuid,
-) -> &'static str {
-    if crate::engine::turn_end::wake_decision::WakeDuty::owes_a_decision(pool, thread_id).await {
+/// The sub-thread section for a session on `thread_id`: the
+/// [`WAKE_DECISION_RULE`] it owes and the read rule its parent's acting calls
+/// for. It is empty for a thread with no parent and for a `no-wake` child.
+pub(super) async fn sub_thread_section(pool: &sqlx::PgPool, thread_id: uuid::Uuid) -> String {
+    sub_thread_rules(
+        crate::engine::turn_end::wake_decision::WakeDuty::of_thread(pool, thread_id).await,
+    )
+}
+
+/// The sub-thread section for a thread that owes `duty`.
+fn sub_thread_rules(duty: crate::engine::turn_end::wake_decision::WakeDuty) -> String {
+    use crate::engine::turn_end::wake_decision::WakeDuty;
+    let wake_rule = if duty == WakeDuty::Decide {
         WAKE_DECISION_RULE
     } else {
         ""
+    };
+    match duty.read_rule() {
+        "" => wake_rule.to_string(),
+        read_rule => format!("{wake_rule}\n\n{read_rule}"),
     }
 }
 
@@ -1054,7 +1077,8 @@ pub(super) struct SpawnPromptInputs<'a> {
     pub(super) base_ref: Option<&'a str>,
     pub(super) repo_id: Option<&'a str>,
     pub(super) app_id: Option<&'a str>,
-    pub(super) wake_section: &'a str,
+    /// What a sub-thread is told about its parent, or empty.
+    pub(super) sub_thread_section: &'a str,
     /// The TTL of the repo's latest Claude Code cache write.
     pub(super) cache_ttl: CacheTtl,
 }
@@ -1072,7 +1096,7 @@ pub(super) fn spawn_prompts(inputs: SpawnPromptInputs<'_>) -> (String, SessionCo
         inputs.app_id,
         inputs.branch,
     ));
-    context.push(inputs.wake_section);
+    context.push(inputs.sub_thread_section);
     context.push(&prompt_cache_section(inputs.cache_ttl, inputs.coding_agent));
     (system_prompt, context)
 }
@@ -1677,6 +1701,119 @@ mod tests {
         assert!(integrated_rule(Some("  ")).contains("integrated into your parent thread."));
     }
 
+    /// A sub-thread's read decision learns when its parent acts (ADR 0607). A
+    /// `wake` child always does, an undeclared one when it wakes its parent,
+    /// and a `no-wake` child or a top-level thread never does.
+    #[test]
+    fn a_sub_thread_is_told_its_read_rule_by_wake_duty() {
+        use crate::engine::thread_events::WakeMode;
+        use crate::engine::turn_end::wake_decision::WakeDuty;
+
+        for mode in [WakeMode::Wake, WakeMode::WakeWhenAllDone] {
+            let section = sub_thread_rules(WakeDuty::Declared(mode));
+            assert!(
+                section.contains("SUB-THREAD READ DECISION: "),
+                "{mode:?}: {section}"
+            );
+            assert!(!section.contains("WAKE DECISION"), "{mode:?}: {section}");
+        }
+
+        let decide = sub_thread_rules(WakeDuty::Decide);
+        assert!(decide.starts_with(WAKE_DECISION_RULE), "{decide}");
+        assert!(
+            decide.contains("SUB-THREAD READ DECISION, only when you wake your parent: "),
+            "{decide}"
+        );
+
+        assert_eq!(sub_thread_rules(WakeDuty::Declared(WakeMode::NoWake)), "");
+        assert_eq!(sub_thread_rules(WakeDuty::NoParent), "");
+    }
+
+    /// The rule names what stays a yes, in the words the judge uses, and
+    /// leaves the user's own turns alone.
+    #[test]
+    fn the_sub_thread_read_rule_keeps_the_must_see_criteria() {
+        use crate::engine::thread_events::WakeMode;
+        use crate::engine::turn_end::wake_decision::WakeDuty;
+        let rule = WakeDuty::Declared(WakeMode::Wake).read_rule();
+        for needle in [
+            "A routine result (a pass, nothing found, already fixed, a ready change, a status) \
+             is a no",
+            "a failure, a gap the user must know about, or something only the user can do or \
+             decide, such as a payment, a sign-in or an approval",
+            "A turn the user opens in this thread is answered as usual.",
+        ] {
+            assert!(rule.contains(needle), "missing {needle:?}");
+        }
+    }
+
+    /// The generic read rule is untouched, so a top-level thread reads as before.
+    #[test]
+    fn a_thread_without_a_parent_gets_no_sub_thread_section() {
+        assert!(!READ_DECISION_RULE.contains("SUB-THREAD"));
+        assert!(!WAKE_DECISION_RULE.contains("SUB-THREAD"));
+    }
+
+    /// The section a spawn builds from the thread's own row.
+    #[tokio::test]
+    async fn the_section_follows_the_wake_mode_the_spawn_declared() {
+        use crate::engine::event_bus::{BusEvent, EventBus};
+        use crate::engine::thread_events::{
+            ActorMode, EventChannel, EventMeta, ThreadEvent, WakeMode,
+        };
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        use uuid::Uuid;
+
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let parent = Uuid::new_v4();
+        let spawn = |thread_id: Uuid, parent: Option<Uuid>, wake_mode: Option<WakeMode>| {
+            bus.emit(BusEvent::Thread {
+                thread_id,
+                event: ThreadEvent::MessageReceived {
+                    provider: None,
+                    voice_session_id: None,
+                    wake_mode,
+                    text: "work".into(),
+                    user_image_hashes: vec![],
+                    device_id: None,
+                    image_description: None,
+                    parent_thread_id: parent,
+                    spawning_event_id: None,
+                    mode: ActorMode::Agent,
+                    model: None,
+                    reasoning_effort: None,
+                    origin: None,
+                },
+                meta: EventMeta {
+                    channel: Some(EventChannel::Chat),
+                    ..EventMeta::NONE
+                },
+            })
+        };
+        let (woken, filed, undeclared) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        spawn(parent, None, None).await.unwrap();
+        spawn(woken, Some(parent), Some(WakeMode::Wake))
+            .await
+            .unwrap();
+        spawn(filed, Some(parent), Some(WakeMode::NoWake))
+            .await
+            .unwrap();
+        spawn(undeclared, Some(parent), None).await.unwrap();
+
+        assert!(sub_thread_section(&pool, woken)
+            .await
+            .contains("SUB-THREAD READ DECISION: "));
+        assert_eq!(sub_thread_section(&pool, filed).await, "");
+        assert_eq!(sub_thread_section(&pool, parent).await, "");
+        assert!(sub_thread_section(&pool, undeclared)
+            .await
+            .contains("only when you wake your parent"));
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
     /// Scratch files go to the per-user temp dir. `/tmp` is readable by every
     /// local user, and on macOS `$TMPDIR` is not (ADR 0456).
     #[test]
@@ -1710,7 +1847,7 @@ mod tests {
         let workspace_sections = ["\n\nLITERACY", "\n\nMEMORY", "\n\nWIDGETS"];
         for (flavor, base) in all_prompt_flavors() {
             for (agent, label) in all_backends() {
-                let session = |branch, base_ref, wake_section, cache_ttl| {
+                let session = |branch, base_ref, sub_thread_section, cache_ttl| {
                     spawn_prompts(SpawnPromptInputs {
                         flavor: base.clone(),
                         coding_agent: agent,
@@ -1719,7 +1856,7 @@ mod tests {
                         base_ref,
                         repo_id: Some("3f9c1b2e"),
                         app_id: None,
-                        wake_section,
+                        sub_thread_section,
                         cache_ttl,
                     })
                 };
@@ -2814,8 +2951,8 @@ mod tests {
                         "{label} ({agent:?}) must tell the agent its reasoning is not shown (`{needle}`)",
                     );
                 }
-                // The Vertex relay makes notes before a tool call visible, so
-                // the stopgap that sent them into the card must stay gone.
+                // Claude Code 2.1.311 shows notes before a tool call, so the
+                // stopgap that sent them into the card must stay gone.
                 assert!(
                     !full.contains("just before a tool call"),
                     "{label} ({agent:?}) still carries the hidden-notes stopgap",
@@ -2853,7 +2990,7 @@ mod tests {
     /// it wrote, so only the prompt can tell it the user saw none.
     #[test]
     fn a_hidden_notes_session_reads_the_hard_rule_in_place_of_the_note_sentence() {
-        use crate::runtime::claude_code_provider::NotesVisibility::{Hidden, Shown};
+        use crate::runtime::claude_code_notes::NotesVisibility::{Hidden, Shown};
         for (label, base) in all_prompt_flavors() {
             let built = append_backend_rules(base, crate::runtime::CodingAgent::ClaudeCode);
             let hidden = with_notes_visibility(built.clone(), Hidden);

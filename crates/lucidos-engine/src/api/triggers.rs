@@ -2,12 +2,12 @@ use super::*;
 
 use crate::core::prefs;
 use crate::engine::command_guard::SideEffectCategory;
+use crate::engine::tools::scheduler::validate_trigger_run;
 use crate::engine::trigger_writes::TriggerWrite;
 use crate::triggers::{
     is_valid_trigger_slug, normalize_mcp_servers, normalize_route_setting,
-    resolve_trigger_provider_update, validate_script_extension, validate_trigger_provider,
-    validate_trigger_reasoning_effort, EventSubscription, TriggerConfig, TriggerRun,
-    TriggerRunStatus,
+    resolve_trigger_provider_update, validate_trigger_provider, validate_trigger_reasoning_effort,
+    EventSubscription, TriggerConfig, TriggerRun, TriggerRunStatus,
 };
 
 #[derive(Serialize)]
@@ -259,20 +259,6 @@ pub struct UpdateTriggerCronRequest {
     pub provider: Option<Option<String>>,
 }
 
-/// Both checks a `run.type = "script"` path has to pass at the boundary.
-///
-/// The extension check ran alone here, so `"../../evil.sh"` answered 200 with
-/// a cron preview and showed as armed. `scheduler::user_tasks` refuses it at
-/// fire time through the canonical guard, so every fire died instead. This is
-/// the same refusal, made before the trigger exists.
-pub(crate) fn validate_script_path(path: &str) -> Result<(), String> {
-    validate_script_extension(path)?;
-    if crate::api::is_path_traversal(path) {
-        return Err(format!("Invalid script path: {}", path));
-    }
-    Ok(())
-}
-
 /// Validate a slug submitted in a `TriggerUpdated` request. Trims whitespace
 /// then runs [`is_valid_trigger_slug`]; returns the trimmed value on success.
 /// Pure helper, exposed for unit tests.
@@ -391,11 +377,8 @@ pub(super) async fn create_trigger(
         Err(e) => return ApiResult::err(format!("Invalid 'run' field: {}", e)),
     };
 
-    // Validate the script path if this is a script trigger
-    if let TriggerRun::Script { ref path } = run {
-        if let Err(e) = validate_script_path(path) {
-            return ApiResult::err(e);
-        }
+    if let Err(e) = validate_trigger_run(&run) {
+        return ApiResult::err(e);
     }
 
     let has_cron = !request.cron_expressions.is_empty();
@@ -593,10 +576,8 @@ pub(super) async fn update_trigger(
     if let Some(ref run_val) = request.run {
         match serde_json::from_value::<TriggerRun>(run_val.clone()) {
             Ok(parsed_run) => {
-                if let TriggerRun::Script { ref path } = parsed_run {
-                    if let Err(e) = validate_script_path(path) {
-                        return ApiResult::err(e);
-                    }
+                if let Err(e) = validate_trigger_run(&parsed_run) {
+                    return ApiResult::err(e);
                 }
             }
             Err(_) => return ApiResult::err("Invalid 'run' field"),
@@ -876,6 +857,7 @@ pub(super) fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::tools::scheduler::{parse_run_arg, validate_script_path};
 
     /// A secret read has no wire form, so a create or update naming it 4xxs.
     #[test]
@@ -918,6 +900,22 @@ mod tests {
         assert!(validate_script_path("scripts/daily-summary.py").is_ok());
         let err = validate_script_path("scripts/daily-summary.txt").unwrap_err();
         assert!(err.contains("Unsupported script extension"), "{err}");
+    }
+
+    /// The `create_trigger` and `update_trigger` tools parse `run` through
+    /// `parse_run_arg`. It once only deserialized, so a traversal path reached
+    /// `TriggerCreated` from the agent side.
+    #[test]
+    fn the_trigger_tools_refuse_a_traversal_script_path() {
+        for path in ["../x.sh", "/etc/x.sh"] {
+            let err =
+                parse_run_arg(&serde_json::json!({ "type": "script", "path": path })).unwrap_err();
+            assert!(err.contains("Invalid script path"), "{path}: {err}");
+        }
+        assert!(
+            parse_run_arg(&serde_json::json!({ "type": "script", "path": "scripts/x.sh" })).is_ok()
+        );
+        assert!(parse_run_arg(&serde_json::json!({ "type": "intent", "intent": "hi" })).is_ok());
     }
 
     // --- Slug resolution at the create boundary ---

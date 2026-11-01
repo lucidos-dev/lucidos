@@ -6,12 +6,14 @@
 //! `CodingAgentIdled`. Each requirement says how it is enforced: a forced
 //! decision the engine makes, or a session re-entry that sends a coding agent
 //! back to do the work. The forced decisions are the read decision and, for a
-//! thread that reports to a parent, the wake decision.
+//! thread that reports to a parent, the wake decision. Beside them, a turn that
+//! leaves its thread waiting with the keep-alive on gets an expected wake.
 //!
 //! The re-entry rules are the *proposal hold*'s, which owns when Lucidos-source
 //! work lacks a plan marker or a harden, and what the agent is told. This
 //! module owns only that a hold sends the agent back, and how often.
 
+mod expected_wake_decision;
 mod read_decision;
 pub(crate) mod wake_decision;
 
@@ -24,7 +26,7 @@ pub use wake_decision::{
     decide_wake_for_eval, wake_decision_chat_judge, EvalWakeDecision, ParentView,
 };
 
-use crate::engine::change_ops::ProposalHold;
+use crate::engine::change_ops::{PlanHold, ProposalHold};
 use crate::llm::judgment::{system_one_or_default_for, JudgmentProvider, JudgmentSite};
 
 impl crate::engine::LucidosEngine {
@@ -119,9 +121,11 @@ impl ReentryLedger {
     /// sends nobody back.
     fn slot(&mut self, hold: ProposalHold) -> Option<&mut Option<String>> {
         match hold {
+            ProposalHold::Plan(PlanHold::PlanOnlyAwaitingApproval)
+            | ProposalHold::IntegratedIntoParent
+            | ProposalHold::CarriedBySuccessor => None,
             ProposalHold::Plan(_) => Some(&mut self.plan),
             ProposalHold::HardeningMissing => Some(&mut self.hardening),
-            ProposalHold::IntegratedIntoParent | ProposalHold::CarriedBySuccessor => None,
         }
     }
 

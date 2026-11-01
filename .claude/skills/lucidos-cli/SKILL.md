@@ -26,6 +26,7 @@ The `lucidos` CLI is on your `PATH`. Use it whenever you need to:
 | Spawn a sub-thread or hand a task to another workspace | `lucidos spawn-thread` |
 | See which model and effort an agent may pick for a coding agent | `lucidos intelligence-ladder` |
 | Wait on something the engine will emit, without polling | `lucidos await-event` |
+| Before finishing with a wait or a child pending, say when you expect to wake | `lucidos expect-wake <duration> --reason <text>` |
 | End every turn with the read decision: `yes` for an answer with no change to apply, else `no` | `lucidos request-read yes\|no` |
 | As a sub-thread with no *wake mode*, say whether your report wakes your parent: `yes` when it must act now, else `no` | `lucidos wake-parent yes\|no` |
 
@@ -177,6 +178,11 @@ events query ...; done` for anything the engine emits burns a tool call per
 poll, samples on an interval so it can miss a transition, and dies with your
 session. This does not: the subscription is persisted and survives an engine
 restart.
+
+**State the expected wake.** With the keep-alive on, the output on a keep-warm
+event asks when you expect to wake. It shows how long past waits like it
+lasted here. Answer with `lucidos expect-wake 45m --reason "the release build"`
+(units `s`, `m`, `h`) before you finish. A later run replaces it.
 
 **Then actually stop.** Say what you subscribed to and end the turn. Do not poll
 for it afterwards, and do not keep the session alive waiting. The thread is

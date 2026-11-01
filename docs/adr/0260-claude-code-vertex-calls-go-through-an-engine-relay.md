@@ -1,6 +1,6 @@
 # 0260: Claude Code's Vertex calls go through an engine relay that asks always-thinking models for progress notes
 
-- **Status**: Accepted
+- **Status**: Superseded by 0605
 - **Date**: 2026-09-23
 
 ## Context

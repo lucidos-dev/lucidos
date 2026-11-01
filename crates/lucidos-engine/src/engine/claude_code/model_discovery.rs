@@ -55,7 +55,7 @@ impl LucidosEngine {
                 permission_mode: permission_mode.as_deref(),
                 additional_directories: &[],
                 auto_compact: None,
-                notes: crate::runtime::claude_code_provider::NotesVisibility::Hidden,
+                keep_alive: false,
                 agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
             };
             match crate::runtime::claude_code::probe_cc_models(args).await {

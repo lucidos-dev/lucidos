@@ -7,3 +7,6 @@
 \bImplement\s+in\s+a\s+new\s+thread\b	Implement in a fresh session	docs/adr/0560-successor-session-in-the-same-thread.md
 \bcache_warm_line\b	cache_cards	docs/adr/0563-cache-keep-alive-speaks-one-grammar.md
 \bobserved\s+TTL\b	cache TTL	docs/adr/0575-cache-ttls-from-evidence-only.md
+\bbreak-even\s+(?:budget|cap|mode|rule|point)s?\b	reread cap	docs/adr/0603-keep-alive-follows-the-expected-wake.md
+[`'"](?:break-even|workspace-data)[`'"]	cache_keep_alive_mode on (the mode is off or on)	docs/adr/0603-keep-alive-follows-the-expected-wake.md
+\bVertex\s+relay\b	nothing: Claude Code 2.1.311 asks for progress notes itself	docs/adr/0605-claude-code-notes-follow-the-claude-code-version.md

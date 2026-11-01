@@ -2,10 +2,9 @@ import { Fragment } from 'preact';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { marked } from 'marked';
 import type { Token, Tokens } from 'marked';
-// escapeHtmlAttr is a DOM-free escaper; importing it also runs markedConfig's
-// marked.use(...) side effects (previously a bare side-effect import).
-import { escapeHtmlAttr } from '../../utils/markedConfig';
-import { sanitizeHtmlFragments, unwrapPathEmailAutolinks } from '../../utils/renderMarkdown';
+import { escapeHtmlAttr } from '../../utils/escapeHtmlAttr';
+// The engine also runs markedConfig's `marked.use(...)`, which `marked` below relies on.
+import { sanitizeHtmlFragments, unwrapPathEmailAutolinks } from '../../utils/markdownEngine';
 import type { DiffFile } from '../../store/store';
 import { getChangeFileContent, getRepoFileContent } from '../../api/client';
 import type { Loadable } from '../../store/types';

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Resolve once in the entry point; exported GH_TOKEN pins every gh subprocess
-# (including sourced release helpers and child build scripts) to that identity.
-release_github_auth() {
+# Resolve credentials for release entry points and e2e GitHub calls.
+# The exported GH_TOKEN pins child subprocesses to the resolved identity.
+github_auth() {
     if [ "${GH_CONFIG_DIR+x}" != x ] && [ -d "${HOME}/.config/gh-lucidos" ]; then
         export GH_CONFIG_DIR="${HOME}/.config/gh-lucidos"
     fi
@@ -10,12 +10,12 @@ release_github_auth() {
         return 0
     fi
     if [ -z "${GH_ACCOUNT_GITHUB_COM:-}" ]; then
-        echo 'ERROR: release preflight requires GH_TOKEN or GH_ACCOUNT_GITHUB_COM; refusing gh active-account fallback.' >&2
+        echo 'ERROR: GitHub access requires GH_TOKEN or GH_ACCOUNT_GITHUB_COM; refusing gh active-account fallback.' >&2
         return 1
     fi
     local token
     if ! token="$(gh auth token -h github.com -u "$GH_ACCOUNT_GITHUB_COM")" || [ -z "$token" ]; then
-        echo 'ERROR: release preflight could not fetch a token for GH_ACCOUNT_GITHUB_COM; set GH_TOKEN or check that account and GH_CONFIG_DIR.' >&2
+        echo 'ERROR: GitHub access could not fetch a token for GH_ACCOUNT_GITHUB_COM; set GH_TOKEN or check that account and GH_CONFIG_DIR.' >&2
         return 1
     fi
     export GH_TOKEN="$token"

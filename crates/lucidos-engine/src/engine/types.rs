@@ -371,6 +371,11 @@ pub enum ContextPurpose {
     /// The user can point it at a System One model with
     /// `judgment_wake_decision`.
     WakeDecision,
+    /// The turn-end *expected wake decision*, for a turn that left its thread
+    /// waiting and stated no expected wake (ADR 0603). It owns
+    /// `model_expected_wake_decision`, which follows no other key. The user can
+    /// point it at a System One model with `judgment_expected_wake_decision`.
+    ExpectedWakeDecision,
     /// One *copy beat* of the cache keep-alive: a Claude Code session copy
     /// asked for one word while its session is parked on a card. It runs the
     /// session's own model. Its `duration_ms` dates the request that refreshed
@@ -433,6 +438,7 @@ impl ContextPurpose {
             Self::Proxy => "Proxied Request",
             Self::ReadDecision => "Read Decision Request",
             Self::WakeDecision => "Wake Decision Request",
+            Self::ExpectedWakeDecision => "Expected Wake Decision Request",
             Self::CacheKeepAlive => "Cache Keep-Alive Request",
             Self::PrefillProbe => "Prefill Probe Request",
         }

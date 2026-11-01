@@ -1,5 +1,5 @@
 import { stripHtml } from '../../utils/escapeHtml';
-import { sanitizeHtmlFragments } from '../../utils/renderMarkdown';
+import { sanitizeHtmlFragments } from '../../utils/markdownEngine';
 
 interface SlidesDeck {
   id?: string;

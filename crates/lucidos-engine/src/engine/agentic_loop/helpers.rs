@@ -1732,12 +1732,12 @@ pub(crate) struct FinalAnswerBesideDecision<'a> {
 }
 
 /// Whether a round's calls are its turn-end decisions and nothing else: the
-/// read decision, the wake decision, or both.
+/// the read decision, the wake decision and the expected wake, in any mix.
 pub(crate) fn calls_only_turn_end_decisions(calls: &[crate::llm::provider::ToolCall]) -> bool {
     !calls.is_empty()
-        && calls
-            .iter()
-            .all(|c| c.name == tn::REQUEST_READ || c.name == tn::WAKE_PARENT)
+        && calls.iter().all(|c| {
+            [tn::REQUEST_READ, tn::WAKE_PARENT, tn::EXPECT_WAKE].contains(&c.name.as_str())
+        })
 }
 
 impl LucidosEngine {

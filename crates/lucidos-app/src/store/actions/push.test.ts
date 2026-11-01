@@ -89,8 +89,8 @@ describe('push.ts uses api/client helpers (not raw fetch)', () => {
           headers: { 'content-type': 'application/json' },
         });
       }
-      // Push subscribe POST — accept and return empty body
-      return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+      // Push subscribe POST: accept, in the engine's ApiResult shape
+      return new Response('{"success":true}', { status: 200, headers: { 'content-type': 'application/json' } });
     }) as typeof fetch;
 
     const fakeRegistration = {
@@ -120,6 +120,44 @@ describe('push.ts uses api/client helpers (not raw fetch)', () => {
   });
 
   /**
+   * The engine answers a refused subscribe with `200 {success: false}`. Read
+   * as a success, the user saw "enabled" for a device that gets no push.
+   */
+  it('initPushSubscription reports a subscribe the engine refused', async () => {
+    const vapidKey = makeVapidKey();
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/api/v1/push/vapid-key')) {
+        return new Response(JSON.stringify({ public_key: vapidKey }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(
+        JSON.stringify({ success: false, error: 'this caller is device dev-a and cannot act for device dev-b' }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as typeof fetch;
+
+    const fakeRegistration = {
+      pushManager: {
+        getSubscription: async () => null,
+        subscribe: async () => ({
+          toJSON: () => ({ endpoint: 'https://push/x', keys: { p256dh: 'p', auth: 'a' } }),
+        }),
+      },
+    };
+    Object.defineProperty(globalThis.navigator, 'serviceWorker', {
+      value: { register: async () => fakeRegistration, ready: Promise.resolve(fakeRegistration) },
+      configurable: true,
+    });
+    installPermissionStubs();
+
+    const { initPushSubscription } = await import('./push');
+    expect(await initPushSubscription()).toBe(false);
+  });
+
+  /**
    * A page relayed by another gateway carries the base `/<slug>@<gateway>/`.
    * The service worker registers under that outside prefix and the stored
    * scope names it, so B's pushes tap back through A's origin.
@@ -143,7 +181,7 @@ describe('push.ts uses api/client helpers (not raw fetch)', () => {
             headers: { 'content-type': 'application/json' },
           });
         }
-        return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response('{"success":true}', { status: 200, headers: { 'content-type': 'application/json' } });
       }) as typeof fetch;
 
       const fakeRegistration = {
@@ -204,7 +242,7 @@ describe('push.ts uses api/client helpers (not raw fetch)', () => {
           headers: { 'content-type': 'application/json' },
         });
       }
-      return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+      return new Response('{"success":true}', { status: 200, headers: { 'content-type': 'application/json' } });
     }) as typeof fetch;
 
     const subscribeCalls: Array<unknown> = [];
@@ -331,7 +369,7 @@ describe('stale applicationServerKey reconciliation', () => {
           headers: { 'content-type': 'application/json' },
         });
       }
-      return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+      return new Response('{"success":true}', { status: 200, headers: { 'content-type': 'application/json' } });
     }) as typeof fetch;
     return seen;
   }

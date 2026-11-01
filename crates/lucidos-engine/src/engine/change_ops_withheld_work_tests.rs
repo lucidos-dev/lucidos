@@ -200,14 +200,23 @@ async fn unhardened_work_is_held_but_a_plan_alone_is_not() {
     );
 
     let plan = files(&["docs/plans/2026-10-10-x.md"]);
-    for kind in [PlanMarkerKind::Planned, PlanMarkerKind::Proposed] {
-        mark(kind).await.expect("mark the plan");
-        assert_eq!(
-            hold_of(&pool, &bus, &input(thread_id, &repo_str, "plan", &plan)).await,
-            None,
-            "a plan alone is never held for hardening ({kind:?})"
-        );
-    }
+    mark(PlanMarkerKind::Planned).await.expect("mark the plan");
+    assert_eq!(
+        hold_of(&pool, &bus, &input(thread_id, &repo_str, "plan", &plan)).await,
+        None,
+        "an approved plan alone is never held for hardening"
+    );
+    mark(PlanMarkerKind::Proposed).await.expect("mark the plan");
+    assert_eq!(
+        hold_of(&pool, &bus, &input(thread_id, &repo_str, "plan", &plan)).await,
+        Some(ProposalHold::Plan(PlanHold::PlanOnlyAwaitingApproval)),
+        "a plan awaiting approval is held, not proposed"
+    );
+    let withheld = payloads(&pool, thread_id, "ProposalWithheld").await;
+    assert_eq!(
+        withheld.last().expect("a plan-only hold announces")["reason"],
+        "plan_awaiting_approval"
+    );
 
     record_hardened(
         &pool,

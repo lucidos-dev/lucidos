@@ -9,9 +9,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
 import type { CacheWarmth } from '../../../api/client/successor';
-import type { CacheKeepAliveNotKeptReason, CacheKeepAliveStatus } from '../../../generated/thread-event-wire';
+import type { CacheKeepAliveNotKeptReason, CacheKeepAliveStatus, CapSource } from '../../../generated/thread-event-wire';
 import { makeThreadState } from '../../../store/actions/threads-test-helpers';
-import { threadMap } from '../../../store/store';
+import { preferences, threadMap } from '../../../store/store';
 import { formatShortTime } from '../../../utils/formatTime';
 import { keepAliveMath, keepAliveSentence, KeepAliveRow, KeepAliveSection, shownKeepAliveStatus } from '../CacheKeepAlive';
 import { waitingPanelBody } from '../WaitingPanel';
@@ -96,7 +96,17 @@ describe('the run sentences', () => {
   });
 
   it('adds what keeping it warm should save, once the engine priced the odds', () => {
-    expect(keepAliveSentence(priced)).toBe(`Spent $0.06 so far. Expected to save $0.17. Warm until ${clock(GIVE_UP)}.`);
+    expect(keepAliveSentence(priced)).toBe(`Spent $0.06 so far. Expected to save $0.17, from your last 10 waits like this. Warm until ${clock(GIVE_UP)}.`);
+  });
+
+  it('names the expected wake the plan follows, and who expects it', () => {
+    const wake = '2026-10-19T10:05:00Z';
+    expect(keepAliveSentence(warming({ expected_wake: { at: wake, source: 'agent' } }))).toBe(
+      `Spent $0.31 so far. Warm until ${clock(GIVE_UP)}. The agent expects a wake about ${clock(wake)}.`,
+    );
+    expect(keepAliveSentence(warming({ expected_wake: { at: wake, source: 'decision' } }))).toBe(
+      `Spent $0.31 so far. Warm until ${clock(GIVE_UP)}. Lucidos estimates a wake about ${clock(wake)}.`,
+    );
   });
 
   it('counts the pings once the run is closed', () => {
@@ -104,7 +114,7 @@ describe('the run sentences', () => {
   });
 
   it('says when the pings stopped, and why', () => {
-    expect(keepAliveSentence(stopped)).toBe(`Spent $0.64 on 25 pings. Stopped at ${clock(GIVE_UP)}, the give-up time set when the wait began.`);
+    expect(keepAliveSentence(stopped)).toBe(`Spent $0.64 on 25 pings. Stopped at ${clock(GIVE_UP)}, the end of its plan.`);
   });
 
   it('gives an ended run its span and what the warm cache saved', () => {
@@ -119,6 +129,75 @@ describe('the run sentences', () => {
 
   it('has none for a thread it does not keep warm', () => {
     expect(keepAliveSentence({ state: 'not_kept', reason: 'restarted' })).toBeNull();
+  });
+});
+
+describe('the cap source', () => {
+  // A learned cap's hours read on the user's clock, so pin it.
+  beforeEach(() => {
+    preferences.value = { status: 'loaded', data: { timezone: 'UTC' } };
+  });
+  afterEach(() => {
+    preferences.value = { status: 'not-loaded' };
+  });
+
+  const plan = (cap_source: CapSource) => warming({ cap_source });
+
+  it('names what set the give-up time of an open run', () => {
+    const at = clock(GIVE_UP);
+    expect(keepAliveSentence(plan({ kind: 'half_reread' }))).toBe(`Spent $0.31 so far. Warm until ${at}, the end of its plan: pings worth half of one reread.`);
+    expect(keepAliveSentence(plan({ kind: 'reread_cap' }))).toContain(`Warm until ${at}, the end of its plan: pings worth one reread.`);
+    expect(keepAliveSentence(plan({ kind: 'timeout' }))).toContain(`Warm until ${at}, the end of its plan: the wait's timeout.`);
+    expect(keepAliveSentence(plan({ kind: 'estimate', by: 'agent' }))).toContain("the end of its plan: the agent's expected wake.");
+    expect(keepAliveSentence(plan({ kind: 'estimate', by: 'decision' }))).toContain("the end of its plan: Lucidos's wake estimate.");
+  });
+
+  it('names it on a stopped, ended or turned-off run', () => {
+    const source: CapSource = { kind: 'half_reread' };
+    expect(keepAliveSentence({ ...stopped, cap_source: source } as CacheKeepAliveStatus)).toBe(
+      `Spent $0.64 on 25 pings. Stopped at ${clock(GIVE_UP)}, the end of its plan: pings worth half of one reread.`,
+    );
+    expect(keepAliveSentence({ ...ended, cap_source: source } as CacheKeepAliveStatus)).toMatch(/Saved about \$0\.57\. Its plan: pings worth half of one reread\.$/);
+    expect(keepAliveSentence({ ...turnedOff, cap_source: source } as CacheKeepAliveStatus)).toMatch(/\. Its plan: pings worth half of one reread\.$/);
+  });
+
+  it('names it on a give-up that sent no ping, from the one reason list', () => {
+    const root = mount(<KeepAliveSection threadId="t1" status={{ state: 'not_kept', reason: 'past_give_up_time', cap_source: { kind: 'half_reread' } }} />);
+    expect(root.textContent).toContain('so no ping went out. Its plan: pings worth half of one reread.');
+  });
+
+  it('names a learned cap, its pings, its cards and their hours', () => {
+    const learned: CapSource = { kind: 'learned', pings: 3, samples: 41, from_hour: 22, to_hour: 3, utc_offset_mins: 0 };
+    expect(keepAliveSentence(plan(learned))).toContain(
+      `Warm until ${clock(GIVE_UP)}, the end of its plan: 3 pings, learned from 41 waits like this asked 22:00 to 03:00.`,
+    );
+    expect(keepAliveSentence(plan({ ...learned, pings: 1, samples: 30, from_hour: 7, to_hour: 12 }))).toContain(
+      'the end of its plan: 1 ping, learned from 30 waits like this asked 07:00 to 12:00.',
+    );
+  });
+
+  it("shows a learned cap's hours on the user's clock", () => {
+    preferences.value = { status: 'loaded', data: { timezone: 'Asia/Tokyo' } };
+    const learned: CapSource = { kind: 'learned', pings: 2, samples: 41, from_hour: 13, to_hour: 18, utc_offset_mins: 0 };
+    expect(keepAliveSentence(plan(learned))).toContain('learned from 41 waits like this asked 22:00 to 03:00.');
+    const inTokyo: CapSource = { ...learned, from_hour: 22, to_hour: 3, utc_offset_mins: 540 };
+    expect(keepAliveSentence(plan(inTokyo))).toContain('learned from 41 waits like this asked 22:00 to 03:00.');
+  });
+
+  it('says a learned cap of none sent no pings at this hour', () => {
+    const none: CapSource = { kind: 'learned', pings: 0, samples: 41, from_hour: 22, to_hour: 3, utc_offset_mins: 0 };
+    const root = mount(<KeepAliveSection threadId="t1" status={{ state: 'not_kept', reason: 'past_give_up_time', cap_source: none }} />);
+    expect(root.textContent).toContain('so no ping went out. Its plan: learned: no pings at this hour, from 41 waits like this asked 22:00 to 03:00.');
+  });
+
+  it('counts the odds of a learned cap from the hours that set it', () => {
+    const learned = warming({ ...priced, cap_source: { kind: 'learned', pings: 2, samples: 10, from_hour: 22, to_hour: 3, utc_offset_mins: 0 } } as Partial<Extract<CacheKeepAliveStatus, { state: 'warming' }>>);
+    expect(keepAliveSentence(learned)).toContain('Expected to save $0.17, from your last 10 waits like this asked 22:00 to 03:00.');
+  });
+
+  it('keeps the sentence of a status stored before cap sources', () => {
+    expect(keepAliveSentence(warming())).toBe(`Spent $0.31 so far. Warm until ${clock(GIVE_UP)}.`);
+    expect(keepAliveSentence(stopped)).toBe(`Spent $0.64 on 25 pings. Stopped at ${clock(GIVE_UP)}, the end of its plan.`);
   });
 });
 
@@ -340,9 +419,9 @@ describe('the keep-alive card in the transcript', () => {
 
 describe('the Prompt cache section', () => {
   const NOW = Date.parse('2026-10-19T10:31:00Z');
-  const COLD: CacheWarmth = { warmth: 'cold', remaining_secs: null, keep_alive: null };
+  const COLD: CacheWarmth = { warmth: 'cold', remaining_secs: null, keep_alive: null, ttl: null };
   const warmFor = (secs: number, status: CacheKeepAliveStatus): CacheWarmth =>
-    ({ warmth: 'warm', remaining_secs: secs, keep_alive: status });
+    ({ warmth: 'warm', remaining_secs: secs, keep_alive: status, ttl: null });
   const headline = (root: HTMLElement) => root.querySelector('.waiting-panel-cache-line')?.textContent;
 
   beforeEach(() => {
@@ -369,7 +448,7 @@ describe('the Prompt cache section', () => {
     expect(fetchCacheWarmth).not.toHaveBeenCalled();
   });
 
-  it('says it stopped at break-even', async () => {
+  it('says it stopped at the reread cap', async () => {
     const root = await mountRead(stopped);
     expect(root.textContent).toContain('A reply after the cache goes cold rereads 262k tokens.');
     expect(root.querySelector('.keep-alive-meter')).toBeNull();
@@ -383,7 +462,7 @@ describe('the Prompt cache section', () => {
 
   it('says the lifetime is unknown when no evidence gives it', async () => {
     const unknownTtl: CacheKeepAliveStatus = { state: 'not_kept', reason: 'unknown_ttl' };
-    fetchCacheWarmth.mockResolvedValue({ warmth: 'unknown', remaining_secs: null, keep_alive: unknownTtl });
+    fetchCacheWarmth.mockResolvedValue({ warmth: 'unknown', remaining_secs: null, keep_alive: unknownTtl, ttl: null });
     const root = await mountRead(unknownTtl);
     expect(headline(root)).toBe('Not kept Its lifetime is unknown.');
     expect(root.querySelector('.waiting-panel-cache-detail')?.textContent).toBe(
@@ -483,7 +562,7 @@ describe('the keep-alive explainer', () => {
   }
 
   it('links the switch that hides the cache cards', async () => {
-    expect(await explain(warming())).toContain('Hide cache cards in Settings → System → Debugging');
+    expect(await explain(warming())).toContain('Hide cache cards in Settings → Models → Cache keep-alive');
   });
 
   it('leaves the switch to the card that opened it', async () => {
@@ -557,7 +636,7 @@ describe('no keep-alive surface joins facts with a dot', () => {
 
   beforeEach(() => {
     fetchCacheWarmth.mockReset();
-    fetchCacheWarmth.mockResolvedValue({ warmth: 'warm', remaining_secs: 120, keep_alive: stopped });
+    fetchCacheWarmth.mockResolvedValue({ warmth: 'warm', remaining_secs: 120, keep_alive: stopped, ttl: null });
   });
 
   afterEach(() => {

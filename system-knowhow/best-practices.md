@@ -203,6 +203,7 @@ For environment that must be the **same for every subprocess in this workspace**
   - Exception: the engine's *own* shell-outs read their vars at startup. For example, the Apply-time `git push` uses `GIT_SSH_COMMAND` / `GH_CONFIG_DIR`. A change reaches the engine's own git on the next restart. Tool and agent subprocesses see it immediately.
 - **Non-secret only.** Values appear in logs, the event store and tool-call payloads, by design. For API keys, tokens or passwords use a **credential** (`request_credential`). A call that names `CRED_<NAME>` gets it, and output masks its value.
 - **Names** are uppercase letters, digits and underscores, not starting with a digit (e.g. `CLAUDE_CODE_USE_VERTEX`, `LUCIDOS_REPO`). Engine-owned names (`CRED_*`, `OAUTH_*`, `PATH`, internal `LUCIDOS_*` like `LUCIDOS_WORKSPACE` and `LUCIDOS_DATABASE_URL`) are rejected. Engine-owned vars always win a collision.
+- **You cannot set a name that loads code**: `BASH_ENV`, `ENV`, `LD_*`, `DYLD_*`, `NODE_OPTIONS`, `PYTHONPATH`, `GIT_SSH*`, `GIT_CONFIG*`, `HOME`, `GH_CONFIG_DIR` and the other names `run_bash`'s command guard checks. A stored one would run in every later subprocess unchecked. Ask the user to set it in Settings.
 
 The main use is **per-workspace identity**: a `gh` config dir, a Google `gws` config dir and project id, an SSH command. Then `gh` / `git push` from agent subprocesses authenticate as the right account:
 
@@ -211,11 +212,11 @@ GH_CONFIG_DIR=/Users/me/.config/gh-work
 GIT_SSH_COMMAND=ssh -i /Users/me/.ssh/id_work -o IdentitiesOnly=yes
 ```
 
-Setup is **partly interactive**. You can set the variables, but the user must complete the auth handshake:
+Setup is **interactive**. Both variables change what code `gh` and `git` run, so the user sets them and completes the auth handshake:
 
 1. Pick a dedicated gh config dir and authenticate it once (user-run, opens a browser): `GH_CONFIG_DIR=<dir> gh auth login`.
 2. For SSH push, make sure the key referenced by `GIT_SSH_COMMAND` is registered on that GitHub account.
-3. Set `GH_CONFIG_DIR` and `GIT_SSH_COMMAND` with the `env_vars` tool (`action: set`), or in Settings → System → Environment Variables.
+3. Ask the user to set `GH_CONFIG_DIR` and `GIT_SSH_COMMAND` in Settings → System → Environment Variables. The `env_vars` tool refuses both.
 
 **Want a credential's secret under a specific env var name?** Give the credential a custom env var name, for a CLI or SDK that expects an exact variable. Its secret then also injects as e.g. `GITHUB_TOKEN`, and the default `CRED_<NAME>` still works. A call gets it only when it names the alias or `CRED_<NAME>`. Set it two ways:
 

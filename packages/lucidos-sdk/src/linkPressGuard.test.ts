@@ -15,15 +15,16 @@ function setup() {
   const doc: Document = document;
   let now = 1_000;
   const swallowed = vi.fn();
-  uninstalls.push(installLinkPressGuard(doc, { now: () => now, onSwallowed: swallowed }));
+  const linkTouch = vi.fn();
+  uninstalls.push(installLinkPressGuard(doc, { now: () => now, onSwallowed: swallowed, onLinkTouch: linkTouch }));
   document.body.innerHTML = '<a id="link" href="/x"><span id="inner">go</span></a><button id="plain">b</button>';
   const link = document.getElementById('inner') as HTMLElement;
   const plain = document.getElementById('plain') as HTMLElement;
 
   const contact = (x: number, y: number) => ({ identifier: 1, screenX: x, screenY: y });
-  const touch = (type: string, x: number, y: number, left = 1) => {
+  const touch = (type: string, x: number, y: number, left = 1, on: EventTarget = doc) => {
     const c = contact(x, y);
-    doc.dispatchEvent(Object.assign(new Event(type, { cancelable: true }), {
+    on.dispatchEvent(Object.assign(new Event(type, { cancelable: true }), {
       changedTouches: [c],
       touches: Array.from({ length: left }, () => c),
     }));
@@ -41,17 +42,18 @@ function setup() {
   };
   return {
     swallowed,
+    linkTouch,
     tick: (ms: number) => { now += ms; },
     touch,
     click,
     plain,
     /** A finger down, dragged by `dx`, then lifted. */
-    gesture(dx: number, { heldMs = 50, fingers = 1 }: { heldMs?: number; fingers?: number } = {}) {
-      touch('touchstart', 100, 100, fingers);
+    gesture(dx: number, { heldMs = 50, fingers = 1, on = doc }: { heldMs?: number; fingers?: number; on?: EventTarget } = {}) {
+      touch('touchstart', 100, 100, fingers, on);
       now += heldMs / 2;
-      touch('touchmove', 100 + dx, 100, fingers);
+      touch('touchmove', 100 + dx, 100, fingers, on);
       now += heldMs / 2;
-      touch('touchend', 100 + dx, 100, 0);
+      touch('touchend', 100 + dx, 100, 0, on);
     },
   };
 }
@@ -71,6 +73,20 @@ describe('installLinkPressGuard', () => {
     t.tick(30);
     expect(t.click()).toEqual({ prevented: true, reached: false });
     expect(t.swallowed).toHaveBeenCalledOnce();
+  });
+
+  it('reports each touch that ends on a link with its verdict', () => {
+    const t = setup();
+    const link = document.getElementById('inner')!;
+    t.gesture(0, { on: link });
+    t.gesture(TAP_MOVE_THRESHOLD_PX + 1, { on: link });
+    expect(t.linkTouch.mock.calls.map(([info]) => [info.href, info.tap])).toEqual([['/x', true], ['/x', false]]);
+  });
+
+  it('reports no touch that ends off a link', () => {
+    const t = setup();
+    t.gesture(0, { on: t.plain });
+    expect(t.linkTouch).not.toHaveBeenCalled();
   });
 
   it('lets a drag of exactly the threshold through, as a tap', () => {

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'preact/hooks';
 import { fetchCacheWarmth, switchCacheKeepAlive } from '../../api/client';
-import type { CacheWarmth } from '../../api/client/successor';
-import type { CacheKeepAliveNotKeptReason, CacheKeepAliveStatus } from '../../generated/thread-event-wire';
+import type { CacheWarmth, WarmthTtl } from '../../api/client/successor';
+import type { CacheKeepAliveNotKeptReason, CacheKeepAliveStatus, CapSource, PlannedWake } from '../../generated/thread-event-wire';
 import { useLoadableFetch } from '../../hooks/useLoadableFetch';
 import { effectiveThreadStatus, isMidTurn, isRenderedThreadIdle, showToast, threadMap } from '../../store/store';
 import type { ThreadState } from '../../store/thread-events';
@@ -62,6 +62,7 @@ const NOT_KEPT_REASON: Record<CacheKeepAliveNotKeptReason, string> = {
   cache_expired: 'The cache went cold before a ping reached it, so a ping would pay to rewrite it.',
   restarted: 'Lucidos restarted since the last request, so a ping would not match the cache.',
   past_give_up_time: 'The wait passed its give-up time before the first ping was due, so no ping went out.',
+  wake_past_reread_cap: 'The wake is expected too late for pings to cost clearly less than rereading the cache, so none go out.',
   nothing_pending:
     'This thread waits only for your next message. Lucidos keeps a cache warm while a thread waits on a sub-thread, an event or a card.',
   unattended_trigger: 'Nobody has written in this trigger thread, so nothing would read a warm cache.',
@@ -70,12 +71,67 @@ const NOT_KEPT_REASON: Record<CacheKeepAliveNotKeptReason, string> = {
   beat_missed: 'A ping missed the cache, so this wait is not kept warm.',
 };
 
-/** Why nothing keeps the cache warm, with the time paused pings resume. */
+/** Why nothing keeps the cache warm, with the time paused pings resume and
+ *  the plan behind a give-up. */
 function notKeptReason(status: Status<'not_kept'>): string {
   if (status.reason === 'pings_paused' && status.until !== undefined) {
     return `Pings to this model's provider kept missing the cache, so they pause until ${clock(status.until)}.`;
   }
-  return NOT_KEPT_REASON[status.reason];
+  return `${NOT_KEPT_REASON[status.reason]}${planSentence(status.cap_source)}`;
+}
+
+/** What set a run's give-up time, as a phrase after "its plan:". */
+function capSourcePhrase(source: CapSource): string {
+  switch (source.kind) {
+    case 'half_reread':
+      return 'pings worth half of one reread';
+    case 'reread_cap':
+      return 'pings worth one reread';
+    case 'timeout':
+      return "the wait's timeout";
+    case 'estimate':
+      return source.by === 'agent' ? "the agent's expected wake" : "Lucidos's wake estimate";
+    case 'learned': {
+      const from = `${waitsLikeThis(source.samples)} asked ${hourWindow(source)}`;
+      return source.pings === 0 ? `learned: no pings at this hour, from ${from}` : `${pings(source.pings)}, learned from ${from}`;
+    }
+  }
+}
+
+/** A learned cap's hours on the clock every other time here reads:
+ *  `20:00 to 01:00`. The engine counts them in the `timezone` preference's
+ *  zone, `utc_offset_mins` from UTC at the ask. */
+function hourWindow(source: Extract<CapSource, { kind: 'learned' }>): string {
+  const today = new Date();
+  const at = (hour: number) =>
+    formatShortTime(
+      new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate(), hour) - source.utc_offset_mins * 60_000),
+    );
+  return `${at(source.from_hour)} to ${at(source.to_hour)}`;
+}
+
+/** `n` past waits, as a phrase: `41 waits like this`. */
+function waitsLikeThis(n: number): string {
+  return n === 1 ? '1 wait like this' : `${n.toLocaleString('en-US')} waits like this`;
+}
+
+/** The sentence naming a run's plan, after the sentence before it. Empty on a
+ *  status stored before cap sources. */
+function planSentence(source: CapSource | undefined): string {
+  return source ? ` Its plan: ${capSourcePhrase(source)}.` : '';
+}
+
+/** "Warm until" or "Stopped at" a time, then what set it. */
+function capEnd(lead: string, iso: string, source: CapSource | undefined): string {
+  return source ? `${lead} ${clock(iso)}, the end of its plan: ${capSourcePhrase(source)}.` : `${lead} ${clock(iso)}.`;
+}
+
+/** Who expects the wake a run plans from, and when. Empty with none: the
+ *  run then pings until the reread cap. */
+function expectedWakeSentence(wake: PlannedWake | undefined): string {
+  if (!wake) return '';
+  const who = wake.source === 'agent' ? 'The agent expects' : 'Lucidos estimates';
+  return ` ${who} a wake about ${clock(wake.at)}.`;
 }
 
 /** The sentences of a run, on the card and in the panel. A run that is not
@@ -86,18 +142,20 @@ export function keepAliveSentence(status: CacheKeepAliveStatus, open = true): st
       if (!open) return `Spent ${usd(status.cost_usd)} on ${pings(status.beats)}.`;
       const math = keepAliveMath(status);
       const expected = math ? ` ${expectedSaving(math)}` : '';
-      return `Spent ${usd(status.cost_usd)} so far.${expected} Warm until ${clock(status.give_up_at)}.`;
+      return `Spent ${usd(status.cost_usd)} so far.${expected} ${capEnd('Warm until', status.give_up_at, status.cap_source)}${expectedWakeSentence(status.expected_wake)}`;
     }
-    case 'stopped':
-      return `Spent ${usd(status.cost_usd)} on ${pings(status.beats)}. Stopped at ${clock(status.at)}, the give-up time set when the wait began.`;
+    case 'stopped': {
+      const end = status.cap_source ? capEnd('Stopped at', status.at, status.cap_source) : `Stopped at ${clock(status.at)}, the end of its plan.`;
+      return `Spent ${usd(status.cost_usd)} on ${pings(status.beats)}. ${end}`;
+    }
     case 'ended': {
       const saved = status.saved_usd === undefined ? '' : ` Saved about ${usd(status.saved_usd)}.`;
       const early = status.beats === 0 ? ' Ended before the first ping.' : '';
-      return `Spent ${usd(status.cost_usd)} on ${pings(status.beats)}, ${clock(status.since)} to ${clock(status.at)}.${saved}${early}`;
+      return `Spent ${usd(status.cost_usd)} on ${pings(status.beats)}, ${clock(status.since)} to ${clock(status.at)}.${saved}${early}${planSentence(status.cap_source)}`;
     }
     case 'turned_off': {
       const early = status.beats === 0 ? ', before the first ping' : '';
-      return `Spent ${usd(status.cost_usd)} on ${pings(status.beats)}. Turned off at ${clock(status.at)}${early}.`;
+      return `Spent ${usd(status.cost_usd)} on ${pings(status.beats)}. Turned off at ${clock(status.at)}${early}.${planSentence(status.cap_source)}`;
     }
     case 'not_kept':
       return null;
@@ -107,7 +165,7 @@ export function keepAliveSentence(status: CacheKeepAliveStatus, open = true): st
 /** The explainer's sentence of a run: a warming one counts against its budget. */
 function explainerSentence(status: RunStatus): string {
   if (status.state !== 'warming') return keepAliveSentence(status)!;
-  return `${status.beats} of ${pings(status.budget_beats)} sent, ${usd(status.cost_usd)} so far. Warm until ${clock(status.give_up_at)}.`;
+  return `${status.beats} of ${pings(status.budget_beats)} sent, ${usd(status.cost_usd)} so far. ${capEnd('Warm until', status.give_up_at, status.cap_source)}${expectedWakeSentence(status.expected_wake)}`;
 }
 
 /** One row of the keep-alive math: when the reply comes, how likely that is,
@@ -139,6 +197,8 @@ export interface KeepAliveMath {
   rereadUsd: number;
   score: KeepAliveScore | null;
   landed: number | null;
+  /** The local hours a learned cap counted, `null` for any other cap. */
+  hours: string | null;
 }
 
 /** Minutes as the math labels them: `4.5`, `9`. */
@@ -209,13 +269,23 @@ export function keepAliveMath(status: CacheKeepAliveStatus): KeepAliveMath | nul
     rereadUsd,
     score,
     landed: landedRow(status, score, cap),
+    hours: status.cap_source?.kind === 'learned' ? hourWindow(status.cap_source) : null,
   };
 }
 
-/** The card's word on the math: what keeping the cache warm should save. */
+/** The card's word on the math: what keeping the cache warm should save, and
+ *  the waits that says so. */
 function expectedSaving(math: KeepAliveMath): string {
   const saving = math.noKeepAlive - math.keepWarm;
-  return saving >= 0 ? `Expected to save ${usd(saving)}.` : `Expected to cost ${usd(-saving)} more.`;
+  const verdict = saving >= 0 ? `Expected to save ${usd(saving)}` : `Expected to cost ${usd(-saving)} more`;
+  return `${verdict}, from ${oddsSource(math)}.`;
+}
+
+/** The past waits the chances count: for a learned cap, those asked in its
+ *  hours. */
+function oddsSource(math: KeepAliveMath): string {
+  const last = `your last ${math.samples === 1 ? 'wait like this' : waitsLikeThis(math.samples)}`;
+  return math.hours ? `${last} asked ${math.hours}` : last;
 }
 
 /** The explainer's one-sentence summary of the math. */
@@ -236,11 +306,10 @@ function scoreSummary({ keepWarm, noKeepAlive }: KeepAliveScore): string {
 function mathFootnote(math: KeepAliveMath): string {
   const tokens = formatTokens(math.contextTokens);
   const perMillion = (price: number) => `$${((price / math.contextTokens) * 1e6).toFixed(2)}/M`;
-  const waits = math.samples === 1 ? 'your last wait' : `your last ${math.samples.toLocaleString('en-US')} waits`;
   return (
     `A ping reads ${tokens} tokens: ${tokens} × ${perMillion(math.pingUsd)} = ${usd(math.pingUsd)}. ` +
     `The reread writes them again: ${tokens} × ${perMillion(math.rereadUsd)} = ${usd(math.rereadUsd)}. ` +
-    `Chances come from ${waits} like this.`
+    `Chances come from ${oddsSource(math)}.`
   );
 }
 
@@ -347,7 +416,7 @@ function KeepAliveSwitch({ threadId, status }: { threadId: string; status: Cache
   );
 }
 
-/** The thin meter of pings spent against the break-even budget. */
+/** The thin meter of pings spent against the reread cap. */
 function KeepAliveMeter({ status }: { status: Status<'warming'> }) {
   return (
     <div class="keep-alive-meter" aria-hidden="true">
@@ -415,13 +484,19 @@ function useColdAt(threadId: string, status: CacheKeepAliveStatus): ColdAt | und
   return loadable.status === 'loaded' ? loadable.data : undefined;
 }
 
-/** When a cache goes cold: a time, `null` once it is cold, or `'unknown'`. */
-type ColdAt = number | null | 'unknown';
+/** When a cache goes cold, with the lifetime that says so. `null` once it is
+ *  cold, or `'unknown'`. */
+type ColdAt = WarmUntil | null | 'unknown';
+
+interface WarmUntil {
+  at: number;
+  ttl: WarmthTtl | null;
+}
 
 function coldAtOf(warmth: CacheWarmth): ColdAt {
   switch (warmth.warmth) {
     case 'warm':
-      return Date.now() + warmth.remaining_secs * 1000;
+      return { at: Date.now() + warmth.remaining_secs * 1000, ttl: warmth.ttl };
     case 'cold':
       return null;
     case 'unknown':
@@ -429,19 +504,29 @@ function coldAtOf(warmth: CacheWarmth): ColdAt {
   }
 }
 
+const LIFETIME_WORDS: Record<WarmthTtl['lifetime'], string> = { '5m': '5-minute', '30m': '30-minute', '1h': '1-hour', '12h': '12-hour' };
+
+/** "Warm until" a time, and the lifetime evidence it counts from (ADR 0575). */
+function warmUntil({ at, ttl }: WarmUntil): string {
+  const time = `Warm until ${formatShortTime(new Date(at))}`;
+  if (!ttl) return time;
+  const says = ttl.evidence === 'reported' ? 'the provider reported' : 'the request asked for';
+  return `${time}, on the ${LIFETIME_WORDS[ttl.lifetime]} lifetime ${says}`;
+}
+
 /** The headline's warmth sentence: until when the cache stays warm, that it
  *  is cold, or that its lifetime is unknown. Empty until read. */
 function warmthSentence(coldAt: ColdAt | undefined, now: number): string {
   if (coldAt === undefined) return '';
   if (coldAt === 'unknown') return ' Its lifetime is unknown.';
-  return coldAt !== null && now < coldAt ? ` Warm until ${formatShortTime(new Date(coldAt))}.` : ' The cache is cold.';
+  return coldAt !== null && now < coldAt.at ? ` ${warmUntil(coldAt)}.` : ' The cache is cold.';
 }
 
 /** The waiting panel's "Prompt cache" section. It is always labelled, since it
  *  says something different in kind from the lists above it. */
 export function KeepAliveSection({ threadId, status }: { threadId: string; status: CacheKeepAliveStatus }) {
   const coldAt = useColdAt(threadId, status);
-  const now = useNow(typeof coldAt === 'number' ? coldAt : 0);
+  const now = useNow(typeof coldAt === 'object' && coldAt !== null ? coldAt.at : 0);
   const detail = sectionDetail(status);
   const headline = `${sectionHeadline(status)}${warmthSentence(coldAt, now)}`;
   return (
@@ -516,7 +601,7 @@ export function cacheWarmLineEligible(thread: ThreadState): boolean {
 /** One read of the cache-warm line: when the cache goes cold, or that no
  *  evidence gives its lifetime. */
 interface WarmRead {
-  coldAt: number | 'unknown';
+  coldAt: WarmUntil | 'unknown';
   keepAlive: CacheKeepAliveStatus;
 }
 
@@ -560,8 +645,8 @@ export function CacheWarmLine({ threadId, eligible, eventCount }: { threadId: st
 function WarmLineCard({ read }: { read: WarmRead }) {
   const { coldAt, keepAlive } = read;
   const unknown = coldAt === 'unknown';
-  const now = useNow(unknown ? 0 : coldAt);
-  if (!unknown && now >= coldAt) return null;
+  const now = useNow(unknown ? 0 : coldAt.at);
+  if (!unknown && now >= coldAt.at) return null;
   return (
     <div class="cache-warm-card">
       {eventRowBody({
@@ -575,7 +660,7 @@ function WarmLineCard({ read }: { read: WarmRead }) {
           </>
         ),
         stateLabel: 'Not kept',
-        detail: unknown ? 'Lifetime unknown' : `Warm until ${formatShortTime(new Date(coldAt))}`,
+        detail: unknown ? 'Lifetime unknown' : warmUntil(coldAt),
       })}
     </div>
   );
@@ -642,45 +727,21 @@ function SettingLink({ label, close, open }: { label: string; close: () => void;
 
 const KEEP_ALIVE_SETTING = 'Settings → Models → Cache keep-alive';
 
-/** Reasons no keep-alive setting can change: the thread is never beaten. */
-const SETTING_CANNOT_APPLY: ReadonlySet<CacheKeepAliveNotKeptReason> = new Set([
-  'codex',
-  'uncacheable_provider',
-  'provider_paused',
-  'prefill_paused',
-  'pings_paused',
-]);
-
-/** What the keep-alive setting changes, as the lead-in to its link. */
-function settingLead(status: CacheKeepAliveStatus): string {
-  switch (status.state) {
-    case 'warming':
-    case 'turned_off':
-    case 'ended':
-      return 'Change how long it keeps warm in';
-    case 'stopped':
-      return 'Change when it gives up in';
-    case 'not_kept':
-      if (status.reason === 'off') return 'Turn it on in';
-      return status.reason === 'past_give_up_time' ? 'Change when it gives up in' : 'Set up the keep-alive in';
-  }
-}
-
-/** The paragraphs linking the settings behind the status: the keep-alive, and
- *  the switch that hides the cache cards. Each ends on its link, with no full
- *  stop to wrap. */
+/** The paragraph linking the setting behind the status, ending on its link
+ *  with no full stop to wrap. The keep-alive is on or off, so an off status
+ *  links the switch. Any other status links the cache cards switch, which
+ *  shows only while the keep-alive is on. */
 function KeepAliveSettingLinks({ status, close }: { status: CacheKeepAliveStatus; close: () => void }) {
-  const keepAliveApplies = !(status.state === 'not_kept' && SETTING_CANNOT_APPLY.has(status.reason));
-  return (
-    <>
-      {keepAliveApplies && (
-        <p>
-          {settingLead(status)} <SettingLink label={KEEP_ALIVE_SETTING} close={close} open={openCacheKeepAliveSetting} />
-        </p>
-      )}
+  if (status.state === 'not_kept' && status.reason === 'off') {
+    return (
       <p>
-        Hide cache cards in <SettingLink label="Settings → System → Debugging" close={close} open={openCacheCardsSetting} />
+        Turn it on in <SettingLink label={KEEP_ALIVE_SETTING} close={close} open={openCacheKeepAliveSetting} />
       </p>
-    </>
+    );
+  }
+  return (
+    <p>
+      Hide cache cards in <SettingLink label={KEEP_ALIVE_SETTING} close={close} open={openCacheCardsSetting} />
+    </p>
   );
 }

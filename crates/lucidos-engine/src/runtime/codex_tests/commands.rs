@@ -659,7 +659,7 @@ fn the_baked_env_compiles_without_the_shared_sccache_daemon() {
         permission_mode: None,
         additional_directories: &[],
         auto_compact: None,
-        notes: crate::runtime::claude_code_provider::NotesVisibility::Hidden,
+        keep_alive: false,
         agent_run: AgentRun::unrecorded(),
     };
     let (env, _) = baked_lucidos_env(&args, None);

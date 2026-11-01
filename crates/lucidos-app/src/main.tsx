@@ -3,7 +3,8 @@
 import './utils/workspaceStorage.install';
 import './utils/pageHealthLog.install';
 import { render, type ComponentChildren } from 'preact';
-import { lazyComponent } from './utils/lazyComponent';
+import { lazyComponent, lazyModule } from './utils/lazyComponent';
+import { provideMarkdownEngine } from './utils/renderMarkdown';
 import { IS_PICKER, WORKSPACE_ID, baseContextIsValid } from './utils/basePath';
 import { rememberLastWorkspace } from './utils/lastWorkspace';
 import { updateAvailable } from './store/store';
@@ -76,7 +77,16 @@ const App = lazyComponent(() =>
     return m.App;
   }),
 );
-if (!IS_PICKER && !isTauriPreGatewayEntry()) void App.preload();
+// The markdown engine is asked for second. It usually lands under the boot
+// splash too. Until it does, markdown draws as plain text, and a failed load
+// takes the stale-chunk path (`chunkLoader` in `utils/lazyComponent.tsx`).
+const markdownEngine = lazyModule(() => import('./utils/markdownEngine'));
+if (!IS_PICKER && !isTauriPreGatewayEntry()) {
+  void App.preload();
+  void markdownEngine.preload().then((loaded) => {
+    if (loaded) provideMarkdownEngine(markdownEngine.get());
+  });
+}
 
 if (isTouchDevice()) {
   document.body.classList.add('is-touch');

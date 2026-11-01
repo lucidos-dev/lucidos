@@ -215,7 +215,7 @@ An opt-in safety gate over the *Lucidos Agent*'s shell/Python tools, under **Set
 
 Three lanes. A clearly catastrophic command (`rm -rf /`, a fork bomb, formatting a disk) is refused. An irreversible real-world side-effect, or destruction outside the workspace, pauses on a *command permission card*. An in-workspace deletion or overwrite runs after a *command checkpoint*, leaving a one-click Undo.
 
-Two sub-settings apply while the guard is on. Turning off the **LLM judge** uses the static dangerous-command classifier and destruction scan. If an enabled judge fails, the permission card asks the user and explains why. The **judge model** defaults to `gemini-3.1-flash-lite`.
+Two sub-settings apply while the guard is on. Turning off the **LLM judge** uses the static dangerous-command classifier and destruction scan, and a command it cannot see through asks. If an enabled judge fails, the permission card asks the user and explains why. The **judge model** defaults to `gemini-3.1-flash-lite`.
 
 A third sub-setting, **Enabled for coding agents** (on by default), lets the guard also answer the permission cards of coding-agent commands (Codex, Claude Code `Bash`). On, a command the guard places as safe or reversible runs without a card, and a wrong reversible verdict has no undo.
 
@@ -909,7 +909,7 @@ The browser cookie carries a window, refreshed each day the device is seen, but 
 See also: *device*, *pairing code*, `system-knowhow/remote-access.md` § Devices pair before Lucidos answers them.
 
 ### Pairing code
-The one-time code that makes a device a *paired device*. It works once and expires in five minutes. Two places produce one to pass on: **Settings → Access → Add a device** (press **Create a pairing code**), and `lucidos pair` on the machine Lucidos runs on. The desktop app mints a third silently for itself: it reads the local file that proves it is on the machine, and pairs its own window on launch.
+The one-time code that makes a device a *paired device*. It works once and expires in five minutes. Two places produce one to pass on: **Settings → Access → Pair a device** (press **Create a pairing code**), and `lucidos pair` on the machine Lucidos runs on. The desktop app mints a third silently for itself: it reads the local file that proves it is on the machine, and pairs its own window on launch.
 
 Both also draw it as a **QR**: the same code wrapped in a reachable address, never a second credential. Typing the digits does the same, so a failed scan is never a dead end.
 
@@ -926,7 +926,7 @@ The address a *pairing code*'s QR carries, so the new device lands on the gatewa
 4. the local network address.
 
 With none, Lucidos shows the code alone.
-See also: *pairing code*, *external address*, `system-knowhow/remote-access.md` § Add a device.
+See also: *pairing code*, *external address*, `system-knowhow/remote-access.md` § Pair a device.
 
 ### Gateway pairing
 A one-way grant from one *workspace gateway* to another: gateway B lets gateway A open its *workspaces*, for every device paired with A. B mints a *gateway pairing code*, and A enters it. Each side records the pairing in its own file, so auth state stays per gateway (ADR 0590).
@@ -1274,6 +1274,8 @@ A turn that ends with work still in flight is a step, not the end: its *sub-thre
 A *trigger* run makes its own read decision every time. It says no when it found nothing new, or when it sent you a notification: you hear through the notification, so you do not need both. The one exception is a failure the notification does not mention. It says yes only for what you would miss without reading the reply. When the background call decides instead, it learns what the turn already notified you about, and applies the same rule (ADR 0472).
 
 A *sub-thread* that another agent started reports to that agent. When its report wakes the parent, the parent acts on it and you read the parent's reply. So a routine result from such a turn is a no. A yes is for a failure, a gap you must know about, or something only you can do or decide. A payment, a sign-in and an approval are examples. The background call is told when the report wakes the parent, unless you opened the turn or answered a question in it (ADR 0446).
+
+The sub-thread's own agent is told the same, so it decides the same way. A child spawned with `wake` or `wake-when-all-done` always learns that its parent acts on its report. One that decides its own wake learns it for the reports that wake the parent. A `no-wake` child and a top-level thread are not told, since you read their reports in the thread itself. A turn you open in the sub-thread is answered as usual (ADR 0607).
 
 A no changes nothing you see, and never clears an earlier read request you have not read yet. Answering a question the thread asked does clear it, since the question sits at the end of the reply, as sending a message does.
 
@@ -2255,15 +2257,24 @@ A Lucidos Agent thread is kept warm too: a chat, Home or a trigger thread. It qu
 
 Lucidos times a ping only from a cache lifetime the model's reply reported. With no such reply, as with Codex or most OpenRouter models, it sends no pings, and the card says the lifetime is unknown.
 
-The keep-alive is off by default. Under `break-even` it stops when the pings would cost one cache rewrite: from about 40 minutes to 3 hours on a 5-minute cache, by model, and far longer on a 1-hour one. For a card it stops at half of that, since late answers are rare. The `cache_keep_alive_mode` *preference* picks the rule, under **Settings → Models → Cache keep-alive**. It can also tune the stop to this workspace's last 30 days of waits.
+The keep-alive is off by default. Turn it on with the `cache_keep_alive_mode` *preference*, under **Settings → Models → Cache keep-alive**. A run pings until the thread's *expected wake* is safely past, and only when those pings cost clearly less than one reread. It never pings past the *reread cap*: from about 40 minutes to 3 hours on a 5-minute cache, by model, and far longer on a 1-hour one. For a card it learns when to stop from this workspace's cards asked near the same hour of day. With too few, it stops at half the cap.
 
-You see the keep-alive as a whole, never the pings. Each wait it kept warm leaves one card in the transcript, a parked wait included. It carries a state word: Warming, Stopped, Ended or Turned off. Its title reads "Cache kept warm" for a run whose pings kept the cache warm (Warming, Ended) and "Cache keep-alive" otherwise. A wait that never got a ping leaves no card.
+You see the keep-alive as a whole, never the pings. With **Cache cards** on, each wait it kept warm leaves one card in the transcript, a parked wait included. That switch sits under the keep-alive's own and shows only while the keep-alive is on, since no card draws while it is off. It carries a state word: Warming, Stopped, Ended or Turned off. Its title reads "Cache kept warm" for a run whose pings kept the cache warm (Warming, Ended) and "Cache keep-alive" otherwise. A wait that never got a ping leaves no card.
 
 One fact line follows, such as "12 of 31 pings · $0.31 · until 15:40". When the run ends it reads "23 pings · $0.29 · 14:02–15:34 · saved about $0.57". The saving shows only when your next request found the cache still warm. The card stays as a record after the run ends.
 
 The waiting panel's Prompt cache section says the same line, and also says when the cache is not kept warm, and why. Where nothing pings a warm cache, a "Prompt cache" card under the thread says "Not kept" and when the cache goes cold. The Token Cost app labels these calls "Cache keep-alive".
 
 Will you answer much later? Then **Turn off for this thread** stops the pings for that thread alone. It sits on the live card and in the waiting panel's Prompt cache section. It also sits in the one popover that the card and the panel each open. It turns back on by itself when the thread runs again, and **Turn back on** undoes it while the cache is still warm. The Lucidos Agent's `threads` tool does the same when you ask it in words.
+
+### Reread cap
+The pings that together cost one reread of a waiting thread's context, at the model's own prices. No *cache keep-alive* run pings past it, since pings past it would cost more than the reread they save. A card's run stops at a cap learned from the cards asked near its hour. It prices every plan: pings run toward the *expected wake* only when they cost at most 80% of one reread. With no expected wake, a run pings to the cap. A run whose wake comes inside the cap is *expected to break even*.
+
+### Expected wake
+When a waiting thread will next wake: the earliest of its event waits and the child threads that report to it. One estimate per turn, for the whole thread, recorded as `WakeExpected`. The agent states it with `expect_wake` or `lucidos expect-wake`. The newest one stands, and the *cache keep-alive* plans its pings from it.
+
+### Expected wake decision
+The background call that fills in an *expected wake* when a turn leaves its thread waiting and the agent stated none. It runs at the turn end beside the read decision, only while the *cache keep-alive* is on, and never for Codex. It reads what the thread waits on, the latest output of running background tasks, the reply, past waits like these, and earlier estimates that passed. Its chat model picks one time bucket; a System One model gives a probability per bucket. A failed call records nothing. Its model is the Expected wake row in Settings → Models (Background tasks).
 
 ### Coding-agent thread
 A *thread* driven by a *coding agent* (Claude Code or Codex) inside an isolated git worktree. Marked by `is_coding_agent = true` on `thread_summaries`. A `SessionStarted` opening an agent session sets it, as does another event on the `claude_code` channel. A *resume boundary* alone never does: `ContinuationStarted` fires on chat and trigger threads too.

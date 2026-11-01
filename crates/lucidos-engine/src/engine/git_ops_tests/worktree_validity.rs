@@ -414,3 +414,95 @@ async fn install_coding_agent_diff_hook_preserves_prior_custom_hooks_path() {
         "reinstall must not chain the Lucidos hook to itself"
     );
 }
+
+/// The worktree-local hooks dir replaces the repo's. It once held only
+/// `post-commit`, so a repo's failing `pre-commit` (a secret scanner) no longer
+/// blocked an agent's commit.
+#[tokio::test]
+async fn install_coding_agent_diff_hook_keeps_the_repos_pre_commit_gate() {
+    let (_tmp, repo) = make_test_repo().await;
+    let wt_base = tempfile::tempdir().unwrap();
+    let wt = wt_base.path().join("thread-pre-commit");
+    let out = worktree_add(&repo, &wt, &["-b", "claude-code/pre-commit"])
+        .await
+        .unwrap();
+    assert!(out.status.success(), "fixture worktree_add failed");
+
+    let pre_commit = repo.join(".git/hooks/pre-commit");
+    tokio::fs::write(
+        &pre_commit,
+        "#!/bin/sh\necho blocked by scanner >&2\nexit 1\n",
+    )
+    .await
+    .unwrap();
+    #[cfg(unix)]
+    make_executable(&pre_commit);
+
+    install_coding_agent_diff_hook(&repo, &wt).await.unwrap();
+
+    tokio::fs::write(wt.join("secret.txt"), "token")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "secret.txt"], &wt).await.unwrap();
+    let agent_env = std::ffi::OsStr::new("agent-thread");
+    let commit = git_cmd_env(
+        &["commit", "-m", "commit from worktree"],
+        &wt,
+        &[("LUCIDOS_THREAD_ID", agent_env)],
+    )
+    .await
+    .unwrap();
+    assert!(
+        !commit.status.success(),
+        "the repo's failing pre-commit must still block an agent's commit"
+    );
+    assert!(
+        String::from_utf8_lossy(&commit.stderr).contains("blocked by scanner"),
+        "stderr: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+
+    // The engine's own auto-commit runs outside a session and never ran the
+    // repo's hooks, so a hook cannot refuse an Apply.
+    let empty_env = std::ffi::OsStr::new("");
+    let commit = git_cmd_env(
+        &["commit", "-m", "engine auto-commit"],
+        &wt,
+        &[("LUCIDOS_THREAD_ID", empty_env)],
+    )
+    .await
+    .unwrap();
+    assert!(
+        commit.status.success(),
+        "commit failed: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+}
+
+/// git expands a leading `~/` in `core.hooksPath` before it runs a hook. Read
+/// raw, the engine forwarded to `<worktree>/~/...`, so the repo's hooks were
+/// skipped with no sign.
+#[tokio::test]
+async fn install_coding_agent_diff_hook_forwards_to_a_home_relative_hooks_path() {
+    let (_tmp, repo) = make_test_repo().await;
+    let out = git_cmd(&["config", "core.hooksPath", "~/.githooks"], &repo)
+        .await
+        .unwrap();
+    assert!(out.status.success(), "fixture git config failed");
+    let wt_base = tempfile::tempdir().unwrap();
+    let wt = wt_base.path().join("thread-home-hooks");
+    let out = worktree_add(&repo, &wt, &["-b", "claude-code/home-hooks"])
+        .await
+        .unwrap();
+    assert!(out.status.success(), "fixture worktree_add failed");
+
+    install_coding_agent_diff_hook(&repo, &wt).await.unwrap();
+
+    let forwarder = std::fs::read_to_string(wt.join(".lucidos/git-hooks/pre-commit")).unwrap();
+    let home = std::env::var("HOME").expect("HOME is set");
+    let target = std::path::Path::new(&home).join(".githooks/pre-commit");
+    assert!(
+        forwarder.contains(&format!("HOOK='{}'", target.display())),
+        "forwarder: {forwarder}"
+    );
+}

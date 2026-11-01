@@ -140,3 +140,20 @@ export async function setupViewMenu(): Promise<() => void> {
     throw err;
   }
 }
+
+/** {@link setupViewMenu} for `startShell`, whose installs return their stop at
+ *  once. A stop that lands before the setup resolves ends it on arrival. */
+export function installViewMenu(): () => void {
+  let stop: (() => void) | null = null;
+  let stopped = false;
+  setupViewMenu()
+    .then((s) => {
+      if (stopped) s();
+      else stop = s;
+    })
+    .catch(() => { /* best-effort: the in-app toggles and shortcuts still work */ });
+  return () => {
+    stopped = true;
+    stop?.();
+  };
+}

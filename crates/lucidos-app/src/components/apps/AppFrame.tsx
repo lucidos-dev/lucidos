@@ -4,6 +4,7 @@ import { useDelayedFlag, useLingeringFlag } from '../../hooks/useDelayedLoading'
 import { setAppFrameHash, splitFrameSrc } from './iframeNav';
 import { APP_FRAME_SANDBOX, APP_FRAME_ALLOW } from './appFrameSandbox';
 import { pushKeybindingsToFrame } from '../../store/actions/app-keybindings';
+import { pushExternalLinksToFrame } from '../../store/actions/app-external-links';
 import { pushAppearanceToFrame } from '../../store/actions/app-appearance';
 import { IframeTabExit } from '../shared/IframeTabExit';
 import { APP_FRAME_READY_EVENT } from '../../store/actions/app-ready-bridge';
@@ -176,6 +177,7 @@ export function AppFrame({ src, reveal, label, onRevealed, onLoad, onUnmount }: 
           probeRef.current?.noteLoad();
           frameLoaded(reload);
           pushKeybindingsToFrame(e.currentTarget as HTMLIFrameElement);
+          pushExternalLinksToFrame(e.currentTarget as HTMLIFrameElement);
           pushAppearanceToFrame(e.currentTarget as HTMLIFrameElement);
           onLoad?.(e.currentTarget as HTMLIFrameElement);
         }}

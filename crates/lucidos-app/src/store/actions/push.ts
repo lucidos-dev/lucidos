@@ -1,4 +1,4 @@
-import { API, json, mutatingFetch, throwIfNotOk } from '../../api/client';
+import { API, json, mutatingFetch, throwIfNotOk, throwIfRefused } from '../../api/client';
 import { showToast, showConfirm } from '../store';
 import { devices, getDeviceId, toggleDevicePush, disablePushForDevices } from './devices';
 import { isTauri, isIOS, isStandalone, isMobileDeviceUserAgent, thisDeviceIsMobile } from '../../utils/platform';
@@ -45,6 +45,8 @@ async function subscribePush(subscription: PushSubscription): Promise<void> {
     }),
   });
   await throwIfNotOk(res);
+  const result = (await res.json()) as { success: boolean; error?: string };
+  throwIfRefused(result, 'the engine refused the push subscription');
 }
 
 /**

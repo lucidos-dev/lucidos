@@ -373,13 +373,13 @@ describe('Debugging row deep links', () => {
     expect(pushNavState).toHaveBeenCalledTimes(1);
   });
 
-  it('lands on the Cache cards row in Settings > Debugging', () => {
+  it('lands on the Cache cards row under Settings > Models > Cache keep-alive', () => {
     // Every cache explainer's link. Without the scroll target the
     // page opens at its top and the row the link names is not marked.
     openCacheCardsSetting();
     expect(activeMenuItem.value).toBe('settings');
-    expect(settingsSubview.value).toBe('debugging');
-    expect(settingsScrollTarget.value).toBe('debugging:cache-cards');
+    expect(settingsSubview.value).toBe('models');
+    expect(settingsScrollTarget.value).toBe('models:cache-cards');
     expect(revealContentPane).toHaveBeenCalledTimes(1);
     expect(pushNavState).toHaveBeenCalledTimes(1);
   });

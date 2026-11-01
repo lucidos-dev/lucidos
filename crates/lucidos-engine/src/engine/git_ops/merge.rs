@@ -996,3 +996,278 @@ async fn read_origin_head_ref(repo_root: &Path) -> Option<String> {
         .strip_prefix("refs/remotes/origin/")
         .map(str::to_string)
 }
+
+/// Free the paths of the Tier-3 temp merge pair a previous attempt left
+/// behind. Apply's slow path calls it before it reuses them. The startup sweep
+/// and the stranded-duty close call it before they null the row's merge
+/// columns, the only pointer at the pair.
+///
+/// The pair may hold a resolver's work: uncommitted changes in the tree, or
+/// commits neither main nor `change_branch` holds. A probe that could not
+/// answer counts as work. Such work is kept on a *kept merge branch* first, so
+/// only the tree is deleted. Every outcome is logged, and `Err` says what still
+/// holds the paths.
+pub(crate) async fn clear_temp_merge_state(
+    repo: &Path,
+    worktree: &Path,
+    temp_branch: &str,
+    change_branch: &str,
+    tag: &str,
+) -> Result<(), String> {
+    // A directory git does not confirm as its own tree resolves to the
+    // enclosing repo, so no git call may run inside it.
+    if worktree.exists() {
+        match worktree_liveness(worktree).await {
+            GitAnswer::Yes => {}
+            GitAnswer::No => return Err(left_in_place(worktree, "it is not a git worktree")),
+            GitAnswer::Unknown => return Err(check_again(worktree)),
+        }
+    }
+    if temp_merge_state_holds_work(repo, worktree, temp_branch, change_branch).await {
+        let stamp = chrono::Utc::now().timestamp_millis();
+        keep_temp_merge_work(repo, worktree, temp_branch, stamp, tag).await?;
+    }
+    if remove_temp_merge_state(repo, &worktree.to_string_lossy(), temp_branch, tag).await {
+        Ok(())
+    } else {
+        Err(format!(
+            "Lucidos could not delete the temp merge pair at {}. Try Apply again.",
+            worktree.display()
+        ))
+    }
+}
+
+/// The refusal for a pair whose work Lucidos cannot keep by itself, so a
+/// retry meets the same state. A refusal after the snapshot is the exception:
+/// the snapshot changed the tree, so its work is staged and maybe committed.
+fn left_in_place(worktree: &Path, why: &str) -> String {
+    format!(
+        "The previous merge attempt at {} may hold work, but {why}. Lucidos left it in place: \
+         move or delete it by hand, then apply again.",
+        worktree.display()
+    )
+}
+
+/// The refusal for a probe that did not answer. Nothing was touched.
+fn check_again(worktree: &Path) -> String {
+    format!(
+        "Lucidos could not check the previous merge attempt at {}. Try Apply again.",
+        worktree.display()
+    )
+}
+
+async fn temp_merge_state_holds_work(
+    repo: &Path,
+    worktree: &Path,
+    temp_branch: &str,
+    change_branch: &str,
+) -> bool {
+    if worktree.exists() && crate::engine::worktree_cleanup::is_worktree_dirty(worktree).await {
+        return true;
+    }
+    let temp_ref = format!("refs/heads/{temp_branch}");
+    let branch_exists = git_answer(&["rev-parse", "--verify", "--quiet", &temp_ref], repo)
+        .await
+        .or_unknown(true);
+    if !branch_exists {
+        return false;
+    }
+    let main = default_local_branch(repo).await;
+    git_answer_when_ok(
+        &[
+            "rev-list",
+            "--count",
+            &temp_ref,
+            "--not",
+            &main,
+            change_branch,
+        ],
+        repo,
+        |o| String::from_utf8_lossy(&o.stdout).trim() != "0",
+    )
+    .await
+    .or_unknown(true)
+}
+
+/// Delete a pair that holds no work: abort the merge, remove the temp
+/// worktree, delete the temp branch. Returns whether both deletions landed.
+/// It removes only the pair `MergeResolutionStarted` recorded, never the
+/// thread's own worktree.
+///
+/// Already gone counts as gone. Most of the time the state IS half-cleared: a
+/// previous pass removed the pair and then died before nulling the columns.
+/// Reading git's refusal to delete a missing thing as a failure would print a
+/// manual-cleanup warning on every boot, for nothing.
+async fn remove_temp_merge_state(
+    repo: &std::path::Path,
+    worktree: &str,
+    temp_branch: &str,
+    tag: &str,
+) -> bool {
+    let _ = git_cmd(&["merge", "--abort"], std::path::Path::new(worktree)).await;
+    let worktree_gone = match git_ran_ok(&["worktree", "remove", "--force", worktree], repo).await {
+        Ok(()) => {
+            log!("{} Removed temp merge worktree {}", tag, worktree);
+            true
+        }
+        // A stat, not a git probe: the directory is either there or it is not.
+        Err(_) if !std::path::Path::new(worktree).exists() => true,
+        Err(e) => {
+            log!(
+                "{} Failed to remove temp merge worktree {}: {}",
+                tag,
+                worktree,
+                e
+            );
+            false
+        }
+    };
+    let branch_gone = match git_ran_ok(&["branch", "-D", temp_branch], repo).await {
+        Ok(()) => {
+            log!("{} Deleted temp merge branch {}", tag, temp_branch);
+            true
+        }
+        Err(e) => {
+            // `or_unknown(true)` keeps an unanswered probe on the "still
+            // there" side, so an unreachable git never buys a claim of
+            // success.
+            let still_there = git_answer(&["rev-parse", "--verify", "--quiet", temp_branch], repo)
+                .await
+                .or_unknown(true);
+            if still_there {
+                log!(
+                    "{} Failed to delete temp merge branch {}: {}",
+                    tag,
+                    temp_branch,
+                    e
+                );
+            }
+            !still_there
+        }
+    };
+    worktree_gone && branch_gone
+}
+
+/// What a kept merge branch carries after the temp branch's name, before a
+/// stamp: `merge-tmp/<id>-kept-<millis>`.
+pub(crate) const KEPT_MERGE_SUFFIX: &str = "-kept-";
+
+/// Keep a pair's work on a kept merge branch. Uncommitted changes become one
+/// commit first, conflict markers included, since this branch never lands.
+/// Then the temp branch is renamed, which frees its name.
+///
+/// Each step leaves a state the next clear finishes. A snapshot leaves the
+/// work committed on the temp branch. A rename leaves a clean tree whose
+/// branch is already kept, so the delete keeps the commits. A tree this cannot
+/// keep whole is refused: one off its temp branch or holding a nested
+/// repository, untouched, or one the snapshot does not clean.
+async fn keep_temp_merge_work(
+    repo: &Path,
+    worktree: &Path,
+    temp_branch: &str,
+    stamp: i64,
+    tag: &str,
+) -> Result<(), String> {
+    let temp_ref = format!("refs/heads/{temp_branch}");
+    if worktree.exists() {
+        // A detached HEAD exits non-zero, which is a no, not a failed probe.
+        let on_temp_branch = git_answer_with(&["symbolic-ref", "-q", "HEAD"], worktree, |o| {
+            String::from_utf8_lossy(&o.stdout).trim() == temp_ref
+        })
+        .await;
+        match on_temp_branch {
+            GitAnswer::Yes => {}
+            GitAnswer::No => {
+                let why = format!("its tree is not on {temp_branch}");
+                return Err(left_in_place(worktree, &why));
+            }
+            GitAnswer::Unknown => return Err(check_again(worktree)),
+        }
+        match holds_nested_repository(worktree).await {
+            GitAnswer::No => {}
+            GitAnswer::Yes => {
+                let why = "it holds a nested git repository, such as an initialised submodule";
+                return Err(left_in_place(worktree, why));
+            }
+            GitAnswer::Unknown => return Err(check_again(worktree)),
+        }
+        if crate::engine::worktree_cleanup::is_worktree_dirty(worktree).await {
+            snapshot_uncommitted_work(worktree).await?;
+        }
+    }
+    let branch_exists = git_answer(&["rev-parse", "--verify", "--quiet", &temp_ref], repo)
+        .await
+        .or_unknown(true);
+    if branch_exists {
+        let kept_branch = format!("{temp_branch}{KEPT_MERGE_SUFFIX}{stamp}");
+        git_ran_ok(&["branch", "-m", temp_branch, &kept_branch], repo)
+            .await
+            .map_err(|e| {
+                format!(
+                    "Lucidos could not rename {temp_branch} to keep its work ({e}). Try Apply again."
+                )
+            })?;
+        log!("{tag} Kept a temp merge pair's work on branch {kept_branch}");
+    }
+    Ok(())
+}
+
+/// Whether `worktree` holds a nested repository: untracked, or a gitlink with
+/// its own `.git`, such as an initialised submodule. A gitlink keeps only a
+/// commit id, so deleting the tree would lose that repository's own work.
+async fn holds_nested_repository(worktree: &Path) -> GitAnswer {
+    // `ls-files --others` lists an untracked nested repository as `dir/`.
+    let untracked = git_answer_when_ok(
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        worktree,
+        |o| o.stdout.split(|b| *b == 0).any(|p| p.ends_with(b"/")),
+    )
+    .await;
+    if untracked != GitAnswer::No {
+        return untracked;
+    }
+    git_answer_when_ok(&["ls-files", "--stage", "-z"], worktree, |o| {
+        o.stdout
+            .split(|b| *b == 0)
+            .filter_map(|entry| {
+                let entry = String::from_utf8_lossy(entry);
+                let (meta, path) = entry.split_once('\t')?;
+                meta.starts_with("160000 ").then(|| path.to_string())
+            })
+            .any(|path| worktree.join(path).join(".git").exists())
+    })
+    .await
+}
+
+/// Commit everything uncommitted in `worktree`. Judged by re-reading the
+/// tree, not by exit codes: `git add -A` exits non-zero after staging all it
+/// could, as `commit_worktree_or_err` documents.
+async fn snapshot_uncommitted_work(worktree: &Path) -> Result<(), String> {
+    let add = git_failure_reason(&["add", "-A"], worktree).await;
+    let message = "Lucidos kept an unfinished merge attempt";
+    let commit = git_failure_reason_env(
+        &["commit", "--no-verify", "-m", message],
+        worktree,
+        &lucidos_identity_env(),
+    )
+    .await;
+    match worktree_dirtiness(worktree).await {
+        GitAnswer::No => Ok(()),
+        GitAnswer::Unknown => Err(check_again(worktree)),
+        GitAnswer::Yes => {
+            let reasons: Vec<String> = [("git add -A", add), ("git commit", commit)]
+                .into_iter()
+                .filter_map(|(step, reason)| reason.map(|r| format!("{step}: {}", r.trim())))
+                .collect();
+            let detail = if reasons.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", reasons.join("; "))
+            };
+            Err(left_in_place(
+                worktree,
+                &format!("a commit did not take all of its work{detail}"),
+            ))
+        }
+    }
+}

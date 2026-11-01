@@ -101,6 +101,8 @@ mod data_mount_test;
 #[path = "api_support/event_wait_test.rs"]
 mod event_wait_test;
 
+#[path = "api_support/expected_wake_test.rs"]
+mod expected_wake_test;
 #[path = "api_support/failed_turn_follow_up_test.rs"]
 mod failed_turn_follow_up_test;
 #[path = "api_support/read_decision_test.rs"]

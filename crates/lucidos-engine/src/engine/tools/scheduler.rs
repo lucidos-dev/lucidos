@@ -204,8 +204,7 @@ impl LucidosEngine {
 
                 // Parse run field: { type: "intent", intent: "..." } or { type: "script", path: "..." }
                 let run: TriggerRun = match args.get("run") {
-                    Some(run_val) if !run_val.is_null() => serde_json::from_value(run_val.clone())
-                        .map_err(|e| format!("Invalid 'run' field: {}. {}", e, RUN_FIELD_SHAPES))?,
+                    Some(run_val) if !run_val.is_null() => parse_run_arg(run_val)?,
                     _ => {
                         // Backward compat: accept prompt_text as a shorthand
                         let prompt_text = args
@@ -420,9 +419,7 @@ impl LucidosEngine {
 
                 let new_name = args.get("name").and_then(|v| v.as_str());
                 let new_run: Option<TriggerRun> = match args.get("run").filter(|v| !v.is_null()) {
-                    Some(v) => Some(serde_json::from_value(v.clone()).map_err(|e| {
-                        format!("Invalid 'run' field: {}. {}", e, RUN_FIELD_SHAPES)
-                    })?),
+                    Some(v) => Some(parse_run_arg(v)?),
                     None => None,
                 };
                 // Subscriptions are sent as a full replacement: None = absent
@@ -911,6 +908,39 @@ impl LucidosEngine {
             _ => Err(format!("Unknown scheduler tool: {}", name).into()),
         }
     }
+}
+
+/// Both checks a `run.type = "script"` path has to pass at the boundary.
+///
+/// The extension check once ran alone, so `"../../evil.sh"` answered 200 with
+/// a cron preview and showed as armed. `scheduler::user_tasks` refuses it at
+/// fire time through the canonical guard, so every fire died instead. This is
+/// the same refusal, made before the trigger exists.
+pub(crate) fn validate_script_path(path: &str) -> Result<(), String> {
+    crate::triggers::validate_script_extension(path)?;
+    if crate::api::is_path_traversal(path) {
+        return Err(format!("Invalid script path: {}", path));
+    }
+    Ok(())
+}
+
+/// [`validate_script_path`] for a parsed `run`, the check every create and
+/// update path shares: the `/api/v1/triggers` routes and the `create_trigger` /
+/// `update_trigger` LLM tools. An intent run has no path to check.
+pub(crate) fn validate_trigger_run(run: &TriggerRun) -> Result<(), String> {
+    match run {
+        TriggerRun::Script { path } => validate_script_path(path),
+        TriggerRun::Intent { .. } => Ok(()),
+    }
+}
+
+/// Parse the tool's `run` argument and refuse a script path the trigger could
+/// never run, before a `TriggerCreated` or `TriggerUpdated` exists.
+pub(crate) fn parse_run_arg(run_val: &serde_json::Value) -> Result<TriggerRun, String> {
+    let run: TriggerRun = serde_json::from_value(run_val.clone())
+        .map_err(|e| format!("Invalid 'run' field: {}. {}", e, RUN_FIELD_SHAPES))?;
+    validate_trigger_run(&run)?;
+    Ok(run)
 }
 
 /// Build human-readable trigger description for create responses.

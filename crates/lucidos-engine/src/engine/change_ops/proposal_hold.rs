@@ -25,9 +25,6 @@ pub(crate) enum PlanFloor {
     Exempt,
     /// The marker satisfies the gate.
     Clear(PlanMarkerKind),
-    /// The plan awaits approval, but everything landing is a plan file. The
-    /// branch records the plan and carries no implementation.
-    PlanOnly,
     /// Neither propose nor apply until the marker satisfies the gate.
     Held(PlanHold),
 }
@@ -39,6 +36,9 @@ pub(crate) enum PlanHold {
     Missing,
     /// A plan is recorded but the user has not approved it.
     AwaitingApproval,
+    /// A plan awaits approval and the branch lands plan files alone. The
+    /// decision is the user's, so the agent is not sent back to ask again.
+    PlanOnlyAwaitingApproval,
     /// A bounded security fix whose work reaches past the files it named.
     OutsideBound,
 }
@@ -62,7 +62,7 @@ impl PlanFloor {
     pub(crate) fn with_landing(self, landing: &[String]) -> Self {
         match self {
             PlanFloor::Held(PlanHold::AwaitingApproval) if lands_plan_files_only(landing) => {
-                PlanFloor::PlanOnly
+                PlanFloor::Held(PlanHold::PlanOnlyAwaitingApproval)
             }
             floor => floor,
         }
@@ -84,7 +84,7 @@ impl PlanHold {
     /// What a refused Apply tells the user.
     pub(crate) fn apply_refusal(self) -> &'static str {
         match self {
-            PlanHold::AwaitingApproval => {
+            PlanHold::AwaitingApproval | PlanHold::PlanOnlyAwaitingApproval => {
                 "The implementation plan on this branch is awaiting approval. The user must \
                  approve the plan, after which the coding agent runs `lucidos planned approve` \
                  to unblock implementation. Approve the plan, then apply."
@@ -106,7 +106,7 @@ impl PlanHold {
     /// What the engine tells a live agent whose turn-end proposal it held.
     pub(crate) fn agent_nudge(self) -> &'static str {
         match self {
-            PlanHold::AwaitingApproval => {
+            PlanHold::AwaitingApproval | PlanHold::PlanOnlyAwaitingApproval => {
                 "Lucidos did not propose this branch's change. Its implementation plan still \
                  awaits the user's approval, so Apply would refuse it. Ask for approval with your \
                  question tool, `Approve` first. Once the user approves, run \
@@ -264,7 +264,7 @@ pub(crate) async fn read_proposal_hold(
     match read_proposal_floor(pool, thread_id, repo_root, branch_name, files).await {
         PlanFloor::Held(hold) => Some(ProposalHold::Plan(hold)),
         PlanFloor::Exempt => None,
-        PlanFloor::Clear(_) | PlanFloor::PlanOnly => {
+        PlanFloor::Clear(_) => {
             if crate::engine::integrated::thread_is_integrated(pool, thread_id).await {
                 let fresh = harden_marker(pool, repo_root, branch_name)
                     .await
@@ -335,10 +335,16 @@ mod tests {
     }
 
     #[test]
-    fn an_unapproved_plan_clears_only_a_branch_that_lands_plan_files_alone() {
+    fn an_unapproved_plan_only_branch_is_held_as_a_plan_only_hold() {
         let waiting = PlanFloor::Held(PlanHold::AwaitingApproval);
         let plan = vec!["docs/plans/2026-10-09-x.md".to_string()];
-        assert_eq!(waiting.with_landing(&plan), PlanFloor::PlanOnly);
+        let plan_only = PlanFloor::Held(PlanHold::PlanOnlyAwaitingApproval);
+        assert_eq!(waiting.with_landing(&plan), plan_only);
+        assert_eq!(
+            plan_only.with_landing(&plan),
+            plan_only,
+            "re-judging a plan-only hold keeps it"
+        );
         let mixed = vec![plan[0].clone(), "src/main.rs".to_string()];
         assert_eq!(waiting.with_landing(&mixed), waiting);
         assert_eq!(
@@ -438,7 +444,10 @@ mod tests {
             let repo = repo.path().to_path_buf();
             async move { read_proposal_floor(&pool, lucidos_thread, &repo, "work", &files).await }
         };
-        assert_eq!(propose(&["docs/plans/x.md"]).await, PlanFloor::PlanOnly);
+        assert_eq!(
+            propose(&["docs/plans/x.md"]).await,
+            PlanFloor::Held(PlanHold::PlanOnlyAwaitingApproval)
+        );
         assert_eq!(
             propose(&["docs/plans/x.md", "src/main.rs"]).await,
             PlanFloor::Held(PlanHold::AwaitingApproval)
@@ -542,6 +551,16 @@ mod tests {
         assert!(
             outside.contains("lucidos planned mark --security-fix"),
             "{outside}"
+        );
+    }
+
+    /// A plan-only hold is the user's decision. Apply refuses it like any
+    /// waiting plan, with the same wire reason.
+    #[test]
+    fn a_plan_only_hold_refuses_apply_like_a_waiting_plan() {
+        assert_eq!(
+            PlanHold::PlanOnlyAwaitingApproval.apply_refusal(),
+            PlanHold::AwaitingApproval.apply_refusal()
         );
     }
 }

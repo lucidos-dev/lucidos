@@ -13,12 +13,17 @@ import {
 import { currentModel, preferences, threadMap } from './store';
 import type { StoredEvent } from './thread-events';
 import type { ThreadState } from './thread-events';
+import type { PairStamp } from '../api/threads';
 
 /** Minimal ThreadState carrying only the events the resolvers read. */
-function seedThread(id: string, events: Array<[number, Partial<StoredEvent>]>): void {
+function seedThread(
+  id: string,
+  events: Array<[number, Partial<StoredEvent>]>,
+  pairStamps?: PairStamp[],
+): void {
   const map = new Map<number, StoredEvent>(events.map(([seq, e]) => [seq, e as StoredEvent]));
   const next = new Map(threadMap.value);
-  next.set(id, { events: map } as unknown as ThreadState);
+  next.set(id, { events: map, pairStamps } as unknown as ThreadState);
   threadMap.value = next;
 }
 
@@ -171,5 +176,42 @@ describe('resolveActiveThreadProvider: a backend is remembered with its model', 
     expect(resolveActiveThreadProvider('t-1', 'opus')).toBe('anthropic');
     // Another thread never sees it.
     expect(resolveActiveThreadProvider('t-2', 'opus')).toBeNull();
+  });
+});
+
+describe('a paged thread reads its pair from the server stamps', () => {
+  const stamp = (sequence: number, model: string, reasoning_effort = '', provider = ''): PairStamp => ({
+    sequence,
+    model,
+    reasoning_effort,
+    provider,
+  });
+
+  it('a stamp older than every loaded event decides the pair, not the account default', () => {
+    seedThread(
+      't-1',
+      [[900, { type: 'ResponseGenerated' }]],
+      [stamp(5, 'stamped-model', 'high', 'vertex')],
+    );
+    expect(resolveActiveThreadModel('t-1')).toBe('stamped-model');
+    expect(resolveActiveThreadReasoningEffort('t-1', 'stamped-model')).toBe('high');
+    expect(resolveActiveThreadProvider('t-1', 'stamped-model')).toBe('vertex');
+  });
+
+  it("each model keeps its own tier when both reach the stamps", () => {
+    seedThread('t-1', [], [stamp(3, 'model-a', 'low'), stamp(8, 'model-b', 'max')]);
+    expect(resolveActiveThreadModel('t-1')).toBe('model-b');
+    expect(resolveActiveThreadReasoningEffort('t-1', 'model-b')).toBe('max');
+    expect(resolveActiveThreadReasoningEffort('t-1', 'model-a')).toBe('low');
+  });
+
+  it('a live pick newer than the snapshot wins over every stamp', () => {
+    seedThread(
+      't-1',
+      [[40, { type: 'ChatSettingsChanged', model: 'picked-model', reasoning_effort: 'low' }]],
+      [stamp(5, 'stamped-model', 'high')],
+    );
+    expect(resolveActiveThreadModel('t-1')).toBe('picked-model');
+    expect(resolveActiveThreadReasoningEffort('t-1', 'picked-model')).toBe('low');
   });
 });

@@ -1639,7 +1639,7 @@ html[data-theme-mode="dark"] .thread-status-question-badge::after {
     padding: calc(var(--transcript-end-reserve) - var(--turn-feed-pad-y)) var(--turn-body-inset) 0 0;
 }
 
-/* A thin meter of the pings spent against the break-even budget. The card,
+/* A thin meter of the pings spent against the reread cap. The card,
    the waiting panel and the explainer draw the same one. */
 .keep-alive-meter {
     margin-top: var(--space-sm);

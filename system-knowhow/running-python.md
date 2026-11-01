@@ -224,6 +224,8 @@ Each yes is remembered for that exact line, so the same server never asks twice.
 
 The guard is deliberately narrow. These all run with no prompt: reads anywhere on the machine (outside the workspace too, by design), a plain `curl https://…` GET, writes under `data/`, and redirects to `/dev/null`. Pure-compute Python that installs no packages runs unprompted too. An in-workspace *deletion* also runs unprompted, with the Undo above. The judge asks only when it can't tell a command is safe. The guard is off by default, so most workspaces never see it.
 
+**With the judge turned off, the static pass decides alone, and it asks more often.** A command it cannot see through asks the user, and on a trigger it needs the `other` grant. That covers a command substitution (`$(…)`), a path-qualified head (`data/bin/tool`) and a code-injecting `VAR=` preamble. It also covers Python that installs packages, shells out, or uses a network or mail library. A head it simply does not know (`cargo build`) still runs. An in-workspace deletion keeps the Undo lane, unless the same command holds one of those shapes.
+
 ## The per-workspace venv
 
 Lucidos provisions one Python venv per workspace at `.lucidos/runtime/python/venv/`. The `run_python*` tools run scripts inside it automatically. Don't activate it, reference it, or reach for `subprocess.run(["python", ...])`. Pass plain Python as the `code` arg.

@@ -35,7 +35,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
-use super::{git_answer, git_cmd, git_cmd_env};
+use super::{git_answer, git_cmd, git_cmd_env, lucidos_identity_env};
 
 /// How long a checkpoint ref pair is kept before [`prune_expired_checkpoints`]
 /// reclaims it. The pair backs the card's diff viewer, so it has to outlive the
@@ -96,16 +96,9 @@ fn ok_stdout(out: std::process::Output, what: &str) -> Result<String, String> {
 async fn snapshot_onto_ref(repo_root: &Path, ref_name: &str, message: &str) -> Result<(), String> {
     let index = TempIndex::new()?;
     let tmp_index = index.path();
-    // A committer identity is forced via env so `commit-tree` works even when
-    // the workspace repo has no user.name/email in its config (the engine
-    // commits artifacts through git2 with a per-commit signature, not config).
-    let envs: &[(&str, &OsStr)] = &[
-        ("GIT_INDEX_FILE", tmp_index.as_os_str()),
-        ("GIT_AUTHOR_NAME", OsStr::new("Lucidos")),
-        ("GIT_AUTHOR_EMAIL", OsStr::new("lucidos@localhost")),
-        ("GIT_COMMITTER_NAME", OsStr::new("Lucidos")),
-        ("GIT_COMMITTER_EMAIL", OsStr::new("lucidos@localhost")),
-    ];
+    let mut env = vec![("GIT_INDEX_FILE", tmp_index.as_os_str())];
+    env.extend(lucidos_identity_env());
+    let envs: &[(&str, &OsStr)] = &env;
 
     async {
         // Stage the whole working tree (respecting .gitignore) into the empty

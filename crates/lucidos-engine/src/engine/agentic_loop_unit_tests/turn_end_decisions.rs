@@ -21,6 +21,10 @@ mod turn_end_decisions_tests {
             call("request_read"),
             call("wake_parent")
         ]));
+        assert!(calls_only_turn_end_decisions(&[
+            call("expect_wake"),
+            call("request_read")
+        ]));
         assert!(!calls_only_turn_end_decisions(&[
             call("wake_parent"),
             call("write_file")

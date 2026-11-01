@@ -23,6 +23,39 @@ async fn spawn_driver_checking(
     session_context: SessionContextDue,
     startup_follow_up: Option<StartupFollowUp>,
 ) -> (RunningAgent, CancellationToken) {
+    spawn_driver_full(
+        program,
+        args,
+        session_context,
+        NotesReminderDue::default(),
+        startup_follow_up,
+    )
+    .await
+}
+
+/// [`spawn_driver_owing`] for a session that owes a notes reminder.
+async fn spawn_driver_owing_notes(
+    program: &str,
+    args: &[&str],
+    notes_reminder: NotesReminderDue,
+) -> (RunningAgent, CancellationToken) {
+    spawn_driver_full(
+        program,
+        args,
+        SessionContextDue::default(),
+        notes_reminder,
+        None,
+    )
+    .await
+}
+
+async fn spawn_driver_full(
+    program: &str,
+    args: &[&str],
+    session_context: SessionContextDue,
+    notes_reminder: NotesReminderDue,
+    startup_follow_up: Option<StartupFollowUp>,
+) -> (RunningAgent, CancellationToken) {
     let mut child = tokio::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::piped())
@@ -50,6 +83,7 @@ async fn spawn_driver_checking(
         cancel.clone(),
         None,
         session_context,
+        notes_reminder,
         CcStreamState::default(),
         startup_follow_up,
     ));
@@ -188,6 +222,68 @@ async fn only_the_first_input_carries_the_owed_session_context() {
     );
 }
 
+fn input_text(text: &str) -> AgentInput {
+    AgentInput {
+        text: text.to_string(),
+        images: Vec::new(),
+        uuid: uuid::Uuid::new_v4(),
+    }
+}
+
+fn written_texts(out: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(out)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            v["message"]["content"].as_str().unwrap().to_string()
+        })
+        .collect()
+}
+
+/// The first note that arrives promotes the session. Two inputs after it
+/// carry the reminder once, on the first that takes a prefix.
+#[tokio::test]
+async fn a_note_that_arrives_is_announced_to_the_agent_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("stdin.jsonl");
+    let note = serde_json::json!({
+        "type": "assistant",
+        "message": {
+            "model": "claude-opus-5-5",
+            "content": [{"type": "thinking", "thinking": "Found it.", "signature": "s"}],
+        },
+    });
+    let ping = r#"{"type":"stream_event","event":{"type":"content_block_stop"}}"#;
+    let script = format!(
+        "printf '%s\\n%s\\n' '{note}' '{ping}'; head -n 3 > '{}'",
+        out.display()
+    );
+    let (mut agent, _cancel) =
+        spawn_driver_owing_notes("sh", &["-c", &script], NotesReminderDue::default()).await;
+    // The ping follows the note, so its event proves the note was parsed.
+    while !matches!(
+        agent.events_rx.recv().await,
+        Some(AgentEvent::StreamActivity)
+    ) {}
+    for text in ["/cost", "first", "second"] {
+        agent.input_tx.send(input_text(text)).unwrap();
+    }
+    output_ended_then_exited(&mut agent.events_rx, std::time::Duration::from_secs(5)).await;
+
+    assert_eq!(
+        written_texts(&out),
+        [
+            "/cost".to_string(),
+            format!(
+                "{}\n\nfirst",
+                crate::engine::agent_session::NOTES_NOW_SHOWN_REMINDER
+            ),
+            "second".to_string(),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn driver_task_cancellation_terminates_process() {
     // Spawn a long-running sleep — driver must kill it when cancel fires.
@@ -267,6 +363,7 @@ async fn driver_task_flags_stray_signal_kill() {
         cancel,
         None,
         SessionContextDue::default(),
+        NotesReminderDue::default(),
         CcStreamState::default(),
         None,
     ));
@@ -1284,7 +1381,12 @@ async fn lines_forwarded_after_the_child_exits_still_settle_the_startup_follow_u
         r#"{"type":"system","subtype":"init","session_id":"sess-drained"}"#,
         r#"{"type":"result","result":"done","duration_ms":1}"#,
     ] {
-        let events = route_stdout_line(&mut state, &mut pending, line);
+        let events = route_stdout_line(
+            &mut state,
+            &mut pending,
+            &mut NotesReminderDue::default(),
+            line,
+        );
         assert!(forward_stdout_events(
             events,
             &mut session_id,

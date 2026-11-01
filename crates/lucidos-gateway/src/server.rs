@@ -3784,29 +3784,39 @@ fn engine_loopback_from_env(value: Option<&str>) -> bool {
 /// the launcher's poll must not be held back by a tailnet that has not come up.
 /// The degraded reachability is reported alongside, in `pending_binds`, so it
 /// is inspectable without reading the log.
-async fn gateway_health(State(state): State<GatewayState>) -> axum::Json<serde_json::Value> {
-    let count = state.inner.routes.read().map(|r| r.len()).unwrap_or(0);
-    let pending: Vec<String> = state
-        .inner
-        .pending_binds
-        .read()
-        .map(|p| p.iter().map(|a| a.to_string()).collect())
-        .unwrap_or_default();
-    // Public, so only what any TLS handshake shows: no expiry, no error.
+///
+/// The route is public, and a wide bind answers anyone on the network. So the
+/// release, the workspace count and `pending_binds` go only to a credentialed
+/// caller. A stranger gets what a peer probe needs to identify this gateway.
+async fn gateway_health(
+    State(state): State<GatewayState>,
+    headers: axum::http::HeaderMap,
+) -> axum::Json<serde_json::Value> {
+    // Only what any TLS handshake shows: no expiry, no error.
     let tls = state.certs().state();
-    axum::Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "status": "ok",
         "role": crate::peers::GATEWAY_ROLE,
-        "release": crate::LUCIDOS_RELEASE,
         "instance_id": instance_id(),
         "gateway_protocol": crate::gateway_protocol::GATEWAY_PROTOCOL,
-        "workspaces": count,
-        "pending_binds": pending,
         "tls": {
             "source": tls.source,
             "https_origin": tls.https_origin(state.gateway_port()),
         },
-    }))
+    });
+    if state.authorize(&headers) != auth::Authorization::Unauthorized {
+        let count = state.inner.routes.read().map(|r| r.len()).unwrap_or(0);
+        let pending: Vec<String> = state
+            .inner
+            .pending_binds
+            .read()
+            .map(|p| p.iter().map(|a| a.to_string()).collect())
+            .unwrap_or_default();
+        body["release"] = crate::LUCIDOS_RELEASE.into();
+        body["workspaces"] = count.into();
+        body["pending_binds"] = pending.into();
+    }
+    axum::Json(body)
 }
 
 /// A random id for this gateway process, new on every boot.
@@ -3839,8 +3849,10 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
     let path = req.uri().path().to_string();
 
     if path == "/" {
-        // Exactly one workspace drops the user straight in.
-        if let Some(slug) = state.sole_workspace() {
+        // Exactly one workspace drops the user straight in. `/` is public, so
+        // only a credentialed caller learns the slug that redirect names.
+        let credentialed = state.authorize(req.headers()) != auth::Authorization::Unauthorized;
+        if let Some(slug) = state.sole_workspace().filter(|_| credentialed) {
             return redirect(&format!("/{slug}/"));
         }
         return serve_picker_shell(&state, None);
@@ -3930,6 +3942,13 @@ pub(crate) async fn serve_workspace(
             // on API, SSE, asset or service-worker traffic from an open tab.
             // Otherwise the picker's Stop shuts the engine down only for the
             // stopped app to resurrect it.
+            //
+            // `auth_api::enforce` lets an app asset past with no credential.
+            // So a stopped and an unknown workspace answer it alike, naming no
+            // slug, or a stranger could probe which slugs exist.
+            if crate::auth_api::is_public_app_asset(&path) {
+                return (StatusCode::NOT_FOUND, "no such workspace").into_response();
+            }
             let registered = state.inner.registry.lock().unwrap().contains(slug);
             if registered {
                 if rest == "manifest.json" {
@@ -3941,13 +3960,12 @@ pub(crate) async fn serve_workspace(
                 if navigation == Navigation::Frame {
                     return proxy::frame_starting_page();
                 }
-                // Never for an app asset or a frame-capability URL, whatever
-                // either claims to accept. `auth_api::enforce` lets both past
-                // the device gate. So an unpaired caller could otherwise send
-                // one `Accept: text/html` and start the engine the picker's
-                // Stop just shut down.
+                // Never for a frame-capability URL, whatever it claims to
+                // accept. `auth_api::enforce` lets one past the device gate.
+                // So an unpaired caller could otherwise send one
+                // `Accept: text/html` and start the engine the picker's Stop
+                // just shut down.
                 if navigation == Navigation::Document
-                    && !crate::auth_api::is_public_app_asset(&path)
                     && !crate::auth_api::path_carries_frame_capability(&path)
                 {
                     // Kick the lazy-start in the background and return the boot
@@ -4755,6 +4773,10 @@ fn raise_fd_limit() {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "unauth_disclosure_tests.rs"]
+mod unauth_disclosure_tests;
 
 #[cfg(test)]
 mod tests {
@@ -6896,16 +6918,19 @@ mod tests {
             .header(header::ACCEPT, "text/html")
             .body(axum::body::Body::empty())
             .unwrap();
-        let response = gateway_router(state).oneshot(request).await.unwrap();
+        let response = gateway_router(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
 
-        // The header is the proof, not the status: `proxy::starting_page` is a
-        // 503 too, so the code alone cannot tell the two branches apart. Only
-        // the lazy-start branch stamps the boot splash.
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // The same answer as an unknown workspace (`unauth_disclosure_tests`).
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(
             response.headers().get("x-lucidos-boot-splash").is_none(),
-            "an exempt path must answer 'stopped', never the starting page"
+            "an exempt path must never answer with the starting page"
         );
+        tokio::task::yield_now().await;
+        assert!(state.inner.starting.lock().await.is_empty());
     }
 
     #[tokio::test]

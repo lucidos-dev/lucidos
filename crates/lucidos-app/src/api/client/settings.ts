@@ -160,7 +160,7 @@ export function setNetworkConfig(body: { engine_bind: string }): Promise<ApiResu
 }
 
 /** The MagicDNS name and this workspace's verified HTTPS URL (Settings →
- *  Access → Connect URLs). Separate from `getNetworkConfig` because it probes:
+ *  Access → Other addresses). Separate from `getNetworkConfig` because it probes:
  *  a reverse lookup and a round trip through the tailnet, which the bind editor
  *  must not pay for. */
 export function getTailnetStatus(): Promise<TailnetStatusResponse> {
@@ -367,7 +367,7 @@ export type HandOverOutcome = 'moved' | 'already-done' | 'no-such-device';
  * the one request whose subject is a change of identity, and `localStorage`
  * still holds the OLD id here by design: nothing is written until the row has
  * moved. `fetchWithDefaults` would therefore claim the identity being left.
- * The engine refuses that (`foreign_hand_over` in `api/settings.rs`) whenever
+ * The engine refuses that (`claims_another_device` in `api/settings.rs`) whenever
  * the gateway is not the one asserting the header. Behind an up-to-date
  * gateway this value is replaced by the authenticated id, which is the same
  * id. `docs/plans/2026-08-22-device-hand-over-must-not-need-a-fresh-gateway.md`

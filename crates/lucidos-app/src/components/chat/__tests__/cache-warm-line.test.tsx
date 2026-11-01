@@ -14,7 +14,7 @@ import { makeThreadState } from '../../../store/actions/threads-test-helpers';
 import type { ThreadState } from '../../../store/thread-events';
 import { applySummaryVersion } from '../../../store/thread-events/thread-meta';
 import { currentCacheCards } from '../../../store/actions/preferences';
-import type { CacheWarmth } from '../../../api/client/successor';
+import type { CacheWarmth, WarmthTtl } from '../../../api/client/successor';
 import { handleEvent, type ThreadEvent } from '../../../store/thread-events';
 import { formatShortTime } from '../../../utils/formatTime';
 import { cacheWarmLineEligible, CacheWarmLine } from '../CacheKeepAlive';
@@ -39,16 +39,18 @@ const NOW = Date.parse('2026-10-19T10:00:00Z');
 /** An idle thread with no card parked on it: nothing keeps its cache warm. */
 const NOTHING_PENDING: CacheKeepAliveStatus = { state: 'not_kept', reason: 'nothing_pending' };
 
-const warm = (remaining_secs: number, keep_alive: CacheKeepAliveStatus = NOTHING_PENDING): CacheWarmth => ({
+const warm = (remaining_secs: number, keep_alive: CacheKeepAliveStatus = NOTHING_PENDING, ttl: WarmthTtl | null = null): CacheWarmth => ({
   warmth: 'warm',
   remaining_secs,
   keep_alive,
+  ttl,
 });
-const COLD: CacheWarmth = { warmth: 'cold', remaining_secs: null, keep_alive: null };
+const COLD: CacheWarmth = { warmth: 'cold', remaining_secs: null, keep_alive: null, ttl: null };
 const unknown = (keep_alive: CacheKeepAliveStatus = NOTHING_PENDING): CacheWarmth => ({
   warmth: 'unknown',
   remaining_secs: null,
   keep_alive,
+  ttl: null,
 });
 
 const kept: CacheKeepAliveStatus = {
@@ -122,6 +124,15 @@ describe('the cache-warm card', () => {
     expect(host.querySelector('.event-row-state')?.textContent).toBe('Not kept');
     expect(detailOf(host)).toBe(warmUntil(240));
     expect(root()?.getAttribute('data-state')).toBe('not_kept');
+  });
+
+  it('names the lifetime it counts from, and what says so', async () => {
+    fetchCacheWarmth.mockResolvedValue(warm(240, NOTHING_PENDING, { lifetime: '5m', evidence: 'reported' }));
+    const host = await mount(threadWith('idle'));
+    expect(detailOf(host)).toBe(`${warmUntil(240)}, on the 5-minute lifetime the provider reported`);
+    fetchCacheWarmth.mockResolvedValue(warm(240, NOTHING_PENDING, { lifetime: '1h', evidence: 'requested' }));
+    const next = await mount(threadWith('idle'));
+    expect(detailOf(next)).toBe(`${warmUntil(240)}, on the 1-hour lifetime the request asked for`);
   });
 
   it('says the lifetime is unknown when no evidence gives it, and keeps drawing', async () => {
@@ -338,6 +349,7 @@ describe('the cache-warm card on a thread nothing keeps warm', () => {
     ['model_changed', 'The model or reasoning effort changed, so this cache cannot be kept warm.'],
     ['beat_missed', 'A ping missed the cache, so this wait is not kept warm.'],
     ['past_give_up_time', 'The wait passed its give-up time before the first ping was due, so no ping went out.'],
+    ['wake_past_reread_cap', 'The wake is expected too late for pings to cost clearly less than rereading the cache, so none go out.'],
     ['nothing_pending', 'This thread waits only for your next message. Lucidos keeps a cache warm while a thread waits on a sub-thread, an event or a card.'],
   ] as const;
 
@@ -357,59 +369,51 @@ describe('the cache-warm card on a thread nothing keeps warm', () => {
     expect(text).toContain(`Pings to this model's provider kept missing the cache, so they pause until ${formatShortTime(new Date(until))}.`);
   });
 
-  const settingCannotApply = ['codex', 'uncacheable_provider', 'provider_paused', 'prefill_paused', 'pings_paused'] as const;
+  it('links the keep-alive switch when it is off', async () => {
+    fetchCacheWarmth.mockResolvedValue(warm(240, { state: 'not_kept', reason: 'off' }));
+    const text = await openExplainer(await mount(threadWith('idle')));
+    expect(text).toContain('Turn it on in');
+    expect(text).not.toContain('Hide cache cards in');
+    await clickLink('Settings → Models → Cache keep-alive');
+    expect(menu.openCacheKeepAliveSetting).toHaveBeenCalledTimes(1);
+    expect(menu.openCacheCardsSetting).not.toHaveBeenCalled();
+  });
 
-  it.each(reasons.filter(([reason]) => !(settingCannotApply as readonly string[]).includes(reason)))(
-    'links the keep-alive setting for %s',
+  it.each(reasons.filter(([reason]) => reason !== 'off'))(
+    'links the cache cards switch, nested under the keep-alive, for %s',
     async (reason) => {
       fetchCacheWarmth.mockResolvedValue(warm(240, { state: 'not_kept', reason }));
-      await openExplainer(await mount(threadWith('idle')));
+      const text = await openExplainer(await mount(threadWith('idle')));
+      expect(text).toContain('Hide cache cards in');
+      expect(text).not.toContain('Turn it on in');
       await clickLink('Settings → Models → Cache keep-alive');
-      expect(menu.openCacheKeepAliveSetting).toHaveBeenCalledTimes(1);
+      expect(menu.openCacheCardsSetting).toHaveBeenCalledTimes(1);
+      expect(menu.openCacheKeepAliveSetting).not.toHaveBeenCalled();
     },
   );
 
-  it.each(settingCannotApply)('drops the keep-alive sentence and link for %s', async (reason) => {
-    fetchCacheWarmth.mockResolvedValue(warm(240, { state: 'not_kept', reason }));
-    const text = await openExplainer(await mount(threadWith('idle')));
-    expect(text).not.toContain('Settings → Models');
-    expect(text).not.toContain('Set up the keep-alive in');
-    expect(text).toContain('Hide cache cards in');
-  });
-
-  it.each(reasons)('links the setting that hides the line for %s', async (reason) => {
-    fetchCacheWarmth.mockResolvedValue(warm(240, { state: 'not_kept', reason }));
-    await openExplainer(await mount(threadWith('idle')));
-    await clickLink('Settings → System → Debugging');
-    expect(menu.openCacheCardsSetting).toHaveBeenCalledTimes(1);
-  });
-
-  it('always links the setting that hides the cache cards', async () => {
+  it('links the cache cards switch while the cache is kept warm', async () => {
     fetchCacheWarmth.mockResolvedValue(warm(240));
     await openExplainer(await mount(threadWith('idle')));
-    await clickLink('Settings → System → Debugging');
+    await clickLink('Settings → Models → Cache keep-alive');
     expect(menu.openCacheCardsSetting).toHaveBeenCalledTimes(1);
   });
 });
 
-describe('the cache-warm card settings links', () => {
-  const cases: [string, CacheKeepAliveStatus, number][] = [
-    ['off', { state: 'not_kept', reason: 'off' }, 2],
-    ['codex', { state: 'not_kept', reason: 'codex' }, 1],
-    ['uncacheable_provider', { state: 'not_kept', reason: 'uncacheable_provider' }, 1],
-    ['provider_paused', { state: 'not_kept', reason: 'provider_paused' }, 1],
-    ['prefill_paused', { state: 'not_kept', reason: 'prefill_paused' }, 1],
-    ['restarted', { state: 'not_kept', reason: 'restarted' }, 2],
-    ['past_give_up_time', { state: 'not_kept', reason: 'past_give_up_time' }, 2],
-    ['nothing_pending', NOTHING_PENDING, 2],
+describe('the cache-warm card settings link', () => {
+  const cases: [string, CacheKeepAliveStatus][] = [
+    ['off', { state: 'not_kept', reason: 'off' }],
+    ['codex', { state: 'not_kept', reason: 'codex' }],
+    ['restarted', { state: 'not_kept', reason: 'restarted' }],
+    ['past_give_up_time', { state: 'not_kept', reason: 'past_give_up_time' }],
+    ['nothing_pending', NOTHING_PENDING],
   ];
 
-  it.each(cases)('gives each link its own paragraph with no stray period for %s', async (_name, keepAlive, linkCount) => {
+  it.each(cases)('draws one link in its own paragraph with no stray period for %s', async (_name, keepAlive) => {
     fetchCacheWarmth.mockResolvedValue(warm(240, keepAlive));
     await openExplainer(await mount(threadWith('idle')));
     const links = Array.from(popover()?.querySelectorAll('button.accent-link') ?? []);
-    expect(links.length).toBe(linkCount);
-    expect(new Set(links.map((link) => link.closest('p'))).size).toBe(linkCount);
+    expect(links.length).toBe(1);
     for (const link of links) {
       expect(link.nextSibling).toBeNull();
       expect(link.parentElement?.textContent?.trimEnd().endsWith('.')).toBe(false);
@@ -418,12 +422,6 @@ describe('the cache-warm card settings links', () => {
     for (let node = walker.nextNode(); node; node = walker.nextNode()) {
       expect((node.textContent ?? '').trim().startsWith('.')).toBe(false);
     }
-  });
-
-  it('words the give-up setting for a wait that passed its give-up time', async () => {
-    fetchCacheWarmth.mockResolvedValue(warm(240, { state: 'not_kept', reason: 'past_give_up_time' }));
-    const text = await openExplainer(await mount(threadWith('idle')));
-    expect(text).toContain('Change when it gives up in');
   });
 });
 

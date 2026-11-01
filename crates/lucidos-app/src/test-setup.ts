@@ -1,4 +1,4 @@
-import { afterAll } from 'vitest';
+import { afterAll, beforeAll, expect } from 'vitest';
 
 // Browser globals needed by store modules that access localStorage/matchMedia/document at load time.
 // These are minimal stubs — just enough to let modules initialize without jsdom.
@@ -218,3 +218,16 @@ if (typeof (globalThis as any).requestAnimationFrame === 'function') {
     return new Promise<void>(resolve => realSetTimeout(resolve, 40));
   });
 }
+
+// The app loads the markdown engine after first paint (`utils/renderMarkdown.ts`).
+// Tests render markdown synchronously, so each file gets it up front. It loads
+// in `beforeAll`, after the file's own `vi.mock` calls, so their mocks apply.
+// The SDK package's tests draw no host markdown, and mock what it imports.
+beforeAll(async () => {
+  if (expect.getState().testPath?.includes('/packages/lucidos-sdk/')) return;
+  const [{ provideMarkdownEngine }, engine] = await Promise.all([
+    import('./utils/renderMarkdown'),
+    import('./utils/markdownEngine'),
+  ]);
+  provideMarkdownEngine(engine);
+});

@@ -95,6 +95,27 @@ describe('installRow', () => {
     expect(text).toContain('com.lucidos.gateway.default');
   });
 
+  // Removal steps are noise unless the install shares a port with another.
+  it('says how to remove it only when its port is contended', () => {
+    expect(vnodeToText(installRow(record()))).not.toContain('To remove');
+
+    const text = vnodeToText(installRow(record(), false, true));
+    expect(text).toContain('To remove');
+    expect(text).toContain('Uninstall Lucidos from the Lucidos menu');
+  });
+
+  // Only a shell command is worth copying. Steps to follow are plain prose.
+  it('offers Copy only for a removal that is a shell command', () => {
+    expect(vnodeToText(installRow(record(), false, true))).not.toContain('Copy');
+
+    const command = 'curl -fsSL https://example.com/install.sh | sh -s -- --uninstall';
+    const text = vnodeToText(
+      installRow(record({ kind: 'headless-installer', removal: command }), false, true),
+    );
+    expect(text).toContain(`<code>${command}</code>`);
+    expect(text).toContain('Copy');
+  });
+
   // The placeholder is the same markup, so it cannot drift from the row. It
   // must not render an install's fields, having none.
   it('draws a placeholder from its own markup', () => {

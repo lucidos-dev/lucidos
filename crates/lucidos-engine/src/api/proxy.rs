@@ -2061,15 +2061,13 @@ async fn follow_redirects(
         let target = resolve_redirect_location(&final_url, &location).ok_or_else(|| {
             (
                 StatusCode::BAD_GATEWAY,
-                format!("proxy '{name}' upstream returned redirect with unparseable Location: {location}"),
+                format!("proxy '{name}' upstream returned redirect with unparseable Location"),
             )
         })?;
         let target_origin = origin_of(target.as_str()).ok_or_else(|| {
             (
                 StatusCode::BAD_GATEWAY,
-                format!(
-                    "proxy '{name}' upstream redirected to a Location with no host: {location}"
-                ),
+                format!("proxy '{name}' upstream redirected to a Location with no host"),
             )
         })?;
         if target_origin != initial_origin {

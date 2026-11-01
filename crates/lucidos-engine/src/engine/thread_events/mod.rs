@@ -15,6 +15,7 @@ mod dashboard;
 mod emit;
 mod event;
 mod event_impl;
+mod expected_wake;
 mod form_request;
 mod keep_alive_status;
 mod mcp;
@@ -39,8 +40,11 @@ pub use event::ThreadEvent;
 pub use event_impl::{
     not_a_keep_alive_idle_sql, KEEP_ALIVE_ENDING_EVENT_TYPES, KEEP_ALIVE_IDLE_REASON,
 };
+pub use expected_wake::{PlannedWake, WakeBucket, WakeSource};
 pub use form_request::FormRequestOutcome;
-pub use keep_alive_status::{CacheKeepAliveNotKeptReason, CacheKeepAliveStatus, CapOdds};
+pub use keep_alive_status::{
+    CacheKeepAliveNotKeptReason, CacheKeepAliveStatus, CapOdds, CapSource,
+};
 pub use mcp::McpEnablementSource;
 pub use memory::RecalledMemory;
 pub use meta::EventMeta;

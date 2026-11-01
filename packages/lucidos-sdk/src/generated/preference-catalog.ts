@@ -201,6 +201,21 @@ export const PREF_REASONING_WAKE_DECISION = {
   fallback: "none",
 } as const;
 
+export const PREF_MODEL_EXPECTED_WAKE_DECISION = {
+  key: "model_expected_wake_decision",
+  scope: "global",
+  type: "text",
+  fallback: "claude-haiku-5-5",
+} as const;
+
+export const PREF_REASONING_EXPECTED_WAKE_DECISION = {
+  key: "reasoning_expected_wake_decision",
+  scope: "global",
+  type: "enum",
+  values: ["none", "low", "medium", "high", "xhigh", "max"],
+  fallback: "none",
+} as const;
+
 export const PREF_MODEL_MEMORY = {
   key: "model_memory",
   scope: "global",
@@ -519,7 +534,7 @@ export const PREF_CACHE_KEEP_ALIVE_MODE = {
   key: "cache_keep_alive_mode",
   scope: "global",
   type: "enum",
-  values: ["break-even", "workspace-data", "off"],
+  values: ["on", "off"],
   fallback: "off",
 } as const;
 
@@ -747,6 +762,13 @@ export const PREF_JUDGMENT_WAKE_DECISION = {
   fallback: null,
 } as const;
 
+export const PREF_JUDGMENT_EXPECTED_WAKE_DECISION = {
+  key: "judgment_expected_wake_decision",
+  scope: "global",
+  type: "text",
+  fallback: null,
+} as const;
+
 export const PREF_MAX_TOOL_CALLS = {
   key: "max_tool_calls",
   scope: "global",
@@ -935,6 +957,8 @@ export const PREFERENCE_CATALOG = {
   "reasoning_read_decision": PREF_REASONING_READ_DECISION,
   "model_wake_decision": PREF_MODEL_WAKE_DECISION,
   "reasoning_wake_decision": PREF_REASONING_WAKE_DECISION,
+  "model_expected_wake_decision": PREF_MODEL_EXPECTED_WAKE_DECISION,
+  "reasoning_expected_wake_decision": PREF_REASONING_EXPECTED_WAKE_DECISION,
   "model_memory": PREF_MODEL_MEMORY,
   "reasoning_memory": PREF_REASONING_MEMORY,
   "model_query_classification": PREF_MODEL_QUERY_CLASSIFICATION,
@@ -1006,6 +1030,7 @@ export const PREFERENCE_CATALOG = {
   "judgment_memory_find": PREF_JUDGMENT_MEMORY_FIND,
   "judgment_read_decision": PREF_JUDGMENT_READ_DECISION,
   "judgment_wake_decision": PREF_JUDGMENT_WAKE_DECISION,
+  "judgment_expected_wake_decision": PREF_JUDGMENT_EXPECTED_WAKE_DECISION,
   "max_tool_calls": PREF_MAX_TOOL_CALLS,
   "capture_context": PREF_CAPTURE_CONTEXT,
   "cache_cards": PREF_CACHE_CARDS,

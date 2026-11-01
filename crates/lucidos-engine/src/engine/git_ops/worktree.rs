@@ -7,6 +7,27 @@ const LUCIDOS_HOOKS_PATH: &str = ".lucidos/git-hooks";
 const LUCIDOS_POST_COMMIT_HOOK: &str = "post-commit";
 const LUCIDOS_CHAIN_MARKER: &str = "# lucidos-chain-hook: ";
 
+/// The client-side hooks git runs in a worktree, besides `post-commit`. The
+/// Lucidos hooks dir replaces the repo's, so each gets a stub that forwards to
+/// the repo's own hook. Without them a pre-commit secret scanner silently
+/// stops running on agent commits. `reference-transaction` is left out: it
+/// runs on every ref update, and no repo gates commits with it.
+const FORWARDED_GIT_HOOKS: &[&str] = &[
+    "applypatch-msg",
+    "pre-applypatch",
+    "post-applypatch",
+    "pre-commit",
+    "pre-merge-commit",
+    "prepare-commit-msg",
+    "commit-msg",
+    "post-checkout",
+    "post-merge",
+    "pre-push",
+    "pre-rebase",
+    "post-rewrite",
+    "pre-auto-gc",
+];
+
 /// How many hex chars of a thread id go into an engine-generated name. Two
 /// names carry it and they must agree: the worktree directory
 /// `thread-<short>` and the `<short>` segment of the thread's branch
@@ -663,7 +684,8 @@ async fn set_shared_config_with_lock_retry(
 /// the user's main checkout or sibling worktrees. If the repo already had a
 /// post-commit hook through the previous `core.hooksPath` (or the common
 /// `.git/hooks` directory), the Lucidos hook chains to it after refreshing the
-/// diff flag.
+/// diff flag. Every other client-side hook forwards to that same directory, so
+/// the repo's `pre-commit` and `commit-msg` gates still run.
 pub(crate) async fn install_coding_agent_diff_hook(
     repo_root: &Path,
     wt_path: &Path,
@@ -678,21 +700,17 @@ pub(crate) async fn install_coding_agent_diff_hook(
     std::fs::create_dir_all(&hook_dir)
         .map_err(|e| format!("create {}: {}", hook_dir.display(), e))?;
 
-    std::fs::write(
-        &hook_path,
-        render_coding_agent_diff_hook(&chain_hook).as_bytes(),
-    )
-    .map_err(|e| format!("write {}: {}", hook_path.display(), e))?;
+    write_executable_hook(&hook_path, &render_coding_agent_diff_hook(&chain_hook))?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&hook_path)
-            .map_err(|e| format!("metadata {}: {}", hook_path.display(), e))?
-            .permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&hook_path, perms)
-            .map_err(|e| format!("chmod {}: {}", hook_path.display(), e))?;
+    // The chained post-commit's directory is the hooks dir git would use
+    // without Lucidos. Never forward into our own dir: a stub would run itself.
+    if let Some(prior_dir) = chain_hook.parent().filter(|dir| *dir != hook_dir) {
+        for name in FORWARDED_GIT_HOOKS {
+            write_executable_hook(
+                &hook_dir.join(name),
+                &render_forwarding_hook(&prior_dir.join(name)),
+            )?;
+        }
     }
 
     // `extensions.worktreeConfig` lives in the SHARED `.git/config`, so under
@@ -742,7 +760,13 @@ async fn prior_post_commit_hook(wt_path: &Path) -> Result<PathBuf, String> {
 }
 
 async fn current_hooks_path(wt_path: &Path) -> Option<String> {
-    match git_cmd(&["config", "--get", "core.hooksPath"], wt_path).await {
+    // `--type=path` expands a leading `~/` the way git does when it runs hooks.
+    match git_cmd(
+        &["config", "--type=path", "--get", "core.hooksPath"],
+        wt_path,
+    )
+    .await
+    {
         Ok(out) if out.status.success() => {
             let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if raw.is_empty() {
@@ -803,6 +827,43 @@ fn render_coding_agent_diff_hook(chain_hook: &Path) -> String {
          fi\n\
          exit 0\n"
     )
+}
+
+/// A hook that runs `target` with the same arguments and stdin, or does
+/// nothing when the repo has no such hook. `exec` keeps the exit status, which
+/// is what lets a failing `pre-commit` still block the commit.
+///
+/// It forwards only inside an agent session, like the post-commit hook. The
+/// engine's own auto-commits and merges never ran the repo's hooks. A commitlint
+/// or slow lint hook there would refuse an Apply, or outlive `GIT_TIMEOUT`.
+fn render_forwarding_hook(target: &Path) -> String {
+    let target_literal = shell_single_quote(&target.to_string_lossy());
+    format!(
+        "#!/bin/sh\n\
+         # Installed by Lucidos. Forwards to the repo's own hook of this name.\n\
+         HOOK={target_literal}\n\
+         if [ -n \"${{LUCIDOS_THREAD_ID:-}}\" ] && [ -x \"$HOOK\" ] && [ \"$HOOK\" != \"$0\" ]; then\n\
+           exec \"$HOOK\" \"$@\"\n\
+         fi\n\
+         exit 0\n"
+    )
+}
+
+fn write_executable_hook(path: &Path, script: &str) -> Result<(), String> {
+    std::fs::write(path, script.as_bytes())
+        .map_err(|e| format!("write {}: {}", path.display(), e))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)
+            .map_err(|e| format!("metadata {}: {}", path.display(), e))?
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms)
+            .map_err(|e| format!("chmod {}: {}", path.display(), e))?;
+    }
+    Ok(())
 }
 
 fn shell_single_quote(value: &str) -> String {

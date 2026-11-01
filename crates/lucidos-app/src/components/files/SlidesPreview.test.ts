@@ -50,7 +50,7 @@ describe('SlidesPreview: every HTML injection is scrubbed', () => {
   });
 
   it('scrubs with the markdown sanitizer, not a local copy', () => {
-    expect(source).toContain("import { sanitizeHtmlFragments } from '../../utils/renderMarkdown'");
+    expect(source).toContain("import { sanitizeHtmlFragments } from '../../utils/markdownEngine'");
     expect(source).toContain('return sanitizeHtmlFragments(raw || \'\');');
   });
 });

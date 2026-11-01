@@ -665,6 +665,7 @@ The symptom was a tab that focused and marked the notification read (the SW-side
 - The retry runs only when there is a subscription to drop, so an `InvalidStateError` raised for another reason cannot destroy a healthy subscription.
 - Enabling push waits on `navigator.serviceWorker.ready` for the registration owning the **active** worker, as `recoverServiceWorker` does. `subscribe()` also rejects with `InvalidStateError` against a worker still `installing`.
 - The follow-up `POST /api/v1/push/subscribe` clears the dead row, since `PushSubscriptionStore::subscribe` deletes by `device_id` before inserting.
+- A device may only subscribe for itself. Behind the gateway the body's `device_id` must match the gateway-asserted `x-lucidos-device-id`, and may not be omitted. The engine answers a refusal as `200 {success: false}`, and the enable flow toasts it.
 - It never unregisters the service worker as a last resort, which would throw away the shell cache.
 
 Chrome / Firefox don't recognize `web_push: 8030` and pass the JSON straight to the SW `push` handler. The handler in `sw.js` reads `data.notification.title` / `body` / `tag` / `navigate` / `data` and calls `showNotification(...)`. It keeps the `navigate` option for when Chromium ships [#382298314 "Implement Declarative Web Push"](https://issues.chromium.org/issues/382298314). `notificationclick` then routes via the SW. Same payload, two handlers: Safari natively, Chrome via SW.

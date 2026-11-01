@@ -50,6 +50,8 @@ fi
 source "$SCRIPT_DIR/lib/e2e.sh"
 # shellcheck source=scripts/lib/e2e_github.sh
 source "$SCRIPT_DIR/lib/e2e_github.sh"
+# shellcheck source=scripts/lib/github_auth.sh
+source "$SCRIPT_DIR/lib/github_auth.sh"
 
 suites=()
 api_args=()
@@ -183,6 +185,8 @@ for arg in ${pw_args[@]+"${pw_args[@]}"}; do
 done
 
 e2e_github_preflight "$PROJECT_DIR" "$commit" || exit "$pre_run_exit"
+# Every gh call below needs a named account, and nothing is pushed without one.
+github_auth || exit "$pre_run_exit"
 
 # ── Split the browser selection into the remote and local legs ──────────
 projects=()

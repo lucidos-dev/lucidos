@@ -246,6 +246,7 @@ fn a_keep_alive_status_serializes_to_its_tagged_object() {
             reread_usd: None,
             beat_every_secs: None,
             odds: None,
+            cap_source: None,
         })),
         ..fixture_row()
     };

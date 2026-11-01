@@ -516,11 +516,21 @@ pub(crate) async fn proposal_files_for_branch(
 
 /// Why a git call did not succeed, or `None` when it did.
 ///
-/// Local rather than [`git_ran_ok`] because it keeps STDOUT: `git commit`
-/// announces "nothing to commit" there, and the caller below has to tell that
-/// apart from a real failure.
-async fn git_failure_reason(args: &[&str], dir: &Path) -> Option<String> {
-    match git_cmd(args, dir).await {
+/// Kept apart from [`git_ran_ok`] because it keeps STDOUT: `git commit`
+/// announces "nothing to commit" there, and a caller has to tell that apart
+/// from a real failure.
+pub(crate) async fn git_failure_reason(args: &[&str], dir: &Path) -> Option<String> {
+    git_failure_reason_env(args, dir, &[]).await
+}
+
+/// [`git_failure_reason`] with extra environment, such as
+/// [`lucidos_identity_env`].
+pub(crate) async fn git_failure_reason_env(
+    args: &[&str],
+    dir: &Path,
+    envs: &[(&str, &std::ffi::OsStr)],
+) -> Option<String> {
+    match git_cmd_env(args, dir, envs).await {
         Ok(o) if o.status.success() => None,
         Ok(o) => Some(format!(
             "{} {}",

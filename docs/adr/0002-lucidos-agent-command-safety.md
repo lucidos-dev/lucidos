@@ -858,3 +858,101 @@ refused. `git --bare` is the third: it reads the cwd as that repository.
   one line the `cd` takes the line to the judge, which reads only the text.
   Some coding-agent shells keep their cwd between calls. There the `cd` alone
   goes to the judge, and the next call's bare `git log` settles Safe.
+
+## Addendum (2026-11-01): with the judge off, a refusal asks
+
+**Context.** With the judge off, the chat lane classified the ambiguous middle
+with `fallback_classify` alone. That classifier ignored `fast_path_refused`. A
+shape the fast path refused, with no side-effect or destruction shape the scan
+could name, settled `Safe` and ran with no card. Two examples:
+`printf x >> .git/config && git status` and `PAGER=data/p.sh git log`. The
+2026-10-09 addendum kept the judge-off switch as "the static classifier", and
+that documented degrade covered this hole.
+
+**Decision.** The owner chose to ask on a refusal rather than keep the degrade.
+
+- A refusal with no other fallback verdict is `IrreversibleDanger`, category
+  `Other`. Its card says the guard cannot see what the command runs while
+  the judge is off. A trigger fails unless it granted `other`.
+- A refused shape with an in-workspace destruction asks too, since a
+  checkpoint covers only what the scan saw. The exception is Python
+  destruction alone. A Python decline counts the destruction call itself as a
+  refusal, so `shutil.rmtree('data/x')` still checkpoints. Add a shell-out, a
+  network signal or a package install and it asks.
+- An omission is unchanged: `cargo build` still runs with the judge off.
+- The coding-agent lanes are unchanged. They already read the flag ahead of
+  the fallback's lane.
+
+**Cost accepted.** While the judge is off, every refusal costs a card. That
+includes harmless ones such as `echo $(date)`, a path-qualified script head
+and a Python `urlopen` GET.
+
+Implementation: `engine/command_guard.rs` (`fallback_classify`,
+`refusal_is_the_destruction`, `python_signal_beyond_destruction`).
+
+## Addendum (2026-11-01): a proven workspace-local `lucidos` call settles Safe
+
+**Context.** The built-in "Keep prices current" trigger failed. Its save step
+was `run_python` code that called `subprocess.run` on `lucidos data write`, the
+path `system-knowhow/model-price-check.md` prescribed. Any Python naming
+`subprocess` was a fast-path refusal, so the LLM judge decided. It answered
+irreversible with no category, and the trigger held no grant.
+
+The 2026-10-21
+addendum had made the marker evidence-based, but the verdict stayed with the
+judge. A bare `run_bash` of `lucidos data write` was an omission, so it also
+depended on the judge.
+
+**Decision.** The static pass proves a few shapes and settles them `Safe`. This
+narrows two 2026-10-21 rejections, `lucidos` and `python3 -c` / heredoc Safe
+settlement, to these shapes only.
+
+- **Workspace-local `lucidos` subcommands are Safe heads**:
+  `data path`, `data write`, `model-prices`, `events query` / `count` and
+  `knowhow list` / `read` (`LUCIDOS_WORKSPACE_LOCAL_SUBCOMMANDS`). Every other
+  subcommand stays an omission, including `events emit`, `notify`,
+  `spawn-thread` and `changes apply`.
+- **The call must reach this workspace's engine.** It settles only with no
+  `VAR=` preamble, on a line that names none of `LUCIDOS_API_BASE_URL`,
+  `LUCIDOS_WORKSPACE` and `LUCIDOS_API_PORT` and uses no `printf -v`
+  (`rebinds_lucidos_cli`). The three names also join the code-injecting
+  variable names, so setting one is a refusal.
+- **Python that shells out to a literal is judged as that literal**
+  (`python_program_proof`). `subprocess.run`, `check_output`, `check_call` and
+  `call` with a string and `shell=True` or a list of strings, and `getoutput` /
+  `getstatusoutput` with a string, qualify. The rest of the code must pass
+  `python_is_statically_safe` and name no relocating call, `environ` or
+  `putenv`. A non-literal argument, an unlisted keyword (`cwd`, `env`,
+  `stdin`, ...) or any other use of `subprocess` keeps the refusal. A
+  Catastrophic literal wins over the proof.
+- **Inline Python in a bash line is judged as `run_python` of that code**:
+  `python3 -c` with one quoted word, or `python3 <<'E'` with a quoted
+  delimiter. Recursion between the two stops at depth 3.
+- **Inline Python is held to a stricter bar than `run_python`**
+  (`inline_python_is_proven`). It names no relocating call, since a link it
+  makes can redirect a later Safe write on the same line. No string literal in
+  it leads out of the workspace. A list element holding a control character
+  fails, because the segment split ignores quotes.
+- **A line that rebinds the CLI proves no inline Python.** The literal inside
+  the Python cannot see an outer `printf -v`, so
+  `printf -v X y; python3 -c '...subprocess.run("lucidos ...")'` would
+  otherwise settle Safe.
+- A proven construct reads as `true` for the fast path only. The catastrophic
+  scan, the secret scan, the out-of-workspace marker and the static fallback
+  still read the command as written.
+- The price check's knowhow now saves with a separate `run_bash` call, which
+  needs no subprocess.
+
+**Accepted residual risk.** `python3 -c` puts the current directory first on
+`sys.path`, and `run_python` does not. An agent that writes `json.py` into the
+workspace root and then runs `python3 -c "import json"` runs its own file with
+no judge. That is a deliberate construction, which the Python lane already
+does not stop (`getattr(builtins, 'ex'+'ec')`). It aims at screwups.
+
+A `data write` into `triggers/` or `apps/` now settles Safe. That equals a
+`run_python` write there, which settles unasked already.
+
+Implementation: `engine/command_guard.rs` (`lucidos_call_is_workspace_local`,
+`rebinds_lucidos_cli`, `python_program_proof`, `inline_python_is_proven`,
+`blank_proven_inline_python`). Plan:
+`docs/plans/2026-11-01-command-guard-proves-workspace-local-lucidos-calls.md`.

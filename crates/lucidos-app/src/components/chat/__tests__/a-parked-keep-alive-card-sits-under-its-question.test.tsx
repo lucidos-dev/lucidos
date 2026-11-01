@@ -34,7 +34,7 @@ let host: HTMLDivElement;
 beforeEach(() => {
   host = document.createElement('div');
   document.body.appendChild(host);
-  preferences.value = { status: 'loaded', data: { cache_cards: 'true' } };
+  preferences.value = { status: 'loaded', data: { cache_keep_alive_mode: 'on', cache_cards: 'true' } };
   threadMap.value = new Map([['tid', makeThreadState('tid', { meta: { status: 'waiting_for_user_answer', cacheKeepAliveStatus: warming } })]]);
 });
 
@@ -147,7 +147,7 @@ describe('a held message under a parked question', () => {
 
 describe('with the cache cards switched off', () => {
   beforeEach(() => {
-    preferences.value = { status: 'loaded', data: { cache_cards: 'false' } };
+    preferences.value = { status: 'loaded', data: { cache_keep_alive_mode: 'on', cache_cards: 'false' } };
   });
 
   it('draws no run under a parked question, and the question keeps its card', () => {
@@ -165,7 +165,7 @@ describe('with the cache cards switched off', () => {
   it('draws the card again once the switch is back on', () => {
     const card: Exchange = { userEvent: status, userSeq: 3, steps: [] };
     draw(card);
-    act(() => { preferences.value = { status: 'loaded', data: { cache_cards: 'true' } }; });
+    act(() => { preferences.value = { status: 'loaded', data: { cache_keep_alive_mode: 'on', cache_cards: 'true' } }; });
     expect(host.querySelector('[data-role="cache-keep-alive"]')).not.toBeNull();
   });
 });

@@ -748,6 +748,8 @@ const NON_EXCHANGE_METADATA_EVENTS: ReadonlySet<string> = new Set([
   // waiting panel say it, never a turn.
   'CacheKeepAliveTurnedOff',
   'CacheKeepAliveTurnedOn',
+  // A forecast of the next wake (ADR 0603). The keep-alive card says it.
+  'WakeExpected',
 ]);
 
 /** True for a `ContextCaptured` recording an *auxiliary model call* rather
@@ -787,14 +789,17 @@ export function isCacheKeepAliveIdle(event: StoredEvent): boolean {
   return event.type === 'CodingAgentIdled' && event.reason === KEEP_ALIVE_IDLE_REASON;
 }
 
-/** Whether `status` reports the wait that `card` last reported. A wait has one
- *  `since` while it warms, and stops for good once past break-even. A turned-off
- *  run carries no `since`, and warms again when the user turns it back on. An
+/** Whether `status` reports the run that `card` last reported. A run has one
+ *  `since` while it warms, and a real turn mid-wait starts the next run with a
+ *  new one. A run stops for good once past its give-up time. A turned-off
+ *  run carries no `since`. It warms again when the user turns it back on,
+ *  unless a real turn since then started a later run. An
  *  ended run reopens only when its own wait warms again. */
 function continuesWait(card: StoredEvent, status: CacheKeepAliveStatus | null | undefined): boolean {
   const last = (card as { status?: CacheKeepAliveStatus }).status;
   if (last?.state === 'ended') return status?.state === 'warming' && status.since === last.since;
-  if (!last || !status || status.state !== 'warming' || last.state === 'turned_off') return true;
+  if (!last || !status || status.state !== 'warming') return true;
+  if (last.state === 'turned_off') return Date.parse(status.since) <= Date.parse(last.at);
   return last.state === 'warming' && last.since === status.since;
 }
 
@@ -821,8 +826,8 @@ function parkedCard(exchanges: Exchange[]): Exchange | null {
  *  run that began while the turn waited on a question or permission card puts
  *  its card under that card, inside the turn (ADR 0563). Any other run leaves a
  *  turnless card of its own. A later status updates the card in place, and a
- *  `not_kept` one leaves it alone: the engine counts pings from the wait's
- *  start, so the same wait may warm again.
+ *  `not_kept` one leaves it alone: the engine counts pings from the run's
+ *  start, so the same run may warm again.
  *
  *  An `ended` status fills the card in, and the same wait warming again
  *  reopens that card (ADR 0563). A cleared status closes the run, as do a ping

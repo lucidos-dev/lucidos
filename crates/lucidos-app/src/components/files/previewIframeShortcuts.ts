@@ -30,7 +30,7 @@ const bridged = new WeakSet<Document>();
  *  Focus (lighting the content pill on a click) is NOT handled here — a PDF's
  *  native plugin swallows pointer events before they reach `contentDocument`, and
  *  a cross-origin preview blocks it entirely. The host-side window-blur tracker
- *  (`installContentPaneIframeFocusTracking` in `components/layout/paneFocus.ts`)
+ *  (`installPaneFocusTracking` in `components/layout/paneFocus.ts`)
  *  covers every content-pane iframe uniformly instead. */
 export function bridgePreviewIframeShortcuts(iframe: HTMLIFrameElement | null): void {
   if (!iframe) return;

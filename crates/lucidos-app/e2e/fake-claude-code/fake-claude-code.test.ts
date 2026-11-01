@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
-  AUTH_STATUS, FAKE_VERSION, NO_EFFORT, NO_RULE_REPLY, NO_SESSION_CONTEXT_REPLY,
+  FAKE_VERSION, NO_EFFORT, NO_RULE_REPLY, NO_SESSION_CONTEXT_REPLY,
   failToStartText, replyTo, resolveModel, turnDurationMs,
 } from './claude.mjs';
 import {
@@ -42,11 +42,6 @@ describe('the fake Claude Code', () => {
     dir = mkdtempSync(join(tmpdir(), 'fake-cc-'));
     symlinkSync(FAKE, join(dir, 'claude'));
     expect(execFileSync(join(dir, 'claude'), ['--version'], { encoding: 'utf8' })).toBe(`${FAKE_VERSION} (Claude Code)\n`);
-  });
-
-  it('answers `auth status` as a first-party login, so the engine shows its notes', () => {
-    expect(runFake(['auth', 'status'])).toEqual([AUTH_STATUS]);
-    expect(AUTH_STATUS.apiProvider).toBe('firstParty');
   });
 
   it('answers initialize with the model list and sends no init', () => {

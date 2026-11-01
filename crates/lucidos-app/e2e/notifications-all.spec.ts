@@ -627,8 +627,10 @@ test.describe('Declarative Web Push payload', () => {
     psql(`DELETE FROM device_presence`);
     expect(baseURL, 'Playwright baseURL is needed to seed the subscription scope').toBeTruthy();
     const scopeUrl = new URL('/', baseURL!).toString();
+    // The device subscribes for itself: the engine refuses a body device_id
+    // that differs from the caller's x-lucidos-device-id.
     const subRes = await apiRequest(page).post('/api/v1/push/subscribe', {
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'x-lucidos-device-id': deviceId },
       data: {
         endpoint: `https://push.test/synthetic/${Date.now()}`,
         p256dh: 'p256dh-test',
@@ -638,6 +640,8 @@ test.describe('Declarative Web Push payload', () => {
       },
     });
     expect(subRes.ok(), `POST /api/v1/push/subscribe -> ${subRes.status()}`).toBeTruthy();
+    // A refusal answers 200 {success: false}, so the status alone passes it.
+    expect(await subRes.json(), 'push subscribe must be stored').toMatchObject({ success: true });
 
     // A seeded event in a thread with no summary row. focusThreadOrBootstrap
     // surfaces a "Thread not found" toast, which is fine: the engine-side

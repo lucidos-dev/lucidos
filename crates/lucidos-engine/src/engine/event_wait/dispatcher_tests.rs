@@ -75,6 +75,19 @@ async fn a_live_discard_ends_the_threads_waits_and_is_offered() {
     teardown_test_db(&db).await;
 }
 
+#[test]
+fn sweeps_keep_their_period_and_never_run_back_to_back() {
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    assert_eq!(
+        sweep_pause(ms(40)) + ms(40),
+        DEADLINE_SWEEP_INTERVAL,
+        "a quick sweep keeps the period"
+    );
+    assert_eq!(sweep_pause(DEADLINE_SWEEP_INTERVAL), MIN_SWEEP_GAP);
+    assert_eq!(sweep_pause(DEADLINE_SWEEP_INTERVAL * 2), MIN_SWEEP_GAP);
+}
+
 /// The live gate and the replay read the same list, so every event that ends a
 /// thread's waits must be on it.
 #[test]

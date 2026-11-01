@@ -508,7 +508,7 @@ pub use device_presence::DevicePresenceStore;
 pub use events::EventRow;
 pub use mcp_servers::{LaunchLineMode, LaunchSpec, McpEnvValue, McpServer, McpServerStore};
 pub use models::{validate_routes, Model, ModelFields, ModelStore, Route};
-pub use preferences::{ModelDefaults, PreferenceStore, ResolvedModelSelection};
+pub use preferences::{ModelDefaults, PairStamp, PreferenceStore, ResolvedModelSelection};
 pub use store::{
     ConversationMessage, ConversationSnapshot, EventStore, SessionMessage, Step, ThreadEventRow,
     ThreadSummary,
@@ -1906,6 +1906,7 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             Some(false) => "No read needed".to_string(),
             _ => "Asking you to read this reply...".to_string(),
         },
+        "expect_wake" => "Noting when this thread expects to wake".to_string(),
         "wake_parent" => match args[crate::llm::tools::WAKE_ARG].as_bool() {
             Some(false) => "Filing the report for the parent thread".to_string(),
             _ => "Waking the parent thread...".to_string(),

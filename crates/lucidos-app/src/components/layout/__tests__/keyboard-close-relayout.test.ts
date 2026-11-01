@@ -493,7 +493,7 @@ describe('the shell hands its viewport reading over', () => {
     // Default off, live, and nothing scheduled while the gate is down.
     expect(body).toContain('perfRecordingOn()');
     expect(source).toContain('onPerfEnabledChange((on) => (on ? startPoll() : stopPoll()))');
-    expect(source).toContain('stopPoll();\n      unsubscribeGate();');
+    expect(source).toMatch(/stopPoll\(\);\s*unsubscribeGate\(\);/);
   });
 
   it('acts on the change no handler saw, so EVERY handler moves the mark', () => {
@@ -511,7 +511,7 @@ describe('the shell hands its viewport reading over', () => {
     const handlers = [
       'const onResize = () => {',
       'const onWake = () => {',
-      'const onOrientationChange = () => {',
+      'const onLayoutViewportChange = () => {',
     ];
     for (const handler of handlers) {
       const body = source.slice(source.indexOf(handler));

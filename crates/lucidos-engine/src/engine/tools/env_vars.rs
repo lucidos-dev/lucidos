@@ -13,7 +13,7 @@
 //! agent-origin, no request headers in the tool path).
 
 use super::{LucidosEngine, ToolOutcome};
-use crate::core::environment_variables::validate_name;
+use crate::core::environment_variables::validate_agent_name;
 use crate::core::EnvironmentVariableStore;
 use crate::llm::tool_names as tn;
 
@@ -108,8 +108,8 @@ impl LucidosEngine {
     }
 
     /// Handler for the `set` action (and the back-compat `set_environment_variable`
-    /// alias) — define a user environment variable. Validates the name (shape +
-    /// not engine-reserved), upserts, and emits `EnvironmentVariableSet` (value
+    /// alias) — define a user environment variable. Validates the name (shape,
+    /// not engine-reserved, not code-injecting), upserts, and emits `EnvironmentVariableSet` (value
     /// carried — these are non-secret). Takes effect on the next spawned
     /// subprocess with no restart. The engine's own process env is a separate
     /// consumer: `environment_variables::apply_to_process_env` loads it once at
@@ -118,29 +118,75 @@ impl LucidosEngine {
         &self,
         args: &serde_json::Value,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let name = args["name"].as_str().unwrap_or("").trim();
-        let value = args["value"].as_str().unwrap_or("");
+        Ok(set_env_var(&self.pool, &self.event_bus, args).await)
+    }
+}
 
-        if name.is_empty() {
-            return Ok("Error: name is required".to_string());
-        }
-        if let Err(rejection) = validate_name(name) {
-            return Ok(format!("Error: {}", rejection.message(name)));
+/// The `set` body, apart from the engine so a test can drive it on a pool.
+/// The caller is always an agent, so the name passes [`validate_agent_name`].
+async fn set_env_var(
+    pool: &sqlx::PgPool,
+    event_bus: &crate::engine::event_bus::EventBus,
+    args: &serde_json::Value,
+) -> String {
+    let name = args["name"].as_str().unwrap_or("").trim();
+    let value = args["value"].as_str().unwrap_or("");
+
+    if name.is_empty() {
+        return "Error: name is required".to_string();
+    }
+    if let Err(rejection) = validate_agent_name(name) {
+        return format!("Error: {}", rejection.message(name));
+    }
+
+    if let Err(e) = EnvironmentVariableStore::upsert(pool, event_bus, name, value, None).await {
+        return format!("Error: Failed to save environment variable: {}", e);
+    }
+
+    format!(
+        "[ACTION COMPLETED] Environment variable '{}' set. It is injected into newly \
+         spawned subprocesses (run_bash, run_python, scheduled scripts, coding agents) with \
+         no restart. The engine loads its own process environment from this store only at \
+         startup, so a variable the engine itself reads needs an engine restart. Note these \
+         are NOT secret; for API keys/tokens use a credential.",
+        name
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::set_env_var;
+    use crate::core::EnvironmentVariableStore;
+    use crate::engine::event_bus::EventBus;
+
+    #[tokio::test]
+    async fn an_agent_cannot_store_a_code_injecting_name() {
+        let (pool, db) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+        for name in [
+            "BASH_ENV",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "NODE_OPTIONS",
+            "GIT_SSH_COMMAND",
+        ] {
+            let args = serde_json::json!({ "name": name, "value": "/tmp/x" });
+            let out = set_env_var(&pool, &bus, &args).await;
+            assert!(out.starts_with("Error:"), "{name} was accepted: {out}");
+            assert!(
+                EnvironmentVariableStore::get(&pool, name)
+                    .await
+                    .expect("get")
+                    .is_none(),
+                "{name} was stored"
+            );
         }
 
-        if let Err(e) =
-            EnvironmentVariableStore::upsert(&self.pool, &self.event_bus, name, value, None).await
-        {
-            return Ok(format!("Error: Failed to save environment variable: {}", e));
-        }
+        let args = serde_json::json!({ "name": "MY_FLAG", "value": "1" });
+        let out = set_env_var(&pool, &bus, &args).await;
+        assert!(out.starts_with("[ACTION COMPLETED]"), "{out}");
 
-        Ok(format!(
-            "[ACTION COMPLETED] Environment variable '{}' set. It is injected into newly \
-             spawned subprocesses (run_bash, run_python, scheduled scripts, coding agents) with \
-             no restart. The engine loads its own process environment from this store only at \
-             startup, so a variable the engine itself reads needs an engine restart. Note these \
-             are NOT secret; for API keys/tokens use a credential.",
-            name
-        ))
+        crate::test_support::teardown_test_db(&db).await;
     }
 }

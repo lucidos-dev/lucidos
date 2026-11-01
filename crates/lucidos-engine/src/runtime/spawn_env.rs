@@ -831,7 +831,7 @@ mod tests {
             permission_mode: None,
             additional_directories: &[],
             auto_compact: None,
-            notes: crate::runtime::claude_code_provider::NotesVisibility::Hidden,
+            keep_alive: false,
             agent_run: AgentRun::unrecorded(),
         }
     }

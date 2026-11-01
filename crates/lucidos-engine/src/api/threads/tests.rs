@@ -576,6 +576,28 @@ fn an_agent_may_only_ask_for_its_own_reply_to_be_read() {
     assert!(refused.1.contains("lucidos request-read"), "{}", refused.1);
 }
 
+/// The expected wake route takes the same guard (ADR 0603).
+#[test]
+fn an_agent_may_only_state_its_own_expected_wake() {
+    use super::actions::refuse_an_agent_from_another_thread;
+    use super::expected_wake::EXPECTED_WAKE_IS_THE_CALLERS;
+    let mine = Uuid::new_v4();
+    assert!(refuse_an_agent_from_another_thread(
+        &agent_headers(Some(mine)),
+        mine,
+        EXPECTED_WAKE_IS_THE_CALLERS
+    )
+    .is_ok());
+    let refused = refuse_an_agent_from_another_thread(
+        &agent_headers(Some(mine)),
+        Uuid::new_v4(),
+        EXPECTED_WAKE_IS_THE_CALLERS,
+    )
+    .expect_err("another thread's id must be refused");
+    assert_eq!(refused.0, axum::http::StatusCode::FORBIDDEN);
+    assert!(refused.1.contains("lucidos expect-wake"), "{}", refused.1);
+}
+
 /// A caller presenting no token is not an agent claiming to be another thread.
 /// It is the ordinary local API surface, which every other `/threads/:id/...`
 /// route treats the same way, so this check leaves it exactly where it was

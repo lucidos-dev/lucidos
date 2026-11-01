@@ -115,6 +115,22 @@ pub struct ResolvedModelSelection {
     pub provider: Option<String>,
 }
 
+/// The event types that stamp a thread's pair: a chat turn's starter, a
+/// trigger fire's starter, and a rung pick between turns. Both pair queries
+/// bind this list, so a new stamping type reaches them together.
+const PAIR_STAMPING_EVENT_TYPES: [&str; 3] =
+    ["MessageReceived", "TriggerStarted", "ChatSettingsChanged"];
+
+/// One pair stamp, as a paged thread snapshot carries it. An empty field means
+/// the event stamped none, and an empty `model` groups the model-less stamps.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PairStamp {
+    pub sequence: i64,
+    pub model: String,
+    pub reasoning_effort: String,
+    pub provider: String,
+}
+
 /// The one chat tier every model shared before ADR 0390. Read only to move it
 /// onto `chat_reasoning_efforts` (`PreferenceStore::move_legacy_chat_effort`).
 const LEGACY_CHAT_EFFORT_KEY: &str = "chat_reasoning_effort";
@@ -576,7 +592,7 @@ impl PreferenceStore {
               SELECT sequence, payload
                 FROM events
                WHERE aggregate_id = $1
-                 AND event_type IN ('MessageReceived', 'TriggerStarted', 'ChatSettingsChanged')
+                 AND event_type = ANY($4)
                  AND ($2::uuid IS NULL OR id <> $2)
             ),
             remembered AS (
@@ -608,6 +624,7 @@ impl PreferenceStore {
         .bind(thread_id.to_string())
         .bind(exclude_event_id)
         .bind(model_override)
+        .bind(PAIR_STAMPING_EVENT_TYPES)
         .fetch_one(pool)
         .await;
         match row {
@@ -625,6 +642,55 @@ impl PreferenceStore {
                 ResolvedModelSelection::default()
             }
         }
+    }
+
+    /// The thread's **pair stamps**: the fewest stamping events that answer
+    /// every question `last_thread_chat_settings` asks of the whole history.
+    ///
+    /// A paged snapshot cannot carry the event that stamped the pair when it
+    /// sits behind the page. These rows stand in for it: the newest stamp
+    /// naming a model, then per model the newest naming an effort and the
+    /// newest naming a provider. An empty model means none, and groups apart.
+    pub async fn thread_pair_stamps(
+        pool: &PgPool,
+        thread_id: Uuid,
+    ) -> Result<Vec<PairStamp>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, (i64, String, String, String)>(
+            r#"
+            WITH stamped AS (
+              SELECT sequence,
+                     COALESCE(payload->>'model', '') AS model,
+                     COALESCE(payload->>'reasoning_effort', '') AS effort,
+                     COALESCE(payload->>'provider', '') AS provider
+                FROM events
+               WHERE aggregate_id = $1
+                 AND event_type = ANY($2)
+            )
+            SELECT sequence, model, effort, provider FROM (
+              (SELECT * FROM stamped WHERE model <> '' ORDER BY sequence DESC LIMIT 1)
+              UNION
+              (SELECT DISTINCT ON (model) * FROM stamped
+                WHERE effort <> '' ORDER BY model, sequence DESC)
+              UNION
+              (SELECT DISTINCT ON (model) * FROM stamped
+                WHERE provider <> '' ORDER BY model, sequence DESC)
+            ) reduced
+            ORDER BY sequence
+            "#,
+        )
+        .bind(thread_id.to_string())
+        .bind(PAIR_STAMPING_EVENT_TYPES)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(sequence, model, reasoning_effort, provider)| PairStamp {
+                sequence,
+                model,
+                reasoning_effort,
+                provider,
+            })
+            .collect())
     }
 
     /// Resolve the *model selection* stamped on a chat exchange when the caller
@@ -984,6 +1050,64 @@ mod tests {
             "deleting a key that was already gone changes nothing, so it says nothing"
         );
 
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Upgrade resets both cache preferences, including already-migrated dev values.
+    #[tokio::test]
+    async fn cache_preferences_upgrade_turns_every_enabled_value_off() {
+        const MODE_MERGE: &str =
+            include_str!("../../migrations/20261030213124_cache_keep_alive_mode_is_off_or_on.sql");
+        const RESET: &str =
+            include_str!("../../migrations/20261101134352_reset_cache_preferences_off.sql");
+        let (pool, db_name) = setup_test_db().await;
+        assert_eq!(prefs::CACHE_KEEP_ALIVE_MODE.default_text(), "off");
+        assert!(!prefs::CACHE_CARDS.default_flag());
+
+        let legacy = ["break-even", "tuned", "workspace-data", "on", "off"];
+        for mode in legacy {
+            for merge_first in [false, true] {
+                for cards in ["true", "on", "invalid", "false"] {
+                    PreferenceStore::set_row_for_test(
+                        &pool,
+                        prefs::CACHE_KEEP_ALIVE_MODE.key(),
+                        mode,
+                    )
+                    .await
+                    .unwrap();
+                    PreferenceStore::set_row_for_test(&pool, prefs::CACHE_CARDS.key(), cards)
+                        .await
+                        .unwrap();
+                    if merge_first {
+                        sqlx::raw_sql(MODE_MERGE).execute(&pool).await.unwrap();
+                    }
+                    sqlx::raw_sql(RESET).execute(&pool).await.unwrap();
+                    assert_eq!(
+                        prefs::CACHE_KEEP_ALIVE_MODE.try_read(&pool).await.unwrap(),
+                        "off",
+                        "stored {mode}, merge first: {merge_first}"
+                    );
+                    assert_eq!(
+                        prefs::CACHE_KEEP_ALIVE_MODE
+                            .try_stored(&pool)
+                            .await
+                            .unwrap()
+                            .as_deref(),
+                        Some("off")
+                    );
+                    assert!(!prefs::CACHE_CARDS.try_read(&pool).await.unwrap());
+                    assert_eq!(
+                        prefs::CACHE_CARDS
+                            .try_stored(&pool)
+                            .await
+                            .unwrap()
+                            .as_deref(),
+                        Some("false")
+                    );
+                }
+            }
+        }
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -1775,6 +1899,55 @@ mod tests {
         let switched =
             PreferenceStore::last_thread_chat_settings(&pool, tid, None, Some("model-b")).await;
         assert_eq!(switched.reasoning_effort, None);
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The reduced stamps must answer exactly what full history answers: the
+    /// newest model, and per model its own newest effort and provider.
+    #[tokio::test]
+    async fn pair_stamps_keep_each_models_own_effort_and_provider() {
+        let (pool, db_name) = setup_test_db().await;
+        let tid = Uuid::new_v4();
+        insert_message_received(&pool, tid, Some("model-a"), Some("low")).await;
+        insert_message_received(&pool, tid, Some("model-a"), Some("high")).await;
+        insert_starter(&pool, tid, Some("model-b"), Some("max"), Some("provider-b")).await;
+        insert_message_received(&pool, tid, Some("model-b"), None).await;
+        insert_message_received(&pool, tid, None, Some("medium")).await;
+        let stamps = PreferenceStore::thread_pair_stamps(&pool, tid)
+            .await
+            .unwrap();
+        let newest_model = stamps
+            .iter()
+            .filter(|s| !s.model.is_empty())
+            .max_by_key(|s| s.sequence);
+        assert_eq!(newest_model.map(|s| s.model.as_str()), Some("model-b"));
+        let effort = |model: &str| {
+            stamps
+                .iter()
+                .filter(|s| s.model == model && !s.reasoning_effort.is_empty())
+                .max_by_key(|s| s.sequence)
+                .map(|s| s.reasoning_effort.as_str())
+        };
+        assert_eq!(effort("model-a"), Some("high"));
+        assert_eq!(effort("model-b"), Some("max"));
+        assert_eq!(effort(""), Some("medium"));
+        let provider_b = stamps
+            .iter()
+            .find(|s| s.model == "model-b" && !s.provider.is_empty());
+        assert_eq!(provider_b.map(|s| s.provider.as_str()), Some("provider-b"));
+        assert!(stamps.len() <= 5, "reduced, not the whole history");
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn pair_stamps_are_empty_for_a_thread_without_starters() {
+        let (pool, db_name) = setup_test_db().await;
+        assert!(PreferenceStore::thread_pair_stamps(&pool, Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_empty());
         pool.close().await;
         teardown_test_db(&db_name).await;
     }

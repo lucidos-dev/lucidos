@@ -4,8 +4,9 @@
 use super::read_decision::{
     chat_turn_read, coding_agent_turn_read, decision_from, read_decision_chat_judge,
     read_decision_prompt, record_forced_decision, wake_settles_first, AnsweredQuestion,
-    ForcedReadDecision, InFlight, OpeningSource, PushedNotification, TurnRead, PUSH_MESSAGE_BYTES,
-    READ_DECISION_INSTRUCTIONS, READ_QUESTION_ID, READ_THRESHOLD,
+    ForcedReadDecision, InFlight, OpeningSource, PushedNotification, TurnRead,
+    PARENT_ACTS_READ_RULE, PUSH_MESSAGE_BYTES, READ_DECISION_INSTRUCTIONS, READ_QUESTION_ID,
+    READ_THRESHOLD,
 };
 use super::wake_decision::{record_wake_decision, OwedReport, WakeDecision};
 use super::*;
@@ -123,6 +124,23 @@ fn a_settled_plan_lets_the_harden_ask_through_at_the_same_head() {
     assert!(ledger
         .take_due(&idle(session("b2", Some(HARDEN))))
         .is_some());
+}
+
+/// A plan-only branch awaits the user's decision. A nudge would make the agent
+/// re-ask mid-discussion, so it sends nobody back, while a mixed branch's
+/// waiting plan still does.
+#[test]
+fn a_plan_only_hold_sends_the_agent_nowhere() {
+    let mut ledger = ReentryLedger::default();
+    let plan_only = ProposalHold::Plan(PlanHold::PlanOnlyAwaitingApproval);
+    assert!(ledger
+        .take_due(&idle(session("a1", Some(plan_only))))
+        .is_none());
+    let mixed = ProposalHold::Plan(PlanHold::AwaitingApproval);
+    assert_eq!(
+        ledger.take_due(&idle(session("a1", Some(mixed)))),
+        Some(mixed)
+    );
 }
 
 #[test]
@@ -670,6 +688,23 @@ fn a_report_that_wakes_the_parent_agent_says_so() {
     // The note means nothing unless the system prompt says what it implies.
     assert!(READ_DECISION_INSTRUCTIONS
         .contains("When a closing note says the parent agent acts on this reply now"));
+}
+
+/// ADR 0607 shares the must-see criteria with the sub-thread's own rule, so
+/// the judge's paragraph has to stay what ADR 0472 measured.
+#[test]
+fn the_judge_keeps_its_parent_paragraph_byte_for_byte() {
+    assert!(READ_DECISION_INSTRUCTIONS.contains(
+        "When a closing note says the parent agent acts on this reply now, a routine result for \
+         it is not worth the user's read. It is still worth reading when it holds a failure, a \
+         gap the user must know about, or something only the user can do or decide, such as a \
+         payment, a sign-in or an approval. The parent agent seeing it does not make it the \
+         parent's to settle.\n\n"
+    ));
+    assert!(PARENT_ACTS_READ_RULE.contains(
+        "a failure, a gap the user must know about, or something only the user can do or \
+         decide, such as a payment, a sign-in or an approval"
+    ));
 }
 
 /// A filed report, and a turn the user opened or resumed, read as before.

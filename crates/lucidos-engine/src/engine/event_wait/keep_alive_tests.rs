@@ -1,11 +1,12 @@
 //! The keep-alive selection (I5), its keep-warm filter, and the schedule read
 //! back from persisted events alone (I10).
 
+use super::super::wait_durations::{LocalStart, WaitSample};
 use super::*;
 use crate::core::event_subscription::EventSubscription;
 use crate::core::prefs::PrefDefault;
 use crate::engine::event_bus::EventBus;
-use crate::engine::thread_events::WakeMode;
+use crate::engine::thread_events::{PlannedWake, WakeMode, WakeSource};
 use crate::engine::types::{ContextProducer, ContextPurpose};
 use crate::llm::model_prices::{cache_shares_of, price_table};
 use crate::test_support::{seed_thread_event, setup_test_db, start_cc_session, teardown_test_db};
@@ -28,6 +29,8 @@ fn due() -> Candidate {
         keep_warm_wait_secs: Some(10.0 * MINUTE),
         keep_warm_kinds: kinds(&["BackgroundBashCompleted"]),
         children: ActiveChildren::None,
+        wake: None,
+        timeout_secs: None,
         secs_since_request: Some(240.0),
         secs_since_beat: None,
         cache_ttl: CacheTtl::Reported(CacheLifetime::FiveMinutes),
@@ -39,6 +42,7 @@ fn due() -> Candidate {
         turned_off_at: None,
         unattended_trigger: false,
         beat_missed: false,
+        frozen_odds: None,
     }
 }
 
@@ -60,7 +64,9 @@ fn parked() -> Candidate {
         parked: Some(Parked {
             card: ParkedCard::Question,
             secs: 240.0,
+            pings_sent: 0,
             copy_ready: true,
+            cap: ParkedCap::HalfReread,
         }),
         keep_warm_wait_secs: None,
         ..due()
@@ -80,20 +86,48 @@ fn skip(reason: SkipReason) -> Beat {
     Beat::Skip(reason)
 }
 
-/// The verdict under the `break-even` rule, which most cases here pin.
+/// The verdict under the reread cap, which most cases here pin.
 fn decide(c: &Candidate) -> Beat {
-    super::decide(c, GiveUpRule::BreakEven)
+    super::decide(c, GiveUpRule::PingPlan)
 }
 
-/// The status under the `break-even` rule.
+/// The status under the reread cap.
 fn status(c: &Candidate, at: &Anchors, spent: Spent) -> CacheKeepAliveStatus {
     super::status(
         c,
-        GiveUpRule::BreakEven,
+        GiveUpRule::PingPlan,
         &WaitDurations::default(),
         at,
         spent,
     )
+}
+
+fn after_secs(at: DateTime<Utc>, secs: f64) -> DateTime<Utc> {
+    at + Duration::milliseconds((secs * 1000.0).round() as i64)
+}
+
+/// `c` with the agent's expected wake, stated `stated` seconds into its wait,
+/// of a wake `expected` seconds after that.
+fn expecting(c: Candidate, stated: f64, expected: f64, asked_again: ReEstimate) -> Candidate {
+    let wait_began = secs_before_now(waiting_secs(&c).expect("a wait"));
+    let stated_at = after_secs(wait_began, stated);
+    let wake = WakeEstimate::new(
+        stated_at,
+        after_secs(stated_at, expected),
+        &[],
+        WakeSource::Agent,
+        wait_began,
+        asked_again,
+    );
+    Candidate {
+        wake: Some(wake),
+        ..c
+    }
+}
+
+/// How long after the wait began a run gives up under `rule`.
+fn give_up_after_secs(c: &Candidate, rule: GiveUpRule) -> Option<f64> {
+    super::plan(c, rule).map(|plan| plan.give_up_after_secs)
 }
 
 #[test]
@@ -269,7 +303,7 @@ fn the_budget_is_the_rewrite_cost_in_beats() {
             cache: cache_shares_of(model),
             ..due()
         };
-        give_up_after_secs(&c, GiveUpRule::BreakEven).expect("a budget")
+        give_up_after_secs(&c, GiveUpRule::PingPlan).expect("a budget")
     };
     let cases = [
         ("claude-opus-5-5", 25.0, 40.0),
@@ -588,11 +622,11 @@ fn every_condition_can_stop_a_parked_beat() {
     }
 }
 
-/// A parked wait gives up at half the break-even budget, timed from the
+/// A parked wait gives up at half the reread cap, timed from the
 /// request that asked. Human answers thin out with time, so later beats mostly
 /// pay for cards nobody answers.
 #[test]
-fn a_parked_wait_gives_up_at_half_the_break_even_budget() {
+fn a_parked_wait_gives_up_at_half_the_reread_cap() {
     let cases = [
         ("a 5-minute cache", CacheLifetime::FiveMinutes, 240.0, 12.5),
         ("a 1-hour cache", CacheLifetime::OneHour, 3310.0, 20.0),
@@ -614,6 +648,282 @@ fn a_parked_wait_gives_up_at_half_the_break_even_budget() {
     }
 }
 
+/// A parked plan reports its own cap source, and never ends at an estimate,
+/// so no card waits on a re-estimate (I11).
+#[test]
+fn a_parked_plan_names_half_the_reread_cap_and_never_an_estimate() {
+    for c in [parked(), lucidos_on_its_card()] {
+        let plan = plan(&c, GiveUpRule::PingPlan).expect("a plan");
+        assert_eq!(plan.end, PlanEnd::HalfReread);
+        assert!(!awaits_re_estimate(&c, plan));
+        let CacheKeepAliveStatus::Warming { cap_source, .. } =
+            status(&c, &anchors_of(&c), Spent::default())
+        else {
+            panic!("a parked card warms");
+        };
+        assert_eq!(cap_source, Some(CapSource::HalfReread));
+    }
+    let learning = expecting(parked_learning(2), 0.0, 60.0, ReEstimate::NotAsked);
+    let plan = plan(&learning, GiveUpRule::PingPlan).expect("a plan");
+    assert_eq!(plan.end, PlanEnd::Learned(learned_cap(2)));
+    assert!(!awaits_re_estimate(&learning, plan), "a learned cap");
+}
+
+/// A learned cap of `pings`, from 40 cards asked 10:00 to 15:00.
+fn learned_cap(pings: u32) -> LearnedCap {
+    LearnedCap {
+        pings,
+        samples: 40,
+        hours: HourWindow { from: 10, to: 15 },
+        utc_offset_mins: 0,
+    }
+}
+
+/// The kinds the frozen-cap lookup matches are the stored `kind` of exactly
+/// the sources [`ParkedCap::of_source`] accepts.
+#[test]
+fn the_parked_cap_kinds_are_the_parked_sources() {
+    let kind = |source: CapSource| serde_json::to_value(source).unwrap()["kind"].clone();
+    let parked = [
+        PlanEnd::HalfReread.cap_source(),
+        PlanEnd::Learned(learned_cap(2)).cap_source(),
+    ];
+    for source in parked {
+        assert!(ParkedCap::of_source(source).is_some());
+    }
+    assert_eq!(
+        parked.map(kind),
+        PARKED_CAP_KINDS.map(serde_json::Value::from)
+    );
+    let others = [
+        CapSource::RereadCap,
+        CapSource::Timeout,
+        CapSource::Estimate {
+            by: WakeSource::Agent,
+        },
+    ];
+    for source in others {
+        assert_eq!(ParkedCap::of_source(source), None);
+    }
+}
+
+/// [`parked`] on a learned cap of `pings`, none sent yet.
+fn parked_learning(pings: u32) -> Candidate {
+    Candidate {
+        parked: parked().parked.map(|p| Parked {
+            cap: ParkedCap::Learned(learned_cap(pings)),
+            ..p
+        }),
+        ..parked()
+    }
+}
+
+/// [`parked_learning`] with `sent` pings out, `secs` into its wait and
+/// `since_request` after the last refresh.
+fn learning_at(pings: u32, sent: u32, secs: f64, since_request: f64) -> Candidate {
+    let c = parked_learning(pings);
+    Candidate {
+        parked: c.parked.map(|p| Parked {
+            secs,
+            pings_sent: sent,
+            ..p
+        }),
+        secs_since_request: Some(since_request),
+        ..c
+    }
+}
+
+/// A learned plan gives up a window's width after its last ping is due,
+/// counted from the last refresh. One of two pings out, refreshed 250 s into
+/// the wait: one more beat, then the window's width.
+#[test]
+fn a_learned_plan_gives_up_a_window_after_its_last_ping_is_due() {
+    let plan = plan(&learning_at(2, 1, 300.0, 50.0), GiveUpRule::PingPlan).expect("a plan");
+    assert_eq!(plan.give_up_after_secs, 250.0 + 230.0 + 30.0);
+    assert_eq!(
+        plan.end.cap_source(),
+        CapSource::Learned {
+            pings: 2,
+            samples: 40,
+            from_hour: 10,
+            to_hour: 15,
+            utc_offset_mins: 0,
+        }
+    );
+}
+
+/// A learned cap of c sends exactly c pings (I6), however late each beat
+/// lands. Beat k comes with k - 1 sent, early or late in its window, after
+/// earlier beats that each drifted 26 s. With c sent, the next window opens
+/// past the give-up time.
+#[test]
+fn a_learned_cap_of_c_sends_c_pings() {
+    let every = window_start(CacheLifetime::FiveMinutes);
+    let late = *CacheLifetime::FiveMinutes
+        .beat_window(BeatStart::Cold)
+        .end();
+    let drifted = every + 26.0;
+    let copy = Beat::Send(BeatRoute::SessionCopy);
+    for c in [1, 2, 12] {
+        for k in 1..=c {
+            for since_request in [every, late] {
+                let secs = f64::from(k - 1) * drifted + since_request;
+                assert_eq!(
+                    decide(&learning_at(c, k - 1, secs, since_request)),
+                    copy,
+                    "beat {k} of {c}, {since_request} s after the last"
+                );
+            }
+        }
+        let secs = f64::from(c) * drifted + every;
+        assert_eq!(
+            decide(&learning_at(c, c, secs, every)),
+            skip(SkipReason::PastCutOff),
+            "beat {} of {c}",
+            c + 1
+        );
+    }
+}
+
+/// [`decide`] and [`status`] read one learned plan (I1): the card's give-up
+/// time is the tick's cut-off, and the stopped run names its cap. Two of three
+/// pings are out, the last refresh 500 s into the wait.
+#[test]
+fn a_learned_runs_give_up_time_is_the_time_decide_stops_at() {
+    let at = |secs: f64| learning_at(3, 2, secs, secs - 500.0);
+    let give_up_after = 500.0 + 230.0 + 30.0;
+    let before = at(give_up_after - 1.0);
+    assert_eq!(decide(&before), Beat::Send(BeatRoute::SessionCopy));
+    let CacheKeepAliveStatus::Warming {
+        give_up_at,
+        budget_beats,
+        cap_source,
+        ..
+    } = status(&before, &anchors_of(&before), pinged())
+    else {
+        panic!("a learned run before its give-up time is warming");
+    };
+    let turn_started = anchors_of(&before).turn_started_at.expect("a parked turn");
+    assert_eq!(give_up_at, after_secs(turn_started, give_up_after));
+    assert_eq!(budget_beats, 3, "the card shows the learned count");
+    let source = Some(PlanEnd::Learned(learned_cap(3)).cap_source());
+    assert_eq!(cap_source, source);
+
+    let after = at(give_up_after + 1.0);
+    assert_eq!(decide(&after), skip(SkipReason::PastCutOff));
+    let CacheKeepAliveStatus::Stopped { cap_source, .. } =
+        status(&after, &anchors_of(&after), pinged())
+    else {
+        panic!("a learned run past its give-up time stopped");
+    };
+    assert_eq!(cap_source, source);
+}
+
+/// The last ping may land after the cut-off it was sent under. Once it
+/// counts, the give-up time is its own refresh, already past, so the stopped
+/// run stays stopped (I5).
+#[test]
+fn a_late_last_ping_never_reopens_a_stopped_run() {
+    let in_flight = learning_at(3, 2, 500.0 + 270.0, 270.0);
+    assert_eq!(decide(&in_flight), skip(SkipReason::PastCutOff));
+    assert!(matches!(
+        status(&in_flight, &anchors_of(&in_flight), pinged()),
+        CacheKeepAliveStatus::Stopped { .. }
+    ));
+    let landed = learning_at(3, 3, 500.0 + 270.0, 25.0);
+    assert_eq!(decide(&landed), skip(SkipReason::PastCutOff));
+    assert!(matches!(
+        status(&landed, &anchors_of(&landed), pinged()),
+        CacheKeepAliveStatus::Stopped { .. }
+    ));
+}
+
+/// A learned cap of none sends no ping, and the card says the plan, not a
+/// fault, stopped it (I9).
+#[test]
+fn a_learned_cap_of_none_reads_past_give_up_time() {
+    let c = learning_at(0, 0, 80.0, 80.0);
+    assert_eq!(decide(&c), skip(SkipReason::PastCutOff));
+    assert_eq!(
+        status(&c, &anchors_of(&c), Spent::default()),
+        CacheKeepAliveStatus::past_cap(
+            CacheKeepAliveNotKeptReason::PastGiveUpTime,
+            PlanEnd::Learned(learned_cap(0)).cap_source(),
+        )
+    );
+}
+
+/// Once a parked wait's status recorded its odds, a rebuilt history never
+/// recounts them (I8), on a learned cap or half the reread cap.
+#[test]
+fn a_parked_waits_recorded_odds_stay_as_recorded() {
+    let recorded = CapOdds {
+        samples: 41,
+        slots: vec![10, 20],
+        after_cap: 11,
+    };
+    for (label, c) in [
+        ("learned", learning_at(1, 0, 100.0, 100.0)),
+        ("half", parked()),
+    ] {
+        let c = Candidate {
+            frozen_odds: Some(recorded.clone()),
+            ..c
+        };
+        let CacheKeepAliveStatus::Warming { odds, .. } = super::status(
+            &c,
+            GiveUpRule::PingPlan,
+            &one_ping_history(),
+            &anchors_of(&c),
+            Spent::default(),
+        ) else {
+            panic!("a {label} run warms");
+        };
+        assert_eq!(odds, Some(recorded.clone()), "{label}");
+    }
+}
+
+/// A learned cap's odds count the cards of the hours that set it, not the
+/// whole history (I8).
+#[test]
+fn a_learned_caps_odds_count_its_own_hours() {
+    let evening = |secs: f64| WaitSample {
+        secs,
+        start: LocalStart {
+            hour: 20,
+            ..WaitSample::at_noon(secs).start
+        },
+    };
+    let question = WaitType::Parked(ParkedCard::Question);
+    let history = WaitDurations::from_samples(
+        (0..30)
+            .map(|_| WaitSample::at_noon(300.0))
+            .chain((0..50).map(|_| evening(f64::INFINITY)))
+            .map(|sample| (WaitAgent::ClaudeCode, question, sample)),
+    );
+    let c = learning_at(1, 0, 100.0, 100.0);
+    let CacheKeepAliveStatus::Warming {
+        odds: Some(odds), ..
+    } = super::status(
+        &c,
+        GiveUpRule::PingPlan,
+        &history,
+        &anchors_of(&c),
+        Spent::default(),
+    )
+    else {
+        panic!("a learned run warms with odds");
+    };
+    assert_eq!(
+        odds,
+        CapOdds {
+            samples: 30,
+            slots: vec![0, 30],
+            after_cap: 0,
+        }
+    );
+}
+
 /// `off` beats nothing, on any wait.
 #[test]
 fn off_beats_nothing() {
@@ -631,55 +941,6 @@ fn off_beats_nothing() {
             "{c:?}"
         );
     }
-}
-
-/// Sixty bash waits that each needed two beats: `workspace-data` caps that
-/// type at two.
-fn short_bash_waits() -> WaitDurations {
-    let bash = WaitType::Events(kinds(&["BackgroundBashCompleted"]));
-    let secs = 2.5 * window_start(CacheLifetime::FiveMinutes);
-    WaitDurations::from_samples((0..60).map(|_| (WaitAgent::ClaudeCode, bash, secs)))
-}
-
-/// `workspace-data` gives up at the cap this workspace's own waits price
-/// cheapest. A type with too few waits keeps break-even.
-#[test]
-fn workspace_data_gives_up_at_the_tuned_cap() {
-    let beat_every = window_start(CacheLifetime::FiveMinutes);
-    let question = WaitType::Parked(ParkedCard::Question);
-    let cards = WaitDurations::from_samples(
-        (0..60).map(|_| (WaitAgent::ClaudeCode, question, 3.5 * beat_every)),
-    );
-    let rule = GiveUpRule::WorkspaceData(&cards);
-    let copy = Beat::Send(BeatRoute::SessionCopy);
-    assert_eq!(super::decide(&parked_for(3.0 * beat_every), rule), copy);
-    assert_eq!(
-        super::decide(&parked_for(3.0 * beat_every + 0.1), rule),
-        skip(SkipReason::PastCutOff)
-    );
-
-    for minutes in 0..=200 {
-        let c = Candidate {
-            keep_warm_wait_secs: Some(f64::from(minutes) * MINUTE),
-            ..due()
-        };
-        assert_eq!(super::decide(&c, rule), decide(&c), "{c:?}");
-    }
-
-    let bash = short_bash_waits();
-    let tuned = GiveUpRule::WorkspaceData(&bash);
-    let waiting = |secs: f64| Candidate {
-        keep_warm_wait_secs: Some(secs),
-        ..due()
-    };
-    assert_eq!(
-        super::decide(&waiting(2.0 * beat_every), tuned),
-        Beat::Send(BeatRoute::Resume)
-    );
-    assert_eq!(
-        super::decide(&waiting(2.0 * beat_every + 0.1), tuned),
-        skip(SkipReason::PastCutOff)
-    );
 }
 
 /// The type is the one of the wait the clock measures: the card when parked,
@@ -754,22 +1015,58 @@ fn the_catalog_default_is_off() {
     assert_eq!(CacheKeepAliveMode::parse(value), CacheKeepAliveMode::Off);
 }
 
+/// The intermediate mode merge converts retired values to on before the later
+/// upgrade reset turns them off. Replay only that intermediate step here.
+#[tokio::test]
+async fn the_intermediate_merge_converts_retired_modes_to_on() {
+    const MERGE: &str =
+        include_str!("../../../migrations/20261030213124_cache_keep_alive_mode_is_off_or_on.sql");
+    let (pool, db_name) = setup_test_db().await;
+    let key = crate::core::prefs::CACHE_KEEP_ALIVE_MODE.key();
+    let retired = ["break-even", "workspace-data"];
+    let cases = retired
+        .map(|mode| (mode, CacheKeepAliveMode::On))
+        .into_iter()
+        .chain([("off", CacheKeepAliveMode::Off)]);
+    for (stored, read) in cases {
+        sqlx::query("DELETE FROM preferences WHERE key = $1")
+            .bind(key)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO preferences (key, value) VALUES ($1, $2)")
+            .bind(key)
+            .bind(stored)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(MERGE).execute(&pool).await.expect("re-runs");
+        let value: String = sqlx::query_scalar("SELECT value FROM preferences WHERE key = $1")
+            .bind(key)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(CacheKeepAliveMode::parse(&value), read, "{stored}");
+        assert!(CACHE_KEEP_ALIVE_MODES.contains(&value.as_str()), "{stored}");
+    }
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Pins the stored values, a wire contract the migration writes.
+#[test]
+fn the_catalog_lists_off_and_on() {
+    assert_eq!(CACHE_KEEP_ALIVE_MODES, ["on", "off"]);
+}
+
 #[test]
 fn each_mode_picks_its_rule() {
-    let bash = short_bash_waits();
-    let c = Candidate {
-        keep_warm_wait_secs: Some(2.0 * window_start(CacheLifetime::FiveMinutes) + 0.1),
-        ..due()
-    };
-    let decide_under = |mode| super::decide(&c, GiveUpRule::of(mode, &bash));
-    assert_eq!(decide_under(CacheKeepAliveMode::BreakEven), decide(&c));
-    assert_eq!(
-        decide_under(CacheKeepAliveMode::WorkspaceData),
-        skip(SkipReason::PastCutOff)
-    );
+    let c = due();
+    let decide_under = |mode| super::decide(&c, GiveUpRule::of(mode));
+    assert_eq!(decide_under(CacheKeepAliveMode::On), decide(&c));
     assert_eq!(
         decide_under(CacheKeepAliveMode::Off),
-        super::decide(&c, GiveUpRule::Off)
+        skip(SkipReason::Disabled)
     );
 }
 
@@ -797,7 +1094,11 @@ fn only_a_wait_on_keep_warm_kinds_alone_counts() {
     let bash = wait_on(&["BackgroundBashCompleted"], 5);
     let mixed = wait_on(&["BackgroundBashCompleted", "E2ETestsPassed"], 1);
     let other = wait_on(&["E2ETestsPassed"], 1);
-    let bash_wait = Some((bash.armed_at, kinds(&["BackgroundBashCompleted"])));
+    let bash_wait = Some(KeepWarmWait {
+        armed_at: bash.armed_at,
+        kinds: kinds(&["BackgroundBashCompleted"]),
+        expires_at: bash.expires_at,
+    });
     assert_eq!(newest_keep_warm_wait([&bash]), bash_wait);
     assert_eq!(newest_keep_warm_wait([&mixed, &other]), None);
     assert_eq!(
@@ -814,7 +1115,7 @@ fn the_newest_keep_warm_wait_names_the_kinds() {
     let lock = wait_on(&["E2ELockReleased"], 9);
     let agent = wait_on(&["ChangeApplied", "CodingAgentIdled"], 2);
     assert_eq!(
-        newest_keep_warm_wait([&lock, &agent]).map(|(_, k)| k),
+        newest_keep_warm_wait([&lock, &agent]).map(|w| w.kinds),
         Some(kinds(&["CodingAgentIdled", "ChangeApplied"]))
     );
     assert_eq!(KeepWarmKinds::of([]), None, "a wait on nothing");
@@ -1189,7 +1490,117 @@ async fn a_child_counts_as_working_only_while_it_runs() {
     set_status(&pool, approving, ThreadStatus::Running).await;
     assert!(
         matches!(children_of_parent().await, ActiveChildren::Working { wait_secs } if wait_secs < 60.0),
-        "an answered card puts the child back to work, timed from the parent's real idle"
+        "an answered card puts the child back to work, timed from its spawn"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A child idles for a few seconds between two successor sessions. The
+/// parent's wait goes on through that gap, so its status is neither cleared
+/// nor written again at every handoff.
+#[tokio::test]
+async fn a_child_between_successor_sessions_still_works() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let (parent, child) = (Uuid::new_v4(), Uuid::new_v4());
+    start_cc_session(&bus, parent, "claude-code/parent", None).await;
+    seed_thread_event(&bus, parent, real_idle()).await;
+    start_cc_session(&bus, child, "claude-code/child", None).await;
+    sqlx::query("UPDATE thread_summaries SET parent_thread_id = $2 WHERE thread_id = $1")
+        .bind(child)
+        .bind(parent)
+        .execute(&pool)
+        .await
+        .unwrap();
+    seed_thread_event(
+        &bus,
+        child,
+        ThreadEvent::SessionHandedOff {
+            opening: crate::engine::thread_events::HandoffOpening::Narrative,
+            message: "A fresh session starts here.".into(),
+            checkpoint: None,
+            progress: None,
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            coding_agent_model: None,
+            reasoning_effort: None,
+            request: None,
+        },
+    )
+    .await;
+    set_status(&pool, child, ThreadStatus::Idle).await;
+    sqlx::query("UPDATE thread_summaries SET active_children_count = 0 WHERE thread_id = $1")
+        .bind(parent)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let row = read_candidates(&pool, &[])
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.thread_id == parent)
+        .expect("a parent whose child is handing off stays a candidate");
+    assert!(matches!(
+        row.active_children(),
+        ActiveChildren::Working { .. }
+    ));
+    assert!(
+        row.children_wait_began_at.is_some(),
+        "the wait keeps its start through the gap"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A wait on children began at the parent's first real idle after the newest
+/// working child was spawned. A later real turn moves the run, not the wait.
+#[tokio::test]
+async fn a_real_turn_mid_wait_moves_no_wait_on_children() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let (parent, child) = (Uuid::new_v4(), Uuid::new_v4());
+    start_cc_session(&bus, parent, "claude-code/parent", None).await;
+    start_cc_session(&bus, child, "claude-code/child", None).await;
+    sqlx::query(
+        "UPDATE thread_summaries SET parent_thread_id = $2, \
+         created_at = now() - interval '31 minutes' WHERE thread_id = $1",
+    )
+    .bind(child)
+    .bind(parent)
+    .execute(&pool)
+    .await
+    .unwrap();
+    set_status(&pool, child, ThreadStatus::Running).await;
+    sqlx::query("UPDATE thread_summaries SET active_children_count = 1 WHERE thread_id = $1")
+        .bind(parent)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let spawned_turn_end = seed_thread_event(&bus, parent, real_idle()).await;
+    age(&pool, spawned_turn_end, 30.0 * MINUTE).await;
+    let parent_row = || async {
+        read_candidates(&pool, &[])
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.thread_id == parent)
+            .expect("a parent with a working child is a candidate")
+    };
+    let wait_began = parent_row()
+        .await
+        .children_wait_began_at
+        .expect("the wait began at the turn that spawned the child");
+
+    let user_turn_end = seed_thread_event(&bus, parent, real_idle()).await;
+    age(&pool, user_turn_end, 60.0).await;
+    let after_the_user_turn = parent_row().await;
+    assert_eq!(after_the_user_turn.children_wait_began_at, Some(wait_began));
+    assert!(
+        after_the_user_turn.idle_at > Some(wait_began),
+        "the run moved"
     );
 
     pool.close().await;
@@ -1267,13 +1678,14 @@ fn secs_before_now(secs: f64) -> DateTime<Utc> {
 
 /// The anchors a candidate's ages were measured from, at [`now`].
 fn anchors_of(c: &Candidate) -> Anchors {
-    let idle_secs = match c.children {
-        ActiveChildren::Working { wait_secs } => Some(wait_secs),
+    let children_wait_began_at = match c.children {
+        ActiveChildren::Working { wait_secs } => Some(secs_before_now(wait_secs)),
         _ => None,
     };
     Anchors {
         keep_warm_armed_at: c.keep_warm_wait_secs.map(secs_before_now),
-        idle_at: idle_secs.map(secs_before_now),
+        idle_at: children_wait_began_at,
+        children_wait_began_at,
         request_started_at: c.secs_since_request.map(secs_before_now),
         turn_started_at: c.parked.map(|p| secs_before_now(p.secs)),
     }
@@ -1325,6 +1737,9 @@ fn status_kind_for(rule: GiveUpRule, c: &Candidate, beat: &Beat) -> StatusKind {
         // The agreement test spends no beat, and a run that never pinged
         // never reads stopped.
         Beat::Skip(SkipReason::PastCutOff) => StatusKind::NotKept(Reason::PastGiveUpTime),
+        // The run warms on while its one re-estimate is due or under way.
+        Beat::Skip(SkipReason::PlanRanOut) => StatusKind::Warming,
+        Beat::Skip(SkipReason::WakePastCap) => StatusKind::NotKept(Reason::WakePastRereadCap),
         Beat::Skip(SkipReason::ChildrenAwaitingUser) => {
             StatusKind::NotKept(Reason::ChildrenAwaitingUser)
         }
@@ -1463,6 +1878,8 @@ fn one_candidate_per_verdict() -> Vec<Candidate> {
             unattended_trigger: true,
             ..due()
         },
+        expecting(due(), 0.0, 5.0 * MINUTE, ReEstimate::NotAsked),
+        expecting(due(), 0.0, 90.0 * MINUTE, ReEstimate::NotAsked),
     ]
 }
 
@@ -1471,12 +1888,7 @@ fn one_candidate_per_verdict() -> Vec<Candidate> {
 #[test]
 fn the_status_agrees_with_the_beat_on_every_verdict() {
     let mut reached = Vec::new();
-    let tuned = short_bash_waits();
-    for rule in [
-        GiveUpRule::BreakEven,
-        GiveUpRule::WorkspaceData(&tuned),
-        GiveUpRule::Off,
-    ] {
+    for rule in [GiveUpRule::PingPlan, GiveUpRule::Off] {
         for candidate in one_candidate_per_verdict() {
             let beat = super::decide(&candidate, rule);
             let status = super::status(
@@ -1493,11 +1905,11 @@ fn the_status_agrees_with_the_beat_on_every_verdict() {
             }
         }
     }
-    assert_eq!(reached.len(), 26, "every verdict is covered: {reached:?}");
+    assert_eq!(reached.len(), 28, "every verdict is covered: {reached:?}");
 }
 
 /// A warming status dates everything from the database's own stamps: the wait
-/// start, the stop at the break-even budget, and the next beat's window.
+/// start, the stop at the reread cap, and the next beat's window.
 #[test]
 fn a_warming_status_dates_the_run_from_its_anchors() {
     let c = due();
@@ -1528,6 +1940,8 @@ fn a_warming_status_dates_the_run_from_its_anchors() {
             ping_usd: None,
             reread_usd: None,
             odds: None,
+            expected_wake: None,
+            cap_source: Some(CapSource::RereadCap),
         }
     );
 }
@@ -1545,7 +1959,7 @@ fn a_stopped_status_says_when_the_budget_ran_out() {
         context_tokens: 262_000,
         ..Spent::default()
     };
-    let give_up = give_up_after_secs(&c, GiveUpRule::BreakEven).expect("a budget");
+    let give_up = give_up_after_secs(&c, GiveUpRule::PingPlan).expect("a budget");
     assert_eq!(
         status(&c, &anchors_of(&c), spent),
         CacheKeepAliveStatus::Stopped {
@@ -1557,6 +1971,7 @@ fn a_stopped_status_says_when_the_budget_ran_out() {
             reread_usd: None,
             beat_every_secs: c.beat_every_secs().map(|secs| secs as u32),
             odds: None,
+            cap_source: Some(CapSource::RereadCap),
         }
     );
 }
@@ -1575,6 +1990,63 @@ fn the_status_does_not_move_with_the_clock() {
         status(&c, &anchors_of(&c), Spent::default()),
         status(&later, &anchors_of(&c), Spent::default())
     );
+}
+
+fn since_and_give_up(status: &CacheKeepAliveStatus) -> (DateTime<Utc>, DateTime<Utc>) {
+    let CacheKeepAliveStatus::Warming {
+        since, give_up_at, ..
+    } = *status
+    else {
+        panic!("a due thread is warming: {status:?}");
+    };
+    (since, give_up_at)
+}
+
+/// A real idle after the wait began starts a new run, but leaves the give-up
+/// time where the wait put it. An idle before the wait began changes nothing.
+/// Both hold for a wait on events and a wait on children.
+#[test]
+fn a_real_idle_mid_wait_starts_a_run_but_keeps_the_give_up_time() {
+    let on_children = Candidate {
+        keep_warm_wait_secs: None,
+        children: ActiveChildren::Working {
+            wait_secs: 10.0 * MINUTE,
+        },
+        ..due()
+    };
+    for c in [due(), on_children] {
+        let armed = anchors_of(&c);
+        let (wait_since, give_up_at) = since_and_give_up(&status(&c, &armed, Spent::default()));
+        assert_eq!(wait_since, secs_before_now(10.0 * MINUTE));
+
+        let idle_mid_wait = Anchors {
+            idle_at: Some(secs_before_now(2.0 * MINUTE)),
+            ..armed
+        };
+        assert_eq!(
+            since_and_give_up(&status(&c, &idle_mid_wait, Spent::default())),
+            (secs_before_now(2.0 * MINUTE), give_up_at),
+            "the user's turn names a new run, and moves no give-up time: {:?}",
+            c.children
+        );
+        let budget = |anchors: &Anchors| match status(&c, anchors, Spent::default()) {
+            CacheKeepAliveStatus::Warming { budget_beats, .. } => budget_beats,
+            other => panic!("warming: {other:?}"),
+        };
+        assert!(
+            budget(&idle_mid_wait) < budget(&armed),
+            "the new run counts only the pings left to it"
+        );
+
+        let idle_before = Anchors {
+            idle_at: Some(secs_before_now(30.0 * MINUTE)),
+            ..armed
+        };
+        assert_eq!(
+            since_and_give_up(&status(&c, &idle_before, Spent::default())),
+            (wait_since, give_up_at)
+        );
+    }
 }
 
 fn keep_alive_anchor() -> ThreadEvent {
@@ -1751,7 +2223,7 @@ async fn the_status_is_written_on_change_and_cleared_when_the_wait_ends() {
         &bus,
         thread_id,
         &candidate,
-        GiveUpRule::BreakEven,
+        GiveUpRule::PingPlan,
         &WaitDurations::default(),
         &anchors,
         None,
@@ -1766,7 +2238,7 @@ async fn the_status_is_written_on_change_and_cleared_when_the_wait_ends() {
         &bus,
         thread_id,
         &candidate,
-        GiveUpRule::BreakEven,
+        GiveUpRule::PingPlan,
         &WaitDurations::default(),
         &anchors,
         written.clone(),
@@ -1792,7 +2264,7 @@ async fn the_status_is_written_on_change_and_cleared_when_the_wait_ends() {
         &bus,
         thread_id,
         &busy,
-        GiveUpRule::BreakEven,
+        GiveUpRule::PingPlan,
         &WaitDurations::default(),
         &anchors_of(&busy),
         written,
@@ -2065,7 +2537,7 @@ async fn a_run_ends_when_its_thread_moves_on_without_leaving_the_selection() {
         &bus,
         thread_id,
         &idle,
-        GiveUpRule::BreakEven,
+        GiveUpRule::PingPlan,
         &WaitDurations::default(),
         &anchors_of(&idle),
         stored,
@@ -2086,7 +2558,7 @@ async fn a_run_ends_when_its_thread_moves_on_without_leaving_the_selection() {
         &bus,
         thread_id,
         &idle,
-        GiveUpRule::BreakEven,
+        GiveUpRule::PingPlan,
         &WaitDurations::default(),
         &anchors_of(&idle),
         after,
@@ -2109,7 +2581,7 @@ async fn a_run_ends_when_its_thread_moves_on_without_leaving_the_selection() {
         &bus,
         thread_id,
         &newer,
-        GiveUpRule::BreakEven,
+        GiveUpRule::PingPlan,
         &WaitDurations::default(),
         &anchors_of(&newer),
         stored,
@@ -2156,13 +2628,13 @@ async fn a_run_that_pinged_ends_when_its_pings_stop_mid_wait() {
         (
             "a restart",
             restarted,
-            GiveUpRule::BreakEven,
+            GiveUpRule::PingPlan,
             Some(CacheKeepAliveNotKeptReason::Restarted),
         ),
         (
             "only no-wake children",
             no_wake_children,
-            GiveUpRule::BreakEven,
+            GiveUpRule::PingPlan,
             Some(CacheKeepAliveNotKeptReason::NoWakeChildren),
         ),
     ];
@@ -2240,6 +2712,8 @@ async fn a_close_waits_for_the_wake_capture_while_the_thread_runs() {
         ping_usd: None,
         reread_usd: None,
         odds: None,
+        expected_wake: None,
+        cap_source: Some(CapSource::HalfReread),
     };
     emit_status(&bus, thread_id, Some(warming.clone())).await;
     seed_ping(&bus, thread_id, 100_000, 1).await;
@@ -2270,6 +2744,266 @@ async fn a_close_waits_for_the_wake_capture_while_the_thread_runs() {
 
     pool.close().await;
     teardown_test_db(&db_name).await;
+}
+
+fn beat_idle() -> ThreadEvent {
+    let mut idle = real_idle();
+    if let ThreadEvent::CodingAgentIdled { reason, .. } = &mut idle {
+        *reason = Some(KEEP_ALIVE_IDLE_REASON.to_string());
+    }
+    idle
+}
+
+/// A real turn mid-wait ends the run with what it spent, and the agent's next
+/// idle opens a new run that has spent nothing. A beat's own idle never opens
+/// one.
+#[tokio::test]
+async fn a_real_turn_mid_wait_ends_the_run_and_opens_the_next() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, "claude-code/mid-wait", None).await;
+    let armed: DateTime<Utc> = sqlx::query_scalar("SELECT now() - interval '10 minutes'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let wait = Some(KeepWarmWait {
+        armed_at: armed,
+        kinds: kinds(&["BackgroundBashCompleted"]),
+        expires_at: armed + Duration::hours(1),
+    });
+    let arming_idle = seed_thread_event(&bus, thread_id, real_idle()).await;
+    age(&pool, arming_idle, 590.0).await;
+    for idle_age in [478.0, 238.0] {
+        seed_ping(&bus, thread_id, 100_000, 1).await;
+        let idle = seed_thread_event(&bus, thread_id, beat_idle()).await;
+        age(&pool, idle, idle_age).await;
+    }
+    place_pings_and_captures(&pool, thread_id, &[480.0, 479.0, 240.0, 239.0]).await;
+    set_status(&pool, thread_id, ThreadStatus::Idle).await;
+    let created = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, DateTime<Utc>>("SELECT created FROM events WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    let first_since = created(arming_idle).await;
+    let tick = |stored: Option<CacheKeepAliveStatus>| {
+        let (bus, pool) = (bus.clone(), pool.clone());
+        async move {
+            let row = candidate_row(&pool, thread_id).await.expect("a candidate");
+            sync_status(
+                &bus,
+                thread_id,
+                &due(),
+                GiveUpRule::PingPlan,
+                &WaitDurations::default(),
+                &row.anchors(wait),
+                stored,
+            )
+            .await;
+            stored_status(&pool, thread_id).await
+        }
+    };
+
+    let first = tick(None).await;
+    assert!(
+        matches!(
+            first,
+            Some(CacheKeepAliveStatus::Warming { since, beats: 2, .. }) if since == first_since
+        ),
+        "the run starts at the arming turn's idle, and the beats' idles move nothing: {first:?}"
+    );
+
+    // The user writes: a real turn reads the warm cache, then the agent idles
+    // with the wait still armed.
+    seed_thread_event(&bus, thread_id, turn_capture(1_000)).await;
+    place_pings_and_captures(&pool, thread_id, &[480.0, 479.0, 240.0, 239.0, 60.0]).await;
+    let user_idle = seed_thread_event(&bus, thread_id, real_idle()).await;
+    age(&pool, user_idle, 30.0).await;
+    set_status(&pool, thread_id, ThreadStatus::Idle).await;
+    let second_since = created(user_idle).await;
+
+    let second = tick(first).await;
+    assert!(
+        matches!(
+            second,
+            Some(CacheKeepAliveStatus::Warming { since, beats: 0, .. }) if since == second_since
+        ),
+        "a new run, with no pings of its own: {second:?}"
+    );
+    let history = status_history(&pool, thread_id).await;
+    assert!(
+        matches!(
+            history[history.len() - 2],
+            Some(CacheKeepAliveStatus::Ended { since, beats: 2, .. }) if since == first_since
+        ),
+        "the old run ended before the new one warmed: {history:?}"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A thread whose warming run of 2 pings ended because its only child asked
+/// the user, so the wait was on nobody.
+struct EndedByChild {
+    pool: sqlx::PgPool,
+    db_name: String,
+    bus: EventBus,
+    thread_id: Uuid,
+    wait: Option<KeepWarmWait>,
+    not_kept: Option<CacheKeepAliveStatus>,
+}
+
+impl EndedByChild {
+    async fn new() -> Self {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        start_cc_session(&bus, thread_id, "claude-code/resumed-wait", None).await;
+        let armed: DateTime<Utc> = sqlx::query_scalar("SELECT now() - interval '10 minutes'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let wait = Some(KeepWarmWait {
+            armed_at: armed,
+            kinds: kinds(&["BackgroundBashCompleted"]),
+            expires_at: armed + Duration::hours(1),
+        });
+        let arming_idle = seed_thread_event(&bus, thread_id, real_idle()).await;
+        age(&pool, arming_idle, 590.0).await;
+        for idle_age in [478.0, 238.0] {
+            seed_ping(&bus, thread_id, 100_000, 1).await;
+            let idle = seed_thread_event(&bus, thread_id, beat_idle()).await;
+            age(&pool, idle, idle_age).await;
+        }
+        place_pings_and_captures(&pool, thread_id, &[480.0, 479.0, 240.0, 239.0]).await;
+        set_status(&pool, thread_id, ThreadStatus::Idle).await;
+        let mut fixture = Self {
+            pool,
+            db_name,
+            bus,
+            thread_id,
+            wait,
+            not_kept: None,
+        };
+        let warming = fixture.tick(due(), None).await;
+        assert!(
+            matches!(
+                warming,
+                Some(CacheKeepAliveStatus::Warming { beats: 2, .. })
+            ),
+            "{warming:?}"
+        );
+        fixture.not_kept = fixture.tick(on_the_user(), warming).await;
+        fixture
+    }
+
+    async fn tick(
+        &self,
+        candidate: Candidate,
+        stored: Option<CacheKeepAliveStatus>,
+    ) -> Option<CacheKeepAliveStatus> {
+        let row = candidate_row(&self.pool, self.thread_id)
+            .await
+            .expect("a candidate");
+        sync_status(
+            &self.bus,
+            self.thread_id,
+            &candidate,
+            GiveUpRule::PingPlan,
+            &WaitDurations::default(),
+            &row.anchors(self.wait),
+            stored,
+        )
+        .await;
+        stored_status(&self.pool, self.thread_id).await
+    }
+
+    async fn ended_runs(&self) -> Vec<u32> {
+        status_history(&self.pool, self.thread_id)
+            .await
+            .into_iter()
+            .filter_map(|s| match s {
+                Some(CacheKeepAliveStatus::Ended { beats, .. }) => Some(beats),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn teardown(self) {
+        self.pool.close().await;
+        teardown_test_db(&self.db_name).await;
+    }
+}
+
+/// The only child asks the user, so the wait is on nobody.
+fn on_the_user() -> Candidate {
+    Candidate {
+        keep_warm_wait_secs: None,
+        children: ActiveChildren::AllAwaitingUser,
+        ..due()
+    }
+}
+
+/// A run that ended keeps its pings. When the same wait resumes past its
+/// budget, with no real turn between, nothing reopens it as stopped: its pings
+/// were reported once, in the ended status.
+#[tokio::test]
+async fn a_resumed_wait_never_reopens_an_ended_run_as_stopped() {
+    let fixture = EndedByChild::new().await;
+    // The user answers long after the budget, and the child works again.
+    let resumed = Candidate {
+        keep_warm_wait_secs: Some(10.0 * 60.0 * MINUTE),
+        ..due()
+    };
+    fixture.tick(resumed, fixture.not_kept.clone()).await;
+
+    let history = status_history(&fixture.pool, fixture.thread_id).await;
+    let ended = history
+        .iter()
+        .position(|s| matches!(s, Some(CacheKeepAliveStatus::Ended { beats: 2, .. })))
+        .unwrap_or_else(|| panic!("the run ended with its pings: {history:?}"));
+    assert!(
+        !history[ended..]
+            .iter()
+            .any(|s| matches!(s, Some(CacheKeepAliveStatus::Stopped { .. }))),
+        "the ended run's pings never come back as a stopped run: {history:?}"
+    );
+    fixture.teardown().await;
+}
+
+/// When the same wait resumes within its budget, the run it opens reports
+/// only its own pings, while warming and when it ends.
+#[tokio::test]
+async fn a_resumed_run_ends_with_only_its_own_pings() {
+    let fixture = EndedByChild::new().await;
+    let resumed = fixture.tick(due(), fixture.not_kept.clone()).await;
+    assert!(
+        matches!(
+            resumed,
+            Some(CacheKeepAliveStatus::Warming { beats: 0, .. })
+        ),
+        "{resumed:?}"
+    );
+    seed_ping(&fixture.bus, fixture.thread_id, 100_000, 1).await;
+    let warming = fixture.tick(due(), resumed).await;
+    assert!(
+        matches!(
+            warming,
+            Some(CacheKeepAliveStatus::Warming { beats: 1, .. })
+        ),
+        "{warming:?}"
+    );
+    fixture.tick(on_the_user(), warming).await;
+
+    assert_eq!(fixture.ended_runs().await, vec![2, 1]);
+    fixture.teardown().await;
 }
 
 fn kind_of_warming_or_ended(status: &Option<CacheKeepAliveStatus>) -> &'static str {
@@ -2748,7 +3482,7 @@ async fn a_parked_session_writes_its_status() {
         &bus,
         thread_id,
         &parked,
-        GiveUpRule::BreakEven,
+        GiveUpRule::PingPlan,
         &WaitDurations::default(),
         &anchors_of(&parked),
         None,
@@ -2763,6 +3497,164 @@ async fn a_parked_session_writes_its_status() {
         anchors_of(&parked).turn_started_at,
         "the run began with the turn request"
     );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The row counts the pings sent since the parking, one per call however
+/// many frames it records. A beat of an earlier wait does not count.
+#[tokio::test]
+async fn the_row_counts_the_pings_since_the_parking() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, "claude-code/pings-sent", None).await;
+    let beat = |call: &str| {
+        let mut event = copy_capture(1_000);
+        if let ThreadEvent::ContextCaptured { api_call_id, .. } = &mut event {
+            *api_call_id = Some(call.to_string());
+        }
+        event
+    };
+    seed_thread_event(&bus, thread_id, beat("earlier-wait")).await;
+    seed_thread_event(&bus, thread_id, question_asked()).await;
+    set_status(&pool, thread_id, ThreadStatus::WaitingForUserAnswer).await;
+    let pings = || async {
+        candidate_row(&pool, thread_id)
+            .await
+            .expect("a parked session")
+            .pings_sent
+    };
+    assert_eq!(pings().await, 0);
+
+    seed_thread_event(&bus, thread_id, beat("first")).await;
+    seed_thread_event(&bus, thread_id, beat("first")).await;
+    seed_thread_event(&bus, thread_id, beat("second")).await;
+    assert_eq!(pings().await, 2);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Question cards at every hour, each needing one 230 s beat: enough to learn
+/// a cap of one ping for an ask at any hour, from 50 cards.
+fn one_ping_history() -> WaitDurations {
+    let question = WaitType::Parked(ParkedCard::Question);
+    WaitDurations::from_samples((0..24u8).flat_map(|hour| {
+        (0..10u32).map(move |i| {
+            let start = LocalStart {
+                hour,
+                day: chrono::NaiveDate::from_ymd_opt(2026, 10, 1 + i % 7).expect("a date"),
+            };
+            (
+                WaitAgent::ClaudeCode,
+                question,
+                WaitSample { secs: 300.0, start },
+            )
+        })
+    }))
+}
+
+/// A run that stopped at a learned cap of `pings`.
+fn stopped_at(pings: u32) -> CacheKeepAliveStatus {
+    CacheKeepAliveStatus::Stopped {
+        at: now(),
+        beats: pings,
+        cost_usd: 0.1,
+        context_tokens: 100_000,
+        ping_usd: None,
+        reread_usd: None,
+        beat_every_secs: Some(230),
+        odds: None,
+        cap_source: Some(PlanEnd::Learned(learned_cap(pings)).cap_source()),
+    }
+}
+
+/// The cap of a Claude Code question card the thread's row resolves against
+/// `history`.
+async fn question_cap(pool: &sqlx::PgPool, thread_id: Uuid, history: &WaitDurations) -> ParkedCap {
+    candidate_row(pool, thread_id)
+        .await
+        .expect("a parked session")
+        .parked_cap(Agent::ClaudeCode, ParkedCard::Question, history)
+}
+
+/// The first status of a parked wait that names a parked cap freezes it
+/// (I5). No rebuild moves it, nor the empty history after a restart (I12). A
+/// status of an earlier wait, an ended one, or one naming another source never
+/// counts.
+#[tokio::test]
+async fn a_parked_waits_cap_is_read_back_from_its_own_status() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, "claude-code/frozen-cap", None).await;
+    seed_thread_event(&bus, thread_id, capture_writing(1_000, 0, false)).await;
+    emit_status(&bus, thread_id, Some(stopped_at(5))).await;
+    seed_thread_event(&bus, thread_id, question_asked()).await;
+    set_status(&pool, thread_id, ThreadStatus::WaitingForUserAnswer).await;
+    let learned = one_ping_history();
+    let empty = WaitDurations::default();
+    let cap = |history| question_cap(&pool, thread_id, history);
+    let fresh =
+        |cap: ParkedCap| matches!(cap, ParkedCap::Learned(c) if c.pings == 1 && c.samples == 50);
+
+    assert!(
+        fresh(cap(&learned).await),
+        "an earlier wait's status never counts"
+    );
+    assert_eq!(cap(&empty).await, ParkedCap::HalfReread, "below the floor");
+
+    let ended = CacheKeepAliveStatus::Ended {
+        since: now(),
+        at: now(),
+        beats: 5,
+        cost_usd: 0.1,
+        saved_usd: None,
+        context_tokens: None,
+        ping_usd: None,
+        reread_usd: None,
+        beat_every_secs: Some(230),
+        odds: None,
+        cap_source: Some(PlanEnd::Learned(learned_cap(5)).cap_source()),
+    };
+    emit_status(&bus, thread_id, Some(ended)).await;
+    assert!(fresh(cap(&learned).await), "an ended run never counts");
+    emit_status(
+        &bus,
+        thread_id,
+        Some(CacheKeepAliveStatus::past_cap(
+            CacheKeepAliveNotKeptReason::PastGiveUpTime,
+            CapSource::RereadCap,
+        )),
+    )
+    .await;
+    assert!(
+        fresh(cap(&learned).await),
+        "a source no parked plan has never counts"
+    );
+
+    emit_status(&bus, thread_id, Some(stopped_at(2))).await;
+    emit_status(
+        &bus,
+        thread_id,
+        Some(CacheKeepAliveStatus::past_cap(
+            CacheKeepAliveNotKeptReason::PastGiveUpTime,
+            CapSource::HalfReread,
+        )),
+    )
+    .await;
+    for (label, history) in [("a rebuild", &learned), ("a restart", &empty)] {
+        assert_eq!(
+            cap(history).await,
+            ParkedCap::Learned(learned_cap(2)),
+            "{label} keeps the first status's cap"
+        );
+    }
+
+    seed_thread_event(&bus, thread_id, question_asked()).await;
+    assert!(fresh(cap(&learned).await), "a new card starts a new wait");
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -2796,7 +3688,7 @@ fn the_status_names_why_nothing_keeps_a_thread_warm() {
                 agent: Agent::Codex,
                 ..parked()
             },
-            GiveUpRule::BreakEven,
+            GiveUpRule::PingPlan,
             Reason::Codex,
             Some(SkipReason::Codex),
         ),
@@ -2810,7 +3702,7 @@ fn the_status_names_why_nothing_keeps_a_thread_warm() {
         (
             "a session that outlived a restart",
             restarted(),
-            GiveUpRule::BreakEven,
+            GiveUpRule::PingPlan,
             Reason::Restarted,
             Some(SkipReason::NoCopyPrompt),
         ),
@@ -2820,7 +3712,7 @@ fn the_status_names_why_nothing_keeps_a_thread_warm() {
                 claim: ThreadClaim::Free,
                 ..parked()
             },
-            GiveUpRule::BreakEven,
+            GiveUpRule::PingPlan,
             Reason::Restarted,
             Some(SkipReason::AwaitingUser),
         ),
@@ -2830,7 +3722,7 @@ fn the_status_names_why_nothing_keeps_a_thread_warm() {
                 awaiting_user: true,
                 ..due()
             },
-            GiveUpRule::BreakEven,
+            GiveUpRule::PingPlan,
             Reason::NothingPending,
             Some(SkipReason::AwaitingUser),
         ),
@@ -2840,7 +3732,7 @@ fn the_status_names_why_nothing_keeps_a_thread_warm() {
                 keep_warm_wait_secs: None,
                 ..due()
             },
-            GiveUpRule::BreakEven,
+            GiveUpRule::PingPlan,
             Reason::NothingPending,
             Some(SkipReason::NothingToWaitFor),
         ),
@@ -2899,7 +3791,7 @@ fn a_reason_that_names_no_wait_records_nothing() {
 /// time.
 #[test]
 fn a_parked_runs_give_up_time_is_the_time_decide_stops_at() {
-    let give_up_after = give_up_after_secs(&parked(), GiveUpRule::BreakEven).expect("a budget");
+    let give_up_after = give_up_after_secs(&parked(), GiveUpRule::PingPlan).expect("a budget");
     let at = |secs: f64| Candidate {
         parked: parked().parked.map(|p| Parked { secs, ..p }),
         secs_since_request: Some(window_start(CacheLifetime::FiveMinutes) + 1.0),
@@ -2912,7 +3804,7 @@ fn a_parked_runs_give_up_time_is_the_time_decide_stops_at() {
 
     let before = at(give_up_after - 1.0);
     assert_eq!(
-        super::decide(&before, GiveUpRule::BreakEven),
+        super::decide(&before, GiveUpRule::PingPlan),
         Beat::Send(BeatRoute::SessionCopy)
     );
     let spent = Spent {
@@ -2930,7 +3822,7 @@ fn a_parked_runs_give_up_time_is_the_time_decide_stops_at() {
         ..
     } = super::status(
         &before,
-        GiveUpRule::BreakEven,
+        GiveUpRule::PingPlan,
         &WaitDurations::default(),
         &anchors_of(&before),
         spent,
@@ -2951,13 +3843,13 @@ fn a_parked_runs_give_up_time_is_the_time_decide_stops_at() {
 
     let after = at(give_up_after + 1.0);
     assert_eq!(
-        super::decide(&after, GiveUpRule::BreakEven),
+        super::decide(&after, GiveUpRule::PingPlan),
         Beat::Skip(SkipReason::PastCutOff)
     );
     assert_eq!(
         super::status(
             &after,
-            GiveUpRule::BreakEven,
+            GiveUpRule::PingPlan,
             &WaitDurations::default(),
             &anchors_of(&after),
             spent
@@ -2971,6 +3863,7 @@ fn a_parked_runs_give_up_time_is_the_time_decide_stops_at() {
             reread_usd: None,
             beat_every_secs: after.beat_every_secs().map(|secs| secs as u32),
             odds: None,
+            cap_source: Some(CapSource::HalfReread),
         }
     );
 }
@@ -3159,7 +4052,7 @@ fn the_switch_shows_on_the_status() {
     let off = |c: &Candidate| {
         super::status(
             c,
-            GiveUpRule::BreakEven,
+            GiveUpRule::PingPlan,
             &WaitDurations::default(),
             &anchors_of(c),
             spent,
@@ -3174,6 +4067,7 @@ fn the_switch_shows_on_the_status() {
         reread_usd: None,
         beat_every_secs: c.beat_every_secs().map(|secs| secs as u32),
         odds: None,
+        cap_source: plan(c, GiveUpRule::PingPlan).map(|plan| plan.end.cap_source()),
     };
     for (label, c) in [
         ("an event wait", turned_off(due())),
@@ -3212,7 +4106,7 @@ fn a_warming_status_carries_the_reread_price() {
     };
     let prices = |model: &str| match super::status(
         &due(),
-        GiveUpRule::BreakEven,
+        GiveUpRule::PingPlan,
         &WaitDurations::default(),
         &anchors_of(&due()),
         spent.priced(Some(model), CacheTtl::Reported(CacheLifetime::FiveMinutes)),
@@ -3239,15 +4133,18 @@ fn a_warming_status_carries_the_reread_price() {
 #[test]
 fn a_warming_status_carries_the_odds_of_its_cap() {
     let c = due();
-    let history = WaitDurations::from_samples(
-        [30.0, 400.0, 50_000.0]
-            .map(|secs| (WaitAgent::ClaudeCode, wait_type(&c).expect("a wait"), secs)),
-    );
+    let history = WaitDurations::from_samples([30.0, 400.0, 50_000.0].map(|secs| {
+        (
+            WaitAgent::ClaudeCode,
+            wait_type(&c).expect("a wait"),
+            WaitSample::at_noon(secs),
+        )
+    }));
     let CacheKeepAliveStatus::Warming {
         budget_beats, odds, ..
     } = super::status(
         &c,
-        GiveUpRule::BreakEven,
+        GiveUpRule::PingPlan,
         &history,
         &anchors_of(&c),
         pinged(),
@@ -3267,17 +4164,20 @@ fn a_warming_status_carries_the_odds_of_its_cap() {
 #[test]
 fn a_closed_status_carries_the_odds_and_interval_of_its_cap() {
     let c = due();
-    let history = WaitDurations::from_samples(
-        [30.0, 400.0, 50_000.0]
-            .map(|secs| (WaitAgent::ClaudeCode, wait_type(&c).expect("a wait"), secs)),
-    );
+    let history = WaitDurations::from_samples([30.0, 400.0, 50_000.0].map(|secs| {
+        (
+            WaitAgent::ClaudeCode,
+            wait_type(&c).expect("a wait"),
+            WaitSample::at_noon(secs),
+        )
+    }));
     let CacheKeepAliveStatus::Warming {
         beat_every_secs,
         odds,
         ..
     } = super::status(
         &c,
-        GiveUpRule::BreakEven,
+        GiveUpRule::PingPlan,
         &history,
         &anchors_of(&c),
         pinged(),
@@ -3292,7 +4192,7 @@ fn a_closed_status_carries_the_odds_and_interval_of_its_cap() {
     };
     let off = turned_off(due());
     for (label, c) in [("stopped", &long), ("turned off", &off)] {
-        let closed = super::status(c, GiveUpRule::BreakEven, &history, &anchors_of(c), pinged());
+        let closed = super::status(c, GiveUpRule::PingPlan, &history, &anchors_of(c), pinged());
         let (CacheKeepAliveStatus::Stopped {
             beat_every_secs: got,
             odds: got_odds,
@@ -3722,7 +4622,9 @@ fn lucidos_on_its_card() -> Candidate {
         parked: Some(Parked {
             card: ParkedCard::Question,
             secs: 265.0,
+            pings_sent: 0,
             copy_ready: false,
+            cap: ParkedCap::HalfReread,
         }),
         keep_warm_wait_secs: None,
         ..lucidos()
@@ -3824,7 +4726,7 @@ fn a_lucidos_agent_pair_with_an_unknown_ttl_never_beats() {
     assert_eq!(
         super::status(
             &unknown(265.0),
-            GiveUpRule::BreakEven,
+            GiveUpRule::PingPlan,
             &WaitDurations::default(),
             &anchors_of(&unknown(265.0)),
             Spent::default()
@@ -3841,9 +4743,9 @@ fn a_lucidos_agent_pair_with_an_unknown_ttl_never_beats() {
 /// The budget counts beats at the direct window, and a card gets half.
 #[test]
 fn a_lucidos_agent_card_gives_up_at_half_the_budget() {
-    let event = give_up_after_secs(&lucidos(), GiveUpRule::BreakEven).expect("a budget");
+    let event = give_up_after_secs(&lucidos(), GiveUpRule::PingPlan).expect("a budget");
     assert!((event - 25.0 * 260.0).abs() < 1e-6, "{event}");
-    let card = give_up_after_secs(&lucidos_on_its_card(), GiveUpRule::BreakEven).expect("a budget");
+    let card = give_up_after_secs(&lucidos_on_its_card(), GiveUpRule::PingPlan).expect("a budget");
     assert!((card - event / 2.0).abs() < 1e-6, "{card}");
     let past = Candidate {
         parked: lucidos_on_its_card().parked.map(|p| Parked {
@@ -3869,10 +4771,10 @@ fn an_openai_pair_spends_its_budget_at_the_thirty_minute_pace() {
     let unpriced =
         CacheLifetime::ThirtyMinutes.rewrite_in_beats(price_table().unpriced_cache_shares);
     assert!(beats > unpriced, "GPT-6.1 is priced: {beats} beats");
-    let event = give_up_after_secs(&gpt(lucidos()), GiveUpRule::BreakEven).expect("a budget");
+    let event = give_up_after_secs(&gpt(lucidos()), GiveUpRule::PingPlan).expect("a budget");
     assert!((event - beats * 1560.0).abs() < 1e-6, "{event}");
     let card =
-        give_up_after_secs(&gpt(lucidos_on_its_card()), GiveUpRule::BreakEven).expect("a budget");
+        give_up_after_secs(&gpt(lucidos_on_its_card()), GiveUpRule::PingPlan).expect("a budget");
     assert!((card - event / 2.0).abs() < 1e-6, "{card}");
     let waiting = |secs: f64| Candidate {
         keep_warm_wait_secs: Some(secs),
@@ -3883,34 +4785,12 @@ fn an_openai_pair_spends_its_budget_at_the_thirty_minute_pace() {
     assert_eq!(decide(&waiting(event + 0.1)), skip(SkipReason::PastCutOff));
 }
 
-/// `off` beats nothing, and `workspace-data` tunes each agent from its own
-/// waits: Claude Code's never cap a Lucidos Agent thread.
+/// `off` beats nothing on a Lucidos Agent thread either.
 #[test]
-fn every_mode_rules_a_lucidos_agent_thread() {
+fn off_beats_no_lucidos_agent_thread() {
     assert_eq!(
         super::decide(&lucidos(), GiveUpRule::Off),
         skip(SkipReason::Disabled)
-    );
-    let waiting = |secs: f64| Candidate {
-        keep_warm_wait_secs: Some(secs),
-        ..lucidos()
-    };
-    let claude_code = short_bash_waits();
-    let theirs = GiveUpRule::WorkspaceData(&claude_code);
-    assert_eq!(
-        super::decide(&waiting(3.0 * 260.0), theirs),
-        prefill(PrefillCut::Stable)
-    );
-    let bash = WaitType::Events(kinds(&["BackgroundBashCompleted"]));
-    let own = WaitDurations::from_samples((0..60).map(|_| (WaitAgent::Lucidos, bash, 2.5 * 260.0)));
-    let tuned = GiveUpRule::WorkspaceData(&own);
-    assert_eq!(
-        super::decide(&waiting(2.0 * 260.0), tuned),
-        prefill(PrefillCut::Stable)
-    );
-    assert_eq!(
-        super::decide(&waiting(2.0 * 260.0 + 0.1), tuned),
-        skip(SkipReason::PastCutOff)
     );
 }
 
@@ -4061,7 +4941,8 @@ fn a_budget_under_one_beat_reads_past_give_up_time() {
         },
         ..remembering(Remembered::Nothing)
     };
-    let budget = budget_beats(&c, GiveUpRule::BreakEven).expect("a budget");
+    let budget = give_up_after_secs(&c, GiveUpRule::PingPlan).expect("a budget")
+        / c.beat_every_secs().expect("a known TTL");
     assert!(budget < 1.0, "the budget is {budget} beats");
     assert_eq!(
         kind_of(&status(&c, &anchors_of(&c), Spent::default())),
@@ -4137,7 +5018,7 @@ fn the_status_covers_a_lucidos_agent_card() {
 /// pinged stopped, never that Lucidos restarted.
 #[test]
 fn a_lucidos_agent_card_past_its_budget_reads_stopped() {
-    let card = give_up_after_secs(&lucidos_on_its_card(), GiveUpRule::BreakEven).expect("a budget");
+    let card = give_up_after_secs(&lucidos_on_its_card(), GiveUpRule::PingPlan).expect("a budget");
     let past = Candidate {
         agent: Agent::Lucidos(Remembered::Nothing),
         parked: lucidos_on_its_card().parked.map(|p| Parked {
@@ -4263,8 +5144,8 @@ async fn a_lucidos_agent_thread_is_a_candidate() {
         .expect("a waiting Lucidos Agent thread is a candidate");
     assert!(!waiting.is_coding_agent);
     assert!(waiting.secs_since_request.is_some());
-    let idle = waiting.secs_since_idle.expect("its turn ended");
-    assert!((idle - 120.0).abs() < 5.0, "{idle}");
+    let idle = (Utc::now() - waiting.idle_at.expect("its turn ended")).num_seconds();
+    assert!((idle - 120).abs() < 5, "{idle}");
 
     seed_thread_event(&bus, thread_id, question_asked()).await;
     set_status(&pool, thread_id, ThreadStatus::WaitingForUserAnswer).await;
@@ -4513,6 +5394,8 @@ async fn a_run_a_beat_ended_counts_that_beat() {
         ping_usd: None,
         reread_usd: None,
         odds: None,
+        expected_wake: None,
+        cap_source: Some(CapSource::HalfReread),
     };
     emit_status(&bus, thread_id, Some(warming)).await;
 
@@ -4822,7 +5705,10 @@ async fn only_the_final_frame_judges_a_beat() {
 fn a_released_request_reports_give_up_instead_of_restart() {
     assert_eq!(
         status_at(&remembering(Remembered::GaveUp)),
-        not_kept(CacheKeepAliveNotKeptReason::PastGiveUpTime)
+        CacheKeepAliveStatus::past_cap(
+            CacheKeepAliveNotKeptReason::PastGiveUpTime,
+            CapSource::RereadCap
+        )
     );
 }
 
@@ -4848,6 +5734,217 @@ async fn an_old_prefill_reply_leaves_the_new_request_eligible() {
         .await;
         assert_eq!(store.state(thread_id, Utc::now()), Remembered::Pair);
     }
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+// --- The ping plan follows the expected wake (ADR 0603) ---
+
+fn warming_times(status: CacheKeepAliveStatus) -> (DateTime<Utc>, DateTime<Utc>) {
+    let CacheKeepAliveStatus::Warming {
+        since, give_up_at, ..
+    } = status
+    else {
+        panic!("a warming run, got {status:?}");
+    };
+    (since, give_up_at)
+}
+
+/// A wake expected past what pings may cost sends none, and the status says
+/// why. A run that pinged under an earlier plan stops where the new estimate
+/// came.
+#[test]
+fn a_wake_past_the_cap_sends_no_pings_and_says_why() {
+    for base in [due(), lucidos()] {
+        let c = expecting(base, 0.0, 90.0 * MINUTE, ReEstimate::NotAsked);
+        assert_eq!(decide(&c), skip(SkipReason::WakePastCap));
+        let state = status(&c, &anchors_of(&c), Spent::default());
+        assert_eq!(
+            state,
+            CacheKeepAliveStatus::past_cap(
+                CacheKeepAliveNotKeptReason::WakePastRereadCap,
+                CapSource::Estimate {
+                    by: WakeSource::Agent
+                }
+            ),
+            "the status names who expects the wake"
+        );
+        assert_eq!(state.clone().recorded(), Some(state), "the card says why");
+    }
+    let c = expecting(due(), 3.0 * MINUTE, 90.0 * MINUTE, ReEstimate::NotAsked);
+    let spent = Spent {
+        beats: 1,
+        cost_usd: 0.02,
+        ..Spent::default()
+    };
+    let CacheKeepAliveStatus::Stopped { at, .. } = status(&c, &anchors_of(&c), spent) else {
+        panic!("a run that pinged stops");
+    };
+    assert_eq!(at, c.wake.expect("an estimate").stated_at);
+}
+
+/// A plan that runs out with no wake asks once for a new estimate, and warms
+/// on while that ask is due or under way. Once asked with no new estimate,
+/// the run stops.
+#[test]
+fn a_plan_that_runs_out_asks_again_once_then_stops() {
+    // Five minutes plans to one ping past it, and the wait has run ten.
+    let ran_out = |asked| expecting(due(), 0.0, 5.0 * MINUTE, asked);
+    for asked in [ReEstimate::NotAsked, ReEstimate::Asking] {
+        let c = ran_out(asked);
+        assert_eq!(decide(&c), skip(SkipReason::PlanRanOut), "{asked:?}");
+        let state = status(&c, &anchors_of(&c), Spent::default());
+        assert_eq!(kind_of(&state), StatusKind::Warming, "{asked:?}");
+    }
+    let c = ran_out(ReEstimate::Asked);
+    assert_eq!(decide(&c), skip(SkipReason::PastCutOff));
+    let spent = Spent {
+        beats: 2,
+        ..Spent::default()
+    };
+    assert_eq!(
+        kind_of(&status(&c, &anchors_of(&c), spent)),
+        StatusKind::Stopped
+    );
+    // A new estimate, stated now, plans forward from here.
+    let restated = expecting(due(), 10.0 * MINUTE, 5.0 * MINUTE, ReEstimate::NotAsked);
+    assert_eq!(decide(&restated), Beat::Send(BeatRoute::Resume));
+}
+
+/// No run pings past the reread cap from its wait start, whatever a late
+/// estimate says.
+#[test]
+fn no_estimate_moves_a_run_past_the_safety_cap() {
+    let safety = 25.0 * window_start(CacheLifetime::FiveMinutes);
+    let late = Candidate {
+        keep_warm_wait_secs: Some(safety - 60.0),
+        ..due()
+    };
+    for minutes in [1.0, 5.0, 20.0] {
+        let c = expecting(
+            late.clone(),
+            safety - 60.0,
+            minutes * MINUTE,
+            ReEstimate::NotAsked,
+        );
+        let give_up = give_up_after_secs(&c, GiveUpRule::PingPlan).expect("a plan");
+        assert!(give_up <= safety + 1e-6, "{minutes} min: {give_up}");
+    }
+}
+
+/// No ping lands past an event wait's own timeout.
+#[test]
+fn no_ping_lands_past_the_wait_timeout() {
+    let expired = Candidate {
+        timeout_secs: Some(8.0 * MINUTE),
+        ..due()
+    };
+    assert_eq!(decide(&expired), skip(SkipReason::PastCutOff));
+    let open = Candidate {
+        timeout_secs: Some(12.0 * MINUTE),
+        ..due()
+    };
+    assert_eq!(decide(&open), Beat::Send(BeatRoute::Resume));
+    let (since, give_up_at) = warming_times(status(&open, &anchors_of(&open), Spent::default()));
+    assert_eq!(give_up_at, after_secs(since, 12.0 * MINUTE));
+}
+
+/// A user message moves the give-up time only through a new expected wake. A
+/// later idle under the same estimate opens a new run with the same give-up.
+#[test]
+fn a_user_message_moves_the_give_up_only_through_a_new_estimate() {
+    let c = expecting(due(), 0.0, 20.0 * MINUTE, ReEstimate::NotAsked);
+    let at = anchors_of(&c);
+    let later_idle = Anchors {
+        idle_at: Some(secs_before_now(2.0 * MINUTE)),
+        ..at
+    };
+    let (first_run, before) = warming_times(status(&c, &at, Spent::default()));
+    let (second_run, after) = warming_times(status(&c, &later_idle, Spent::default()));
+    assert_eq!(before, after);
+    assert_ne!(first_run, second_run, "the idle opens a new run");
+    let restated = expecting(due(), 8.0 * MINUTE, 20.0 * MINUTE, ReEstimate::NotAsked);
+    let (_, moved) = warming_times(status(&restated, &later_idle, Spent::default()));
+    assert!(
+        moved > before,
+        "the new estimate moves it: {moved} after {before}"
+    );
+}
+
+/// A warming run shows the expected wake it follows, and counts its plan's
+/// pings as its budget. A parked wait plans from no estimate.
+#[test]
+fn a_warming_status_shows_the_expected_wake() {
+    let c = expecting(due(), 0.0, 20.0 * MINUTE, ReEstimate::NotAsked);
+    let CacheKeepAliveStatus::Warming {
+        since,
+        give_up_at,
+        budget_beats,
+        expected_wake,
+        ..
+    } = status(&c, &anchors_of(&c), Spent::default())
+    else {
+        panic!("a warming run");
+    };
+    let planned = 25.0 * MINUTE;
+    assert_eq!(give_up_at, after_secs(since, planned));
+    assert_eq!(
+        budget_beats,
+        (planned / window_start(CacheLifetime::FiveMinutes)).floor() as u32
+    );
+    let at = c.wake.as_ref().expect("an estimate").shown.at;
+    assert_eq!(
+        expected_wake,
+        Some(PlannedWake {
+            at,
+            source: WakeSource::Agent,
+        })
+    );
+    let parked_with_a_wake = expecting(parked(), 0.0, 1.0, ReEstimate::NotAsked);
+    assert_eq!(
+        give_up_after_secs(&parked_with_a_wake, GiveUpRule::PingPlan),
+        give_up_after_secs(&parked(), GiveUpRule::PingPlan),
+    );
+}
+
+/// The newest expected wake counts for a wait only when the turn that stated
+/// it ended after the wait began. A beat's idle ends no turn.
+#[tokio::test]
+async fn an_expected_wake_counts_for_the_wait_its_turn_covered() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, "claude-code/expected-wake", None).await;
+    let stated: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let wake = ThreadEvent::WakeExpected {
+        at: stated + Duration::minutes(20),
+        distribution: vec![],
+        source: WakeSource::Agent,
+        reason: "the release build".into(),
+    };
+    seed_thread_event(&bus, thread_id, wake).await;
+    seed_thread_event(&bus, thread_id, beat_idle()).await;
+    let row = candidate_row(&pool, thread_id).await.expect("a candidate");
+    assert!(row.wake_stated_at.is_some());
+    assert_eq!(row.wake_turn_ended_at, None, "a beat's idle ends no turn");
+
+    seed_thread_event(&bus, thread_id, real_idle()).await;
+    let row = candidate_row(&pool, thread_id).await.expect("a candidate");
+    let ended = row.wake_turn_ended_at.expect("the turn ended");
+    let estimate = row
+        .wake_estimate(ended - Duration::minutes(1), ReEstimate::NotAsked)
+        .expect("it covers a wait armed in its turn");
+    assert_eq!(estimate.shown.source, WakeSource::Agent);
+    assert!((estimate.expected_secs - 20.0 * MINUTE).abs() < 1.0);
+    assert_eq!(
+        row.wake_estimate(ended + Duration::seconds(1), ReEstimate::NotAsked),
+        None,
+        "a wait armed after its turn ended is another wait"
+    );
+
     pool.close().await;
     teardown_test_db(&db_name).await;
 }

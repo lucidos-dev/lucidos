@@ -102,8 +102,8 @@ describe('MobileSwipeContainer — --app-height wake recovery', () => {
     expect(onWakeBody!).toMatch(/!readableVisualViewport\(\)\s*\|\|\s*viewportIsKeyboardShrunk/);
   });
 
-  it('onResize, onOrientationChange, and the initial write all route through computeAppHeight', () => {
-    // Single decision site. Routing onOrientationChange through the helper
+  it('onResize, onLayoutViewportChange, and the initial write all route through computeAppHeight', () => {
+    // Single decision site. Routing onLayoutViewportChange through the helper
     // covers the case where the user rotates with the keyboard up — writing
     // innerHeight blindly would occlude the prompt area behind the keyboard
     // until the next vv.resize repaired it. Same for the initial write if a
@@ -111,7 +111,7 @@ describe('MobileSwipeContainer — --app-height wake recovery', () => {
     const callCount = (swipeSource.match(/computeAppHeight\s*\(/g) ?? []).length;
     // Helper definition (1) + currentAppHeight closure (1) + helper-import in
     // tests doesn't count (different file). Three currentAppHeight() call
-    // sites (onResize, onOrientationChange, initial, plus the wake-time
+    // sites (onResize, onLayoutViewportChange, initial, plus the wake-time
     // recompute = 4) all hit the helper transitively, so the source-level
     // computeAppHeight reference count just needs to be ≥ 2 (definition +
     // closure body).

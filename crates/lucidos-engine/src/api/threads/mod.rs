@@ -24,6 +24,7 @@ pub(super) mod child_reports;
 mod delete;
 mod detach;
 mod events_snapshot;
+mod expected_wake;
 mod family;
 mod follow_up;
 mod list;
@@ -203,6 +204,11 @@ pub(super) fn router() -> Router<super::AppState> {
         .route(
             "/threads/:thread_id/read-request/seen",
             post(read_request::mark_thread_reply_seen),
+        )
+        // A coding agent stating when it expects to wake (ADR 0603).
+        .route(
+            "/threads/:thread_id/expected-wake",
+            post(expected_wake::record_thread_expected_wake),
         )
         // A coding-agent child deciding whether its report wakes its parent.
         .route(

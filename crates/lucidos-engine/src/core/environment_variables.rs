@@ -45,6 +45,10 @@ pub enum NameRejection {
     /// A well-formed name the engine itself owns — injecting it would clobber an
     /// engine-critical var, so creation is refused outright.
     Reserved,
+    /// A name that makes a subprocess load code it never names (`BASH_ENV`,
+    /// `LD_PRELOAD`, `NODE_OPTIONS`, `GIT_SSH_COMMAND`). The user may set it;
+    /// an agent may not, since every later subprocess would run it unguarded.
+    CodeInjecting,
 }
 
 impl NameRejection {
@@ -58,6 +62,10 @@ impl NameRejection {
                 "'{name}' is reserved by the engine and can't be used as a user environment \
                  variable. Names starting with CRED_ or OAUTH_ and the engine-owned \
                  LUCIDOS_* / PATH / RUSTC_WRAPPER vars are off-limits."
+            ),
+            NameRejection::CodeInjecting => format!(
+                "'{name}' changes what code every later subprocess loads, so an agent can't \
+                 set it. Ask the user to set it in Settings → System → Environment variables."
             ),
         }
     }
@@ -127,6 +135,17 @@ pub fn validate_name(name: &str) -> Result<(), NameRejection> {
     }
     if is_reserved_name(name) {
         return Err(NameRejection::Reserved);
+    }
+    Ok(())
+}
+
+/// [`validate_name`] for a write an agent makes or could have made: the
+/// `env_vars` tool, an agent-origin `/api/v1/env-vars` call, or the `data/.env`
+/// import. It also refuses the names the command guard treats as code-injecting.
+pub fn validate_agent_name(name: &str) -> Result<(), NameRejection> {
+    validate_name(name)?;
+    if crate::engine::command_guard::is_code_injecting_env_name(name) {
+        return Err(NameRejection::CodeInjecting);
     }
     Ok(())
 }
@@ -441,7 +460,9 @@ fn unquote(s: &str) -> String {
 ///
 /// Self-idempotent: the file is removed once every line has landed, so a later
 /// boot finds nothing to do. Invalid- or reserved-named lines are skipped with a
-/// log line (the engine owns those names). Each imported row announces
+/// log line (the engine owns those names). A code-injecting name is held: an
+/// agent can write this file, so only the user may set that name, in Settings.
+/// The file stays until they have. Each imported row announces
 /// `EnvironmentVariableSet` like any other write, because the write path owns
 /// the emit and a backfill is not special: these variables genuinely start
 /// existing here. It cannot spam a restart: the file is deleted once the import
@@ -476,6 +497,7 @@ pub async fn migrate_env_file_to_db(
     let mut imported = 0usize;
     let mut failed = 0usize;
     let mut already = 0usize;
+    let mut held = 0usize;
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -487,7 +509,7 @@ pub async fn migrate_env_file_to_db(
         };
         let key = raw_key.trim();
         let value = unquote(raw_val.trim());
-        match validate_name(key) {
+        match validate_agent_name(key) {
             Ok(()) => {
                 // The DB wins over the file, which is what makes a retained
                 // file safe to re-read. A retry boot must not overwrite a value
@@ -513,6 +535,21 @@ pub async fn migrate_env_file_to_db(
                     }
                 }
             }
+            // An agent can write data/.env, so this name waits for the user.
+            // Keeping the file keeps their legacy value until they set it.
+            Err(NameRejection::CodeInjecting) => {
+                match EnvironmentVariableStore::get(pool, key).await {
+                    Ok(Some(_)) => already += 1,
+                    _ => {
+                        held += 1;
+                        crate::log!(
+                            "[EnvMigration] Not importing '{}' from data/.env: {}",
+                            key,
+                            NameRejection::CodeInjecting.message(key)
+                        );
+                    }
+                }
+            }
             Err(rejection) => crate::log!(
                 "[EnvMigration] Skipping '{}' from data/.env: {}",
                 key,
@@ -529,12 +566,13 @@ pub async fn migrate_env_file_to_db(
     // boot imports only what is still missing and announces nothing for the
     // rest. That also bounds a permanently failing line: the file stays, and
     // every boot after the first does the same small read and no writes.
-    if failed > 0 {
+    if failed > 0 || held > 0 {
         crate::log!(
-            "[EnvMigration] Imported {} var(s), skipped {} already in the DB, {} failed, so data/.env stays for the next boot",
+            "[EnvMigration] Imported {} var(s), skipped {} already in the DB, {} failed, {} held for Settings, so data/.env stays for the next boot",
             imported,
             already,
-            failed
+            failed,
+            held
         );
         return;
     }
@@ -932,6 +970,39 @@ mod tests {
             .await
             .expect("get after delete")
             .is_none());
+
+        crate::test_support::teardown_test_db(&db).await;
+    }
+
+    /// An agent can write `data/.env` with `run_bash`, so the boot import must
+    /// not store a name the `env_vars` tool refuses. The file stays until the
+    /// user has set that name, so a legacy value is never lost.
+    #[tokio::test]
+    async fn the_env_file_import_holds_a_code_injecting_name_for_the_user() {
+        let (pool, db) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let data = workspace.path().join(crate::core::DATA_DIR);
+        std::fs::create_dir_all(&data).expect("data dir");
+        let env_file = data.join(".env");
+        std::fs::write(&env_file, "BASH_ENV=data/artifacts/x.sh\nMY_FLAG=1\n").expect("write");
+
+        migrate_env_file_to_db(&pool, &bus, workspace.path()).await;
+        assert!(EnvironmentVariableStore::get(&pool, "BASH_ENV")
+            .await
+            .expect("get")
+            .is_none());
+        assert!(EnvironmentVariableStore::get(&pool, "MY_FLAG")
+            .await
+            .expect("get")
+            .is_some());
+        assert!(env_file.exists(), "the held name keeps the file");
+
+        EnvironmentVariableStore::upsert(&pool, &bus, "BASH_ENV", "/etc/profile", None)
+            .await
+            .expect("the user sets it in Settings");
+        migrate_env_file_to_db(&pool, &bus, workspace.path()).await;
+        assert!(!env_file.exists(), "nothing is left to import");
 
         crate::test_support::teardown_test_db(&db).await;
     }

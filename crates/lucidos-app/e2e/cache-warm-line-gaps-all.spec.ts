@@ -13,10 +13,13 @@
 import { test, expect, Page } from './fixtures';
 import { apiRequest, assertHealthy, navigateToApp, sendMessage, uniqueMessage, waitForResponse } from './helpers';
 import { psql } from './db-helpers';
+import type { CacheWarmth } from '../src/api/client/successor';
 
-const WARMTH = {
+const WARMTH: CacheWarmth = {
+  warmth: 'warm',
   remaining_secs: 240,
   keep_alive: { state: 'not_kept', reason: 'nothing_pending' },
+  ttl: { lifetime: '5m', evidence: 'reported' },
 };
 
 // The service worker answers GETs under /api/v1 itself, so `page.route` never sees them.
@@ -57,7 +60,17 @@ async function measureGaps(page: Page): Promise<Gaps | null> {
     const exchange = lastVisible(document.querySelectorAll('.chat-exchange'));
     const box = lastVisible(document.querySelectorAll('.prompt-box'));
     const edgeOwner = exchange?.lastElementChild;
-    if (!card || !edgeOwner || !box) return null;
+    const scroller = lastVisible(document.querySelectorAll('.thread-content'));
+    const promptArea = lastVisible(document.querySelectorAll('.prompt-area'));
+    if (!card || !edgeOwner || !box || !scroller || !promptArea) return null;
+    // A settled scroller ends at the composer's top edge, or at its bottom edge
+    // where dynamic bars overlay the composer on the transcript. A resize
+    // settles in two layout steps, and between them the scroller ends a pixel
+    // short, which skews the gap below.
+    const promptRect = promptArea.getBoundingClientRect();
+    const overlaid = getComputedStyle(promptArea).position === 'absolute';
+    const settledBottom = overlaid ? promptRect.bottom : promptRect.top;
+    if (Math.abs(scroller.getBoundingClientRect().bottom - settledBottom) > 0.01) return null;
     const cardRect = card.getBoundingClientRect();
     const edge = edgeOwner.getBoundingClientRect().bottom - parseFloat(getComputedStyle(edgeOwner).paddingBottom);
     return {
@@ -70,14 +83,16 @@ async function measureGaps(page: Page): Promise<Gaps | null> {
 test.describe('the cache-warm line gaps', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
-    // The cache cards are off by default.
-    const res = await apiRequest(page).put('/api/v1/preferences?key=cache_cards', { data: { value: 'true' } });
-    expect(res.ok(), 'cache_cards=true').toBe(true);
+    // The cache cards are off by default, and draw only while the keep-alive is on.
+    for (const [key, value] of [['cache_keep_alive_mode', 'on'], ['cache_cards', 'true']]) {
+      const res = await apiRequest(page).put(`/api/v1/preferences?key=${key}`, { data: { value } });
+      expect(res.ok(), `${key}=${value}`).toBe(true);
+    }
     await page.route('**/api/v1/threads/*/cache-warmth', (route) => route.fulfill({ json: WARMTH }));
   });
 
   test.afterEach(() => {
-    psql("DELETE FROM preferences WHERE key = 'cache_cards'");
+    psql("DELETE FROM preferences WHERE key IN ('cache_cards', 'cache_keep_alive_mode')");
   });
 
   test('the space above the card equals the space below it', async ({ page }) => {
@@ -91,6 +106,7 @@ test.describe('the cache-warm line gaps', () => {
     const { width } = page.viewportSize()!;
     await page.setViewportSize({ width, height: SHORT_WINDOW_PX });
     await expect.poll(() => scrollTranscriptToEnd(page), { timeout: 10_000 }).toBe(true);
+    // null until the resize has settled (see measureGaps).
     await expect.poll(() => measureGaps(page), { timeout: 10_000 }).not.toBeNull();
     const gaps = (await measureGaps(page))!;
 

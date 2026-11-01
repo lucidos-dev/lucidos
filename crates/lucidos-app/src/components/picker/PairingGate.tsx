@@ -606,7 +606,7 @@ function PairingForm({ onPaired, notice }: { onPaired: () => void; notice?: stri
         <h1 class="pairing-title">Pair this device</h1>
         <p class="pairing-lede">
           {scanned
-            ? 'Lucidos only answers devices you have paired. The code from the QR came in with this launch. If it is refused, it has expired: make a fresh one under Add a device on the other machine, then scan again below.'
+            ? 'Lucidos only answers devices you have paired. The code from the QR came in with this launch. If it is refused, it has expired: make a fresh one under Pair a device on the other machine, then scan again below.'
             : 'Lucidos only answers devices you have paired. Here is where to get a code.'}
         </p>
         {/* Named menu items, in the order they are tapped, for the same reason
@@ -618,7 +618,7 @@ function PairingForm({ onPaired, notice }: { onPaired: () => void; notice?: stri
               On the machine running Lucidos, open <strong>Settings → Access</strong>.
             </li>
             <li>
-              Under <strong>Add a device</strong>, press{' '}
+              Under <strong>Pair a device</strong>, press{' '}
               <strong>Create a pairing code</strong>.
             </li>
           </ol>

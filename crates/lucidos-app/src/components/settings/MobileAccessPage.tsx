@@ -1,5 +1,5 @@
 import type { ComponentChildren } from 'preact';
-import { useState, useEffect, useCallback } from 'preact/hooks';
+import { useState, useEffect, useLayoutEffect, useCallback } from 'preact/hooks';
 import { showToast, enginePackaged, tailscaleServeRun, settingsScrollTarget } from '../../store/store';
 import {
   beginTailscaleServeRun,
@@ -22,13 +22,15 @@ import { getExternalAddress, getGatewayTls, type ExternalAddressInfo, type Gatew
 import { GatewayHttpsRow } from './GatewayHttpsRow';
 import { SCOPE_PATH, WORKSPACE_ID } from '../../utils/basePath';
 import { Explainer } from '../shared/Explainer';
+import { Disclosure } from '../shared/Disclosure';
+import { DisclosureChevron } from '../shared/DisclosureChevron';
 import { LoadingFade } from '../shared/LoadingFade';
 import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
 import { PairGatewaySection, RemoteGatewaysSection } from './GatewayPairingSections';
-import { AddDeviceSection } from './AddDeviceSection';
+import { PairDeviceSection } from './PairDeviceSection';
 import { ExternalAddressSection } from './ExternalAddressSection';
 import { NetworkAccessPage } from './NetworkAccessPage';
-import type { PairTarget } from './AddDeviceSection';
+import type { PairTarget } from './PairDeviceSection';
 import type { NetworkConfigResponse, TailnetStatusResponse } from '../../api/types';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
@@ -80,36 +82,27 @@ export function openTailscaleDownload(): void {
   });
 }
 
-/** What the "Local network" row should show, derived from the gateway's
- *  configured bind. Loopback (the packaged default) means a LAN URL would be
- *  DEAD — the gateway only listens on this Mac — so the row must point at the
- *  Network access setting instead of advertising an unreachable URL. */
-export type LanRowState =
-  | { kind: 'disabled' }
-  | { kind: 'url'; url: string }
-  | { kind: 'none' };
-
-/** Pure: derive the LAN row from the configured gateway bind. A specific-IP
- *  bind serves exactly that IP (plus loopback), so the row shows the bound
- *  IP's URL rather than the detected LAN IP (which may be a different,
- *  unreachable interface). Config-based, same "takes effect after restart"
- *  caveat as the Network access section below it on this page. */
-export function lanRowState(gatewayBind: string, lanIp: string | null, port: number): LanRowState {
+/** Pure: the LAN URL the gateway actually serves, or `null` for none.
+ *
+ *  Loopback (the packaged default) serves no LAN URL: the gateway only listens
+ *  on this Mac. A specific-IP bind serves exactly that IP (plus loopback). So
+ *  the URL uses the bound IP, not the detected LAN IP, which may be a
+ *  different, unreachable interface. Config-based, so a bind change counts
+ *  only after a restart, like the Network access section on this page. */
+export function lanUrl(gatewayBind: string, lanIp: string | null, port: number): string | null {
   const bind = gatewayBind.trim();
-  if (bind === '' || bind === 'loopback') return { kind: 'disabled' };
-  if (bind === 'all') {
-    return lanIp ? { kind: 'url', url: `http://${lanIp}:${port}` } : { kind: 'none' };
-  }
-  return { kind: 'url', url: `http://${bind}:${port}` };
+  if (bind === '' || bind === 'loopback') return null;
+  if (bind === 'all') return lanIp ? `http://${lanIp}:${port}` : null;
+  return `http://${bind}:${port}`;
 }
 
 /** Pure: the plain-HTTP tailnet URL, but only when the gateway actually serves
  *  that address.
  *
- *  Same rule as {@link lanRowState}, applied to the tailnet address: being on a
+ *  Same rule as {@link lanUrl}, applied to the tailnet address: being on a
  *  tailnet says nothing about whether the gateway is listening on it. The
  *  packaged default binds loopback only, where `http://100.x:<port>` is as dead
- *  as the LAN URL that row already refuses to print. A specific-IP bind serves
+ *  as the LAN URL {@link lanUrl} already refuses to return. A specific-IP bind serves
  *  exactly that address, so it counts only when it IS the tailnet address. */
 export function tailnetHttpUrl(
   gatewayBind: string,
@@ -133,31 +126,21 @@ export function tailnetIsServed(gatewayBind: string, tailnetIp: string): boolean
   return bind === 'all' || bind === tailnetIp;
 }
 
-/** Pure: the Local network row, silenced when the address it would print is the
- *  tailnet's.
+/** Pure: the LAN URL, silenced when it is the tailnet's address.
  *
  *  A bind pinned to the tailnet address serves the tailnet, not the LAN.
- *  `lanRowState` shows whatever specific address is bound, by design. So on its
- *  own it prints that address under "Local network" with a "same Wi-Fi" hint,
- *  beside a Tailscale row carrying the very same URL. Reporting the LAN as off
- *  is the honest half: with a tailnet-pinned bind, no LAN address is served.
- *
- *  Returns the LAN row alone. It used to hand back the tailnet URL beside it,
- *  from when both rows were derived here. That ended when the Tailscale row
- *  moved to {@link tailnetConnectRows}, which any browser can reach. Two
- *  functions each offering "the tailnet URL" is one more than the page prints. */
-export function lanRowAvoidingTailnet(
+ *  `lanUrl` returns whatever specific address is bound, by design. Alone, it
+ *  would list that address under "Local network" with a "same Wi-Fi" hint.
+ *  A Tailscale row would carry the very same URL beside it. With a
+ *  tailnet-pinned bind, no LAN address is served. */
+export function lanUrlAvoidingTailnet(
   gatewayBind: string,
   lanIp: string | null,
   tailnetIp: string | null,
   port: number,
-): LanRowState {
-  const lan = lanRowState(gatewayBind, lanIp, port);
-  const tailnetUrl = tailnetHttpUrl(gatewayBind, tailnetIp, port);
-  if (lan.kind === 'url' && tailnetUrl !== null && lan.url === tailnetUrl) {
-    return { kind: 'disabled' };
-  }
-  return lan;
+): string | null {
+  const lan = lanUrl(gatewayBind, lanIp, port);
+  return lan !== null && lan === tailnetHttpUrl(gatewayBind, tailnetIp, port) ? null : lan;
 }
 
 /** Pure: the URL that reaches THIS workspace at `origin`.
@@ -205,10 +188,10 @@ export function servingBind(
   return config.inherit ? config.gateway_bind : config.engine_bind;
 }
 
-/** One Connect URLs row: a copyable address plus the sentence qualifying it. */
+/** One Other addresses row: a copyable address plus the sentence qualifying it. */
 export type ConnectUrlRow = { label: string; url: string; hint: string };
 
-/** Pure: the tailnet rows of Connect URLs, from facts any browser can hold.
+/** Pure: the tailnet rows of Other addresses, from facts any browser can hold.
  *
  *  This is what ungates the section off the packaged desktop app. Every input
  *  comes from the reader's own `location`, `GET /api/v1/network-config` or
@@ -256,7 +239,7 @@ export interface TailnetInput {
 /** Pure: the tailnet ORIGIN that reaches this machine, or `null` for none.
  *
  *  The host half of {@link tailnetConnectRows}, lifted out so a second
- *  consumer cannot grow its own copy of the rule. Connect URLs adds this
+ *  consumer cannot grow its own copy of the rule. Other addresses adds this
  *  workspace's path to it; the pairing QR adds the picker's. They must not
  *  disagree about which host is reachable.
  *
@@ -317,7 +300,7 @@ function originOf(url: string): string | null {
  *  only after proving it reached this very gateway
  *  (`verified_workspace_serve_url`), which spawned this workspace's engine. */
 export function pairingOrigin(
-  input: TailnetInput & { external: string | null; lan: LanRowState | null },
+  input: TailnetInput & { external: string | null; lan: string | null },
 ): string | null {
   const reader =
     input.here.protocol !== 'http:' || isLoopbackHostname(input.here.hostname)
@@ -327,7 +310,7 @@ export function pairingOrigin(
     input.external ??
     tailnetOrigin(input) ??
     reader ??
-    (input.lan?.kind === 'url' ? input.lan.url : null)
+    input.lan
   );
 }
 
@@ -806,9 +789,9 @@ function DeviceStepsSection({ state }: { state: DeviceSetupState }) {
  */
 export function MobileAccessPage() {
   // What still needs the packaged always-on service: the Tailscale ACTIONS, and
-  // the This Mac / Local network rows. Those two addresses come from the bridge,
-  // and a dev Tauri build has no gateway on the stable port, so they would be a
-  // guess. Connect URLs itself is not gated, and neither is any other reporting.
+  // the Local network row. That address comes from the bridge, and a dev Tauri
+  // build has no gateway on the stable port, so it would be a guess. Other
+  // addresses itself is not gated, and neither is any other reporting.
   const showMachineHalf = isTauri() && enginePackaged.value;
   const [connectInfo, setConnectInfo] = useState<Loadable<ConnectInfo>>({ status: 'not-loaded' });
   const [netConfig, setNetConfig] = useState<Loadable<NetworkConfigResponse>>({ status: 'not-loaded' });
@@ -829,11 +812,13 @@ export function MobileAccessPage() {
   // the moment the user navigated away and came back to a still-running setup.
   const serveRunning = tailscaleServeRun.value !== null;
   const [authKey, setAuthKey] = useState('');
-  // Connect URLs needs the two HTTP reads on every platform, and the bridge only
+  const addressesHit = settingsScrollTarget.value === 'access:addresses';
+  const [addressesOpen, setAddressesOpen] = useState(addressesHit);
+  // Other addresses needs the two HTTP reads on every platform, and the bridge only
   // where there is one. A `useDelayedLoading(connectInfo)` would sit at
   // `not-loaded` forever in a browser, which is indistinguishable from a slow
   // load and would hold the loader up permanently.
-  const connectUrlsReady =
+  const addressesReady =
     netConfig.status === 'loaded' &&
     tailnetStatus.status === 'loaded' &&
     (!showMachineHalf || connectInfo.status === 'loaded') &&
@@ -841,7 +826,7 @@ export function MobileAccessPage() {
     // that answer rather than flipping from http to https. A failure settles
     // it: the HTTPS row reports that error.
     (!gatewayIsOurOrigin || gatewayTls.status === 'loaded' || gatewayTls.status === 'failed');
-  const showLoading = useDelayedFlag(!connectUrlsReady);
+  const showLoading = useDelayedFlag(!addressesReady);
 
   // Concern 1, from whichever source this platform has. Concern 2 reads the
   // host's address as ONE of its three proofs and is otherwise independent of
@@ -874,20 +859,19 @@ export function MobileAccessPage() {
     host.kind === 'on-tailnet' &&
     tailnetAddressIsServed(bind, host.ip, window.location.hostname);
 
-  // `null`, not `{kind:'none'}`: off the bridge we cannot see this machine's
-  // interfaces at all, and "No LAN address detected" would be a finding we
-  // never made. Computed here rather than inside Connect URLs, because the
-  // pairing QR falls back to the same address.
-  const lan: LanRowState | null =
+  // Off the bridge this machine's interfaces are out of sight, so no LAN row.
+  // Computed here rather than inside Other addresses, because the pairing QR
+  // falls back to the same address.
+  const lan: string | null =
     connectInfo.status === 'loaded' && netConfig.status === 'loaded'
-      ? lanRowAvoidingTailnet(
+      ? lanUrlAvoidingTailnet(
         netConfig.data.gateway_bind,
         connectInfo.data.lan_ip,
         connectInfo.data.tailscale.tailnet_ip,
         connectInfo.data.port,
         )
       : null;
-  // The first read that failed, or null. Connect URLs renders it, and Add a
+  // The first read that failed, or null. Other addresses renders it, and Pair a
   // device uses it to say "could not work out an address" instead of "there
   // is none". Those are different claims and only one of them is supportable.
   const connectReadsError =
@@ -895,6 +879,13 @@ export function MobileAccessPage() {
     : tailnetStatus.status === 'failed' ? tailnetStatus.error
     : showMachineHalf && connectInfo.status === 'failed' ? connectInfo.error
     : null;
+  // A search hit opens Other addresses: the hit IS the request to see them. A
+  // failed read opens it too, since Pair a device points at its error. A layout
+  // effect runs before SettingsView's passive effect clears the target.
+  const addressesFailed = connectReadsError !== null;
+  useLayoutEffect(() => {
+    if (addressesHit || addressesFailed) setAddressesOpen(true);
+  }, [addressesHit, addressesFailed]);
   const external = externalAddress.status === 'loaded' ? externalAddress.data.external_address : null;
   const tailnetInput = (status: TailnetStatusResponse): TailnetInput => ({
     here: window.location,
@@ -912,7 +903,7 @@ export function MobileAccessPage() {
 
   /** Where a NEW device should point.
    *
-   *  `pairingOrigin` shares `tailnetOrigin` with the Connect URLs row, so the
+   *  `pairingOrigin` shares `tailnetOrigin` with the Tailscale row, so the
    *  QR and that row cannot name different hosts. Off the gateway it answers
    *  `none`: the section is hidden behind `canMint` there anyway, and
    *  `location.port` would be the engine's, which builds a dead address. */
@@ -924,7 +915,7 @@ export function MobileAccessPage() {
       return { kind: 'unknown' };
     }
     if (
-      !connectUrlsReady ||
+      !addressesReady ||
       tailnetStatus.status !== 'loaded' ||
       externalAddress.status !== 'loaded' ||
       gatewayTls.status !== 'loaded'
@@ -1037,12 +1028,13 @@ export function MobileAccessPage() {
     }
   }, [reload]);
 
-  /** The Connect URLs section, plus its loading / failed states.
+  /** Other addresses: a fold under Pair a device, plus its loading / failed
+   *  states.
    *
-   *  Rendered on EVERY platform. The tailnet rows come from two plain-HTTP
-   *  reads a browser can make. So the address a user copies to their phone is
-   *  on the page wherever they read it. Only the extra rows are machine-side:
-   *  the localhost and LAN addresses need `lan_ip` and the Tauri bridge.
+   *  Pairing already hands a new device the best address, so these are the
+   *  rest: a route other than the QR's, or a bookmark for a device that is
+   *  already paired. Rendered on EVERY platform. The tailnet rows come from two
+   *  plain-HTTP reads a browser can make; only the LAN row needs the bridge.
    *
    *  Every row is workspace-scoped. A bare gateway origin reaches the root,
    *  which redirects to the sole workspace or to the picker. That is the wrong
@@ -1050,38 +1042,38 @@ export function MobileAccessPage() {
    *
    *  All three loads share one failure branch, and the bridge only counts where
    *  there is one. A `netConfig` that failed cannot be rendered as an empty
-   *  section: the bind it carries decides whether a plain-HTTP row is a live
+   *  list: the bind it carries decides whether a plain-HTTP row is a live
    *  address or a dead one. */
-  function connectUrlsSection() {
-    // The shell and its TITLE render in every state, for the reason
+  function otherAddressesSection() {
+    // The shell and its toggle render in every state, for the reason
     // `NetworkAccessPage` records for `access:network`: the anchor is a
     // navigation target, and `SettingsView` resolves it with ONE `querySelector`
     // on the mounting commit, then clears the target either way. An anchor that
-    // waits for a fetch is missed on a cold open. Search Everywhere reaches this
-    // one from a browser now, so it has to be there before the two reads land.
+    // waits for a fetch is missed on a cold open.
     const shell = (body: ComponentChildren) => (
       <div class="settings-section">
-        <div class="settings-section-title" data-search-anchor="access:urls">
-        Connect URLs
-        <Explainer title="Connect URLs">
-          <p>
-            The addresses that reach <strong>this workspace</strong>. Each carries the
-            workspace's own path, so it lands here rather than wherever the gateway
-            would send a bare address.
-          </p>
-          <p>Open one on another device to use Lucidos from your phone.</p>
-        </Explainer>
+        <button
+          type="button"
+          class="settings-disclosure-toggle"
+          data-search-anchor="access:addresses"
+          aria-expanded={addressesOpen}
+          onClick={() => setAddressesOpen(!addressesOpen)}
+        >
+          <DisclosureChevron open={addressesOpen} />
+          Other addresses
+        </button>
+        <div class="settings-section-desc">
+          Tailscale and your own route, to bookmark on a device that is already paired.
         </div>
-        {body}
+        <Disclosure open={addressesOpen}>{body}</Disclosure>
       </div>
     );
     if (connectReadsError !== null) {
       return shell(<LoadableError noun="connect info" error={connectReadsError} />);
     }
-    // `connectUrlsReady` is the whole condition. The two status checks beside
+    // `addressesReady` is the whole condition. The two status checks beside
     // it are what narrows the types below, which it cannot do from up there.
-    // One fade for every settled body, so the skeleton crossfades into it. The
-    // shell around it is not delay-gated, per the anchor rule above.
+    // One fade for every settled body, so the skeleton crossfades into it.
     const settled = (body: ComponentChildren) => shell(
       <LoadingFade
         showSkeleton={showLoading}
@@ -1090,16 +1082,12 @@ export function MobileAccessPage() {
         {body}
       </LoadingFade>,
     );
-    if (!connectUrlsReady || netConfig.status !== 'loaded' || tailnetStatus.status !== 'loaded') {
+    if (!addressesReady || netConfig.status !== 'loaded' || tailnetStatus.status !== 'loaded') {
       return settled(null);
     }
-    const tailnet = tailnetStatus.data;
-    const connect = connectInfo.status === 'loaded' ? connectInfo.data : null;
-    const tailnetRows = tailnetConnectRows({ ...tailnetInput(tailnet), scope: SCOPE_PATH });
-    // Nothing honest to list. Says so rather than rendering a bare heading, and
-    // rather than vanishing: the anchor is a search destination, so an absent
-    // section drops the reader at the top of the page with no explanation.
-    if (connect === null && tailnetRows.length === 0 && external === null) {
+    const tailnetRows = tailnetConnectRows({ ...tailnetInput(tailnetStatus.data), scope: SCOPE_PATH });
+    // Nothing honest to list. Says so rather than rendering an empty fold.
+    if (lan === null && tailnetRows.length === 0 && external === null) {
       return settled(
         <div class="settings-section-desc">
         No address reaches this workspace from another device yet. The Tailscale section
@@ -1109,48 +1097,12 @@ export function MobileAccessPage() {
     }
     return settled(
       <div class="list-rows">
-        {connect && (
-          <UrlRow
-            label="This Mac"
-            url={workspaceUrlAt(connect.localhost_url, SCOPE_PATH)}
-            hint="localhost"
-          />
-        )}
-        {lan?.kind === 'url' && (
+        {lan !== null && (
           <UrlRow
             label="Local network"
-            url={workspaceUrlAt(lan.url, SCOPE_PATH)}
+            url={workspaceUrlAt(lan, SCOPE_PATH)}
             hint="same Wi-Fi · plain HTTP, so no app install or push (use Tailscale for those)"
           />
-        )}
-        {lan?.kind === 'disabled' && (
-          <div class="list-row">
-            <div class="list-row-info">
-              <div class="title">Local network</div>
-              <div class="list-row-details list-row-details-prose">
-                Off: the gateway only listens on this Mac. Allow LAN access in Network access
-                (applies after a restart).
-              </div>
-            </div>
-            <div class="list-row-actions">
-              {/* Network access is a section further down THIS page now (both
-                  halves of "reach this engine from elsewhere" live under
-                  Settings → Access), so this scrolls rather than switching
-                  subview. `settingsScrollTarget` drives the scroll-and-mark
-                  effect in SettingsView. */}
-              <button class="action-btn" onClick={() => { settingsScrollTarget.value = 'access:network'; }}>
-                Network access
-              </button>
-            </div>
-          </div>
-        )}
-        {lan?.kind === 'none' && (
-          <div class="list-row">
-            <div class="list-row-info">
-              <div class="title">Local network</div>
-              <div class="list-row-details list-row-details-prose">No LAN address detected</div>
-            </div>
-          </div>
         )}
         {/* Derived by `tailnetConnectRows`, which owns the whole rule: the
             verified HTTPS URL when there is one, otherwise the plain-HTTP
@@ -1258,9 +1210,9 @@ export function MobileAccessPage() {
             <div class="list-row-details list-row-details-prose">
               {serving
                 // Names the machine's HTTPS endpoint, NOT an address to open:
-                // that one carries the workspace path and is in Connect URLs.
+                // that one carries the workspace path and is in Other addresses.
                 ? <>Serving at <strong>{row.url}</strong> with an auto-renewed cert. The
-                    address to open is under Connect URLs.</>
+                    address to open is under Other addresses.</>
                 : row.canRun
                   ? 'Sets up tailnet HTTPS for the engine, which is what enables the installable PWA and push. Setup runs in the background and reports on the Lucidos badge, and it may ask you to enable Serve for your tailnet.'
                   : <>Your phone can already reach the plain-HTTP address above. HTTPS is what adds the installable PWA and push, and it needs <code>tailscale serve</code>. Install the Tailscale command-line tool to set it up: use Install CLI in the Tailscale app, or <code>brew install tailscale</code>.</>}
@@ -1284,14 +1236,11 @@ export function MobileAccessPage() {
   // them is TRUE, and conflating those is what this page used to do.
   return (
     <>
-      {connectUrlsSection()}
+      {/* First, because pairing is what most people come here to do, and the
+          code already carries the best address. */}
+      <PairDeviceSection canMint={gatewayIsOurOrigin} target={pairTarget()} />
 
-      {/* Directly under the addresses, because it is what you DO with one:
-          Connect URLs says where the other device should point, and this
-          gets that device let in. */}
-      <AddDeviceSection canMint={gatewayIsOurOrigin} target={pairTarget()} />
-
-      {/* Directly under Add a device, because adding one and un-adding one are
+      {/* Directly under Pair a device, because adding one and un-adding one are
           the same question asked twice. The LIST moved to Settings -> Devices,
           where each device's push and preferences already were, but this line
           has to stay: browsing is how people find Revoke, and a search hit only
@@ -1305,6 +1254,8 @@ export function MobileAccessPage() {
           , where you can revoke one.
         </p>
       </div>
+
+      {otherAddressesSection()}
 
       {/* Who else gets in, one level up: whole gateways rather than devices
           (ADR 0590). Beside device pairing because it is the same question. */}

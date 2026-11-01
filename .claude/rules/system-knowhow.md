@@ -53,7 +53,7 @@ paths:
   - "crates/lucidos-tailscale/**"
   - "crates/lucidos-app/src/components/settings/MobileAccessPage.tsx"
   # The other two § Settings -> Access surfaces.
-  - "crates/lucidos-app/src/components/settings/AddDeviceSection.tsx"
+  - "crates/lucidos-app/src/components/settings/PairDeviceSection.tsx"
   - "crates/lucidos-app/src/components/picker/PairingGate.tsx"
   # The device LIST, documented in remote-access.md.
   - "crates/lucidos-app/src/components/settings/deviceList.ts"

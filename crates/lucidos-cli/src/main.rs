@@ -34,6 +34,7 @@ mod data;
 mod data_store;
 mod event_waits;
 mod events;
+mod expect_wake;
 mod external_address;
 mod frontend_preview;
 mod gateway;
@@ -284,6 +285,23 @@ enum Command {
     RequestRead {
         /// `yes` or `no`. Required: there is no default.
         answer: request_read::ReadAnswer,
+    },
+    /// State when this thread expects to wake next.
+    ///
+    /// Run it before you finish a turn that leaves an event wait or a child
+    /// thread pending: the earliest of them, as a duration from now. The
+    /// `await-event` output shows how long past waits like it lasted here. A
+    /// later run replaces it. While the keep-alive is on, Lucidos keeps the
+    /// prompt cache warm until then when that costs less than a reread. Acts on
+    /// `$LUCIDOS_THREAD_ID` and takes no thread argument.
+    #[command(name = "expect-wake")]
+    ExpectWake {
+        /// How long from now, with a unit: `90s`, `45m`, `2h` or `1h30m`.
+        #[arg(value_parser = expect_wake::parse_duration_secs)]
+        duration: u64,
+        /// What you wait for, and why it should come by then.
+        #[arg(long)]
+        reason: String,
     },
     /// Decide whether this turn's report wakes your parent thread.
     ///
@@ -2049,6 +2067,11 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
         Command::RequestRead { answer } => {
             let ws = resolve_from_env()?;
             request_read::cmd_request_read(&ws, answer)?;
+            Ok(0)
+        }
+        Command::ExpectWake { duration, reason } => {
+            let ws = resolve_from_env()?;
+            expect_wake::cmd_expect_wake(&ws, duration, &reason)?;
             Ok(0)
         }
         Command::WakeParent { answer } => {

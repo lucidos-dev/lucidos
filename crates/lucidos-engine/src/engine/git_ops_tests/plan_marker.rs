@@ -515,8 +515,9 @@ async fn re_marking_an_approved_plan_proposes_it_again() {
     teardown_test_db(&db_name).await;
 }
 
-/// A plan-only Apply lands an unapproved plan. Its `proposed` marker must
-/// survive, or the approval that follows finds nothing to flip.
+/// A plan recorded while an Apply ran belongs to the next round. Its
+/// `proposed` marker must survive, or the approval that follows finds nothing
+/// to flip.
 #[tokio::test]
 async fn consuming_leaves_a_proposed_marker_for_the_approval() {
     use crate::test_support::{setup_test_db, teardown_test_db};

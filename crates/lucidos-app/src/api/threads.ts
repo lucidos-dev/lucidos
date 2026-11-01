@@ -507,6 +507,15 @@ export type ThreadEventRow = {
   event_id: string;
 };
 
+/** One event that stamped the thread's model, effort or provider. An empty
+ *  string means the event stamped none. */
+export type PairStamp = {
+  sequence: number;
+  model: string;
+  reasoning_effort: string;
+  provider: string;
+};
+
 /** Wraps `events[]` with `currentAggregate` so the historical-replay path
  *  applies meta from a fetched snapshot — same source-of-truth model as live
  *  SSE per-event aggregate. Without it, refresh paths can't reconstruct meta
@@ -523,6 +532,9 @@ export type ThreadEventsSnapshot = {
    *  against the clock, so the newest row by clock often does not hold the
    *  highest one. Absent on an unpaged read, whose own rows are the watermark. */
   maxSequence?: number;
+  /** Sent only for a PAGE. The events that stamped the thread's pair may sit
+   *  behind it. The rung pill reads them from here, not the account default. */
+  pairStamps?: PairStamp[];
 };
 
 export interface FetchThreadEventsOptions {

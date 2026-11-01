@@ -62,6 +62,9 @@ test.describe('the disclosure roll', () => {
     const release = page.locator(`.whats-new-release[data-release="${version}"]:visible`);
     const header = release.locator('.whats-new-release-header');
 
+    // A body that would open below the fold snaps with no roll, and a long
+    // release open above can push this row there. So the row goes to the top.
+    await header.evaluate((el) => el.scrollIntoView({ block: 'start' }));
     await header.click();
     await expect.poll(async () => {
       const f = await sample(page, version);

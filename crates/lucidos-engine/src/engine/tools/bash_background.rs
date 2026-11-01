@@ -187,6 +187,11 @@ impl Stream {
         String::from_utf8_lossy(&self.bytes[self.cursor.min(self.bytes.len())..])
     }
 
+    /// The last `bytes` of the retained buffer, raw. Read-only, like [`Self::all`].
+    fn window(&self, bytes: usize) -> Vec<u8> {
+        self.bytes[self.bytes.len().saturating_sub(bytes)..].to_vec()
+    }
+
     /// The whole retained buffer and everything the cap ever cut from it.
     /// Used for the final `BackgroundBashCompleted` record. Read-only: it
     /// leaves the cursor alone, so building the completion event cannot
@@ -364,6 +369,24 @@ pub struct RunningTaskHandle {
     /// The owner polls for this task's result, so no engine wait arms for it.
     pub polled: bool,
 }
+
+/// How far one running task has got, as [`BackgroundBashRegistry::progress_for_thread`]
+/// reports it for the expected wake decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskProgress {
+    /// The description, else the command.
+    pub what: String,
+    pub running_secs: i64,
+    /// The last bytes the task printed, stdout then stderr, redacted.
+    pub latest_output: String,
+}
+
+/// How much of a task's latest output a progress report carries.
+const PROGRESS_TAIL_BYTES: usize = 1_500;
+
+/// The raw window a progress tail is redacted over. Wider than the tail, so
+/// a secret cut at the window's front edge falls outside the tail kept.
+const PROGRESS_WINDOW_BYTES: usize = 16 * 1024;
 
 /// The right to stop one task, taken by [`BackgroundBashRegistry::begin_stop`]
 /// and not yet used.
@@ -861,6 +884,47 @@ impl BackgroundBashRegistry {
             .collect()
     }
 
+    /// The latest output of every task still running for `thread_id` that no
+    /// stop was asked for. Read-only: no drain cursor moves.
+    pub async fn progress_for_thread(&self, thread_id: Uuid) -> Vec<TaskProgress> {
+        let windows: Vec<_> = {
+            let tasks = self.locked().await;
+            tasks
+                .values()
+                .filter(|t| t.thread_id == Some(thread_id) && !t.is_finished())
+                .filter(|t| !t.stop_requested())
+                .map(|t| {
+                    (
+                        t.description.clone().unwrap_or_else(|| t.command.clone()),
+                        (Utc::now() - t.started_at).num_seconds().max(0),
+                        t.stdout.window(PROGRESS_WINDOW_BYTES),
+                        t.stderr.window(PROGRESS_WINDOW_BYTES),
+                        t.secrets.clone(),
+                    )
+                })
+                .collect()
+        };
+        windows
+            .into_iter()
+            .map(|(what, running_secs, stdout, stderr, secrets)| {
+                let output = [stdout, stderr]
+                    .iter()
+                    .map(|raw| String::from_utf8_lossy(raw))
+                    .filter(|text| !text.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let output = crate::core::redact_subprocess_output(&output, &secrets);
+                let cut =
+                    output.ceil_char_boundary(output.len().saturating_sub(PROGRESS_TAIL_BYTES));
+                TaskProgress {
+                    what,
+                    running_secs,
+                    latest_output: output[cut..].to_string(),
+                }
+            })
+            .collect()
+    }
+
     /// Is this exact task still running in THIS process?
     ///
     /// The guard the boot sweep asks before settling a task the event store
@@ -1325,8 +1389,8 @@ mod tests {
         assert_eq!(
             src.matches("crate::core::redact_subprocess_output(")
                 .count(),
-            4,
-            "stdout and stderr, at the drain and at the completion record"
+            5,
+            "stdout and stderr at the drain and at the completion record, plus the progress tail"
         );
         assert!(!src.contains("redact_secret_values("));
     }
@@ -1914,6 +1978,41 @@ mod tests {
         assert_eq!(snap.outcome, Some(TaskOutcome::Exited(0)));
         assert!(!snap.timed_out);
         assert!(!snap.killed);
+    }
+
+    /// The expected wake decision reads a running task's latest output for its
+    /// own thread only, and reading it leaves the drain cursor alone.
+    #[tokio::test]
+    async fn progress_reads_the_latest_output_without_draining_it() {
+        let reg = BackgroundBashRegistry::new();
+        let thread_id = Uuid::new_v4();
+        let (task_id, _finish_rx) = reg
+            .spawn(
+                "echo step 3/5: linking; sleep 3",
+                10,
+                std::path::Path::new("/tmp"),
+                &[],
+                Some(thread_id),
+                Some("the release build"),
+            )
+            .await
+            .expect("spawn");
+        assert!(
+            reg.wait_for_stdout(&task_id, "linking", Duration::from_secs(30))
+                .await
+        );
+
+        let progress = reg.progress_for_thread(thread_id).await;
+        assert_eq!(progress.len(), 1);
+        assert_eq!(progress[0].what, "the release build");
+        assert!(progress[0].latest_output.contains("step 3/5: linking"));
+        assert!(reg.progress_for_thread(Uuid::new_v4()).await.is_empty());
+
+        let drained = reg
+            .read_output_in_memory_wait(&task_id, Duration::ZERO)
+            .await
+            .expect("a running task is drainable");
+        assert!(drained.stdout.contains("step 3/5: linking"));
     }
 
     /// The drain cursor is not reset by retention: a second drain inside the

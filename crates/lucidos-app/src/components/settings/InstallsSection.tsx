@@ -50,8 +50,11 @@ const KIND_LABEL: Record<InstallKind, string> = {
  *  render. Skeleton mode is the `sk` flag plus the `SkText` leaves, which read
  *  the provider `ListSkeletonOf` wraps them in. Same markup either way, so the
  *  placeholder mirrors the row by construction.
+ *
+ *  `contended` adds how to remove it. Only an install sharing a port gets that:
+ *  elsewhere there is nothing to fix, and the steps are noise.
  */
-export function installRow(install?: InstallRecord, sk = false): VNode {
+export function installRow(install?: InstallRecord, sk = false, contended = false): VNode {
   const path = install?.root ?? install?.data_dir ?? null;
   return (
     <div class="list-row">
@@ -82,7 +85,28 @@ export function installRow(install?: InstallRecord, sk = false): VNode {
               Starts on its own: <code>{agent.label}</code>
             </div>
           ))}
+        {install && contended && removalLine(install)}
       </div>
+    </div>
+  );
+}
+
+/** How to remove one install. Only the installer's removal is a shell command,
+ *  so only it is set as code with a Copy. The others are steps to follow. */
+function removalLine(install: InstallRecord): VNode {
+  return (
+    <div class="list-row-details list-row-details-prose">
+      To remove:{' '}
+      {install.kind === 'headless-installer' ? (
+        <>
+          <code>{install.removal}</code>{' '}
+          <button class="accent-link" onClick={() => copyToClipboard(install.removal)}>
+            Copy
+          </button>
+        </>
+      ) : (
+        install.removal
+      )}
     </div>
   );
 }
@@ -99,8 +123,8 @@ export function installConflictNotice(conflict: InstallPortConflict): VNode {
         {conflict.installs.length} installs are set up to use port {conflict.port}.
       </strong>{' '}
       Only one can answer, and whichever started first wins. So this workspace may be
-      served by an install you did not choose. Remove the one you do not want, with
-      the command listed below.
+      served by an install you did not choose. Remove the one you do not want: its
+      row below says how.
     </div>
   );
 }
@@ -116,10 +140,7 @@ export function InstallsSection() {
   usePanelRefresh('the installs on this machine', loadInstalls);
 
   const inventory = loadable.status === 'loaded' ? loadable.data : null;
-  // A removal command is offered only where there is a choice to make. With one
-  // install there is nothing to disambiguate, and the command would be an
-  // invitation nobody asked for.
-  const several = (inventory?.installs.length ?? 0) > 1;
+  const contended = new Set(inventory?.conflicts.flatMap((c) => c.installs));
 
   return (
     <div class="settings-section">
@@ -169,7 +190,9 @@ export function InstallsSection() {
           (inventory.installs.length > 0 ? (
             <div class="list-rows">
               {inventory.installs.map((install) =>
-                cloneElement(installRow(install), { key: install.name }),
+                cloneElement(installRow(install, false, contended.has(install.name)), {
+                  key: install.name,
+                }),
               )}
             </div>
           ) : (
@@ -182,16 +205,6 @@ export function InstallsSection() {
             </div>
           ))}
       </LoadingFade>
-
-      {several &&
-        inventory?.installs.map((install) => (
-          <div key={`removal-${install.name}`} class="system-footnote">
-            Remove {install.name}: <code>{install.removal}</code>{' '}
-            <button class="accent-link" onClick={() => copyToClipboard(install.removal)}>
-              Copy
-            </button>
-          </div>
-        ))}
     </div>
   );
 }

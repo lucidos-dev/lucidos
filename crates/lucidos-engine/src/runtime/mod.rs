@@ -5,7 +5,7 @@ mod browser_consent;
 pub mod cc_model_discovery;
 pub mod chat_ladder;
 pub mod claude_code;
-pub mod claude_code_provider;
+pub mod claude_code_notes;
 pub mod codex;
 mod codex_app_server;
 mod codex_app_server_parse;
@@ -16,8 +16,6 @@ pub mod lucidos_cli;
 pub mod python;
 pub(crate) mod spawn_env;
 pub(crate) mod startup_instructions;
-pub mod vertex_relay;
-mod vertex_relay_probe;
 
 use std::sync::Arc;
 

@@ -24,7 +24,7 @@
 
 import { ALL_HIGHLIGHT, CURRENT_HIGHLIGHT } from '@lucidos/find';
 import { WORKSPACE_ID } from '../../utils/basePath';
-import { escapeHtmlAttr } from '../../utils/markedConfig';
+import { escapeHtmlAttr } from '../../utils/escapeHtmlAttr';
 import {
   extractAppTargetFromHref,
   extractNavTargetFromHref,
@@ -332,7 +332,7 @@ export function runPreviewLinkAction(action: PreviewNavigation, artifactPath: st
 }
 
 /** Where this page is, as `classifyPreviewLink` needs it. Guarded like
- *  `threadLinkHref` in utils/renderMarkdown.ts: `location` is always there in
+ *  `threadLinkHref` in utils/markdownEngine.ts: `location` is always there in
  *  the app, never in a bare unit-test environment. */
 export function previewLinkContext(
   artifactPath: string,

@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::core::environment_variables::validate_name;
+use crate::core::environment_variables::{validate_agent_name, validate_name, NameRejection};
 use crate::core::grants::{self, GrantFile};
 use crate::core::{
     validate_routes, AuthType, CredentialStore, EnvironmentVariable, EnvironmentVariableStore,
@@ -187,7 +187,7 @@ pub(super) async fn create_credential(
         .map(str::trim)
         .filter(|s| !s.is_empty());
     if let Some(name) = env_var_name {
-        if let Err(rejection) = validate_name(name) {
+        if let Err(rejection) = validate_env_name_for(&headers, name) {
             return ApiResult::err(rejection.message(name));
         }
     }
@@ -316,7 +316,7 @@ pub(super) async fn update_credential(
         .map(str::trim)
         .filter(|s| !s.is_empty());
     if let Some(name) = env_var_name {
-        if let Err(rejection) = validate_name(name) {
+        if let Err(rejection) = validate_env_name_for(&headers, name) {
             return ApiResult::err(rejection.message(name));
         }
     }
@@ -521,6 +521,26 @@ pub(super) struct UpdateEnvVarRequest {
     value: String,
 }
 
+/// [`validate_name`] for whoever is asking. An agent caller, proven by its
+/// origin token, gets [`validate_agent_name`]: it cannot store a name that
+/// makes every later subprocess load code.
+fn validate_env_name_for(headers: &HeaderMap, name: &str) -> Result<(), NameRejection> {
+    match crate::api::actor::subprocess_origin(headers) {
+        crate::api::actor::SubprocessOrigin::Subprocess { .. } => validate_agent_name(name),
+        crate::api::actor::SubprocessOrigin::NotSubprocess => validate_name(name),
+    }
+}
+
+/// The `/api/v1/env-vars` response for a refused name. A code-injecting name is
+/// 403: the agent identified itself, and the answer is still no.
+fn env_name_refusal(rejection: &NameRejection, name: &str) -> (StatusCode, String) {
+    let status = match rejection {
+        NameRejection::CodeInjecting => StatusCode::FORBIDDEN,
+        NameRejection::Invalid | NameRejection::Reserved => StatusCode::BAD_REQUEST,
+    };
+    (status, rejection.message(name))
+}
+
 /// GET /api/v1/env-vars — list all user environment variables (name + value).
 pub(super) async fn list_env_vars(
     State(state): State<AppState>,
@@ -537,15 +557,15 @@ pub(super) async fn list_env_vars(
 }
 
 /// POST /api/v1/env-vars — create (or replace) a variable. Validates the name
-/// shape and rejects engine-reserved names with 400.
+/// shape and rejects engine-reserved names with 400, and an agent's
+/// code-injecting name with 403.
 pub(super) async fn create_env_var(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<CreateEnvVarRequest>,
 ) -> Result<Json<ApiResult>, (StatusCode, String)> {
-    if let Err(rejection) = validate_name(&request.name) {
-        return Err((StatusCode::BAD_REQUEST, rejection.message(&request.name)));
-    }
+    validate_env_name_for(&headers, &request.name)
+        .map_err(|rejection| env_name_refusal(&rejection, &request.name))?;
     // The store emits `EnvironmentVariableSet` from inside its write path, so
     // this handler resolves the device actor and hands it over rather than
     // emitting afterwards (see `EnvironmentVariableStore`'s type doc).
@@ -576,9 +596,8 @@ pub(super) async fn update_env_var(
 ) -> Result<Json<ApiResult>, (StatusCode, String)> {
     // A stored name is already valid, but re-checking keeps the contract honest
     // if an out-of-band row ever sneaks in.
-    if let Err(rejection) = validate_name(&query.name) {
-        return Err((StatusCode::BAD_REQUEST, rejection.message(&query.name)));
-    }
+    validate_env_name_for(&headers, &query.name)
+        .map_err(|rejection| env_name_refusal(&rejection, &query.name))?;
     let actor = crate::api::actor::user_actor(&headers, None);
     match EnvironmentVariableStore::update(
         &state.pool,
@@ -1649,21 +1668,22 @@ pub(super) async fn register_device(
     }
 }
 
-/// Why this caller may not move a row onto `target`, or `None` when it may.
+/// Why this caller may not act for device `target`, or `None` when it may.
 ///
-/// The rule is that a caller may only hand a row over to ITSELF. Behind the
-/// *workspace gateway* the `x-lucidos-device-id` header is gateway-asserted
-/// (ADR 0094's amendment), so requiring the body's target to match it is free.
-/// Unchecked, a paired caller could move another device's row onto an id nobody
-/// will ever present, taking its push subscription and preferences with it.
+/// The rule is that a caller may only act for ITSELF. Behind the *workspace
+/// gateway* the `x-lucidos-device-id` header is gateway-asserted (ADR 0094's
+/// amendment), so requiring the body's device id to match it is free.
+/// Unchecked, a paired caller could move another device's row onto an id
+/// nobody will ever present. It could also point that device's push
+/// subscription at its own endpoint.
 ///
 /// A missing or blank header is the loopback case and is not refused, matching
 /// every other endpoint here.
 ///
-/// The client asserts the id it is ADOPTING, which is what makes the rule
-/// satisfiable at all: it still stores the old one when it asks. See
+/// A hand-over asserts the id it is ADOPTING, which is what makes the rule
+/// satisfiable at all: the client still stores the old one when it asks. See
 /// `handOverDevice` in `api/client/settings.ts`.
-fn foreign_hand_over(headers: &HeaderMap, target: &str) -> Option<String> {
+pub(super) fn claims_another_device(headers: &HeaderMap, target: &str) -> Option<String> {
     let asserted = headers
         .get(super::actor::HEADER_DEVICE_ID)
         .and_then(|v| v.to_str().ok())
@@ -1673,7 +1693,7 @@ fn foreign_hand_over(headers: &HeaderMap, target: &str) -> Option<String> {
         return None;
     }
     Some(format!(
-        "this caller is device {asserted} and cannot hand a row over to {target}"
+        "this caller is device {asserted} and cannot act for device {target}"
     ))
 }
 
@@ -1688,13 +1708,13 @@ fn foreign_hand_over(headers: &HeaderMap, target: &str) -> Option<String> {
 /// it cannot see is a row abandoned forever. The frontend's `json()` only
 /// rejects on a non-2xx status, so the status IS the signal.
 ///
-/// Who may ask is [`foreign_hand_over`]'s rule.
+/// Who may ask is [`claims_another_device`]'s rule.
 pub(super) async fn hand_over_device(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<DeviceHandOverRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if let Some(reason) = foreign_hand_over(&headers, &request.device_id) {
+    if let Some(reason) = claims_another_device(&headers, &request.device_id) {
         return Err(ApiError::bad_request(reason));
     }
     let actor = super::actor::user_actor(&headers, Some(&request.device_id));
@@ -2069,7 +2089,7 @@ pub(super) fn router() -> Router<AppState> {
             get(get_network_config).put(put_network_config),
         )
         // The MagicDNS name and the verified HTTPS URL for this workspace, for
-        // the Connect URLs on that same page. Its own route rather than fields
+        // the Other addresses on that same page. Its own route rather than fields
         // on `/network-config`, which the bind editor also fetches and which
         // must stay a cheap local read.
         .route("/tailnet-status", get(get_tailnet_status))
@@ -2274,7 +2294,7 @@ mod tailnet_status_tests {
     #[test]
     fn every_port_tailscale_serve_can_bind_is_a_candidate() {
         // Serve accepts exactly these three. Leaving one out makes a live route
-        // invisible, which is the bug: Connect URLs fell back to the raw
+        // invisible, which is the bug: Other addresses fell back to the raw
         // gateway port while a verified route answered on 10000.
         assert_eq!(SERVE_PORTS, [443, 8443, 10000]);
     }
@@ -2444,7 +2464,7 @@ mod hand_over_guard_tests {
     #[test]
     fn a_caller_may_move_its_own_row() {
         assert_eq!(
-            foreign_hand_over(&headers_with(Some("dev-a")), "dev-a"),
+            claims_another_device(&headers_with(Some("dev-a")), "dev-a"),
             None
         );
     }
@@ -2453,7 +2473,7 @@ mod hand_over_guard_tests {
     fn a_caller_may_not_move_someone_elses_row() {
         // The reason names both, so the client's own log says which two ids
         // disagreed rather than only that something was refused.
-        let reason = foreign_hand_over(&headers_with(Some("dev-a")), "dev-b")
+        let reason = claims_another_device(&headers_with(Some("dev-a")), "dev-b")
             .expect("a caller that is not the target must be refused");
         assert!(reason.contains("dev-a"), "{reason}");
         assert!(reason.contains("dev-b"), "{reason}");
@@ -2464,22 +2484,25 @@ mod hand_over_guard_tests {
         // What `handOverDevice` sends. Asserting the id it still STORES is the
         // shape that stranded the migration, so pin both directions.
         assert_eq!(
-            foreign_hand_over(&headers_with(Some("paired-device")), "paired-device"),
+            claims_another_device(&headers_with(Some("paired-device")), "paired-device"),
             None
         );
         assert!(
-            foreign_hand_over(&headers_with(Some("minted-locally")), "paired-device").is_some()
+            claims_another_device(&headers_with(Some("minted-locally")), "paired-device").is_some()
         );
     }
 
     #[test]
     fn no_header_is_the_loopback_case_and_is_allowed() {
-        assert_eq!(foreign_hand_over(&headers_with(None), "dev-a"), None);
+        assert_eq!(claims_another_device(&headers_with(None), "dev-a"), None);
     }
 
     #[test]
     fn a_blank_header_asserts_nothing_and_is_allowed() {
-        assert_eq!(foreign_hand_over(&headers_with(Some("   ")), "dev-a"), None);
+        assert_eq!(
+            claims_another_device(&headers_with(Some("   ")), "dev-a"),
+            None
+        );
     }
 }
 
@@ -2557,5 +2580,43 @@ mod model_update_tests {
         )
         .unwrap();
         assert!(!fields.vision);
+    }
+}
+
+#[cfg(test)]
+mod env_name_tests {
+    use super::*;
+    use crate::api::actor::{
+        init_agent_origin_secret, mint_agent_origin_token, HEADER_AGENT_ORIGIN_TOKEN,
+    };
+
+    fn agent_headers() -> HeaderMap {
+        init_agent_origin_secret("env-name-test-secret".to_string());
+        let token = mint_agent_origin_token(Some(Uuid::new_v4()), 0, None)
+            .expect("the secret is installed above");
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_AGENT_ORIGIN_TOKEN, token.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn an_agent_caller_cannot_store_a_code_injecting_name() {
+        let agent = agent_headers();
+        for name in ["BASH_ENV", "LD_PRELOAD", "NODE_OPTIONS", "GIT_SSH_COMMAND"] {
+            let rejection = validate_env_name_for(&agent, name).unwrap_err();
+            assert_eq!(rejection, NameRejection::CodeInjecting, "{name}");
+            assert_eq!(env_name_refusal(&rejection, name).0, StatusCode::FORBIDDEN);
+        }
+        assert!(validate_env_name_for(&agent, "MY_FLAG").is_ok());
+    }
+
+    #[test]
+    fn the_user_can_still_store_a_code_injecting_name() {
+        let user = HeaderMap::new();
+        assert!(validate_env_name_for(&user, "GIT_SSH_COMMAND").is_ok());
+        assert_eq!(
+            validate_env_name_for(&user, "PATH").unwrap_err(),
+            NameRejection::Reserved
+        );
     }
 }

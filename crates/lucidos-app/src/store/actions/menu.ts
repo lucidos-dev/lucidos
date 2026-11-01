@@ -144,11 +144,12 @@ export function openCaptureContextSetting(): void {
   openSettingsSubview('debugging');
 }
 
-/** Deep-link to the Cache cards switch in Settings → System → Debugging.
- *  Callers are the prompt-cache cards' explainers. It navigates and nothing else. */
+/** Deep-link to the Cache cards switch, nested under Settings → Models →
+ *  Cache keep-alive. Callers are the prompt-cache cards' explainers. It
+ *  navigates and nothing else. */
 export function openCacheCardsSetting(): void {
-  settingsScrollTarget.value = 'debugging:cache-cards';
-  openSettingsSubview('debugging');
+  settingsScrollTarget.value = 'models:cache-cards';
+  openSettingsSubview('models');
 }
 
 /** Deep-link to the Cache keep-alive section in Settings → Models. Two

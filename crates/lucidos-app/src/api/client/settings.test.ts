@@ -57,7 +57,7 @@ describe('handOverDevice', () => {
   });
 
   it('sends a header the engine will accept, matching the body it carries', async () => {
-    // The engine's guard is `asserted == device_id` (`foreign_hand_over`), so
+    // The engine's guard is `asserted == device_id` (`claims_another_device`), so
     // the two values this request sends must never drift apart.
     await handOverDevice('before-reinstall', 'paired-again');
 

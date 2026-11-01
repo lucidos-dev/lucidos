@@ -86,9 +86,9 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   answers `Withdrawn` for an input it still holds. (`agent_session/child_reports.rs`,
   `runtime/codex.rs` `answer_withdraw`.)
 
-- **A working-children wait is tuned from `ChildThreadCompleted` event
-  waits.** A reviewer reports that `workspace-data` never samples a parent
-  waiting on working children, so that type always falls back. The type is
+- **A working-children wait reads its cap odds from `ChildThreadCompleted`
+  event waits.** A reviewer reports that the odds never sample a parent
+  waiting on working children, so that type never shows any. The type is
   `WaitType::Events` of `ChildThreadCompleted` alone, the same type an event
   wait on that kind has. `DURATIONS_SQL` samples those event waits, so the
   two share one duration list (ADR 0547). Re-flag only if the two types part.
@@ -1382,6 +1382,14 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   the user moved `data/`. A link at the tree level or below is refused by
   `join_data_contained`. Re-flag only with a root whose missing part sits under
   a link the product does not support. (`core/contained_path.rs`.)
+
+- **The check-then-read window after a containment join gains no privilege.**
+  A reviewer reports that a link swapped in between `join_data_contained` and
+  the `fs::read` is followed. Only a process that can already write the tree
+  can swap it: the agent's shell, which reads `data/.env` directly anyway.
+  Apps write through the data API, which refuses aliases. Re-flag only with a
+  writer that can place a link but cannot read its target. (`core/email.rs`,
+  `api/apps.rs`.)
 
 - **The engine's working directory in an MCP launch fingerprint is stable.**
   A reviewer reads `std::env::current_dir()` in the fingerprint as drifting
@@ -4757,3 +4765,11 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   holds the temporary `provider_paused` and the historical `prefill_paused`. The link's only
   lead for such a reason would be "Set up the keep-alive in", which misreads a
   pause. (`crates/lucidos-app/src/components/chat/CacheKeepAlive.tsx`.)
+
+- **A required field on a stored variant that never shipped needs no serde
+  default.** A reviewer reads `utc_offset_mins` on `CapSource::Learned` as
+  breaking statuses stored before it, and the candidate query with them. The
+  diff against `main` is the shipped state: the `learned` kind first lands in
+  the same change, so no stored status lacks the field. Re-flag only when
+  `main` already emits the variant without the field.
+  (`crates/lucidos-engine/src/engine/thread_events/keep_alive_status.rs`.)

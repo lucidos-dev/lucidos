@@ -1,5 +1,5 @@
 /**
- * The Add a device section: its pure helpers, and the two things about the
+ * The Pair a device section: its pure helpers, and the two things about the
  * section that a source scan is the only cheap way to pin.
  *
  * Mounting is not the tool here, for the reason the sibling page test gives:
@@ -13,7 +13,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
-import { qrImageSrc, expiryLabel, targetSentence } from './AddDeviceSection';
+import { qrImageSrc, expiryLabel, targetSentence } from './PairDeviceSection';
 import { secondsLeft } from './useCodeCountdown';
 import { findSettingsEntry, getSettingsSearchResults } from '../search/searchIndex';
 import { vnodeToText } from '../chat/__tests__/vnodeToText';
@@ -93,7 +93,7 @@ describe('expiryLabel', () => {
 });
 
 const here = dirname(fileURLToPath(import.meta.url));
-const SECTION = readFileSync(resolve(here, 'AddDeviceSection.tsx'), 'utf8');
+const SECTION = readFileSync(resolve(here, 'PairDeviceSection.tsx'), 'utf8');
 const PAGE = readFileSync(resolve(here, 'MobileAccessPage.tsx'), 'utf8');
 
 /** Strip comments so the prose explaining a rule can never stand in for it. */
@@ -101,7 +101,7 @@ function stripComments(src: string): string {
   return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^\\:])\/\/.*$/gm, '$1');
 }
 
-describe('Add a device is reachable and honest', () => {
+describe('Pair a device is reachable and honest', () => {
   const section = stripComments(SECTION);
   const page = stripComments(PAGE);
 
@@ -109,19 +109,19 @@ describe('Add a device is reachable and honest', () => {
     // The anchor is a Search Everywhere destination, resolved with one
     // `querySelector` on the mounting commit. A section that waits for a fetch,
     // or hides itself off the gateway, drops that hit at the top of the page.
-    const anchor = section.indexOf('data-search-anchor="access:add-device"');
+    const anchor = section.indexOf('data-search-anchor="access:pair-device"');
     const gate = section.indexOf('canMint ?');
     expect(anchor).toBeGreaterThan(-1);
     expect(gate).toBeGreaterThan(anchor);
   });
 
   it('is listed in the settings search index, under the words people use', () => {
-    const entry = findSettingsEntry('access:add-device');
+    const entry = findSettingsEntry('access:pair-device');
     expect(entry?.subview).toBe('access');
-    expect(entry?.anchor).toBe('access:add-device');
+    expect(entry?.anchor).toBe('access:pair-device');
     for (const term of ['pair', 'qr', 'pairing code']) {
       expect(
-        getSettingsSearchResults(term, 20).some((r) => r.id === 'access:add-device'),
+        getSettingsSearchResults(term, 20).some((r) => r.id === 'access:pair-device'),
         `"${term}" should reach this section`,
       ).toBe(true);
     }
@@ -131,7 +131,7 @@ describe('Add a device is reachable and honest', () => {
     // `/~/…` is an absolute path. Off the gateway it resolves to the engine,
     // which 404s every one of these routes.
     expect(page).toContain('const gatewayIsOurOrigin = WORKSPACE_ID !== null;');
-    expect(page).toContain('<AddDeviceSection canMint={gatewayIsOurOrigin}');
+    expect(page).toContain('<PairDeviceSection canMint={gatewayIsOurOrigin}');
   });
 
   it('holds the mint button until the address is known', () => {
@@ -142,7 +142,7 @@ describe('Add a device is reachable and honest', () => {
   });
 
   it('takes its origin from the shared derivation, never its own', () => {
-    // The QR and the Connect URLs Tailscale row must not name different hosts.
+    // The QR and the Other addresses Tailscale row must not name different hosts.
     expect(page).toContain('pairingOrigin({');
     expect(section).not.toContain('magicDnsName');
     expect(section).not.toContain('location.hostname');

@@ -3,6 +3,7 @@
 - **Status**: Accepted
 - **Date**: 2026-10-12
 - **Amends**: [0417](0417-turn-end-gate-enforces-valid-states.md), [0434](0434-sub-threads-wake-parents-only-when-needed.md)
+- **Amended by**: [0607](0607-sub-thread-read-decision-knows-the-parent-acts.md), which tells a sub-thread's own read decision the same
 
 ## Context
 

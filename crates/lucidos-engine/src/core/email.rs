@@ -358,13 +358,20 @@ impl EmailAttachment {
                     super::known_data_prefixes_text()
                 ));
             }
-            let filename = std::path::Path::new(stripped)
+            // An empty segment would turn the rest into an absolute path when
+            // the containment check joins it under its tree.
+            let canonical = stripped
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("/");
+            let filename = std::path::Path::new(&canonical)
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
             validated.push(ValidatedAttachment {
-                rel_path: stripped.to_string(),
+                rel_path: canonical,
                 filename,
             });
         }
@@ -372,15 +379,25 @@ impl EmailAttachment {
     }
 
     /// Read attachments from workspace data/ directory.
-    /// Validates paths and reads file data in one step.
+    /// Validates paths and reads file data in one step. A file that a symlink
+    /// carries out of its typed subdirectory is refused, since the prefix test
+    /// reads only the string.
     pub fn read_from_workspace(
         workspace_path: &std::path::Path,
         relative_paths: &[String],
     ) -> Result<Vec<Self>, String> {
         let validated = Self::validate_paths(relative_paths)?;
+        let data_dir = workspace_path.join(super::DATA_DIR);
         let mut attachments = Vec::new();
         for v in validated {
-            let full_path = workspace_path.join("data").join(&v.rel_path);
+            let full_path = super::contained_path::join_data_contained(&data_dir, &v.rel_path)
+                .ok_or_else(|| {
+                    format!(
+                        "Invalid attachment path '{}': it resolves outside its data/ \
+                         subdirectory through a symlink",
+                        v.rel_path
+                    )
+                })?;
             let data = std::fs::read(&full_path)
                 .map_err(|e| format!("Failed to read attachment '{}': {}", v.rel_path, e))?;
             let mime_type = mime_type_from_extension(&v.filename);

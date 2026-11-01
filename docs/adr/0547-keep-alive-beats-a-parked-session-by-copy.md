@@ -11,6 +11,8 @@
 - **Amended by**: [0554](0554-keep-alive-per-thread-switch.md). A thread can turn the keep-alive off for one wait.
 - **Amended by**: [0556](0556-lucidos-agent-keep-alive-prefill-beats.md). A Lucidos Agent thread parked on its own card is kept warm by a prefill beat.
 - **Amended by**: [0563](0563-cache-keep-alive-speaks-one-grammar.md). A parked wait shows its status and card, not only the cache-warm line.
+- **Amended by**: [0603](0603-keep-alive-follows-the-expected-wake.md). The `workspace-data` rule is retired; the mode is off or on.
+- **Amended by**: [0606](0606-parked-card-cap-learned-by-hour.md). A parked card's cap is learned by local hour, up to one full reread cap.
 
 ## Context
 
@@ -90,7 +92,8 @@ from cache.
 - **The 1-hour TTL for parked sessions only.** The TTL is per spawn, not per
   wait, so it raises the write price of every call. ADR 0470 holds.
 - **Full break-even for parked waits.** It saves 43% against 51%: beats past
-  an hour mostly pay for cards nobody answers.
+  an hour mostly pay for cards nobody answers. ADR 0606 allows the full cap
+  only where a workspace's own cards at that hour say it pays.
 - **Show the estimated caps in Settings.** The status card already shows each
   run's give-up time.
 

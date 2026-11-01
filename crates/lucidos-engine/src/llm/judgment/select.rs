@@ -57,15 +57,19 @@ pub enum JudgmentSite {
     /// The turn-end gate's *wake decision*: whether a child's report wakes its
     /// parent. Every doubt wakes, so a missing answer is a wake.
     WakeDecision,
+    /// The turn end's *expected wake decision*: when a waiting thread wakes
+    /// next. A missing answer records no estimate.
+    ExpectedWakeDecision,
 }
 
 impl JudgmentSite {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::CommandGuard,
         Self::QueryClassification,
         Self::MemoryFind,
         Self::ReadDecision,
         Self::WakeDecision,
+        Self::ExpectedWakeDecision,
     ];
 
     pub const fn preference_key(self) -> &'static Pref<Optional> {
@@ -75,6 +79,7 @@ impl JudgmentSite {
             Self::MemoryFind => &prefs::JUDGMENT_MEMORY_FIND,
             Self::ReadDecision => &prefs::JUDGMENT_READ_DECISION,
             Self::WakeDecision => &prefs::JUDGMENT_WAKE_DECISION,
+            Self::ExpectedWakeDecision => &prefs::JUDGMENT_EXPECTED_WAKE_DECISION,
         }
     }
 
@@ -86,6 +91,7 @@ impl JudgmentSite {
             Self::MemoryFind => &prefs::MODEL_MEMORY_FIND,
             Self::ReadDecision => &prefs::MODEL_READ_DECISION,
             Self::WakeDecision => &prefs::MODEL_WAKE_DECISION,
+            Self::ExpectedWakeDecision => &prefs::MODEL_EXPECTED_WAKE_DECISION,
         }
     }
 
@@ -97,6 +103,7 @@ impl JudgmentSite {
         match self {
             Self::WakeDecision => Some(WAKE_DECISION_DEFAULT),
             Self::ReadDecision
+            | Self::ExpectedWakeDecision
             | Self::CommandGuard
             | Self::QueryClassification
             | Self::MemoryFind => None,
@@ -111,6 +118,7 @@ impl JudgmentSite {
             Self::MemoryFind => "memory find",
             Self::ReadDecision => "read decision",
             Self::WakeDecision => "wake decision",
+            Self::ExpectedWakeDecision => "expected wake decision",
         }
     }
 
@@ -121,12 +129,14 @@ impl JudgmentSite {
         static MEMORY_FIND: AtomicBool = AtomicBool::new(false);
         static READ_DECISION: AtomicBool = AtomicBool::new(false);
         static WAKE_DECISION: AtomicBool = AtomicBool::new(false);
+        static EXPECTED_WAKE_DECISION: AtomicBool = AtomicBool::new(false);
         match self {
             Self::CommandGuard => &COMMAND_GUARD,
             Self::QueryClassification => &QUERY_CLASSIFICATION,
             Self::MemoryFind => &MEMORY_FIND,
             Self::ReadDecision => &READ_DECISION,
             Self::WakeDecision => &WAKE_DECISION,
+            Self::ExpectedWakeDecision => &EXPECTED_WAKE_DECISION,
         }
     }
 }

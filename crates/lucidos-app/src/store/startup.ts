@@ -30,7 +30,6 @@ import { loadAllThreads, loadFilterFacets } from './actions/thread-loading';
 import { refreshPushSubscription, recoverServiceWorker } from './actions/push';
 import { createSwLivenessProbe } from '../utils/swLivenessProbe';
 import { setupNativePushTapRouting } from './actions/native-push';
-import { setupViewMenu } from './actions/view-menu';
 import { startDevicePresenceTracking } from './actions/device-presence';
 import { startAppUpdateProgress, stopAppUpdateProgress, refreshReleaseCheck, resumeUpdateRelay } from './actions/app-update';
 import { startEngineUpdateChecks, stopEngineUpdateChecks, checkEngineVersion } from './actions/engine-update';
@@ -59,7 +58,7 @@ import { clipboardOrReport } from '../utils/clipboard';
 import { effect, untracked } from '@preact/signals';
 import { markBoot } from '../utils/bootTiming';
 import { activeMenuItem, connectionStatus, intelligenceLadderVersion, notificationsFilter, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, CONNECTION_POLL_INTERVAL_MS, FOCUSED_THREAD_KEY, focusedThreadId, setFocusedThread, currentApp } from './store';
-import { installContentPaneIframeFocusTracking } from '../components/layout/paneFocus';
+import { installPaneFocusTracking } from '../components/layout/paneFocus';
 import { requestServiceWorkerBuildId } from '../hooks/sw-update';
 import { syncClientUpdateFromBuild } from './actions/client-update';
 import {
@@ -285,15 +284,6 @@ export function startClient(): () => void {
       else stopNativeTap = un;
     })
     .catch(() => { /* best-effort: tap routing is additive; banners still show */ });
-  // The macOS View menu's pane items mirror this window (Tauri only).
-  let stopViewMenu: (() => void) | null = null;
-  let viewMenuCanceled = false;
-  setupViewMenu()
-    .then((stop) => {
-      if (viewMenuCanceled) stop();
-      else stopViewMenu = stop;
-    })
-    .catch(() => { /* best-effort: the in-app toggles and shortcuts still work */ });
   refreshChangesState();
 
   // Global click handler for thread links, inline images, external URLs, and
@@ -332,7 +322,7 @@ export function startClient(): () => void {
       e.stopPropagation();
       // Only the renderer writes `data-copy-text` and `data-copy-code`, and
       // content cannot, so a lookalike block copies nothing
-      // (utils/renderMarkdown.ts).
+      // (utils/markdownEngine.ts).
       const text = copyBtn.closest('[data-copy-text]')?.getAttribute('data-copy-text')
         ?? copyBtn.closest('[data-copy-code]')?.querySelector('pre code')?.textContent
         ?? null;
@@ -726,12 +716,9 @@ export function startClient(): () => void {
   // The gateway's slowness answer (ADRs 0274, 0283), polled while visible.
   startSlownessChecks();
 
-  // Keep the content-pane focus marker fresh when keyboard focus lands inside a
-  // content-pane iframe (app, file/HTML/PDF preview, cross-origin URL preview).
-  // Those clicks never reach the pane's own onPointerDown handler, so the focus
-  // marker would otherwise go stale. See installContentPaneIframeFocusTracking
-  // (paneFocus.ts).
-  const stopIframeFocusTracking = installContentPaneIframeFocusTracking();
+  // The focused-pane marker follows keyboard focus into a pane, iframes
+  // included, even when no pointer-down reached the pane (paneFocus.ts).
+  const stopPaneFocusTracking = installPaneFocusTracking();
 
   // A development desktop window moves to a new build with the engine it
   // shows, never ahead of it (ADR 0461). See actions/dev-window.ts.
@@ -772,8 +759,6 @@ export function startClient(): () => void {
     stopDevicePresence();
     nativeTapCanceled = true;
     stopNativeTap?.();
-    viewMenuCanceled = true;
-    stopViewMenu?.();
     document.removeEventListener('click', onGlobalClick);
     stopLinkPressGuard();
     stopMarkdownImageRetry();
@@ -781,6 +766,6 @@ export function startClient(): () => void {
     document.removeEventListener('visibilitychange', handleVisibilityChange);
     window.removeEventListener('focus', onResumeCoalesced);
     window.removeEventListener('pageshow', onResumeCoalesced);
-    stopIframeFocusTracking();
+    stopPaneFocusTracking();
   };
 }

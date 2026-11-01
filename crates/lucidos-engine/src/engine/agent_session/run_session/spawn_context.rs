@@ -5,7 +5,7 @@ use crate::engine::agent_session::prompts::{
     app_worktree_recovery_system_prompt, app_worktree_system_prompt,
     conflict_resolution_system_prompt, external_repo_recovery_system_prompt,
     external_repo_system_prompt, lane_thread_system_prompt, recovery_system_prompt, spawn_prompts,
-    wake_decision_section, worktree_system_prompt, SessionContext, SpawnPromptInputs,
+    sub_thread_section, worktree_system_prompt, SessionContext, SpawnPromptInputs,
 };
 use crate::engine::agent_session::spawn::{
     recover_renamed_branch, resolve_branch_for_resume, BranchResolution, FreshBranch,
@@ -881,8 +881,7 @@ impl LucidosEngine {
             base_ref: base_ref.as_deref(),
             repo_id: repo_id.as_deref(),
             app_id: app_spawn_id.as_deref(),
-            // Only a sub-thread reports to a parent, so only it decides a wake.
-            wake_section: wake_decision_section(&self.pool, thread_id).await,
+            sub_thread_section: &sub_thread_section(&self.pool, thread_id).await,
             cache_ttl,
         });
         Ok(SpawnWorktreeContext {

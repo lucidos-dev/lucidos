@@ -318,12 +318,22 @@ restore_target_state() {
     fi
 }
 
+# The runner is a disposable VM, not this Mac: the absolute available floor
+# gives way to the share of its RAM, and the load guard, which protects a
+# shared host, stands down. A 7 GB macOS runner never clears the 8 GB floor,
+# and it idles at a load above that guard's cap.
+stand_down_shared_host_guards() {
+    export LUCIDOS_E2E_FREE_FLOOR_MIN_GB=1
+    export HOST_LOAD_GUARD_DISABLE=1
+}
+
 prepare_build() {
     export_coverage_request
     # lib/e2e.sh halves the cores to spare a shared Mac. A runner is a VM with
     # nothing else on it.
     export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu)}"
     use_e2e_profile
+    stand_down_shared_host_guards
     # Swatinem/rust-cache exports CARGO_INCREMENTAL=0, which overrides the e2e
     # profile's incremental = true and makes every change recompile the engine
     # whole.
@@ -614,14 +624,10 @@ cmd_run() {
     # on a runner that never installed node_modules.
     export_coverage_request
 
-    # The binaries came from the build job. The runner is a disposable VM, not
-    # this Mac: the absolute available floor gives way to the share of its RAM,
-    # and the load guard, which protects a shared host, stands down. A macOS
-    # runner idles at a load above that guard's cap.
+    # The binaries came from the build job.
     export LUCIDOS_E2E_ENGINE_BUILT=1
     use_e2e_profile
-    export LUCIDOS_E2E_FREE_FLOOR_MIN_GB=1
-    export HOST_LOAD_GUARD_DISABLE=1
+    stand_down_shared_host_guards
     # A shard IS the GitHub run, so its e2e scripts must never hand off again.
     export LUCIDOS_E2E_LOCAL=1
 

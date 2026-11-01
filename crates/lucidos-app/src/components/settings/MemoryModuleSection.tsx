@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'preact/hooks';
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
+import { useVersionedRefresh } from '../../hooks/useVersionedRefresh';
 import { preferences, settingsScrollTarget } from '../../store/store';
 import { openSettingsSubview } from '../../store/actions/menu';
 import {
@@ -9,7 +10,7 @@ import {
   storedMemoryModule,
   type MemoryModule,
 } from '../../store/actions/preferences';
-import { loadTreeBackfill, treeBackfillStarted } from '../../store/actions/treeBackfill';
+import { loadTreeBackfill, treeBackfillStarted, treeBackfillVersion } from '../../store/actions/treeBackfill';
 import { displayModelName } from '../../store/thread-events/exchange';
 import { Disclosure } from '../shared/Disclosure';
 import { PREF_MEMORY_MODULE } from '@lucidos/preference-catalog';
@@ -49,6 +50,7 @@ export function MemoryModuleSection() {
     ?? null;
   // Read on Classic too: it says whether choosing Tree resumes a backfill.
   useEffect(() => { void loadTreeBackfill(); }, []);
+  useVersionedRefresh(treeBackfillVersion.value, false, () => void loadTreeBackfill());
   usePanelRefresh('Tree memory', chosen === 'tree' ? loadTreeBackfill : null);
 
   function openCompactionModel() {

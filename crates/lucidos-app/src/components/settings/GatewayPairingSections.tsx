@@ -8,7 +8,7 @@
  *   new one.
  *
  * Both live on the gateway's own surface, so off the gateway they render their
- * shell and say what to run instead, like "Add a device".
+ * shell and say what to run instead, like "Pair a device".
  */
 
 import { useCallback, useEffect, useState } from 'preact/hooks';
@@ -30,7 +30,7 @@ import { Explainer } from '../shared/Explainer';
 import { LoadableError } from '../shared/LoadableError';
 import { LoadingFade } from '../shared/LoadingFade';
 import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
-import { CopyButton, PairCard, expiryLabel, type PairTarget } from './AddDeviceSection';
+import { CopyButton, PairCard, expiryLabel, type PairTarget } from './PairDeviceSection';
 import { timeAgo } from './pairedDevices';
 import {
   EMPTY_REMOTE_GATEWAY_DRAFT,

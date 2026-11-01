@@ -202,6 +202,9 @@ An apply's in-memory hold on one change (`change_ops/apply_claim.rs`, ADR 0442).
 
 A merge session that hands its duty to a continuation releases it to that continuation. `emit_change_applied` takes it by type, so no `ChangeApplied` is emitted without it. Released by drop, so an error, a panic or a dropped request future lets go. Not the *spawn claim*, which holds a thread.
 
+### Kept merge branch
+Where a Tier-3 temp merge pair's work survives once its tree is cleared: `merge-tmp/<id>-kept-<millis>`. `git_ops::clear_temp_merge_state` commits any uncommitted work first, conflict markers included, then renames the temp branch and deletes the tree. A tree it cannot keep whole is left in place, and the clear fails loudly. The branch never lands and nothing reclaims it; it costs one ref. Not a *set-aside* change, which is a status of the change itself.
+
 ### Announced surface
 A place the engine stores user-visible state whose mutations must reach the rest
 of the system as a `SystemEvent`. Enumerated in
@@ -254,7 +257,7 @@ and the pause defers rather than drops: see the allowlist editors. See also
 Markup that reaches the host DOM from content rather than from Lucidos itself.
 Examples: raw HTML in a reply, a question card, a markdown file, a slide deck
 or a rendered diff. It always passes `sanitizeHtmlFragments`
-(`utils/renderMarkdown.ts`) first, which keeps `style` and `class` but shows
+(`utils/markdownEngine.ts`) first, which keeps `style` and `class` but shows
 form controls as text and drops the popover attributes.
 
 Every host element it lands in carries the *containment class*,
@@ -830,10 +833,16 @@ Quiet, not silent: the *delayed* status still writes past `STATUS_DELAY_MS`, so 
 The built chunk holding `<App/>` and everything only the UI reaches: header, thread drawer, panes, the transcript and composer. `main.tsx` imports it lazily and asks for it as soon as the entry evaluates, and `index.html` modulepreloads it (`vite/shellChunkPreload.ts`). It loads beside the entry chunk, under the *boot splash*, while *client startup* is already fetching. So the entry chunk is the data layer alone, held to its *entry chunk budget* (ADR 0288). The shell has no number of its own: it counts toward the *first-paint budget*. Anything a cold open can draw in its first frame belongs here, not behind an *idle prefetch*.
 
 ### Shell startup
-`startShell()` in `crates/lucidos-app/src/shellStartup.ts`: the document-level listeners only a drawn UI can need. `main.tsx`'s shell loader runs it once the *shell chunk* resolves, before `<App/>` first renders, so nothing it installs can be needed earlier. It holds the composer and toast diagnostic probes, the *seen target* watch and the transcript liveness watch, and fills the *scroll state handle* first. It also holds the app keybindings sync, the app frame messages, the UI scale wheel, and the pending upload and unsent message restores. Their code ships in the shell chunk rather than the entry chunk (ADR 0353); the composer's press probe, a diagnostic, loads as its own chunk. It returns its teardown.
+`startShell()` in `crates/lucidos-app/src/shellStartup.ts`: the document-level listeners only a drawn UI can need. `main.tsx`'s shell loader runs it once the *shell chunk* resolves, before `<App/>` first renders, so nothing it installs can be needed earlier. It holds the composer and toast diagnostic probes, the *seen target* watch and the transcript liveness watch, and fills the *scroll state handle* first. It also holds the app keybindings sync, app frame messages, UI scale wheel, macOS View menu, and pending upload and unsent message restores. Their code ships in the shell chunk rather than the entry chunk (ADR 0353); the composer's press probe, a diagnostic, loads as its own chunk. It returns its teardown.
 
 ### Scroll state handle
 `components/chat/scrollStateHandle.ts`: how the data layer in the entry chunk reaches `scrollState.ts`, the transcript's scroll engine, which ships in the *shell chunk*. A store module only the shell reaches may still import it directly. *Shell startup* fills it with the real module, first, before `<App/>` first renders. A call made earlier is queued and replays in order on that fill, so a deep link at boot keeps its landing. A call made after forwards synchronously, and a question about what is drawn answers as an empty document until the fill. `__tests__/scroll-state-stays-out-of-the-entry.test.ts` walks `main.tsx`'s static imports and fails if any of them reaches `scrollState.ts`.
+
+### Drawer order handle
+`store/drawerOrderHandle.ts`: how the data layer in the entry chunk reaches the thread drawer's display order, which `components/drawer/drawerOrder.ts` computes in the *shell chunk*. Reading it directly pulled the *thread family* graph into the entry. *Shell startup* provides the real module, then records the focused thread's position in its view. Before that, the handle answers with no order (ADR 0611).
+
+### Markdown engine
+The lazily loaded chunk that turns markdown into sanitized HTML: `utils/markdownEngine.ts`, `marked` and DOMPurify. `main.tsx` requests it right after the *shell chunk*, so it stays out of the *first-paint set*. First-paint code reaches it only through the facade, `utils/renderMarkdown.ts`. A chunk that is already lazy may import the engine directly, as `RenderedDiff.tsx` does for the sanitizer. Until it lands, the facade returns escaped plain text and caches nothing. Its `markdownEngine` signal then changes, so a memoised caller lists `markdownEngine.value` in its dependencies (ADR 0611).
 
 ### Entry chunk budget
 The ceiling on the built entry chunk, `ENTRY_BUDGET` (600 kB) in `vite/chunkBudget.ts`. Its bytes sit in front of the startup fetches, so it is held tighter than the *first-paint budget* it counts toward. Past it, every single-shot build fails. Past the **soft line** at 90 %, every build warns with the headroom left, so the nightly goes red before an Apply is blocked. The dev *shared build-watch* only reports an overrun, recorded under `chunkBudgets` in `.build-watch/status.json`. It names itself to the plugin through `LUCIDOS_DEV_BUILD_WATCH`, honoured only when the value is the build's parent pid (ADR 0288, ADR 0353).
@@ -1597,7 +1606,7 @@ Remaining limit: a gitignored path never enters the snapshot, so its content sta
 ### Command classifier
 The static, deterministic fast-path of the *command guard*: `static_classify(tool_name, &input, site)` in `engine/command_guard.rs`. It returns a `StaticVerdict`, either `Settled(RiskLane)` or `NeedsJudge(JudgeInput)`. The catastrophic deny-list (recursive root/home delete, fork bomb, disk format/overwrite) settles `Catastrophic`. A positive read-only / in-workspace-write allowlist settles `Safe`.
 
-Everything else is the *ambiguous middle* (`NeedsJudge`). The *judge* classifies it, or `fallback_classify` does when the judge is off or fails. The classifier also computes the out-of-workspace risk marker carried on `JudgeInput`. Zero cost, it runs on every command before any LLM call. The `site` is a *command site*.
+Everything else is the *ambiguous middle* (`NeedsJudge`). The *judge* classifies it, or `fallback_classify` does when the judge is off, and a fast-path refusal asks there. A judge that fails asks. The classifier also computes the out-of-workspace risk marker carried on `JudgeInput`. Zero cost, it runs on every command before any LLM call. The `site` is a *command site*.
 
 ### Command guard
 The pre-dispatch safety gate over the Lucidos Agent's command-running tools, in `agentic_loop/run.rs` before tool dispatch (`LucidosEngine::command_guard_decision`). It covers:
@@ -2429,29 +2438,21 @@ in block order. It also lists each note in `LlmResponse::progress_notes`. A
 note cut before its stop stays hidden reasoning, so a dropped stream still
 retries. Never shown on any other model, where `thinking` text is reasoning.
 
-A Claude Code session gets its notes on Anthropic's own API, and on Vertex
-through the *Vertex relay*. Its parser emits each one as
-`AgentEvent::ProgressNote`, by the same rule (`anthropic_wire::progress_note`).
-It is stored as its own `CodingAgentTextStreamed` event, flagged
-`progress_note`. On any other provider the notes are hidden: the block comes
-back empty while the agent's own context holds the text. The engine asks
-`claude auth status` at spawn (`runtime/claude_code_provider.rs`) and tells a
-hidden session so in its prompt.
+A Claude Code session starts with its notes hidden, unless its spawn model is
+known to think adaptively without always thinking. The first non-empty `thinking`
+block from an always-thinking model proves the notes
+(`runtime/claude_code_parse.rs`), and the agent is told once. Its parser emits
+each later note as `AgentEvent::ProgressNote`, by the same rule
+(`anthropic_wire::progress_note`). It is stored as its own
+`CodingAgentTextStreamed` event, flagged `progress_note`. Until a note arrives
+the agent's own context holds text the user never sees, so its prompt carries
+the hidden rule (`runtime/claude_code_notes.rs`, ADR 0608).
 
 The agent believes the user read its whole text, so the engine tells it
 otherwise. A chat round that carried a note quotes it in the instruction after
 its tool results. A card raised right after a note, with no `message`, is
 refused by the question card gate. See `docs/temporary-measures.md` § "A
 progress note stands in for the text before a tool call".
-
-### Vertex relay
-The engine's loopback hop between Claude Code and Vertex
-(`runtime/vertex_relay.rs`). Each Claude Code session's
-`ANTHROPIC_VERTEX_BASE_URL` points at it, carrying a signed per-thread token.
-For an always-thinking model it sets `thinking.display: "updates"` and the
-beta, so *progress notes* come back. It forwards everything else unchanged. A
-temporary measure until Claude Code asks for notes on Vertex itself; see ADR
-0260.
 
 ### Thinking mode
 What a Claude adaptive-thinking model does with thinking when a request does
@@ -2630,13 +2631,15 @@ A *keep-alive run*'s beat for a Claude Code session parked mid-turn on a questio
 ### Cache keep-alive status
 What the *keep-alive run* does for one waiting thread, as its tick last saw it (`CacheKeepAliveStatus`, `thread_events/keep_alive_status.rs`). One type serves the card, the waiting panel and the *cache-warm line*. The tick is its one writer: a pure `status()` beside `decide()`, sharing its arithmetic, for event waits, children and parked waits alike. It emits `CacheKeepAliveStatusChanged` only on a change, which projects into `thread_summaries.cache_keep_alive_status` and rides the thread aggregate. Five states:
 
-- **`warming`**: the engine pings within the *keep-alive budget*. It carries the ping count, the budget, the beat interval and the pings' cost (from `ApiUsage::usd_on`, each ping on its own day). It also carries the context a wake-up would reread, the next ping and give-up times, and the *cap odds*. A parked wait dates from its turn request.
-- **`stopped`**: a run that pinged, then passed break-even. It carries when, the ping count, the cost and the context the wake-up rereads instead.
+- **`warming`**: the engine pings within the *keep-alive budget*. It carries the ping count, the budget, the beat interval and the pings' cost (from `ApiUsage::usd_on`, each ping on its own day). It also carries the context a wake-up would reread, the next ping and give-up times, and the *cap odds*. It names the *expected wake* its *ping plan* follows. A parked wait dates from its turn request.
+- **`stopped`**: a run that pinged, then reached the end of its *ping plan*. It carries when, the ping count, the cost and the context the wake-up rereads instead.
 - **`ended`**: the wait ended while the engine kept it warm. It carries the span, the ping count, the cost, the run's context and `saved_usd`, the reread price of that context. `saved_usd` is set only when the next real request began while the cache was still warm and held the context (`read_run_end`). A restart, a stop or a cold wake leaves it absent.
 - **`turned_off`**: the user turned the *keep-alive switch* off. It carries when, the run's pings and cost, and the context a cold reply rereads.
 
-Every state but `not_kept` also carries `ping_usd` and `reread_usd`: one ping (a cache read of the context) and the reread (a cache write of it) at today's list price. `Spent::priced` sets both from the model of the last cache write and the session's TTL, so the card and the cache-warm line quote one price. Each is absent for an unpriced model, and on a status stored before prices. An `ended` status copies them from its warming run. `stopped`, `ended` and `turned_off` also carry the optional `beat_every_secs` and `odds` of the run's cap; `ended` copies both from its warming run.
-- **`not_kept`**: the thread waits and gets no keep-alive. Its `reason` is `codex`, `off`, `no_wake_children`, `children_awaiting_user`, `uncacheable_provider`, `provider_paused`, `prefill_paused`, `pings_paused`, `cache_expired`, `restarted`, `past_give_up_time`, `nothing_pending`, `unattended_trigger`, `model_changed`, `beat_missed` or `unknown_ttl`.
+Every state but `not_kept` also carries `ping_usd` and `reread_usd`: one ping (a cache read of the context) and the reread (a cache write of it) at today's list price. `Spent::priced` sets both from the model of the last cache write and the session's TTL, so the card and the cache-warm line quote one price. Each is absent for an unpriced model, and on a status stored before prices. An `ended` status copies them from its warming run. `stopped`, `ended` and `turned_off` also carry the optional `beat_every_secs` and `odds` of the run's cap; `ended` copies both from its warming run. These four carry the run's *cap source* too, and so do `past_give_up_time` and `wake_past_reread_cap`.
+- **`not_kept`**: the thread waits and gets no keep-alive. Its `reason` is `codex`, `off`, `no_wake_children`, `children_awaiting_user`, `uncacheable_provider`, `provider_paused`, `prefill_paused`, `pings_paused`, `cache_expired`, `restarted`, `past_give_up_time`, `wake_past_reread_cap`, `nothing_pending`, `unattended_trigger`, `model_changed`, `beat_missed` or `unknown_ttl`.
+
+`wake_past_reread_cap` means the *ping plan* refused: the expected wake lies past what pings may cost.
 
 `uncacheable_provider` means the request has no prefill pair or backend. `provider_paused` means a refused or talkative ping paused the provider until restart. `prefill_paused` is historical: stored events carry it, and the engine no longer emits it. `pings_paused` means the provider's pings kept missing, so they pause until the status's `until`.
 
@@ -2659,17 +2662,17 @@ The card that closes the feed of a waiting thread while its prompt cache is warm
 
 `keep_alive` is the *cache keep-alive status* the tick would record, or the reason it records none. It carries its own prices, and is null only when cold.
 
-The card shows only when `keep_alive` is `not_kept`, the one state that draws no keep-alive card, so a cache never has two cards. It reads the chip `Prompt cache` with the explainer, the state `Not kept` and the detail `Warm until HH:MM`. It goes at that time. With an unknown lifetime the detail reads `Lifetime unknown`, and the card stays. A `not_kept` reason is `codex`, `restarted`, `uncacheable_provider`, `provider_paused`, `prefill_paused`, `pings_paused`, `cache_expired`, `past_give_up_time`, `nothing_pending`, `unattended_trigger`, `model_changed`, `beat_missed`, `unknown_ttl` or `off`.
+The card shows only when `keep_alive` is `not_kept`, the one state that draws no keep-alive card, so a cache never has two cards. It reads the chip `Prompt cache` with the explainer, the state `Not kept` and the detail `Warm until HH:MM`. It goes at that time. With an unknown lifetime the detail reads `Lifetime unknown`, and the card stays. A `not_kept` reason is `codex`, `restarted`, `uncacheable_provider`, `provider_paused`, `prefill_paused`, `pings_paused`, `cache_expired`, `past_give_up_time`, `wake_past_reread_cap`, `nothing_pending`, `unattended_trigger`, `model_changed`, `beat_missed`, `unknown_ttl` or `off`.
 
 The info icon opens the one shared explainer (`KeepAliveExplainerButton`), which the card and the waiting panel open too. It says what the cache is, the run's sentence, the switch and the setting behind it. A run with *cap odds*, an interval and prices adds its math, with the slot table folded behind "Show the math": a warming run its expected cost, a closed run (stopped, ended or turned off) its final score, with the row it landed in marked. A run without them prices its reread.
 
 A closed run's score is what it cost against what no keep-alive would have cost. An ended run that read a warm cache pays its pings and saves the reread. Any other closed run pays the reread, whatever the pings did.
 
-No keep-alive surface joins its facts with ` · `: the card, the panel and the explainer speak sentences. Every such icon links the Cache cards switch.
+No keep-alive surface joins its facts with ` · `: the card, the panel and the explainer speak sentences. Every such icon links the Cache cards switch, or the keep-alive's own switch while it is off.
 
 The client holds no TTL and prices nothing: it multiplies the engine's prices by the *cap odds*. It shows a time, never a countdown, and reads again when the thread's status or events change. It shows only while the thread is idle or awaits an answer, with none in flight, and never while an open run's panel section shows.
 
-The `cache_cards` preference ("Cache cards", Settings → System → Debugging, off by default) turns it off, and the Cache kept warm card with it. It also skips the read behind the line. A cold cache, a thread that never wrote one and a failed read draw nothing.
+The `cache_cards` preference ("Cache cards", off by default) turns it off, and the Cache kept warm card with it. It is a sub-setting of the keep-alive: nested under Settings → Models → Cache keep-alive, shown only while the mode is `on`, and read as off while the mode is `off` (`currentCacheCards`). It also skips the read behind the line. A cold cache, a thread that never wrote one and a failed read draw nothing.
 
 ### Keep-alive switch
 The user's per-thread "Turn off for this thread" (ADR 0554). `POST /api/v1/threads/:thread_id/cache-keep-alive` with `{"state": "off"}` or `{"state": "on"}`, the popover button, the waiting panel's link and the `threads` tool's `cache_keep_alive` action all emit `CacheKeepAliveTurnedOff` or `CacheKeepAliveTurnedOn`. They project into `thread_summaries.cache_keep_alive_off_at`.
@@ -2677,14 +2680,39 @@ The user's per-thread "Turn off for this thread" (ADR 0554). `POST /api/v1/threa
 The switch is in force while that time is later than `last_real_request_started_sql`: the thread's last turn request no keep-alive anchor started. So the next real request re-arms it with no event. While in force, `decide()` skips with `TurnedOff` on every route, and the status reads `turned_off`. That keeps the run open: turning it back on warms the same run. It never reaches a parent or a sub-thread.
 
 ### Keep-alive budget
-How long a *keep-alive run* keeps beating, counted from the wait's start. Under `cache_keep_alive_mode` `break-even` it is the break-even of the session's model: the beats that cost one cache rewrite. That is the TTL's write rate over its read rate, times its beat window start (230 s on 5 minutes, 3300 s on 1 hour). The rates come from the *price table*, read for the model of the capture that decides the TTL. An unknown model prices at the standard multipliers, the shortest budget (ADR 0489).
+How long a *keep-alive run* keeps beating, counted from the wait's start: the end of its *ping plan*. It never passes the *reread cap* of the session's model, the beats that cost one reread. That is the TTL's write rate over its read rate, times its beat window start (230 s on 5 minutes, 3300 s on 1 hour). The rates come from the *price table*, read for the model of the capture that decides the TTL. An unknown model prices at the standard multipliers, the shortest budget (ADR 0489).
 
-A parked wait gets half of it, and its clock starts at the turn request that asked. Under `workspace-data` the budget is the cheapest cap over this workspace's last 30 days of waits of the same type: the card, or the kinds an event wait watches (`WaitType`, `wait_durations.rs`). It never exceeds twice break-even, and a type with under 50 waits keeps break-even. `budget_beats` is the one function `decide` and `status` both read (ADR 0547).
+A parked wait gets its *learned cap*, or half the reread cap without one. Its clock starts at the turn request that asked. `plan()` in `keep_alive.rs` is the one function `decide` and `status` both read (ADRs 0547 and 0606).
+
+### Ping plan
+How long a *keep-alive run* on events or children pings, from the thread's newest *expected wake* (`event_wait/ping_plan.rs`, ADR 0603). Every time counts from the wait start, so each tick reads the same plan.
+
+- **Margins.** The *saving margin* (`PLAN_SPEND_SHARE`) caps a plan's pings at a share of one reread. The *overrun margin* (`OVERRUN_FACTOR`) pings a point estimate past its expected wait, and at least one ping past it. A distribution pings to the bucket end with the best expected saving. A plan past either margin is `PlanEnd::WakePastCap`: no pings, and the status reads `wake_past_reread_cap`.
+- **Caps.** No ping lands past the earliest keep-warm wait's timeout, and no run pings past the reread cap from the wait start.
+- **Coverage.** An estimate covers a wait when the turn that stated it ended after the wait began (`wake_turn_ended_at`). With none, the bare reread cap applies.
+- **Re-estimate.** A plan that runs out with no wake skips with `PlanRanOut` and asks the *expected wake decision* once more (`ReEstimates`, in memory). The status stays `warming` meanwhile. A new estimate plans forward; without one the run stops.
+
+A parked wait takes no estimate. Its plan ends at its *learned cap* (`PlanEnd::Learned`) or half the reread cap (`PlanEnd::HalfReread`), so it never asks for a re-estimate.
 
 ### Cap odds
-How this workspace's finished waits of one agent and wait type ended against a give-up cap (`CapOdds`, `thread_events/keep_alive_status.rs`). `samples` counts the waits, `slots[k]` those that needed `k` pings with the cache still warm, and `after_cap` those that outlasted the cap. A wait of `d` seconds needs `floor(d / beat_every_secs)` pings. The cheapest-cap search under `workspace-data` costs each candidate cap through `CapOdds::cost_in_beats`, so the odds shown and the cap chosen share one definition. A `warming`, `stopped` or `turned_off` status carries the odds of the cap in force, under either mode, from one past wait up. The tick reads the durations hourly unless the mode is `off`.
+How this workspace's finished waits of one agent and wait type ended against a give-up cap (`CapOdds`, `thread_events/keep_alive_status.rs`). `samples` counts the waits, `slots[k]` those that needed `k` pings with the cache still warm, and `after_cap` those that outlasted the cap. A wait of `d` seconds needs `floor(d / beat_every_secs)` pings. The type is the card, or the kinds an event wait watches (`WaitType`, `wait_durations.rs`). A `warming`, `stopped` or `turned_off` status carries the odds of the cap in force, from one past wait up. The tick reads the durations hourly unless the mode is `off`.
+
+Under a *learned cap* the odds count only the cards in its hour window. So the math explains the cap with the cards that set it.
 
 The explainer turns them into an expected cost. A reply in slot 0 costs nothing either way. One in slot `k` costs `k` pings kept warm, or the reread without a keep-alive. One after the cap costs every ping and the reread kept warm, or the reread alone.
+
+### Cap source
+What set a *keep-alive run*'s give-up time (`CapSource`, `thread_events/keep_alive_status.rs`, ADR 0606). Internally tagged by `kind`: `half_reread`, `reread_cap`, `timeout`, `estimate` (with `by`) or `learned`. Every run status carries it, so the card names the evidence behind each estimate. A status stored before the field has none, and the card then says its old sentence.
+
+### Learned cap
+A parked wait's ping count, learned from this workspace's own cards (`WaitDurations::learned_cap`, `event_wait/wait_durations.rs`, ADR 0606). It reads the cards of the same agent and card type asked within two hours of the ask's local hour (`HourWindow::around`), in the `timezone` preference. It picks the count with the least summed cost, up to one reread cap.
+
+- **Card waits.** A card's wait ends at the first real request after it closes (`first_real_request_started_after_sql`), since that request reads the cache. An allowed permission card ends at the allow, since its tool runs first. With no real request, a card stays out for a day (`CARD_UNDECIDED`), then counts as never answered.
+
+- **Floor.** Below 30 cards across 7 days in the window, there is none, and the card keeps half the reread cap.
+- **Frozen.** It resolves at the wait's first status. `candidates_sql` reads it and its odds back from the first status after the parking event that names a parked cap (`PARKED_CAP_KINDS`), by event sequence. Half the reread cap keeps its recorded odds too. An hourly rebuild never moves it.
+- **Counted.** The run counts its pings since the parking (`Parked::pings_sent`) and stops after the `c`-th. Its give-up time is the last refresh, plus the beats left, plus the beat window's width. With every ping out it is the last refresh, so a ping that lands late never reopens a stopped run.
+- **Zone.** Its cap source carries `utc_offset_mins`, the preference zone's offset at the ask, so the card converts the hours to the user's clock.
 
 ### Price table (mechanism)
 The user-facing *price table* is defined in `system-knowhow/glossary.md`. In code it is `llm::model_prices` (ADR 0525).
@@ -3436,7 +3464,7 @@ Dev-only bash wrapper (`scripts/lib/gateway_supervisor.sh`, function `run_gatewa
 The **packaged** app needs no bash equivalent: the Rust `--service` process (`crates/lucidos-app/src/desktop.rs::run_service`) supervises the gateway under launchd `KeepAlive`. Call it the **gateway supervisor**, and keep it distinct from the *engine supervisor*.
 
 ### Gateway relay
-How gateway A serves a paired gateway B's workspaces to A's own devices (`lucidos-gateway/src/relay.rs`, ADR 0591). A routes `/<slug>@<name>/*` to B's `/~/api/gateway/v1/relay/<slug>/*`. B serves it through its ordinary workspace route, so B's engine sees the outside prefix and a namespaced device. It is the one hop that proxies another gateway's workspaces. Keep it distinct from the *update relay* and the *Vertex relay*.
+How gateway A serves a paired gateway B's workspaces to A's own devices (`lucidos-gateway/src/relay.rs`, ADR 0591). A routes `/<slug>@<name>/*` to B's `/~/api/gateway/v1/relay/<slug>/*`. B serves it through its ordinary workspace route, so B's engine sees the outside prefix and a namespaced device. It is the one hop that proxies another gateway's workspaces. Keep it distinct from the *update relay*.
 
 ### Relay claim
 What A signs on every relayed request: the issue time, the outside prefix and the calling device (ADR 0591). An HMAC keyed by the gateway credential signs it, in the `x-lucidos-relay-claim` and `x-lucidos-relay-signature` headers. B refuses a claim that is unsigned, older than five minutes, or names another workspace. B's engine sees the device as `<pairing id>:<device id>`.
@@ -3543,6 +3571,8 @@ The durable, user-configurable control over what address the *workspace gateway*
 
 The gateway splits its resolved addresses into **required** and **optional** (`net_config::bind_plan`), which is not a second config knob but the answer to what a bind FAILURE means. A literal `<IP>` is always served alongside loopback, and only loopback is required: the gateway serves on it immediately and retries the configured address in the background (capped backoff) until the interface exists, then listens on it too, with no restart. That is the one exception to the restart sentence above, and it exists because launchd starts the packaged service before `tailscaled` has assigned the machine's `100.x` address, so binding it fails with `EADDRNOTAVAIL`. Until 2026-08-07 that failure aborted the whole `serve()` (one `try_join_all`, fail-fast on any address), taking the loopback listener with it and stranding the desktop window on its startup splash for the service's full health timeout. `loopback` and `all` have no optional half, so a bind failure there is still fatal, correctly: it means the port is held, not that an interface is missing. Addresses still being waited on are reported by `GET /~/api/v1/health` as `pending_binds`.
 
+Only a caller with a credential (the local token or a paired device) sees `pending_binds`.
+
 ### Event store
 The persistence layer for events — the `events` table plus the append semantics that write to it. Today the *write* path is inlined inside *EventBus* (raw `INSERT INTO events` at `event_bus.rs:218, 276`) — `EventBus::emit` is the only API that appends. The `EventStore` struct (`core/store/mod.rs`) still exists, but only as a **read-only query facade** (`query_events`, `count_events`, `get_event_by_id`, …); its historical `append` / `append_thread_event` write methods were removed when persistence moved to *EventBus*. The term remains valid for the concept.
 
@@ -3621,7 +3651,7 @@ The fallible half of the *command guard* (ADR 0002, Phase 3), in `engine/command
 
 For the `IrreversibleDanger` lane it also tags a *SideEffectCategory* (`email` / `external_api` / `cloud_cli` / `out_of_workspace_destruction` / `other`). The trigger *side-effect grant* check keys on that category. The judge errs toward *ask* through thresholds in Rust: a weak, missing or malformed answer resolves to `IrreversibleDanger` with category `Other`, on every provider. The category question also offers `none`, read as `Other`, and an `email` answer for a command with no messaging signal (`command_has_messaging_signal`) reads as `Other` too.
 
-It returns `Err` only when nothing answered: no provider, a failed call, or a timeout. The guard then falls back to `fallback_classify` and `static_side_effect_category`. `command_guard_judge` gates it, and defaults on when the guard is on. Verdicts are cached per response by `JudgeInput::cache_key`: the tool, the command text and the out-of-workspace marker. So a re-emit does not re-pay, and a link laid down mid-turn misses the cache.
+It returns `Err` only when nothing answered: no provider, a failed call, or a timeout. The guard then falls back to `fallback_classify` and `static_side_effect_category`. `command_guard_judge` gates it, and defaults on when the guard is on. Verdicts are cached per response by `JudgeInput::cache_key`: the tool, the command text, the out-of-workspace marker and the refusal flag. So a re-emit does not re-pay, and a link laid down mid-turn misses the cache.
 
 Triggers DO reach the judge now (Phase 5), since the side-effect grant needs the lane and the category. `judge_with` is the provider-agnostic core, exercised offline with stubbed judgment providers in tests.
 
@@ -4310,6 +4340,13 @@ A tier is remembered WITH its model, so a thread switched to another model never
 
 It is **backend-authoritative**: a follow-up with no override reuses the thread's value for any caller (chat UI, triggers, API). On the frontend the *rung control* resolves the same chain from the thread's events (`resolveActiveThreadModel` / `resolveActiveThreadReasoningEffort` in `store/threadModelSelections.ts`, ending in `accountChatEffort`). A pick there is recorded on the engine for THIS thread, never as the account preference. The browser holds no pending pick.
 
+A paged thread may not hold the event that stamped its pair, so the rung control also reads the thread's *pair stamps*.
+
+### Pair stamps
+The fewest stamping events that answer every question the *per-thread model memory* asks of a thread's whole history. They are the newest stamp naming a model, then per model the newest naming an effort and the newest naming a provider.
+
+A paged events snapshot carries them as `pairStamps`, from `PreferenceStore::thread_pair_stamps`. An unpaged read carries every event, so it sends none. The frontend keeps them in `ThreadState.pairStamps`, and `newestPairValue` in `store/threadModelSelections.ts` merges them with the loaded events by sequence. A read that fails fails the snapshot, so the rung control never shows the account default by mistake. See `docs/plans/2026-11-01-chat-rung-pill-reads-paged-thread-pair.md`.
+
 A pinned *preferred provider* is remembered the same way, but WITH its model. `provider` comes from the newest starter stamped beside the model the turn runs on. So switching a thread from Opus to Sonnet drops the backend picked for Opus. Only a pin is stamped, never a backend the row chose, so removing a credential cannot strand a thread that never chose one.
 
 Distinct from the coding agent's per-thread model, which is session-bound via `CodingAgentSettingsChanged`. See `docs/plans/2026-07-03-per-thread-model-memory.md`.
@@ -4545,7 +4582,7 @@ Four states. Only `proposed` and an absent row block the gate; the other three s
 
 A *successor session* keeps the thread's branch, so its marker needs no carry. A legacy *successor thread*'s fresh branch got a copy of its old branch's marker (`git_ops::carry_planned`).
 
-One exception lets a plan land before approval: a branch whose landing files are all under `docs/plans/` clears the floor with a `proposed` marker (`PlanFloor::PlanOnly`). Apply keeps that marker, and `lucidos planned approve` later flips both it and the plan file's `- **Status**: Proposed` line. Such a branch also skips hardening, under either marker kind: plans have no tests, and hardening runs on the branch that implements the plan (`git_ops::needs_hardening`, ADR 0416).
+A branch whose landing files are all under `docs/plans/` is held while its marker is `proposed` (`PlanHold::PlanOnlyAwaitingApproval`, ADR 0604). Lucidos proposes nothing and Apply refuses it, with the reason `plan_awaiting_approval`. Unlike a mixed branch, the agent gets no re-entry nudge, because the decision is the user's. Once approved, such a branch proposes and applies. It also skips hardening, under either marker kind: plans have no tests, and hardening runs on the branch that implements the plan (`git_ops::needs_hardening`, ADR 0416).
 
 - **`proposed`**: a `docs/plans/<date>-<slug>.md` file was written and recorded by `lucidos planned mark --plan`. The human has NOT approved it yet, so it does **not** satisfy the gate.
 - **`planned`**: the human approved the proposed plan, flipped by `lucidos planned approve`. Also any legacy row predating the approval step.
@@ -5256,6 +5293,8 @@ One rule the *turn-end gate* enforces. Three kinds today. The two decisions run 
    A turn the user did not open notes when its report wakes the parent agent, which then acts on it (`TurnRead::report_wakes_parent`). `OwedReport::wakes_parent` decides that over `Delivery::for_report`, with the child's *wake mode* (ADR 0446, ADR 0451).
 2. **Wake decision**, every chat and coding-agent turn of a thread that owes its parent a report and has no *wake mode* (ADR 0451): a forced decision on `JudgmentSite::WakeDecision` (`model_wake_decision`, or a System One row via `judgment_wake_decision`). Unset, it runs on OpenAI Decisions while the chat provider serves OpenAI (`WAKE_DECISION_DEFAULT`, ADRs 0435, 0472). It reads the message that opened the child's turn, the parent's latest reply, the child's reply and its running siblings. Any doubt wakes; a confident no files the report (ADR 0434). `lucidos-eval wake-decision` scores it through the gate's own state and question (ADR 0439). Its chat call is forced, and unpinned it asks only a model that eval cleared (`asks_no_model`, ADR 0448).
 3. **Re-entry for a *proposal hold***, *Lucidos-source* coding-agent sessions whose turn completed: the hold's reason, a missing *plan marker* or a missing harden, sends the agent back with the hold's own nudge. Each reason re-enters once per branch HEAD, on separate keys, so a settled plan still lets the harden ask through. The hold owns the rule and the text; the gate owns that it re-enters and how often.
+
+Beside the gate, not a requirement: the *expected wake decision* (`engine/turn_end/expected_wake_decision.rs`) runs concurrently with the two decisions, on `JudgmentSite::ExpectedWakeDecision` (`ContextPurpose::ExpectedWakeDecision`). It reads `PendingWake` and asks only when the keep-alive could plan pings from the answer.
 
 ### Turn-gap note
 The *resume-time note* built from the persisted events in the *turn gap* (`agent_session/turn_gap.rs`, `compute_turn_gap_note`). It also rides every prompt forwarded to a kept-alive session (`compute_turn_gap_note_until`, via `build_followup_prompt_text`), the one resume-time note that does. It covers the events a resumed coding agent cannot otherwise see, and whose absence made it describe a discarded change as awaiting Apply: `ChangeApplied`, `ChangeDiscarded`, `ChangeReverted`, `ChangeApplyFailed`, `WorktreeCleaned`, `BackgroundBashCompleted`, `ChildThreadStopped`, `ChildThreadDetached` and `ChildReportFiled`.

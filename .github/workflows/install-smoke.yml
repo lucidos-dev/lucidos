@@ -856,12 +856,20 @@ jobs:
           # ── rung 2: it is the RIGHT build ────────────────────────────────────
           # The GATEWAY's health payload is not the engine's, so do not copy the
           # `smoke` job's assertions verbatim: `gateway_health` in
-          # crates/lucidos-gateway/src/server.rs emits
-          # {status, role, release, workspaces, pending_binds}, with no
+          # crates/lucidos-gateway/src/server.rs emits `release`, with no
           # engine_version and no llm_configured to check. `release` is
           # LUCIDOS_RELEASE, baked from the repo's RELEASE file at compile time
           # (crates/lucidos-gateway/src/main.rs), so it names the build these
           # bytes came from and is exactly the field to compare against the tag.
+          # The gateway tells only a credentialed caller its `release`, so this
+          # read sends the local token the gateway wrote at startup.
+          token_file="$HOME/.lucidos/local-token"
+          [ -r "$token_file" ] || {
+            echo "::error::local token missing at $token_file: the gateway writes it at startup"
+            diagnostics
+            exit 1
+          }
+          body="$(curl -fsS --max-time 5 -H "x-lucidos-local-token: $(cat "$token_file")" "$base/~/api/v1/health" 2>/dev/null || true)"
           echo "$body" | grep -q "\"release\":\"$EXPECTED_VERSION\"" || {
             echo "::error::the DMG on this tag reports a release other than $EXPECTED_VERSION, so the wrong build is attached to it: $body"
             diagnostics
@@ -1186,9 +1194,18 @@ jobs:
           done
           echo "$gw" | grep -q '"status":"ok"'   || { echo "::error::gateway /~/api/v1/health not ok: $gw"; exit 1; }
           echo "$gw" | grep -q '"role":"gateway"' || { echo "::error::gateway health missing role=gateway: $gw"; exit 1; }
+          # The gateway tells only a credentialed caller its `release`, so the
+          # release read goes through gateway_curl with the local token.
+          token_file="$HOME/.lucidos/local-token"
+          [ -r "$token_file" ] || {
+            echo "::error::local token missing at $token_file: the gateway writes it at startup, so the service did not come up as expected"
+            exit 1
+          }
+          gateway_curl() { curl -H "x-lucidos-local-token: $(cat "$token_file")" "$@"; }
+          gw="$(gateway_curl -fsS --max-time 5 "$base/~/api/v1/health" 2>/dev/null || true)"
           echo "$gw" | grep -q "\"release\":\"$repo_version\"" \
-            || { echo "::error::gateway release != RELEASE ($repo_version) — stale or wrong build: $gw"; exit 1; }
-          echo "rung 2 OK — gateway healthy, release matches: $gw"
+            || { echo "::error::gateway release != RELEASE ($repo_version), a stale or wrong build: $gw"; exit 1; }
+          echo "rung 2 OK: gateway healthy, release matches: $gw"
 
           # ── rung 3: the ENGINE answers /api/v1/health. It is reachable only behind a
           # workspace, so create one, poll it healthy, then hit it through the gateway
@@ -1204,12 +1221,6 @@ jobs:
           # EVERY call below goes through gateway_curl for that reason, the engine
           # health read included: unauthenticated it returns an empty body through
           # `-fsS`, and rung 3 then reports "not ok" with nothing after the colon.
-          token_file="$HOME/.lucidos/local-token"
-          [ -r "$token_file" ] || {
-            echo "::error::local token missing at $token_file — the gateway writes it at startup, so the service did not come up as expected"
-            exit 1
-          }
-          gateway_curl() { curl -H "x-lucidos-local-token: $(cat "$token_file")" "$@"; }
 
           create="$(gateway_curl -s --max-time 30 -X POST "$base/~/api/v1/control/workspaces" \
             -H 'Content-Type: application/json' -d '{"name":"smoke-ws"}' 2>/dev/null || true)"

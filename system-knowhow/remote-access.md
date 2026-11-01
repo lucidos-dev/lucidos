@@ -88,7 +88,7 @@ the port no longer makes you the user.
 which a browser cannot, so it mints a code and spends it without asking. That
 makes it the first device on a fresh install, with no terminal.
 
-Any paired device can then let the next one in. **Settings → Access → Add a
+Any paired device can then let the next one in. **Settings → Access → Pair a
 device** mints a code and draws a QR the phone can scan.
 
 A terminal does the same, and is the fallback when nothing is paired at all:
@@ -290,7 +290,7 @@ Things to know:
   `100.x` address redirects to it.
 - **Check it** with `lucidos tls status`, or the **HTTPS** row on Settings →
   Access. Both say which source serves, until when, and the reason when none.
-- **Pairing follows it.** The pairing QR and Connect URLs use the gateway's
+- **Pairing follows it.** The pairing QR and Other addresses use the gateway's
   HTTPS origin, right after an external address.
 
 ### Route A: plain HTTP over the Tailscale tunnel
@@ -400,8 +400,8 @@ that rejects the old form **prints the exact command it wants**, so read the
 error instead of guessing.
 
 **Port 443 fronts exactly one target, so a second gateway needs a second
-port.** Serve binds 443, 8443 or 10000. Lucidos probes all three, so Connect
-URLs and the pairing QR find the route wherever it is:
+port.** Serve binds 443, 8443 or 10000. Lucidos probes all three, so Other
+addresses and the pairing QR find the route wherever it is:
 
 ```bash
 tailscale serve --bg --https=443  http://127.0.0.1:5252   # packaged install
@@ -552,8 +552,10 @@ The page that drives all of this: point the user here before hand-running
 commands. It was called **Mobile Access** until the **Network access** bind
 setting moved onto its bottom from Settings → System.
 
-**It answers two independent questions, numbered in setup order**, because the
-first must be true before the second buys anything:
+**It opens with Pair a device**, because pairing is what most readers came for
+and the code already carries the best address. **Other addresses** folds under
+it. Below those, the page answers two independent questions, numbered in setup
+order, because the first must be true before the second buys anything:
 
 | Section | Question | Where the answer comes from |
 |---|---|---|
@@ -564,13 +566,13 @@ first must be true before the second buys anything:
 itself. It reads `GET /~/api/v1/control/tls` and says which certificate serves,
 until when, or why there is none (§ Automatic: the gateway's own certificate).
 
-**Add a device is the action they lead to**, not a third question: pairing a
-new device at one of those addresses. See its own section below. **External
+**Pair a device is the action they lead to**, not a third question. It sits at
+the top of the page; see its own section below. **External
 address**, at the bottom of the page, is for a route other than Tailscale
 (§ Any other VPN).
 
 Every section renders **everywhere**, phone browsers and the installed PWA
-included, Connect URLs among them. Platform changes how much each can say,
+included, Other addresses among them. Platform changes how much each can say,
 never whether it appears. Only the **actions** are gated. Sign in to Tailscale
 and Expose are native commands with no HTTP equivalent, so only the packaged
 desktop app has them. **Get Tailscale** is a link, not a bridge call, so it
@@ -619,19 +621,21 @@ read it as often as handsets, and have no home screen. So the "add to home
 screen" wording sits behind an iOS/Android check, and the neutral phrasing is
 "install Lucidos".
 
-**Connect URLs** lists the addresses that reach **this workspace**:
+**Other addresses** is a fold under Pair a device, closed until tapped. A
+search hit on it lands open. It lists the addresses that reach **this
+workspace**, for a route other than the QR's or a bookmark on a device that is
+already paired. A new device pairs first, so it never needs one of these:
 
-- **This Mac**: `http://localhost:<port>/<slug>/`. A secure origin, so a full
-  PWA works here (Route D). Packaged desktop app only, since the localhost port
-  comes from the Tauri bridge.
-- **Local network**: only when the gateway is bound beyond loopback. Plain HTTP,
-  so no PWA install and no push. Under a loopback bind (the packaged default),
-  the row points at the **Network access** section further down this page
-  instead of printing a dead URL. Packaged desktop app only, since detecting a
-  LAN address needs the bridge.
+- **Local network**: only when the gateway serves a LAN address. Plain HTTP,
+  so no PWA install and no push. Under a loopback bind (the packaged default)
+  the row is absent; the **Network access** section further down says why.
+  Packaged desktop app only, since detecting a LAN address needs the bridge.
 - **Tailscale**: the tailnet address over plain HTTP until `serve` is verified,
   and `https://<name>.ts.net/<slug>/` once it is. Rendered **everywhere**,
   including a phone browser: see § The tailnet-status endpoint.
+- **External address**: the user's own route, when one is set (§ Any other VPN).
+
+There is no localhost row: that address is no use to another device.
 
 **Every row carries the `/<slug>/` prefix**, because that addresses a workspace
 (ADR 0014). A bare origin 307-redirects to the sole workspace or the picker,
@@ -640,7 +644,7 @@ the wrong address on an install with several workspaces.
 Both plain-HTTP rows obey the network bind: being on a tailnet does not mean the
 gateway **listens** on the tailnet address. Under the packaged loopback default
 neither prints, because both URLs would be dead. A bind pinned to the tailnet
-address shows the Tailscale row and reports the LAN as off. `serve` needs no
+address shows the Tailscale row and no LAN row. `serve` needs no
 wider bind, so the **HTTPS row is never bind-gated** and survives the packaged
 default.
 
@@ -648,9 +652,9 @@ The bind that counts belongs to whichever process served the page. Behind the
 gateway that is `gateway_bind`. On a direct engine port the origin is the
 engine, which follows the gateway only while `[engine] inherit` is on.
 
-### Add a device
+### Pair a device
 
-It sits under Connect URLs, as what you DO with one of those addresses. It
+It opens the page, since pairing is what most readers came to do. It
 mints a *pairing code* and draws it as a QR, so a phone scans rather than
 typing eight digits. The reader is already paired, which makes the offer safe:
 a paired device holds full authority and may enrol another.
@@ -785,7 +789,7 @@ never drops off this way. See *one-off device* in the glossary.
 
 A *gateway pairing* lets one gateway open another gateway's workspaces, for
 every device paired with it (ADR 0590). Two sections on **Settings → Access**
-carry it, right under **Add a device**:
+carry it, right under **Pair a device**:
 
 | Section | On which gateway | What it does |
 |---|---|---|
@@ -999,7 +1003,7 @@ The Access page applies this rule with two different probes:
   claims serving only once **port 443 on the tailnet address** has a listener.
   That proves a listener, not a working certificate, so the row can show while
   a first-run cert still provisions.
-- The **Connect URLs Tailscale row** needs this gateway's own public health to
+- The **Other addresses Tailscale row** needs this gateway's own public health to
   answer at the candidate origin over validated TLS (§ The tailnet-status
   endpoint).
   Until then it shows the plain-HTTP tailnet address.
@@ -1061,7 +1065,8 @@ then reopening, also works, but halts triggers and sessions in between. Prefer
 Restart engine.
 
 After the restart, `GET /~/api/v1/health` lists any address the gateway still
-awaits as `pending_binds`.
+awaits as `pending_binds`. Only a credentialed caller sees that field: send the
+`x-lucidos-local-token` header with the contents of `~/.lucidos/local-token`.
 
 ### An engine that faces a network asks for a credential
 
@@ -1097,8 +1102,10 @@ starts the service before `tailscaled` assigns the `100.x` address, so that bind
 fails with `Can't assign requested address`.
 
 So right after a restart, a `100.x` URL can be briefly unreachable while the
-local one works. `GET /~/api/v1/health` lists addresses still awaited as
-`pending_binds`, empty once all are bound. `loopback` and `all` are unaffected:
+local one works. `GET /~/api/v1/health`, sent with the local token, lists
+addresses still awaited as `pending_binds`, empty once all are bound. Without a
+credential it answers only `status`, `role`, `instance_id`, `gateway_protocol`
+and `tls`, so a stranger on the network learns no release or address. `loopback` and `all` are unaffected:
 their single address is required, and failing to bind it is a hard error
 (the port is held, not an interface missing).
 
@@ -1126,7 +1133,8 @@ their single address is required, and failing to bind it is a hard error
 - **The URL to hand over.** The gateway root 307-redirects to the sole workspace
   or the picker (`/~/`). A direct workspace link is
   `https://mymac.tailnet-name.ts.net/<slug>/`. Settings → Access prints exactly
-  that under Connect URLs, with a Copy button, so point the user there.
+  that under **Other addresses** (a fold under Pair a device), with a Copy
+  button, so point the user there.
 
 ## Quick triage
 

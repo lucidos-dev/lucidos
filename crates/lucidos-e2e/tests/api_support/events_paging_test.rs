@@ -185,3 +185,29 @@ async fn half_a_cursor_is_refused() {
         "before_created and before_seq travel together"
     );
 }
+
+/// A page cannot hold the event that stamped the thread's pair when it sits
+/// behind the page, so the snapshot carries its pair stamps. An unpaged read
+/// carries every event and sends none.
+#[tokio::test]
+async fn a_page_carries_the_pair_stamped_behind_it() {
+    let pool = pool().await;
+    let thread_id = seed_thread(&pool, 12).await;
+    sqlx::query(
+        "UPDATE events SET payload = payload || '{\"model\":\"model-old\",\"reasoning_effort\":\"high\"}'::jsonb \
+         WHERE thread_id = $1 AND payload->>'text' = 'message 0'",
+    )
+    .bind(thread_id)
+    .execute(&pool)
+    .await
+    .expect("stamp the oldest message");
+
+    let body = snapshot(thread_id, &[("limit", "4".into())]).await;
+    let stamps = body["pairStamps"].as_array().expect("pairStamps on a page");
+    assert_eq!(stamps.len(), 1, "one stamp covers model and effort");
+    assert_eq!(stamps[0]["model"], "model-old");
+    assert_eq!(stamps[0]["reasoning_effort"], "high");
+
+    let unpaged = snapshot(thread_id, &[]).await;
+    assert!(unpaged.get("pairStamps").is_none(), "unpaged sends none");
+}

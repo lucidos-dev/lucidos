@@ -197,12 +197,12 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=scripts/lib/release_github_auth.sh
-source "$SCRIPT_DIR/lib/release_github_auth.sh"
+# shellcheck source=scripts/lib/github_auth.sh
+source "$SCRIPT_DIR/lib/github_auth.sh"
 # Only upload modes need GitHub credentials. Resolve before build side effects.
 for release_arg in "$@"; do
     case "$release_arg" in
-        --release|--release-attach) release_github_auth || exit 1; break ;;
+        --release|--release-attach) github_auth || exit 1; break ;;
     esac
 done
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

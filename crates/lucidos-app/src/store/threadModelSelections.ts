@@ -28,32 +28,42 @@ function isPairEvent(event: StoredEvent): event is PairEvent {
     || event.type === 'ChatSettingsChanged';
 }
 
+/** The fields of a pair event and of a server `PairStamp` that name the pair. */
+type PairFields = Pick<PairEvent, 'model' | 'reasoning_effort' | 'provider'>;
+
 /** The non-empty string `read` picks from the thread's most recent event that
  *  names a pair and carries one. Mirrors the backend's newest-by-sequence
  *  lookup, so the menu displays what the next turn will actually use.
  *  Synthetic failed-send rows carry no model, so the filter skips them.
+ *
+ *  A paged thread can hold its stamping event behind the page. The server's
+ *  `pairStamps` stand in for what the page left out, and compete by sequence
+ *  like any loaded event: a live event is newer than the snapshot, so it wins.
  *
  *  Both starter kinds count, as does a pick: a chat turn starts with
  *  `MessageReceived` and a trigger fire with `TriggerStarted`, which emits no
  *  `MessageReceived` at all. */
 function newestPairValue(
   threadId: string | null | undefined,
-  read: (event: PairEvent) => unknown,
+  read: (event: PairFields) => unknown,
 ): string | undefined {
   if (!threadId) return undefined;
   const thread = threadMap.value.get(threadId);
   if (!thread) return undefined;
   let bestSeq = -Infinity;
   let bestValue: string | undefined;
-  for (const [seq, event] of thread.events) {
-    if (!isPairEvent(event)) continue;
-    const value = read(event);
-    if (typeof value !== 'string' || value === '') continue;
+  const consider = (seq: number, fields: PairFields): void => {
+    const value = read(fields);
+    if (typeof value !== 'string' || value === '') return;
     if (seq > bestSeq) {
       bestSeq = seq;
       bestValue = value;
     }
+  };
+  for (const [seq, event] of thread.events) {
+    if (isPairEvent(event)) consider(seq, event);
   }
+  for (const stamp of thread.pairStamps ?? []) consider(stamp.sequence, stamp);
   return bestValue;
 }
 

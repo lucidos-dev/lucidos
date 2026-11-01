@@ -7,7 +7,8 @@
 #   scripts/build-memory-gate.sh --once                # one reading: 0 GO, 72 NO-GO
 #
 # The rule is the pre-flight gate's, applied by host_memory_gate_verdict in
-# scripts/lib/host_memory_guard.sh. Callers: scripts/with-build-slot.sh, before
+# scripts/lib/host_memory_guard.sh. LUCIDOS_E2E_FREE_FLOOR_MIN_GB moves its
+# available line (host_memory_build_line_gb). Callers: scripts/with-build-slot.sh, before
 # it asks for a slot, and scripts/harden-suites.sh, before each cargo suite.
 #
 # A pass holds for 60 s in the process tree. A caller that just passed exports
@@ -44,7 +45,7 @@ case "$passed_at" in
 esac
 
 if [ -n "$once" ]; then
-    if reasons="$(host_memory_gate_verdict "$HOST_MEMORY_FREE_FLOOR_ABS_GB")"; then
+    if reasons="$(host_memory_gate_verdict "$(host_memory_build_line_gb)")"; then
         echo "[build-memory-gate] GO"
         exit 0
     fi

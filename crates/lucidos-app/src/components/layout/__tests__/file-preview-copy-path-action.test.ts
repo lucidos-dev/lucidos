@@ -82,7 +82,7 @@ describe('filePreviewCopyPathAction', () => {
 
   // Nothing here shows the path as selectable text, so with no clipboard a tap
   // could only open the "no clipboard" toast. Hidden instead, like every other
-  // copy button in this codebase (AddDeviceSection's `CopyButton`, PairingGate).
+  // copy button in this codebase (PairDeviceSection's `CopyButton`, PairingGate).
   it('is null off a non-secure origin, where there is no clipboard to write to', () => {
     clipboard.copy = false;
 

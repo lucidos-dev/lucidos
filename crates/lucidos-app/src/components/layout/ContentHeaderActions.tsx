@@ -137,7 +137,7 @@ export function filePreviewPopoutAction(encoded: string): HeaderActionSpec | nul
  *  Null off a non-secure origin (a plain-HTTP LAN address), the one case
  *  `navigator.clipboard` is absent: nothing here shows the path as selectable
  *  text, so a tap could only ever open the "no clipboard" toast. Same
- *  `clipboardAbilities().copy` gate `CopyButton` (`AddDeviceSection.tsx`) and
+ *  `clipboardAbilities().copy` gate `CopyButton` (`PairDeviceSection.tsx`) and
  *  `PairingGate` use. */
 export function filePreviewCopyPathAction(encoded: string): HeaderActionSpec | null {
   if (!clipboardAbilities().copy) return null;

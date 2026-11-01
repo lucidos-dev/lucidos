@@ -209,8 +209,16 @@ pub(crate) async fn cache_remaining(
     pool: &PgPool,
     thread_id: Uuid,
 ) -> Result<CacheRemaining, sqlx::Error> {
+    Ok(cache_remaining_and_ttl(pool, thread_id).await?.0)
+}
+
+/// [`cache_remaining`], with the TTL evidence it was measured on.
+pub(crate) async fn cache_remaining_and_ttl(
+    pool: &PgPool,
+    thread_id: Uuid,
+) -> Result<(CacheRemaining, CacheTtl), sqlx::Error> {
     let (age_secs, ttl) = cache_age_and_ttl(pool, thread_id).await?;
-    Ok(remaining_of(age_secs, ttl))
+    Ok((remaining_of(age_secs, ttl), ttl))
 }
 
 /// Seconds since the thread's cache last refreshed (a turn request or a

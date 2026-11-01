@@ -349,6 +349,7 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ),
     ("/threads/:thread_id/event-waits/cancel", Agent, &[]),
     ("/threads/:thread_id/events", Host, &[]),
+    ("/threads/:thread_id/expected-wake", Agent, &[]),
     ("/threads/:thread_id/follow-up", Host, &[]),
     ("/threads/:thread_id/images", Host, &[]),
     ("/threads/:thread_id/images/:index", Host, &[]),

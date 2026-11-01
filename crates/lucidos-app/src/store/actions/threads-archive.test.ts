@@ -39,6 +39,8 @@ import { upsertThread } from './thread-loading';
 import { handleThreadEvent } from './thread-sync';
 import { ARCHIVE_PINNED_CONFIRM, focusThread, handleArchiveThread, subscriptionsStoppedByArchive } from './threads';
 import { _resetRowIntentsForTesting, archiveRequestInFlight } from '../rowIntents';
+import * as drawerOrder from '../../components/drawer/drawerOrder';
+import { provideDrawerOrder } from '../drawerOrderHandle';
 
 // Mock the API module
 vi.mock('../../api/threads', () => ({
@@ -71,6 +73,9 @@ vi.mock('../../api/client', async (importOriginal) => ({
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
+
+// The archive hand-off walks the drawer on screen, which `startShell` provides.
+provideDrawerOrder(drawerOrder);
 
 beforeEach(() => {
   threadMap.value = new Map();

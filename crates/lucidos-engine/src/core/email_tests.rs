@@ -842,3 +842,38 @@ fn an_attachment_cannot_traverse_out_of_a_typed_subdirectory() {
         .expect_err("traversal must be refused");
     assert!(err.contains("no '..' components"), "wrong refusal: {err}");
 }
+
+/// The prefix test reads the path string, and a symlink makes the string lie.
+/// A link under `artifacts/` must not mail `data/.env` or a host file.
+#[test]
+fn an_attachment_that_links_out_of_its_tree_is_refused() {
+    use std::os::unix::fs::symlink;
+    let ws = tempfile::tempdir().unwrap();
+    let artifacts = ws.path().join("data/artifacts");
+    std::fs::create_dir_all(&artifacts).unwrap();
+    std::fs::write(artifacts.join("report.pdf"), "mine").unwrap();
+    std::fs::write(ws.path().join("data/.env"), "KEY=1").unwrap();
+    std::fs::write(ws.path().join("secret.txt"), "private").unwrap();
+    symlink(ws.path().join("data/.env"), artifacts.join("env.txt")).unwrap();
+    symlink(ws.path().join("secret.txt"), artifacts.join("out.txt")).unwrap();
+    symlink(artifacts.join("report.pdf"), artifacts.join("alias.pdf")).unwrap();
+
+    for path in ["artifacts/env.txt", "artifacts/out.txt"] {
+        let Err(err) = EmailAttachment::read_from_workspace(ws.path(), &[path.to_string()]) else {
+            panic!("{path} links out of its tree and was attached");
+        };
+        assert!(err.contains("symlink"), "wrong refusal for {path}: {err}");
+    }
+    let read = EmailAttachment::read_from_workspace(
+        ws.path(),
+        &[
+            "artifacts/report.pdf".to_string(),
+            "artifacts/alias.pdf".to_string(),
+            "artifacts//report.pdf".to_string(),
+        ],
+    )
+    .expect("a file inside its tree still attaches");
+    for attachment in &read {
+        assert_eq!(attachment.data, b"mine");
+    }
+}

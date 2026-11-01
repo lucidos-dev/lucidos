@@ -1576,3 +1576,266 @@ fn a_concurrent_main_conflict_is_recognised_inside_its_wrappers() {
         "update-ref failed: cannot lock ref 'refs/heads/main'"
     ));
 }
+
+mod a_temp_merge_pair_keeps_its_work_on_a_kept_branch {
+    //! Apply's Tier-3 slow path reuses `merge-<id>` and `merge-tmp/<id>`. A
+    //! previous pair that holds work leaves it on a kept merge branch, so the
+    //! work survives and Apply still starts a fresh attempt.
+
+    use crate::engine::git_ops::{clear_temp_merge_state, git_cmd, KEPT_MERGE_SUFFIX};
+    use crate::test_support::make_repo_and_worktree;
+    use std::path::{Path, PathBuf};
+
+    const CHANGE: &str = "lucidos-claude-code-repo-add-streaks-1c0ffee0";
+    const TEMP: &str = "merge-tmp/1c0ffee0";
+    const MERGE_DIR: &str = "merge-1c0ffee0";
+
+    /// A change branch one commit ahead of main, plus the temp merge pair a
+    /// previous Tier-3 attempt created from main.
+    async fn repo_with_previous_merge_attempt() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let (tmp, repo, wt) = make_repo_and_worktree(CHANGE).await;
+        commit_file(&wt, "streaks.txt", "the change").await;
+        let merge = tmp.path().join(MERGE_DIR);
+        add_merge_pair(&repo, &merge).await;
+        (tmp, repo, merge)
+    }
+
+    async fn add_merge_pair(repo: &Path, merge: &Path) {
+        let out = git_cmd(
+            &["worktree", "add", merge.to_str().unwrap(), "-b", TEMP],
+            repo,
+        )
+        .await
+        .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+
+    async fn commit_file(dir: &Path, name: &str, body: &str) {
+        std::fs::write(dir.join(name), body).unwrap();
+        git_cmd(&["add", "."], dir).await.unwrap();
+        git_cmd(&["commit", "-m", name], dir).await.unwrap();
+    }
+
+    async fn clear(repo: &Path, merge: &Path) -> Result<(), String> {
+        clear_temp_merge_state(repo, merge, TEMP, CHANGE, "[Test]").await
+    }
+
+    async fn git_out(dir: &Path, args: &[&str]) -> String {
+        let out = git_cmd(args, dir).await.unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn branch_exists(repo: &Path, branch: &str) -> bool {
+        std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", branch])
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    fn kept_branches(repo: &Path) -> Vec<String> {
+        let out = std::process::Command::new("git")
+            .args(["for-each-ref", "--format=%(refname:short)"])
+            .arg(format!("refs/heads/{TEMP}{KEPT_MERGE_SUFFIX}*"))
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn the_kept_branch(repo: &Path) -> String {
+        let kept = kept_branches(repo);
+        assert_eq!(kept.len(), 1, "one kept branch: {kept:?}");
+        kept[0].clone()
+    }
+
+    /// The paths are free again, which is what the slow path needs next.
+    async fn assert_paths_reusable(repo: &Path, merge: &Path) {
+        assert!(!merge.exists());
+        assert!(!branch_exists(repo, TEMP));
+        add_merge_pair(repo, merge).await;
+    }
+
+    #[tokio::test]
+    async fn uncommitted_merge_work_is_committed_to_the_kept_branch() {
+        let (_tmp, repo, merge) = repo_with_previous_merge_attempt().await;
+        std::fs::write(merge.join("resolution.txt"), "half-resolved conflict").unwrap();
+
+        clear(&repo, &merge).await.expect("held work is kept");
+
+        let kept = the_kept_branch(&repo);
+        let kept_file = format!("{kept}:resolution.txt");
+        assert_eq!(
+            git_out(&repo, &["show", &kept_file]).await,
+            "half-resolved conflict"
+        );
+        assert_paths_reusable(&repo, &merge).await;
+    }
+
+    #[tokio::test]
+    async fn a_committed_resolution_is_kept_as_is() {
+        let (_tmp, repo, merge) = repo_with_previous_merge_attempt().await;
+        commit_file(&merge, "resolution.txt", "resolved").await;
+        let resolution = git_out(&repo, &["rev-parse", TEMP]).await;
+
+        clear(&repo, &merge).await.expect("held work is kept");
+
+        let kept = the_kept_branch(&repo);
+        assert_eq!(git_out(&repo, &["rev-parse", &kept]).await, resolution);
+        assert_paths_reusable(&repo, &merge).await;
+    }
+
+    /// The conflicted merge is the work, so it is kept, not aborted: the
+    /// snapshot is a merge commit carrying the conflict markers.
+    #[tokio::test]
+    async fn an_in_progress_merge_is_kept_with_its_conflicts() {
+        let (_tmp, repo, merge) = repo_with_previous_merge_attempt().await;
+        commit_file(&merge, "streaks.txt", "main's side").await;
+        let conflicted = git_cmd(&["merge", CHANGE], &merge).await.unwrap();
+        assert!(!conflicted.status.success(), "the merge must conflict");
+
+        clear(&repo, &merge).await.expect("held work is kept");
+
+        let kept = the_kept_branch(&repo);
+        let second_parent = format!("{kept}^2");
+        assert_eq!(
+            git_out(&repo, &["rev-parse", &second_parent]).await,
+            git_out(&repo, &["rev-parse", CHANGE]).await
+        );
+        let kept_file = format!("{kept}:streaks.txt");
+        assert!(git_out(&repo, &["show", &kept_file])
+            .await
+            .contains("<<<<<<<"));
+        assert_paths_reusable(&repo, &merge).await;
+    }
+
+    /// A clear that stopped after the rename left a clean tree on the kept
+    /// branch. The next clear deletes the tree and the commits stay.
+    #[tokio::test]
+    async fn a_keep_that_stopped_after_the_rename_finishes_on_the_next_clear() {
+        let (_tmp, repo, merge) = repo_with_previous_merge_attempt().await;
+        commit_file(&merge, "resolution.txt", "resolved").await;
+        let resolution = git_out(&repo, &["rev-parse", TEMP]).await;
+        let kept = format!("{TEMP}{KEPT_MERGE_SUFFIX}1");
+        git_out(&repo, &["branch", "-m", TEMP, &kept]).await;
+
+        clear(&repo, &merge).await.expect("the clear finishes");
+
+        assert_eq!(git_out(&repo, &["rev-parse", &kept]).await, resolution);
+        assert_paths_reusable(&repo, &merge).await;
+    }
+
+    /// The temp branch only carries what main and the change branch already
+    /// hold, so deleting it loses nothing.
+    #[tokio::test]
+    async fn a_pair_with_no_work_of_its_own_is_deleted() {
+        let (_tmp, repo, merge) = repo_with_previous_merge_attempt().await;
+        git_cmd(&["merge", "--ff-only", CHANGE], &merge)
+            .await
+            .unwrap();
+
+        clear(&repo, &merge)
+            .await
+            .expect("nothing unique, so the pair is deleted");
+
+        assert!(kept_branches(&repo).is_empty());
+        assert!(
+            branch_exists(&repo, CHANGE),
+            "the change branch is never touched"
+        );
+        assert_paths_reusable(&repo, &merge).await;
+    }
+
+    /// A directory with no `.git` of its own resolves to the enclosing repo.
+    /// A snapshot there would commit the repo's files, so nothing runs.
+    #[tokio::test]
+    async fn a_directory_git_does_not_confirm_is_left_untouched() {
+        let (_tmp, repo, _merge) = repo_with_previous_merge_attempt().await;
+        let stray = repo.join(MERGE_DIR);
+        std::fs::create_dir(&stray).unwrap();
+        std::fs::write(stray.join("resolution.txt"), "stray").unwrap();
+        let head = git_out(&repo, &["rev-parse", "HEAD"]).await;
+
+        let err = clear(&repo, &stray).await.expect_err("not a worktree");
+
+        assert!(err.contains("left it in place"), "got: {err}");
+        assert_eq!(git_out(&repo, &["rev-parse", "HEAD"]).await, head);
+        assert!(stray.join("resolution.txt").exists());
+        assert!(branch_exists(&repo, TEMP));
+    }
+
+    #[tokio::test]
+    async fn a_tree_off_its_temp_branch_is_left_untouched() {
+        let (_tmp, repo, merge) = repo_with_previous_merge_attempt().await;
+        git_out(&merge, &["checkout", "--detach"]).await;
+        std::fs::write(merge.join("resolution.txt"), "on a detached head").unwrap();
+
+        let err = clear(&repo, &merge).await.expect_err("off the temp branch");
+
+        assert!(err.contains(TEMP), "got: {err}");
+        assert!(merge.join("resolution.txt").exists());
+        assert!(kept_branches(&repo).is_empty());
+    }
+
+    /// `git add -A` would keep a nested repository as a bare gitlink.
+    #[tokio::test]
+    async fn a_tree_holding_a_nested_repository_is_left_untouched() {
+        let (_tmp, repo, merge) = repo_with_previous_merge_attempt().await;
+        let nested = merge.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        git_out(&nested, &["init", "-q"]).await;
+        std::fs::write(nested.join("notes.txt"), "nested work").unwrap();
+
+        let err = clear(&repo, &merge).await.expect_err("nested repository");
+
+        assert!(err.contains("nested git repository"), "got: {err}");
+        assert!(nested.join("notes.txt").exists());
+        assert!(kept_branches(&repo).is_empty());
+    }
+
+    /// A staged gitlink no longer shows as untracked, so the index is read too.
+    #[tokio::test]
+    async fn a_tree_with_a_staged_nested_repository_is_left_untouched() {
+        let (_tmp, repo, merge) = repo_with_previous_merge_attempt().await;
+        let nested = merge.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        git_out(&nested, &["init", "-q"]).await;
+        std::fs::write(nested.join("notes.txt"), "nested work").unwrap();
+        git_out(&nested, &["add", "."]).await;
+        git_out(
+            &nested,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-qm",
+                "nested",
+            ],
+        )
+        .await;
+        git_out(&merge, &["add", "nested"]).await;
+
+        let err = clear(&repo, &merge)
+            .await
+            .expect_err("staged nested repository");
+
+        assert!(err.contains("nested git repository"), "got: {err}");
+        assert!(nested.join("notes.txt").exists());
+        assert!(kept_branches(&repo).is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_previous_attempt_is_a_no_op() {
+        let (tmp, repo, _wt) = make_repo_and_worktree(CHANGE).await;
+        let merge = tmp.path().join(MERGE_DIR);
+
+        clear(&repo, &merge).await.expect("nothing to clear");
+    }
+}

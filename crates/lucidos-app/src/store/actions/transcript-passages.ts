@@ -19,7 +19,7 @@ import type { ThreadState } from '../thread-events/thread-meta';
 import type { ResponseEvent } from '../types';
 import type { SideQuestion } from '../sideQuestions';
 import { getCollapsedVisibleEvents, headClampApplies, isMeaningfulText } from '../event-rendering';
-import { renderMarkdown, renderMarkdownInline } from '../../utils/renderMarkdown';
+import { markdownEngine, renderMarkdown, renderMarkdownInline } from '../../utils/renderMarkdown';
 import { QUESTION_SUPERSEDED_NOTE, typedAnswerText } from '../../components/chat/QuestionCard';
 import {
   engineResolutionNote, renderCommandQuestion, renderMcpQuestion, renderQuestion,
@@ -98,7 +98,8 @@ export const freshText: PassageText = {
   drawing: (_key, draw) => drawingText(draw()),
 };
 
-/** Reads each text once into `cache`. */
+/** Reads each text once into `cache`. A markdown text read before the markdown
+ *  engine landed is plain, so its key says which it is. */
 export function cachedText(cache: Map<string, string>): PassageText {
   const once = (key: string, read: () => string) => {
     let text = cache.get(key);
@@ -106,11 +107,13 @@ export function cachedText(cache: Map<string, string>): PassageText {
     return text;
   };
   return {
-    markdown: (md) => once(`md:${md}`, () => freshText.markdown(md)),
-    inlineMarkdown: (md) => once(`inline:${md}`, () => freshText.inlineMarkdown(md)),
+    markdown: (md) => once(`md:${formatted()}:${md}`, () => freshText.markdown(md)),
+    inlineMarkdown: (md) => once(`inline:${formatted()}:${md}`, () => freshText.inlineMarkdown(md)),
     drawing: (key, draw) => once(`drawing:${key}`, () => freshText.drawing(key, draw)),
   };
 }
+
+const formatted = (): boolean => markdownEngine.peek() !== null;
 
 /** A value as a quoted CSS attribute string. */
 const css = (value: string | number) => `"${String(value).replace(/["\\]/g, '\\$&')}"`;

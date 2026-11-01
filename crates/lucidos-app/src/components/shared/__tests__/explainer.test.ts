@@ -262,7 +262,7 @@ describe('Explainer: sections of the same shape place the icon the same way', ()
    *
    * Scoped to that page's one-control sections rather than asserting "no
    * heading ever takes an icon", which would be false: a list section
-   * (Repositories, Connect URLs) has no label narrower than its heading, and
+   * (Repositories) has no label narrower than its heading, and
    * Chat & triggers' copy covers two rows at once.
    */
   it('puts the push explanation on the switch, not on the heading above it', () => {

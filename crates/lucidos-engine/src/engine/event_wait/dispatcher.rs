@@ -137,6 +137,18 @@ fn wait_ending(emitted: &EmittedEvent) -> Option<(Uuid, EventWaitCancelCause)> {
     Some((*thread_id, cause))
 }
 
+/// The least pause between two sweeps, so a slow one never runs back to back.
+const MIN_SWEEP_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long to pause after a sweep that took `elapsed`. Sweeps start every
+/// `DEADLINE_SWEEP_INTERVAL`, which the keep-alive beat windows rely on, and
+/// a slow sweep stretches the period by `MIN_SWEEP_GAP` at most.
+fn sweep_pause(elapsed: std::time::Duration) -> std::time::Duration {
+    DEADLINE_SWEEP_INTERVAL
+        .saturating_sub(elapsed)
+        .max(MIN_SWEEP_GAP)
+}
+
 impl LucidosEngine {
     /// Start the dispatcher's two background tasks: the bus subscriber and the
     /// deadline sweep.
@@ -171,15 +183,14 @@ impl LucidosEngine {
 
         let engine = self.clone();
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(DEADLINE_SWEEP_INTERVAL);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                ticker.tick().await;
                 if engine.is_shutting_down() {
                     break;
                 }
+                let started = tokio::time::Instant::now();
                 engine.sweep_expired_event_waits().await;
                 engine.beat_cache_keep_alives().await;
+                tokio::time::sleep(sweep_pause(started.elapsed())).await;
             }
         });
     }

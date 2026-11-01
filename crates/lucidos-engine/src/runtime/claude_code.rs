@@ -10,9 +10,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::agent_runtime::{
     AccountPin, AgentEvent, AgentExitFacts, AgentInput, AgentRuntime, CodingAgent, ControlRequest,
-    InputWithdrawal, RunningAgent, SessionContextDue, SpawnArgs, WithdrawRequest,
+    InputWithdrawal, NotesReminderDue, RunningAgent, SessionContextDue, SpawnArgs, WithdrawRequest,
 };
-use super::claude_code_provider::NotesVisibility;
 use super::lucidos_cli::{
     ensure_workspace_bin_symlink, lucidos_cli_dir, place_lucidos_cli_skill, LUCIDOS_BIN_NAME,
     LUCIDOS_CLI_SKILL,
@@ -447,21 +446,28 @@ fn withdrawal(body: ControlBody) -> InputWithdrawal {
 }
 
 /// Withdraws the driver has written and CC has not answered yet, by request
-/// id. Dropping one tells its caller the process ended first.
+/// id, with the input each names. Dropping one tells its caller the process
+/// ended first.
 type PendingReplies =
-    std::collections::HashMap<String, tokio::sync::oneshot::Sender<InputWithdrawal>>;
+    std::collections::HashMap<String, (uuid::Uuid, tokio::sync::oneshot::Sender<InputWithdrawal>)>;
 
 /// Parse one stdout line. A reply to a pending withdraw goes to its caller and
-/// yields no event, so it never reaches the session's history.
+/// yields no event, so it never reaches the session's history. A dropped input
+/// gives back the notes reminder it carried.
 fn route_stdout_line(
     state: &mut CcStreamState,
     pending: &mut PendingReplies,
+    notes_reminder: &mut NotesReminderDue,
     line: &str,
 ) -> Vec<AgentEvent> {
     if let Some((request_id, body)) = control_reply(line) {
-        if let Some(reply) = pending.remove(&request_id) {
+        if let Some((input_uuid, reply)) = pending.remove(&request_id) {
+            let outcome = withdrawal(body);
+            if outcome == InputWithdrawal::Withdrawn {
+                notes_reminder.withdrawn(input_uuid);
+            }
             // A caller that gave up dropped its receiver; the reply has nowhere to go.
-            let _ = reply.send(withdrawal(body));
+            let _ = reply.send(outcome);
             return Vec::new();
         }
     }
@@ -896,7 +902,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
             startup_follow_up,
         } = build_command(&args, cli_dir)?;
         let agent_run = args.agent_run.clone();
-        let stream_state = stream_state_for(args.notes);
+        let stream_state = CcStreamState::default();
         let secrets = command_secret_values(&cmd);
         let mut child = super::spawn_env::spawn_below_engine(&mut cmd)?;
         let stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
@@ -913,6 +919,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
 
         let initial_session_id = args.resume_session_id.map(str::to_string);
         let session_context = args.owed_session_context();
+        let notes_reminder = args.owed_notes_reminder();
         tokio::spawn(async move {
             driver_task(
                 child,
@@ -926,6 +933,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
                 cancel,
                 initial_session_id,
                 session_context,
+                notes_reminder,
                 stream_state,
                 startup_follow_up,
             )
@@ -946,13 +954,6 @@ impl AgentRuntime for ClaudeCodeRuntime {
             withdraw_tx,
         })
     }
-}
-
-/// The parser's state for a session whose notes are `notes`: a `thinking`
-/// block is a progress note for the user only when the verdict says it reaches
-/// them. The spawn's prompt follows the same verdict.
-fn stream_state_for(notes: NotesVisibility) -> CcStreamState {
-    CcStreamState::with_notes_relayed(notes == NotesVisibility::Shown)
 }
 
 /// Resolve the `claude` executable for spawn. The user-configured override wins
@@ -1386,9 +1387,6 @@ fn build_command_with_settings(
     // a notification for one. Engine-owned, so it also goes AFTER
     // `apply_lucidos_env` (ADR 0358).
     cmd.env(BACKGROUND_TASKS_OFF_ENV, "1");
-    // Engine-owned, so it goes AFTER `apply_lucidos_env`. A workspace value
-    // then becomes the relay's upstream instead of bypassing the relay.
-    stamp_vertex_relay(&mut cmd, args, super::vertex_relay::port());
     // The engine permission handler waits indefinitely for the user, matching
     // `AskUserQuestion`. CC has TWO separate MCP timeouts that both have to be
     // lifted, otherwise whichever is shorter forces a retry that surfaces a
@@ -1414,9 +1412,8 @@ fn build_command_with_settings(
     })
 }
 
-/// Replay a thread's account pin onto `cmd`. Shared with the provider check,
-/// which must read the profile the session runs under.
-pub(super) fn apply_account_pin(cmd: &mut tokio::process::Command, pin: Option<&AccountPin>) {
+/// Replay a thread's account pin onto `cmd`.
+fn apply_account_pin(cmd: &mut tokio::process::Command, pin: Option<&AccountPin>) {
     match pin {
         Some(AccountPin::ExplicitConfigDir { dir }) => {
             cmd.env("CLAUDE_CONFIG_DIR", dir);
@@ -1425,53 +1422,6 @@ pub(super) fn apply_account_pin(cmd: &mut tokio::process::Command, pin: Option<&
             cmd.env_remove("CLAUDE_CONFIG_DIR");
         }
         None => {}
-    }
-}
-
-/// The relay URL a session for `thread_id` gets as its Vertex base URL. `None`
-/// when this engine runs no relay or has no signing secret yet. A Vertex base
-/// URL the session would otherwise use becomes the relay's upstream.
-pub(super) fn vertex_relay_url(
-    user_env_vars: &[(String, String)],
-    thread_id: uuid::Uuid,
-    relay_port: Option<u16>,
-) -> Option<String> {
-    use super::vertex_relay::{relay_base_url, ENV_VERTEX_BASE_URL};
-    let port = relay_port?;
-    let user_base = user_env_vars
-        .iter()
-        .find(|(name, _)| name == ENV_VERTEX_BASE_URL)
-        .map(|(_, value)| value.clone())
-        .or_else(|| std::env::var(ENV_VERTEX_BASE_URL).ok());
-    relay_base_url(port, thread_id, user_base.as_deref())
-}
-
-/// Point the session's Vertex calls at the engine's relay, so an
-/// always-thinking model's notes come back (`runtime::vertex_relay`).
-///
-/// Set for every session, not only Vertex ones: Claude Code reads the variable
-/// only on Vertex, and a settings file can switch Vertex on out of our sight.
-/// Whether the notes then reach the user depends on the provider Claude Code
-/// actually uses (`claude_code_provider`).
-///
-/// A temporary measure: `docs/temporary-measures.md` § "Claude Code's Vertex
-/// calls go through the Vertex relay".
-fn stamp_vertex_relay(
-    cmd: &mut tokio::process::Command,
-    args: &SpawnArgs<'_>,
-    relay_port: Option<u16>,
-) {
-    if relay_port.is_none() {
-        return;
-    }
-    match vertex_relay_url(args.user_env_vars, args.thread_id, relay_port) {
-        Some(url) => {
-            cmd.env(super::vertex_relay::ENV_VERTEX_BASE_URL, url);
-        }
-        None => crate::log!(
-            "[ClaudeCode] no signing secret, so thread {} runs without the Vertex relay",
-            args.thread_id
-        ),
     }
 }
 
@@ -1781,6 +1731,20 @@ fn forward_stdout_events(
     true
 }
 
+/// `input` as the session writes it: behind the notes reminder, then behind the
+/// session context. A note that arrived since the last input promotes first.
+fn lead_input(
+    session_context: &mut SessionContextDue,
+    notes_reminder: &mut NotesReminderDue,
+    stream_state: &mut CcStreamState,
+    input: AgentInput,
+) -> AgentInput {
+    if stream_state.take_promotion() {
+        notes_reminder.promoted();
+    }
+    session_context.lead(notes_reminder.lead(input))
+}
+
 /// Drive the CC process: forward stdout → events_tx, input/control → stdin,
 /// and react to cancellation. Always emits `AgentEvent::Exited` (best-effort)
 /// before returning so consumers can distinguish a clean close from a panic.
@@ -1797,6 +1761,7 @@ async fn driver_task(
     cancel: CancellationToken,
     mut session_id: Option<String>,
     mut session_context: SessionContextDue,
+    mut notes_reminder: NotesReminderDue,
     mut stream_state: CcStreamState,
     mut startup_follow_up: Option<StartupFollowUp>,
 ) {
@@ -1837,6 +1802,7 @@ async fn driver_task(
                             let events = route_stdout_line(
                                 &mut stream_state,
                                 &mut pending_replies,
+                                &mut notes_reminder,
                                 &String::from_utf8_lossy(&line_buf),
                             );
                             forward_stdout_events(
@@ -1854,6 +1820,7 @@ async fn driver_task(
                         let events = route_stdout_line(
                             &mut stream_state,
                             &mut pending_replies,
+                            &mut notes_reminder,
                             &String::from_utf8_lossy(&line_buf),
                         );
                         // A consumer that dropped stops the forwarding of this
@@ -1876,7 +1843,10 @@ async fn driver_task(
             }
             input = input_rx.recv() => {
                 let Some(input) = input else { break };
-                let line = format_user_input(&session_context.lead(input), session_id.as_deref());
+                let line = format_user_input(
+                    &lead_input(&mut session_context, &mut notes_reminder, &mut stream_state, input),
+                    session_id.as_deref(),
+                );
                 if !write_stdin_line(&mut stdin, &line, "user input").await {
                     break;
                 }
@@ -1897,8 +1867,10 @@ async fn driver_task(
                 // overtaking the message it names.
                 let mut flushed = true;
                 while let Ok(input) = input_rx.try_recv() {
-                    let line =
-                        format_user_input(&session_context.lead(input), session_id.as_deref());
+                    let line = format_user_input(
+                        &lead_input(&mut session_context, &mut notes_reminder, &mut stream_state, input),
+                        session_id.as_deref(),
+                    );
                     flushed = write_stdin_line(&mut stdin, &line, "user input").await;
                     if !flushed {
                         break;
@@ -1909,7 +1881,7 @@ async fn driver_task(
                 }
                 let request_id = uuid::Uuid::new_v4().to_string();
                 let line = cc_cancel_async_message_json(withdraw.input_uuid, &request_id);
-                pending_replies.insert(request_id, withdraw.reply);
+                pending_replies.insert(request_id, (withdraw.input_uuid, withdraw.reply));
                 if !write_stdin_line(&mut stdin, &line, "withdraw").await {
                     break;
                 }
@@ -1957,6 +1929,7 @@ async fn driver_task(
                             let events = route_stdout_line(
                                 &mut stream_state,
                                 &mut pending_replies,
+                                &mut notes_reminder,
                                 &String::from_utf8_lossy(&line_buf),
                             );
                             forward_stdout_events(
@@ -1974,6 +1947,7 @@ async fn driver_task(
                     let events = route_stdout_line(
                         &mut stream_state,
                         &mut pending_replies,
+                        &mut notes_reminder,
                         &String::from_utf8_lossy(&line_buf),
                     );
                     forward_stdout_events(

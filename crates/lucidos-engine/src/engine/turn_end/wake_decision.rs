@@ -25,7 +25,7 @@
 
 use uuid::Uuid;
 
-use super::read_decision::TurnRead;
+use super::read_decision::{TurnRead, PARENT_ACTS_READ_RULE, PARENT_MAY_ACT_READ_RULE};
 use crate::engine::aux_purpose::asks_no_model;
 use crate::engine::chat::agent_archive::agent_thread_actor;
 use crate::engine::event_bus::{BusEvent, Delivery, EventBus};
@@ -213,6 +213,17 @@ impl WakeDuty {
             }
             Some((Some(_), None)) => Self::Decide,
             _ => Self::NoParent,
+        }
+    }
+
+    /// The read rule a session of this duty is told, or empty. Only a child
+    /// whose report reaches a parent agent that acts on it gets one: a
+    /// `no-wake` child's report is read in the child (ADR 0607).
+    pub(crate) fn read_rule(self) -> &'static str {
+        match self {
+            Self::Declared(WakeMode::Wake | WakeMode::WakeWhenAllDone) => PARENT_ACTS_READ_RULE,
+            Self::Decide => PARENT_MAY_ACT_READ_RULE,
+            Self::Declared(WakeMode::NoWake) | Self::NoParent => "",
         }
     }
 

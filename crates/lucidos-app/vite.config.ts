@@ -315,6 +315,9 @@ export default defineConfig({
     // tell the first-paint chunks from the lazy ones. `chunkBudget` judges each
     // chunk against the number for its class instead (ADR 0436).
     chunkSizeWarningLimit: Infinity,
+    // Safari 16.4 and up runs ES2022 natively, and no shipped client is older.
+    // Vite's default target down-levels that syntax into larger, slower code.
+    target: 'es2022',
     // The main check's coverage build maps executed code back to source
     // (e2e/coverage.ts). Hidden: no bundle names its map, and no other build
     // writes one.

@@ -2,7 +2,7 @@
  * A multiline `<copy>` block wraps RENDERED MARKDOWN, not preformatted text, so
  * its container must not preserve newlines.
  *
- * `postprocessCopyBlocks` (utils/renderMarkdown.ts) hands marked the raw
+ * `postprocessCopyBlocks` (utils/markdownEngine.ts) hands marked the raw
  * markdown between its comment markers and wraps whatever comes back, so the
  * `.copyable-block-multi` div's children are marked's block elements with
  * marked's own `\n` between them. Two consequences, and they point the same way:

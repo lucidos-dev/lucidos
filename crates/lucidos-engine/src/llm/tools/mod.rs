@@ -72,7 +72,9 @@ pub use images::{get_image_generation_tool, get_save_thread_image_tool, get_view
 /// keeping a copy that drifts.
 #[cfg(test)]
 pub(crate) use misc::NAVIGABLE_SETTINGS_VIEWS;
-pub(crate) use misc::{wake_parent_tool, READ_ARG, WAKE_ARG};
+pub(crate) use misc::{
+    wake_parent_tool, EXPECT_WAKE_MINUTES_ARG, EXPECT_WAKE_REASON_ARG, READ_ARG, WAKE_ARG,
+};
 pub use notifications::get_notification_tool;
 
 /// Synchronous `run_bash` defaults. Both the JSON schema (described to the
@@ -259,6 +261,8 @@ const CHAT_TAIL: &[FamilyRow] = &[
     // Last, so adding it moved no tool already on the wire. A chat turn and a
     // trigger run both splice this tail.
     (Gate::Ungated, Build::Fixed(misc::request_read_tools)), // request_read
+    // After request_read, so adding it moved no tool already on the wire.
+    (Gate::Ungated, Build::Fixed(misc::expect_wake_tools)), // expect_wake
 ];
 
 /// Splice one registry table down to the families this workspace can use.

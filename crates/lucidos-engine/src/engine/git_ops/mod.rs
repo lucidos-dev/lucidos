@@ -173,6 +173,18 @@ pub(crate) async fn git_main_worktree(dir: &Path) -> Result<PathBuf, String> {
     Ok(main)
 }
 
+/// The author and committer env for a commit Lucidos itself makes, so it
+/// works when the repo has no user.name/email in its config. The engine
+/// commits artifacts through git2 with a per-commit signature, not config.
+pub(crate) fn lucidos_identity_env() -> Vec<(&'static str, &'static OsStr)> {
+    vec![
+        ("GIT_AUTHOR_NAME", OsStr::new("Lucidos")),
+        ("GIT_AUTHOR_EMAIL", OsStr::new("lucidos@localhost")),
+        ("GIT_COMMITTER_NAME", OsStr::new("Lucidos")),
+        ("GIT_COMMITTER_EMAIL", OsStr::new("lucidos@localhost")),
+    ]
+}
+
 /// Like [`git_cmd`] but with extra environment variables. Used by the command
 /// checkpoint helpers, which set `GIT_INDEX_FILE` to a throwaway index so a
 /// snapshot/restore never disturbs the repo's real index or working tree.

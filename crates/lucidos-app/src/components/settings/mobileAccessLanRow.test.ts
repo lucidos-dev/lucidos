@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
-  lanRowState,
+  lanUrl,
   tailnetHttpUrl,
-  lanRowAvoidingTailnet,
+  lanUrlAvoidingTailnet,
   workspaceUrlAt,
   originAtHost,
   servingBind,
@@ -11,33 +11,27 @@ import {
   tailnetConnectRows,
 } from './MobileAccessPage';
 
-describe('lanRowState', () => {
+describe('lanUrl', () => {
   it('hides the URL under the loopback bind (the packaged default)', () => {
     // A loopback-bound gateway cannot serve a LAN address — advertising the
     // URL anyway was the original Mobile Access bug (a dead, copyable URL).
-    expect(lanRowState('loopback', '192.168.1.20', 5252)).toEqual({ kind: 'disabled' });
-    expect(lanRowState('', '192.168.1.20', 5252)).toEqual({ kind: 'disabled' });
-    expect(lanRowState('  loopback  ', '192.168.1.20', 5252)).toEqual({ kind: 'disabled' });
+    expect(lanUrl('loopback', '192.168.1.20', 5252)).toBeNull();
+    expect(lanUrl('', '192.168.1.20', 5252)).toBeNull();
+    expect(lanUrl('  loopback  ', '192.168.1.20', 5252)).toBeNull();
   });
 
   it('shows the detected LAN URL when bound to all interfaces', () => {
-    expect(lanRowState('all', '192.168.1.20', 5252)).toEqual({
-      kind: 'url',
-      url: 'http://192.168.1.20:5252',
-    });
+    expect(lanUrl('all', '192.168.1.20', 5252)).toBe('http://192.168.1.20:5252');
   });
 
   it('reports no address when bound to all but no LAN IP was detected', () => {
-    expect(lanRowState('all', null, 5252)).toEqual({ kind: 'none' });
+    expect(lanUrl('all', null, 5252)).toBeNull();
   });
 
   it('shows the bound IP for a specific-IP bind, ignoring the detected LAN IP', () => {
     // A specific-IP bind serves exactly that IP (plus loopback); the detected
     // en0 address may be a different, unreachable interface.
-    expect(lanRowState('100.64.0.7', '192.168.1.20', 5252)).toEqual({
-      kind: 'url',
-      url: 'http://100.64.0.7:5252',
-    });
+    expect(lanUrl('100.64.0.7', '192.168.1.20', 5252)).toBe('http://100.64.0.7:5252');
   });
 });
 
@@ -45,7 +39,7 @@ describe('tailnetHttpUrl', () => {
   it('stays silent when the gateway does not listen on the tailnet address', () => {
     // Being on a tailnet says nothing about the gateway's bind. Loopback is the
     // packaged DEFAULT, so this is the common case, and printing the URL anyway
-    // would repeat the dead-URL bug lanRowState exists to prevent.
+    // would repeat the dead-URL bug lanUrl exists to prevent.
     expect(tailnetHttpUrl('loopback', '100.64.0.7', 5252)).toBeNull();
     expect(tailnetHttpUrl('', '100.64.0.7', 5252)).toBeNull();
     // Bound to some OTHER specific address: that one is served, not this one.
@@ -63,29 +57,29 @@ describe('tailnetHttpUrl', () => {
   });
 });
 
-describe('lanRowAvoidingTailnet', () => {
+describe('lanUrlAvoidingTailnet', () => {
   it('never prints the same address as both Local network and Tailscale', () => {
     // The user's own configuration: the gateway pinned to the tailnet address.
-    // lanRowState shows whatever specific address is bound, so derived
+    // lanUrl returns whatever specific address is bound, so derived
     // separately this rendered the tailnet URL twice, once mislabelled "Local
     // network / same Wi-Fi".
-    expect(lanRowAvoidingTailnet('100.64.0.7', '192.168.1.20', '100.64.0.7', 5252))
-      .toEqual({ kind: 'disabled' });
+    expect(lanUrlAvoidingTailnet('100.64.0.7', '192.168.1.20', '100.64.0.7', 5252))
+      .toBeNull();
   });
 
-  it('shows the LAN row when the gateway is on all interfaces', () => {
-    expect(lanRowAvoidingTailnet('all', '192.168.1.20', '100.64.0.7', 5252))
-      .toEqual({ kind: 'url', url: 'http://192.168.1.20:5252' });
+  it('returns the LAN URL when the gateway is on all interfaces', () => {
+    expect(lanUrlAvoidingTailnet('all', '192.168.1.20', '100.64.0.7', 5252))
+      .toBe('http://192.168.1.20:5252');
   });
 
   it('shows nothing under the loopback default', () => {
-    expect(lanRowAvoidingTailnet('loopback', '192.168.1.20', '100.64.0.7', 5252))
-      .toEqual({ kind: 'disabled' });
+    expect(lanUrlAvoidingTailnet('loopback', '192.168.1.20', '100.64.0.7', 5252))
+      .toBeNull();
   });
 
   it('leaves a genuine LAN bind alone', () => {
-    expect(lanRowAvoidingTailnet('192.168.1.20', '192.168.1.20', '100.64.0.7', 5252))
-      .toEqual({ kind: 'url', url: 'http://192.168.1.20:5252' });
+    expect(lanUrlAvoidingTailnet('192.168.1.20', '192.168.1.20', '100.64.0.7', 5252))
+      .toBe('http://192.168.1.20:5252');
   });
 });
 

@@ -60,8 +60,9 @@ marker. Its next turn end proposes the change.
   where the plan floor clears the branch.
 - A plan-only branch is the one exception. When every landing file is under
   `docs/plans/`, a `proposed` marker clears the floor, so the plan can land as
-  a record. Apply keeps that marker, and `lucidos planned approve` flips it and
-  the plan file's `Status` line together.
+  a record. ADR 0604 later removed this exception for a `proposed` marker: such
+  a branch is held until the plan is approved. `lucidos planned approve` flips
+  the marker and the plan file's `Status` line together.
 - A plan-only branch also skips hardening, under either marker: plans have no
   tests, and hardening runs on the branch that implements the plan. The same
   change made the proposal hold unhardened work too (ADR 0416).

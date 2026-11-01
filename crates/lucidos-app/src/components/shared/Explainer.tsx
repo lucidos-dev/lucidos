@@ -37,7 +37,7 @@ export interface ExplainerProps {
  * **Where it goes: at the SCOPE of what it explains.** Copy about one control
  * hangs on that control's own label. A section title takes the icon only when
  * nothing narrower owns the copy: a list of rows with no label between them
- * (Repositories, Marketplaces, Connect URLs, Workspace data), a body with no
+ * (Repositories, Marketplaces, Workspace data), a body with no
  * labelled row at all (Network access), or several rows one explanation covers
  * at once (Chat & triggers, whose copy is about Model AND Reasoning together).
  * A heading icon beside a label icon is therefore fine when the two really do

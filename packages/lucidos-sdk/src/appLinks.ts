@@ -1,5 +1,6 @@
 import { lucidos } from './index';
 import { isBridged } from './_bridge';
+import { currentFrameOpens, openSafariNow, openTabNow, traceAppLink } from './externalLinks';
 import { externalWebUrl } from './webLink';
 
 /** Route a click on a link inside an app frame. Installed in the capture phase,
@@ -39,29 +40,37 @@ export function installAppLinkRouting(): void {
       // asynchronously, and tearing the anchor out from under it is enough to
       // lose it on some engines.
       setTimeout(() => via.remove(), 0);
+      traceAppLink('route', { route: 'download', href });
       return;
     }
     if (webUrl) {
       e.preventDefault();
       e.stopPropagation();
       // openExternal, not navigate: it honours the user's external-link
-      // preference and, in "Ask" mode, must run inside this frame while the
-      // click's user activation is still live. Called synchronously here for
-      // exactly that reason.
+      // preference, and its in-frame open and "Ask" share sheet both need this
+      // click's user activation. Called synchronously here for exactly that
+      // reason.
       //
-      // The window.open fallback stays. It fires only after the host route
-      // failed (engine unreachable). No path can honour the preference then.
-      // The choice is the in-app web view or a tap that does nothing, and a
-      // visible page wins.
+      // The catch runs only after the host route failed (engine unreachable).
+      // The tap has lost its activation by then, so the open may be blocked.
+      // A tap must never do nothing, so a blocked open ends in a toast.
       lucidos.ui.openExternal(webUrl).catch((err) => {
         console.warn('[lucidos-sdk] external link fell back to window.open:', webUrl, err);
-        window.open(webUrl, '_blank', 'noopener');
+        traceAppLink('host-route-rejected', { href: webUrl, error: String(err) });
+        // A user who chose Safari never gets the in-app overlay instead.
+        const openNow = currentFrameOpens() === 'safari' ? openSafariNow : openTabNow;
+        if (!openNow(webUrl)) {
+          lucidos.ui.toast(`Could not open ${webUrl}. Try the link again.`, 'error');
+          traceAppLink('toast', { href: webUrl });
+        }
       });
+      traceAppLink('route', { route: 'external', href: webUrl, opens: currentFrameOpens() });
     } else if (anchor.getAttribute('target') === '_blank') {
       e.preventDefault();
       e.stopPropagation();
       const resolved = new URL(href, window.location.href).pathname;
       window.location.href = resolved;
+      traceAppLink('route', { route: 'same-site-blank', href });
     }
   }, true);
 }

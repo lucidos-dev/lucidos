@@ -10,7 +10,8 @@
 //!  * The LLM *judge* classifies that middle, erring toward ask, and a judge
 //!    that fails asks too. When the judge is off, [`fallback_classify`]
 //!    degrades to the static lists: the dangerous side-effect shapes plus a destruction scan, where an
-//!    out-of-workspace target asks and an in-workspace one checkpoints.
+//!    out-of-workspace target asks and an in-workspace one checkpoints. A
+//!    shape the fast path refused asks there too.
 //!
 //! `IrreversibleDanger` on a chat channel pauses to ask the user, mirroring the
 //! coding-agent permission model. `ReversibleDanger` snapshots the workspace on
@@ -241,22 +242,23 @@ pub struct JudgeInput {
     /// preamble, a path-qualified head, an out-of-workspace write, an
     /// executable git config.
     ///
-    /// The chat lane ignores it, because both outcomes route to the judge
-    /// there. The UNATTENDED coding-agent lane reads it: with nobody to answer
-    /// a card, a shape the guard refused to see through is denied, while an
-    /// unrecognised head (`cargo build`) still runs.
+    /// The judge ignores it. With the judge off, [`fallback_classify`] reads
+    /// it, so the chat lane asks rather than runs. The UNATTENDED coding-agent
+    /// lane reads it too: with nobody to answer a card, a shape the guard
+    /// refused to see through is denied. An unrecognised head (`cargo build`)
+    /// still runs on both.
     pub fast_path_refused: bool,
 }
 
 impl JudgeInput {
-    /// Per-turn cache key. The same tool, command text and marker re-judge to
-    /// the same verdict, so the agentic loop caches by this string. The marker
-    /// is in it because it reads the disk: a link laid down mid-turn changes
+    /// Per-turn cache key. The same tool, command text and flags re-judge to
+    /// the same verdict, so the agentic loop caches by this string. Both flags
+    /// are in it because they read the disk: a link laid down mid-turn changes
     /// the verdict for the same text.
     pub fn cache_key(&self) -> String {
         format!(
-            "{}\u{0}{}\u{0}{}",
-            self.tool_name, self.command, self.out_of_workspace
+            "{}\u{0}{}\u{0}{}\u{0}{}",
+            self.tool_name, self.command, self.out_of_workspace, self.fast_path_refused
         )
     }
 }
@@ -728,14 +730,18 @@ fn static_classify_at(
         .then(|| after_root_cd(&unwrapped, root, disk, home.as_deref()))
         .flatten()
         .unwrap_or(unwrapped.as_ref());
-    // Python declines are all ACTIVE signals: subprocess, eval, a network
-    // write, a destruction call, a package install. None is an unlisted-head
-    // omission, so the whole set is a refusal.
+    // Python declines are all ACTIVE signals: a shell-out the proof cannot
+    // read, eval, a network write, a destruction call, a package install. None
+    // is an unlisted-head omission, so the whole set is a refusal.
     let packages = (!is_bash).then(|| python_packages(input)).flatten();
     let declined = if is_bash {
         bash_fast_path(cmd, disk, trusted)
     } else {
-        (packages.is_some() || !python_is_statically_safe(cmd)).then_some(FastPathDecline::Refusal)
+        match python_program_proof(cmd, disk, 0) {
+            Proof::Catastrophic => return StaticVerdict::Settled(RiskLane::Catastrophic),
+            Proof::Safe if packages.is_none() => None,
+            _ => Some(FastPathDecline::Refusal),
+        }
     };
     let Some(declined) = declined else {
         return StaticVerdict::Settled(RiskLane::Safe);
@@ -744,7 +750,7 @@ fn static_classify_at(
         tool_name: tool_name.to_string(),
         // The judge reads one text, so the install goes in front of the code.
         command: match &packages {
-            Some(list) => format!("# pip install {list}\n{cmd}"),
+            Some(list) => format!("{PIP_INSTALL_LINE}{list}\n{cmd}"),
             None => cmd.to_string(),
         },
         // For bash the destruction scan adds what one token cannot show: a
@@ -772,8 +778,12 @@ fn static_classify_at(
 ///      `IrreversibleDanger` + [`SideEffectCategory::OutOfWorkspaceDestruction`]
 ///      (no checkpoint can cover it),
 ///   3. a destruction shape confined to the workspace → `ReversibleDanger`
-///      (checkpoint + run — no prompt),
-///   4. everything else → `Safe` (the Phase-2 default: run it).
+///      (checkpoint + run, no prompt), unless the command also holds a
+///      refusal the destruction does not explain,
+///   4. any other fast-path refusal ([`JudgeInput::fast_path_refused`]) →
+///      `IrreversibleDanger` + [`SideEffectCategory::Other`]. A scan cannot
+///      clear a shape the fast path could not see through, so it asks,
+///   5. everything else, an omission → `Safe` (the Phase-2 default: run it).
 ///
 /// Coarser than the judge by construction. Destruction behind a variable path,
 /// and the in-place editing flags, are residuals only the judge catches. What
@@ -809,17 +819,38 @@ pub fn fallback_classify(ji: &JudgeInput, site: CommandSite<'_>) -> JudgedClassi
             )),
             category: Some(SideEffectCategory::OutOfWorkspaceDestruction),
         },
-        Some(DestructionScope::InWorkspace) => JudgedClassification {
-            lane: RiskLane::ReversibleDanger,
-            summary: None,
-            category: None,
+        Some(DestructionScope::InWorkspace)
+            if !ji.fast_path_refused || refusal_is_the_destruction(ji, is_bash) =>
+        {
+            JudgedClassification {
+                lane: RiskLane::ReversibleDanger,
+                summary: None,
+                category: None,
+            }
+        }
+        _ if ji.fast_path_refused => JudgedClassification {
+            lane: RiskLane::IrreversibleDanger,
+            summary: Some(
+                "The guard cannot see what this command runs, and the command judge is off."
+                    .to_string(),
+            ),
+            category: Some(SideEffectCategory::Other),
         },
-        None => JudgedClassification {
+        _ => JudgedClassification {
             lane: RiskLane::Safe,
             summary: None,
             category: None,
         },
     }
+}
+
+/// True when the destruction call is the whole of a refusal, so a checkpoint
+/// covers it. A Python decline counts a destruction call as a refusal. A bash
+/// destruction head is an omission, so a bash refusal is always something more.
+fn refusal_is_the_destruction(ji: &JudgeInput, is_bash: bool) -> bool {
+    !is_bash
+        && !ji.command.starts_with(PIP_INSTALL_LINE)
+        && !python_signal_beyond_destruction(&ji.command)
 }
 
 // --- Static destruction scan (fallback coverage for the judge-off path) -----
@@ -990,7 +1021,7 @@ fn may_make_a_link(segment: &str) -> bool {
     if runs_more_than_its_head(segment) {
         return true;
     }
-    if head_safety(segment, None, &TrustedHeads::NONE).is_none() {
+    if head_safety(segment, None, &TrustedHeads::NONE, LineFacts::default()).is_none() {
         return false;
     }
     let toks: Vec<&str> = segment.split_whitespace().collect();
@@ -1824,6 +1855,25 @@ static GH_READ_ONLY_SUBCOMMANDS: &[(&str, &[&str])] = &[
     ("workflow", &["view", "list"]),
 ];
 
+/// `lucidos` calls that act on this workspace alone, as `(group,
+/// subcommands)`: a GET, or a committed write under `data/`. Every other call
+/// can reach past it (`events emit` fires triggers, `changes apply` pushes),
+/// so it stays an omission.
+static LUCIDOS_WORKSPACE_LOCAL_SUBCOMMANDS: &[(&str, &[&str])] = &[
+    ("data", &["path", "write"]),
+    ("model-prices", &[]),
+    ("events", &["query", "count"]),
+    ("knowhow", &["list", "read"]),
+];
+
+/// The variables that tell the `lucidos` CLI which engine to reach. A line
+/// that sets one can send a `data write --from` file anywhere.
+const LUCIDOS_CLI_ENV_NAMES: [&str; 3] = [
+    "LUCIDOS_API_BASE_URL",
+    "LUCIDOS_WORKSPACE",
+    "LUCIDOS_API_PORT",
+];
+
 /// Why the Safe fast path did not settle a command. The two are NOT
 /// interchangeable, and two permissive paths separate them: the unattended
 /// coding-agent lane denies a [`FastPathDecline::Refusal`] and still runs a
@@ -1876,22 +1926,41 @@ enum FastPathDecline {
 ///
 /// Both scans skip a literal heredoc body ([`blank_literal_heredoc_bodies`]).
 /// The head may still run that body as code (`sh <<'E'`), so it is an omission.
+/// Inline Python whose code proves Safe reads as `true` instead
+/// ([`blank_proven_inline_python`]).
 fn bash_fast_path(
     command: &str,
     disk: Option<OnDisk<'_>>,
     trusted: &TrustedHeads,
 ) -> Option<FastPathDecline> {
+    bash_fast_path_at(command, disk, trusted, 0)
+}
+
+/// [`bash_fast_path`], `depth` language hops into a proof.
+fn bash_fast_path_at(
+    command: &str,
+    disk: Option<OnDisk<'_>>,
+    trusted: &TrustedHeads,
+    depth: usize,
+) -> Option<FastPathDecline> {
     // Read over the whole line, body included: `. /dev/stdin <<'E'` runs its
     // body in this shell, so the body can rebind TMPDIR.
-    let tmpdir_trusted = tmpdir_trusted_for(command);
-    let blanked = blank_literal_heredoc_bodies(command);
-    let command = blanked.as_deref().unwrap_or(command);
-    if has_command_substitution(command) {
+    let line = LineFacts::of(command);
+    // A Python shell-out inherits the line's environment.
+    let proven =
+        |code: &str| !line.rebinds_lucidos_cli && inline_python_is_proven(code, disk, depth);
+    let heredocs = blank_literal_heredoc_bodies(command, proven);
+    let command = heredocs.as_ref().map_or(command, |h| h.text.as_str());
+    let command = blank_proven_inline_python(command, proven);
+    if has_command_substitution(&command) {
         return Some(FastPathDecline::Refusal);
     }
-    let mut declined = blanked.is_some().then_some(FastPathDecline::Omission);
-    for segment in command_segments(command) {
-        match segment_safety(&segment, disk, trusted, tmpdir_trusted) {
+    let mut declined = heredocs
+        .as_ref()
+        .is_some_and(|h| h.unproven)
+        .then_some(FastPathDecline::Omission);
+    for segment in command_segments(&command) {
+        match segment_safety(&segment, disk, trusted, line) {
             Some(FastPathDecline::Refusal) => return Some(FastPathDecline::Refusal),
             Some(FastPathDecline::Omission) => declined = Some(FastPathDecline::Omission),
             None => {}
@@ -1917,13 +1986,45 @@ fn args_have_exec_capable_flag(args: &[&str]) -> bool {
     })
 }
 
+/// What a segment check needs to know about the whole line.
+#[derive(Debug, Clone, Copy, Default)]
+struct LineFacts {
+    /// [`is_scratch_target`]'s TMPDIR trust.
+    tmpdir_trusted: bool,
+    /// The line may re-point the `lucidos` CLI at another engine.
+    rebinds_lucidos_cli: bool,
+}
+
+impl LineFacts {
+    fn of(command: &str) -> Self {
+        Self {
+            tmpdir_trusted: tmpdir_trusted_for(command),
+            rebinds_lucidos_cli: rebinds_lucidos_cli(command),
+        }
+    }
+}
+
+/// True when `command` names a [`LUCIDOS_CLI_ENV_NAMES`] variable, or sets a
+/// variable whose name it builds at run time (`printf -v "${x}L"`).
+fn rebinds_lucidos_cli(command: &str) -> bool {
+    LUCIDOS_CLI_ENV_NAMES
+        .iter()
+        .any(|name| command.contains(name))
+        || command_segments(command).any(|segment| {
+            let toks: Vec<&str> = segment.split_whitespace().collect();
+            let i = command_head_index(&toks);
+            toks.get(i) == Some(&"printf")
+                && toks[i + 1..].iter().any(|t| dequoted(t).starts_with("-v"))
+        })
+}
+
 /// Why one shell command segment is not obviously safe, or `None` when it is.
-/// `tmpdir_trusted` is [`is_scratch_target`]'s, read over the whole line.
+/// `line` is read over the whole line.
 fn segment_safety(
     segment: &str,
     disk: Option<OnDisk<'_>>,
     trusted: &TrustedHeads,
-    tmpdir_trusted: bool,
+    line: LineFacts,
 ) -> Option<FastPathDecline> {
     use FastPathDecline::{Omission, Refusal};
     // An output redirect to a path outside the workspace is a write outside the
@@ -1937,12 +2038,12 @@ fn segment_safety(
         if safe_write_target(target, disk) || is_harmless_redirect(target) {
             continue;
         }
-        if names_git_metadata(target, disk) || !is_scratch_target(target, tmpdir_trusted) {
+        if names_git_metadata(target, disk) || !is_scratch_target(target, line.tmpdir_trusted) {
             return Some(Refusal);
         }
         declined = Some(Omission);
     }
-    head_safety(segment, disk, trusted).or(declined)
+    head_safety(segment, disk, trusted, line).or(declined)
 }
 
 /// [`segment_safety`] past its redirect and substitution checks: why the head
@@ -1951,6 +2052,7 @@ fn head_safety(
     segment: &str,
     disk: Option<OnDisk<'_>>,
     trusted: &TrustedHeads,
+    line: LineFacts,
 ) -> Option<FastPathDecline> {
     use FastPathDecline::{Omission, Refusal};
     let toks: Vec<&str> = segment.split_whitespace().collect();
@@ -1995,6 +2097,10 @@ fn head_safety(
         "git" => git_subcommand_safety(args),
         // An unlisted `gh` call hides nothing: it is an omission, like `push`.
         "gh" => (!gh_call_is_read_only(args)).then_some(Omission),
+        // A preamble, or a rebinding elsewhere on the line, can point the CLI
+        // at another engine. Only a bare call on a clean line settles.
+        "lucidos" => (i > 0 || line.rebinds_lucidos_cli || !lucidos_call_is_workspace_local(args))
+            .then_some(Omission),
         // A GET/download is safe unless it writes its output to a path outside
         // the workspace (`curl -o /etc/cron.d/evil …`) or into git metadata,
         // or loads options the command line does not show. A mutating method
@@ -2059,11 +2165,7 @@ fn head_safety(
 /// to see. Such a call would settle `Safe`, with no card on the chat lane and
 /// an unattended auto-allow on the coding-agent one.
 fn git_subcommand_safety(args: &[&str]) -> Option<FastPathDecline> {
-    // The shell strips quotes and escapes before git sees `'-Osh'`.
-    let unquoted: Vec<String> = args
-        .iter()
-        .map(|a| a.replace(['\'', '"', '\\'], ""))
-        .collect();
+    let unquoted = shell_stripped(args);
     let args: Vec<&str> = unquoted.iter().map(String::as_str).collect();
     let mut i = 0;
     while let Some(&arg) = args.get(i) {
@@ -2116,11 +2218,7 @@ fn git_subcommand_safety(args: &[&str]) -> Option<FastPathDecline> {
 /// `--web` opens a browser and `--show-token` prints a secret. `-w` is
 /// `--web` everywhere but `run list`, where it filters by workflow.
 fn gh_call_is_read_only(args: &[&str]) -> bool {
-    // The shell strips quotes and escapes before gh sees `'--web'`.
-    let unquoted: Vec<String> = args
-        .iter()
-        .map(|a| a.replace(['\'', '"', '\\'], ""))
-        .collect();
+    let unquoted = shell_stripped(args);
     let args: Vec<&str> = unquoted.iter().map(String::as_str).collect();
     let Some((group, subs)) = args
         .first()
@@ -2141,6 +2239,29 @@ fn gh_call_is_read_only(args: &[&str]) -> bool {
         }
     };
     sub_listed && !args.iter().any(acts)
+}
+
+/// True when `args`, the tokens after `lucidos`, make a call on
+/// [`LUCIDOS_WORKSPACE_LOCAL_SUBCOMMANDS`]. The group and subcommand must
+/// lead, since the CLI takes no global flag.
+fn lucidos_call_is_workspace_local(args: &[&str]) -> bool {
+    let args = shell_stripped(args);
+    let Some((_, subs)) = args.first().and_then(|group| {
+        LUCIDOS_WORKSPACE_LOCAL_SUBCOMMANDS
+            .iter()
+            .find(|(g, _)| g == group)
+    }) else {
+        return false;
+    };
+    subs.is_empty() || args.get(1).is_some_and(|sub| subs.contains(&sub.as_str()))
+}
+
+/// `args` as the command receives them: the shell strips quotes and escapes
+/// before git sees `'-Osh'` or gh sees `'--web'`.
+fn shell_stripped(args: &[&str]) -> Vec<String> {
+    args.iter()
+        .map(|a| a.replace(['\'', '"', '\\'], ""))
+        .collect()
 }
 
 /// True when `git grep` args carry `-O[<cmd>]` / `--open-files-in-pager`,
@@ -2200,6 +2321,9 @@ fn is_git_output_flag(arg: &str) -> bool {
         || arg.starts_with("--output-directory=")
 }
 
+/// The first line of a judged Python command that installs packages first.
+const PIP_INSTALL_LINE: &str = "# pip install ";
+
 /// The packages a python tool call installs before it runs, space-joined, or
 /// `None` when it installs none.
 fn python_packages(input: &Value) -> Option<String> {
@@ -2216,16 +2340,434 @@ fn python_is_statically_safe(code: &str) -> bool {
     !python_side_effect_signal(code)
 }
 
+/// What a proof found about code it can see through. Ordered by severity, so
+/// a fold over parts keeps the worst with `max`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Proof {
+    Safe,
+    Unproven,
+    Catastrophic,
+}
+
+/// How many language hops a proof follows: Python into a shell literal, or
+/// bash into inline Python. Deeper nesting stays unproven.
+const MAX_PROOF_DEPTH: usize = 3;
+
+/// [`python_is_statically_safe`], seeing through a `subprocess` call whose
+/// command is a literal ([`python_shell_outs`]). Each literal must pass the
+/// bash fast path, and the code around the calls must pass the static check.
+/// That code may not change directory, make a link or touch the environment,
+/// since each of those changes what the literal does.
+fn python_program_proof(code: &str, disk: Option<OnDisk<'_>>, depth: usize) -> Proof {
+    if !code.contains("subprocess") {
+        return if python_is_statically_safe(code) {
+            Proof::Safe
+        } else {
+            Proof::Unproven
+        };
+    }
+    let Some(shell_outs) = python_shell_outs(code) else {
+        return Proof::Unproven;
+    };
+    let literals = shell_outs
+        .commands
+        .iter()
+        .map(|cmd| shell_literal_proof(cmd, disk, depth + 1))
+        .max()
+        .unwrap_or(Proof::Safe);
+    let rest = &shell_outs.rest;
+    let rest_reaches_out = !python_is_statically_safe(rest)
+        || PY_RELOCATING_CALLS
+            .iter()
+            .chain(&["environ", "putenv"])
+            .any(|s| rest.contains(s));
+    if rest_reaches_out && literals != Proof::Catastrophic {
+        return Proof::Unproven;
+    }
+    literals
+}
+
+/// What one shell literal a Python call runs proves to be.
+fn shell_literal_proof(cmd: &str, disk: Option<OnDisk<'_>>, depth: usize) -> Proof {
+    if catastrophic_reason(&unwrap_shell_command(cmd)).is_some() {
+        Proof::Catastrophic
+    } else if command_reads_secret(cmd)
+        || bash_fast_path_at(cmd, disk, &TrustedHeads::NONE, depth).is_some()
+    {
+        Proof::Unproven
+    } else {
+        Proof::Safe
+    }
+}
+
+/// True when inline Python in a bash line proves Safe as `run_python` of
+/// `code`. Two checks go further than [`python_program_proof`]. A link the
+/// code makes can redirect a later write on the same line. And `run_python`
+/// weighs a literal path only against a destruction call, while here the
+/// whole line settles on the proof.
+fn inline_python_is_proven(code: &str, disk: Option<OnDisk<'_>>, depth: usize) -> bool {
+    depth < MAX_PROOF_DEPTH
+        && !PY_RELOCATING_CALLS.iter().any(|s| code.contains(s))
+        && !python_string_literal_escapes(code, disk.map(|d| d.root), disk, home_dir().as_deref())
+        && python_program_proof(code, disk, depth + 1) == Proof::Safe
+}
+
+/// The shell commands Python code runs through `subprocess`, and the code
+/// with those calls blanked.
+struct ShellOuts {
+    /// One bash line per call.
+    commands: Vec<String>,
+    /// The code with each call, and each plain `import subprocess`, read as
+    /// ` _ `.
+    rest: String,
+}
+
+/// Every use of `subprocess` in Python `code`, or `None` when one is not a
+/// call [`python_shell_out_call`] can read or a plain import. A small lexer
+/// skips strings and comments, so a mention there is no use.
+///
+/// Any string the lexer cannot place for sure gives up: a raw newline in a
+/// one-line string, or a quote inside an f-string's braces.
+fn python_shell_outs(code: &str) -> Option<ShellOuts> {
+    let mut commands = Vec::new();
+    let mut rest = String::with_capacity(code.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while let Some(c) = code[i..].chars().next() {
+        if c == '#' {
+            i = code[i..].find('\n').map_or(code.len(), |o| i + o);
+        } else if c == '\'' || c == '"' {
+            i = python_string_end(code, i, "")?;
+        } else if c == '_' || c.is_alphanumeric() {
+            let end = python_word_end(code, i);
+            let word = &code[i..end];
+            if code[end..].starts_with(['\'', '"']) && is_python_string_prefix(word) {
+                i = python_string_end(code, end, word)?;
+            } else if word == "subprocess" {
+                let span_end = python_subprocess_use(code, i, end, &mut commands)?;
+                rest.push_str(&code[copied..i]);
+                rest.push_str(" _ ");
+                copied = span_end;
+                i = span_end;
+            } else {
+                i = end;
+            }
+        } else {
+            i += c.len_utf8();
+        }
+    }
+    rest.push_str(&code[copied..]);
+    Some(ShellOuts { commands, rest })
+}
+
+/// The byte offset past the identifier starting at `at`.
+fn python_word_end(code: &str, at: usize) -> usize {
+    code[at..]
+        .find(|c: char| !(c == '_' || c.is_alphanumeric()))
+        .map_or(code.len(), |o| at + o)
+}
+
+fn is_python_string_prefix(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "r" | "u" | "b" | "f" | "t" | "br" | "rb" | "fr" | "rf" | "tr" | "rt"
+    )
+}
+
+/// The byte offset past the Python string literal whose quote is at `quote`,
+/// or `None` when the lexer cannot place its end for sure.
+fn python_string_end(code: &str, quote: usize, prefix: &str) -> Option<usize> {
+    let formatted = prefix.contains(['f', 'F', 't', 'T']);
+    let q = &code[quote..quote + 1];
+    let closer = if code[quote..].starts_with(&q.repeat(3)) {
+        q.repeat(3)
+    } else {
+        q.to_string()
+    };
+    let triple = closer.len() == 3;
+    let mut braces = 0usize;
+    let mut i = quote + closer.len();
+    loop {
+        let c = code[i..].chars().next()?;
+        match c {
+            '\\' => {
+                let escaped = code[i + 1..].chars().next()?;
+                i += 1 + escaped.len_utf8();
+                continue;
+            }
+            '\n' if !triple => return None,
+            '\'' | '"' if braces > 0 => return None,
+            _ if braces == 0 && code[i..].starts_with(&closer) => return Some(i + closer.len()),
+            '{' if formatted && braces == 0 && code[i + 1..].starts_with('{') => {
+                i += 2;
+                continue;
+            }
+            '{' if formatted => braces += 1,
+            '}' if formatted && braces > 0 => braces -= 1,
+            '}' if formatted && code[i + 1..].starts_with('}') => {
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        i += c.len_utf8();
+    }
+}
+
+/// Reads the `subprocess` word at `start..end`: a call [`python_shell_out_call`]
+/// can read, or a plain `import` that names it. Returns the byte offset past
+/// the use, after pushing a call's command onto `commands`.
+fn python_subprocess_use(
+    code: &str,
+    start: usize,
+    end: usize,
+    commands: &mut Vec<String>,
+) -> Option<usize> {
+    static IMPORT: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"^\s*import\s+[A-Za-z_][\w.]*(\s*,\s*[A-Za-z_][\w.]*)*\s*$").unwrap()
+    });
+    // An attribute of something else, possibly across a line continuation.
+    let before = code[..start].trim_end_matches(|c: char| c.is_whitespace() || c == '\\');
+    if before.ends_with('.') {
+        return None;
+    }
+    if code[end..].starts_with('.') {
+        let name_end = python_word_end(code, end + 1);
+        let open = code[name_end..].trim_start_matches([' ', '\t']);
+        let args = open.strip_prefix('(')?;
+        let name = &code[end + 1..name_end];
+        let (command, close) = python_shell_out_call(code, name, code.len() - args.len())?;
+        commands.push(command);
+        return Some(close);
+    }
+    let statement_start = code[..start].rfind(['\n', ';']).map_or(0, |p| p + 1);
+    let statement_end = code[end..]
+        .find(['\n', ';'])
+        .map_or(code.len(), |o| end + o);
+    IMPORT
+        .is_match(&code[statement_start..statement_end])
+        .then_some(end)
+}
+
+/// The keywords a readable `subprocess` call may pass. None of them changes
+/// what runs, where, or with which environment and streams.
+const PY_SHELL_OUT_KEYWORDS: &[&str] = &[
+    "shell",
+    "capture_output",
+    "text",
+    "check",
+    "timeout",
+    "encoding",
+    "errors",
+    "universal_newlines",
+];
+
+/// The bash line a `subprocess.<name>(` call runs, and the offset past its
+/// `)`. `None` when the proof cannot read the call. `at` is the first byte
+/// after `(`.
+///
+/// `run`, `check_output`, `check_call` and `call` take a plain string with a
+/// literal `shell=True`, or a list of plain strings with no `shell=True`.
+/// `getoutput` and `getstatusoutput` take a plain string, plus `encoding` and
+/// `errors`. Keyword values are literals.
+fn python_shell_out_call(code: &str, name: &str, at: usize) -> Option<(String, usize)> {
+    let getoutput = matches!(name, "getoutput" | "getstatusoutput");
+    if !getoutput && !matches!(name, "run" | "check_output" | "check_call" | "call") {
+        return None;
+    }
+    let mut args = PyArgs { code, at };
+    args.skip_blank()?;
+    let (command, is_list) = if args.eat("[") {
+        (args.string_list()?, true)
+    } else {
+        (args.plain_string()?, false)
+    };
+    let mut shell = None;
+    let mut seen = Vec::new();
+    loop {
+        args.skip_blank()?;
+        if args.eat(")") {
+            break;
+        }
+        if !args.eat(",") {
+            return None;
+        }
+        args.skip_blank()?;
+        if args.eat(")") {
+            break;
+        }
+        let key = args.word();
+        let allowed = if getoutput {
+            matches!(key, "encoding" | "errors")
+        } else {
+            PY_SHELL_OUT_KEYWORDS.contains(&key)
+        };
+        if !allowed || seen.contains(&key) {
+            return None;
+        }
+        seen.push(key);
+        args.skip_blank()?;
+        if !args.eat("=") {
+            return None;
+        }
+        args.skip_blank()?;
+        let value = args.literal_value()?;
+        if key == "shell" {
+            shell = Some(value);
+        }
+    }
+    let readable = if is_list {
+        !getoutput && shell.is_none_or(|v| v == "False")
+    } else {
+        getoutput || shell == Some("True")
+    };
+    readable.then_some((command, args.at))
+}
+
+/// A cursor over the arguments of a Python call.
+struct PyArgs<'a> {
+    code: &'a str,
+    at: usize,
+}
+
+impl<'a> PyArgs<'a> {
+    fn rest(&self) -> &'a str {
+        &self.code[self.at..]
+    }
+
+    fn eat(&mut self, token: &str) -> bool {
+        let ate = self.rest().starts_with(token);
+        if ate {
+            self.at += token.len();
+        }
+        ate
+    }
+
+    /// Skips whitespace and newlines. `None` on a comment, which could hide
+    /// anything the lexer then misreads.
+    fn skip_blank(&mut self) -> Option<()> {
+        let rest = self.rest();
+        let trimmed = rest.trim_start();
+        self.at += rest.len() - trimmed.len();
+        (!trimmed.starts_with('#')).then_some(())
+    }
+
+    fn word(&mut self) -> &'a str {
+        let start = self.at;
+        self.at = python_word_end(self.code, start);
+        &self.code[start..self.at]
+    }
+
+    /// A string literal with no prefix and no triple quote, whose only
+    /// escapes are `\\ \' \" \n \t \r`, decoded.
+    fn plain_string(&mut self) -> Option<String> {
+        let q = self
+            .rest()
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '\'' | '"'))?;
+        if self.rest().starts_with(&q.to_string().repeat(3)) {
+            return None;
+        }
+        let mut chars = self.rest()[1..].char_indices();
+        let mut out = String::new();
+        while let Some((j, c)) = chars.next() {
+            match c {
+                '\\' => out.push(match chars.next()?.1 {
+                    e @ ('\\' | '\'' | '"') => e,
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    _ => return None,
+                }),
+                '\n' => return None,
+                _ if c == q => {
+                    self.at += 1 + j + 1;
+                    return Some(out);
+                }
+                _ => out.push(c),
+            }
+        }
+        None
+    }
+
+    /// A list of plain strings after its `[`, joined into one bash line that
+    /// runs the same argv.
+    fn string_list(&mut self) -> Option<String> {
+        let mut words = Vec::new();
+        loop {
+            self.skip_blank()?;
+            if !words.is_empty() && self.eat("]") {
+                return Some(words.join(" "));
+            }
+            let word = self.plain_string()?;
+            if word.chars().any(char::is_control) {
+                return None;
+            }
+            words.push(shell_quoted(&word));
+            self.skip_blank()?;
+            if !self.eat(",") {
+                return self.eat("]").then(|| words.join(" "));
+            }
+        }
+    }
+
+    /// `True`, `False`, `None`, a number, or a plain string, as written.
+    fn literal_value(&mut self) -> Option<&'a str> {
+        let start = self.at;
+        if self.rest().starts_with(['\'', '"']) {
+            self.plain_string()?;
+        } else {
+            let is_digits = |w: &str| w.chars().all(|c| c.is_ascii_digit() || c == '_');
+            let word = self.word();
+            let number = word.starts_with(|c: char| c.is_ascii_digit()) && is_digits(word);
+            if number && self.eat(".") {
+                if !is_digits(self.word()) {
+                    return None;
+                }
+            } else if !number && !matches!(word, "True" | "False" | "None") {
+                return None;
+            }
+        }
+        Some(&self.code[start..self.at])
+    }
+}
+
+/// `word` as one bash word: bare when it holds only characters bash reads
+/// literally, else single-quoted. `=` is quoted, so a first word is never an
+/// assignment.
+fn shell_quoted(word: &str) -> String {
+    let bare = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_./:,@%+-".contains(c));
+    if bare {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
 /// Heuristic signal that Python `code` may have a real-world side-effect or
 /// run arbitrary shell. Broader than [`python_side_effect_category`], which is
 /// the definite-write set the static fallback summarises. A match routes the
 /// code to the judge, which reads the actual call to decide the lane.
 fn python_side_effect_signal(code: &str) -> bool {
+    // Filesystem destruction also routes to the judge, which reads the path to
+    // decide the lane. The static fallback derives the same split from string
+    // literals. A plain write is a known residual: flagging every file write
+    // would tax routine data output, and an out-of-workspace one is an
+    // implausible screwup.
+    python_signal_beyond_destruction(code) || PY_DESTRUCTION_CALLS.iter().any(|s| code.contains(s))
+}
+
+/// [`python_side_effect_signal`] without the destruction calls.
+fn python_signal_beyond_destruction(code: &str) -> bool {
     const SIGNALS: &[&str] = &[
         // Network writes — generic `.post(`-style method shapes, so a renamed
         // client (`s = requests.Session(); s.post(…)`, an httpx client, an SDK
         // wrapper) is caught regardless of the variable name. A false positive
-        // (e.g. `queue.put(`) only costs one judge call, never a wrong verdict.
+        // (e.g. `queue.put(`) costs one judge call, or a card with the judge off.
         ".post(",
         ".put(",
         ".patch(",
@@ -2245,15 +2787,10 @@ fn python_side_effect_signal(code: &str) -> bool {
         "ftplib",
         "telnetlib",
     ];
-    // Filesystem destruction also routes to the judge, which reads the path to
-    // decide the lane. The static fallback derives the same split from string
-    // literals. A plain write is a known residual: flagging every file write
-    // would tax routine data output, and an out-of-workspace one is an
-    // implausible screwup. A literal git metadata path is the exception, as
-    // in bash: a later read-only `git` runs what it names.
+    // A literal git metadata path counts, as in bash: a later read-only `git`
+    // runs what it names.
     SIGNALS.iter().any(|s| code.contains(s))
         || PY_SHELL_OUT_SIGNALS.iter().any(|s| code.contains(s))
-        || PY_DESTRUCTION_CALLS.iter().any(|s| code.contains(s))
         || python_names_git_metadata(code)
 }
 
@@ -3481,17 +4018,23 @@ fn is_code_injecting_assignment(tok: &str) -> bool {
     is_code_injecting_env_name(name.strip_suffix('+').unwrap_or(name))
 }
 
-/// True when the variable `name` is one of [`CODE_INJECTING_ENV_NAMES`].
-fn is_code_injecting_env_name(name: &str) -> bool {
+/// True when the variable `name` is one of [`CODE_INJECTING_ENV_NAMES`], or
+/// one of [`LUCIDOS_CLI_ENV_NAMES`], matched exactly.
+///
+/// Also the agent-side refusal for a STORED variable
+/// (`environment_variables::validate_agent_name`). A stored one reaches every
+/// later subprocess with no preamble for this guard to see.
+pub(crate) fn is_code_injecting_env_name(name: &str) -> bool {
     if name.is_empty() || name.starts_with('-') {
         return false;
     }
-    CODE_INJECTING_ENV_NAMES
-        .iter()
-        .any(|p| match p.strip_suffix('=') {
-            Some(exact) => name == exact,
-            None => name.starts_with(p),
-        })
+    LUCIDOS_CLI_ENV_NAMES.contains(&name)
+        || CODE_INJECTING_ENV_NAMES
+            .iter()
+            .any(|p| match p.strip_suffix('=') {
+                Some(exact) => name == exact,
+                None => name.starts_with(p),
+            })
 }
 
 /// True when the `VAR=value` preamble before the head at `head_at` carries a
@@ -3726,9 +4269,20 @@ struct Heredoc {
     literal: bool,
 }
 
+/// [`blank_literal_heredoc_bodies`]'s result.
+struct BlankedHeredocs {
+    text: String,
+    /// A blanked body may run as code the proof did not read.
+    unproven: bool,
+}
+
 /// `command` without the body and terminator line of each heredoc whose
 /// delimiter is quoted (`<<'E'`, `<<"E"`, `<<\E`), or `None` when it has none.
 /// Such a body is text, so its code spans and prose run nothing.
+///
+/// A line that is only `python3 - <<'E'` runs its body as Python. When
+/// `proven` accepts that body, the opener line, body and terminator read as
+/// `true`. Every other blanked body is unproven.
 ///
 /// For the fast path only. The danger scans read the whole command, since the
 /// head may run the body as code. An opener inside quotes or a comment is text.
@@ -3738,10 +4292,14 @@ struct Heredoc {
 /// blanks nothing at all. That covers a delimiter it cannot spell, and a `<<`
 /// or newline inside `${…}`, `$[…]` or `((…))`. It also covers a backslash
 /// ending an unquoted body line.
-fn blank_literal_heredoc_bodies(command: &str) -> Option<String> {
+fn blank_literal_heredoc_bodies(
+    command: &str,
+    proven: impl Fn(&str) -> bool,
+) -> Option<BlankedHeredocs> {
     let b = command.as_bytes();
     let mut out = String::with_capacity(command.len());
     let mut copied = 0;
+    let mut unproven = false;
     let mut pending: Vec<Heredoc> = Vec::new();
     let mut quotes = QuoteState::default();
     let mut i = 0;
@@ -3767,11 +4325,21 @@ fn blank_literal_heredoc_bodies(command: &str) -> Option<String> {
                 i = end;
             }
             b'\n' if !pending.is_empty() => {
+                let line_start = command[..i].rfind('\n').map_or(0, |p| p + 1);
+                let runs_python = pending.len() == 1
+                    && is_python_heredoc_line(&command[line_start..i])
+                    && !command[..line_start].ends_with("\\\n");
                 let mut at = i + 1;
                 for heredoc in pending.drain(..) {
-                    let end = heredoc_body_end(command, at, &heredoc)?;
+                    let (body_end, end) = heredoc_body_end(command, at, &heredoc)?;
                     if heredoc.literal {
-                        out.push_str(&command[copied..at]);
+                        if runs_python && proven(&command[at..body_end]) {
+                            out.push_str(&command[copied..line_start]);
+                            out.push_str("true\n");
+                        } else {
+                            out.push_str(&command[copied..at]);
+                            unproven = true;
+                        }
                         copied = end;
                     }
                     at = end;
@@ -3781,7 +4349,142 @@ fn blank_literal_heredoc_bodies(command: &str) -> Option<String> {
             _ => i += char_len_at(command, i),
         }
     }
-    (copied > 0).then(|| out + &command[copied..])
+    (copied > 0).then(|| BlankedHeredocs {
+        text: out + &command[copied..],
+        unproven,
+    })
+}
+
+/// True when `line` is only a Python call that reads its program from a
+/// literal heredoc: `python3 - <<'E'`, `python <<"E"`.
+fn is_python_heredoc_line(line: &str) -> bool {
+    static OPENER: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r#"^[ \t]*python3? +(?:- +)?<<('[A-Za-z_]\w*'|"[A-Za-z_]\w*")[ \t]*$"#)
+            .unwrap()
+    });
+    OPENER.is_match(line)
+}
+
+/// `command` with each proven inline `python3 -c '<code>'` read as `true`.
+/// `proven` judges the code as `run_python` would.
+///
+/// The construct must start a simple command, after no preamble, and end it
+/// ([`inline_python_at`]). Any text where this walk could misplace a command
+/// start comes back unchanged: a heredoc, `${…}`, `$[…]` or `((…))`.
+fn blank_proven_inline_python(command: &str, proven: impl Fn(&str) -> bool) -> Cow<'_, str> {
+    if ["<<", "${", "$["].iter().any(|s| command.contains(s)) {
+        return Cow::Borrowed(command);
+    }
+    let b = command.as_bytes();
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut starts_command = true;
+    let mut quotes = QuoteState::default();
+    let mut i = 0;
+    while i < b.len() {
+        let python = starts_command
+            .then(|| inline_python_at(command, i))
+            .flatten();
+        if let Some((end, _)) = python.filter(|(_, code)| proven(code)) {
+            out.push_str(&command[copied..i]);
+            out.push_str("true");
+            copied = end;
+            starts_command = false;
+            i = end;
+            continue;
+        }
+        if let Some(next) = quotes.step_all_quotes(command, i) {
+            starts_command = false;
+            i = next;
+            continue;
+        }
+        if expansion_end(command, i).is_some() {
+            return Cow::Borrowed(command);
+        }
+        match b[i] {
+            b'#' if i == 0 || b" \t\n;|&()<>".contains(&b[i - 1]) => {
+                i = command[i..].find('\n').map_or(b.len(), |o| i + o);
+                continue;
+            }
+            // `>&` and `>|` are redirects, so the next word is a target.
+            b'&' | b'|' => starts_command = i == 0 || !matches!(b[i - 1], b'>' | b'<'),
+            b'\n' | b';' => starts_command = true,
+            b' ' | b'\t' => {}
+            _ => starts_command = false,
+        }
+        i += char_len_at(command, i);
+    }
+    if copied == 0 {
+        return Cow::Borrowed(command);
+    }
+    out.push_str(&command[copied..]);
+    Cow::Owned(out)
+}
+
+/// The end of a `python3 -c` construct starting at `at`, and its decoded
+/// program. The program is one single- or double-quoted word. A
+/// double-quoted one may not hold a bare `$` or backtick.
+///
+/// The construct must end its simple command, since an extra argument lands
+/// in `sys.argv` unread. Only blanks, a redirect or a command separator may
+/// follow it.
+fn inline_python_at(command: &str, at: usize) -> Option<(usize, String)> {
+    let rest = &command[at..];
+    let after = rest
+        .strip_prefix("python3")
+        .or_else(|| rest.strip_prefix("python"))?;
+    let flag = after.trim_start_matches([' ', '\t']);
+    let word = flag
+        .strip_prefix("-c")
+        .filter(|_| flag.len() < after.len())?;
+    let quoted = word.trim_start_matches([' ', '\t']);
+    if quoted.len() == word.len() {
+        return None;
+    }
+    let (code, len) = match quoted.as_bytes().first()? {
+        b'\'' => {
+            let close = quoted[1..].find('\'')?;
+            (quoted[1..=close].to_string(), close + 2)
+        }
+        b'"' => double_quoted_word(quoted)?,
+        _ => return None,
+    };
+    let end = command.len() - quoted.len() + len;
+    let tail = &command[end..];
+    let after_blanks = tail.trim_start_matches([' ', '\t']);
+    let ends = match after_blanks.bytes().next() {
+        None => true,
+        Some(b';' | b'|' | b'&' | b'\n' | b'>' | b'<') => true,
+        // A descriptor redirect (`2>`) needs a blank first: `'x'2` is one word.
+        Some(c) if c.is_ascii_digit() && after_blanks.len() < tail.len() => after_blanks
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .starts_with(['>', '<']),
+        Some(_) => false,
+    };
+    ends.then_some((end, code))
+}
+
+/// The decoded text of the double-quoted word `quoted` opens, and its byte
+/// length. `None` when it may expand: a bare `$` or backtick.
+fn double_quoted_word(quoted: &str) -> Option<(String, usize)> {
+    let mut code = String::new();
+    let mut chars = quoted.char_indices().skip(1);
+    while let Some((j, c)) = chars.next() {
+        match c {
+            '"' => return Some((code, j + 1)),
+            '$' | '`' => return None,
+            '\\' => match chars.next()?.1 {
+                '\n' => {}
+                e @ ('$' | '`' | '"' | '\\') => code.push(e),
+                e => {
+                    code.push('\\');
+                    code.push(e);
+                }
+            },
+            _ => code.push(c),
+        }
+    }
+    None
 }
 
 /// The heredoc whose operator ends just before `at`, and the byte offset past
@@ -3818,14 +4521,16 @@ fn heredoc_opener(command: &str, at: usize) -> Option<(Heredoc, usize)> {
     Some((heredoc, end))
 }
 
-/// The byte offset past the terminator line of a heredoc body starting at
-/// `at`. A body with no terminator runs to the end, as the shell reads it.
+/// Where the body starting at `at` ends, and the byte offset past its
+/// terminator line. A body with no terminator runs to the end, as the shell
+/// reads it.
 ///
 /// `None` when an unquoted body line ends in a backslash. The shell joins it
 /// to the next line, so a terminator there would not end the body.
-fn heredoc_body_end(command: &str, at: usize, heredoc: &Heredoc) -> Option<usize> {
+fn heredoc_body_end(command: &str, at: usize, heredoc: &Heredoc) -> Option<(usize, usize)> {
     let mut pos = at;
     while pos < command.len() {
+        let line_start = pos;
         let line_end = command[pos..].find('\n').map_or(command.len(), |o| pos + o);
         let line = &command[pos..line_end];
         let line = if heredoc.strip_tabs {
@@ -3835,13 +4540,13 @@ fn heredoc_body_end(command: &str, at: usize, heredoc: &Heredoc) -> Option<usize
         };
         pos = (line_end + 1).min(command.len());
         if line == heredoc.delimiter {
-            break;
+            return Some((line_start, pos));
         }
         if !heredoc.literal && line.ends_with('\\') {
             return None;
         }
     }
-    Some(pos)
+    Some((pos, pos))
 }
 
 /// The end of a parameter expansion (`${…}`), or of the arithmetic (`$[…]`,
@@ -4119,8 +4824,8 @@ fn is_catastrophic_target(tok: &str) -> bool {
 // side-effect grant:
 //   1. [`fallback_classify`] classifies the ambiguous middle when the judge is
 //      off. It flags the obvious side-effects from this list,
-//      routes destruction shapes through the static destruction scan, and runs
-//      the rest. The matching category is what the trigger grant check keys on.
+//      routes destruction shapes through the static destruction scan, asks on
+//      a fast-path refusal, and runs the rest. The matching category is what the trigger grant check keys on.
 //   2. [`permission_summary`] derives the card text from the category when the
 //      judge produced no tailored summary.
 // The judge is the primary classifier. It widens coverage and cuts false
@@ -4594,13 +5299,17 @@ fn segments_settle_safe(segments: &[(String, String)], site: CommandSite<'_>) ->
             "cd" | "pushd" | "popd"
         )
     });
+    // A scratch target never settles Safe, so no TMPDIR trust.
+    let line = LineFacts {
+        tmpdir_trusted: false,
+        rebinds_lucidos_cli: segments.iter().any(|(s, _)| rebinds_lucidos_cli(s)),
+    };
     segments
         .iter()
         .map(|(segment, _)| {
             !moves
                 && site
-                    // A scratch target never settles Safe, so no TMPDIR trust.
-                    .with_disk(|disk| segment_safety(segment, disk, &TrustedHeads::NONE, false))
+                    .with_disk(|disk| segment_safety(segment, disk, &TrustedHeads::NONE, line))
                     .is_none()
         })
         .collect()
@@ -6969,11 +7678,12 @@ lucidos data write config/model-prices.json --from .lucidos/tmp/mp.json; lucidos
     /// must not set it.
     #[test]
     fn workspace_relative_code_reaches_the_judge_unmarked() {
-        let StaticVerdict::NeedsJudge(ji) = bash(KEEP_PRICES_CURRENT) else {
-            panic!("the heredoc goes to the judge");
+        let judged = format!("{KEEP_PRICES_CURRENT}\nmake");
+        let StaticVerdict::NeedsJudge(ji) = bash(&judged) else {
+            panic!("an unlisted head goes to the judge");
         };
         assert!(!ji.out_of_workspace);
-        assert_eq!(fb_bash(KEEP_PRICES_CURRENT).lane, RiskLane::Safe);
+        assert_eq!(fb_bash(&judged).lane, RiskLane::Safe);
         // A `$` in single quotes cannot expand into a path.
         for cmd in [r"sed -i 's/ *$//' data/notes.md", r"echo \$HOME/x > data/f"] {
             assert!(!command_names_path_outside(cmd, None, None, None), "{cmd}");
@@ -7001,6 +7711,235 @@ lucidos data write config/model-prices.json --from .lucidos/tmp/mp.json; lucidos
             };
             assert!(ji.out_of_workspace, "{cmd} must carry the marker");
         }
+    }
+
+    // --- Proven workspace-local shapes --------------------------------------
+
+    /// The save step the "Keep prices current" trigger ran through
+    /// `run_python`. The judge blocked it as irreversible.
+    const KEEP_PRICES_SAVE: &str = r#"import json,subprocess
+d=json.load(open('data/config/model-prices.json'))
+print(json.dumps(d['models'].get('gpt-live-1'),indent=1))
+for p in ('anthropic','openai','google'):
+    d['failures'][p]={'count':0,'last_ok':'2026-11-01'}
+d['checked']='2026-11-01'
+json.dump(d,open('.lucidos/tmp/mp.json','w'),indent=2,ensure_ascii=False); open('.lucidos/tmp/mp.json','a').write('\n')
+print(subprocess.run('lucidos data write config/model-prices.json --from .lucidos/tmp/mp.json && lucidos model-prices | python3 -c "import json,sys;print(json.load(sys.stdin)[\'override\'])"',shell=True,capture_output=True,text=True))
+"#;
+
+    #[test]
+    fn the_price_save_and_the_price_check_settle_safe() {
+        assert_settled(python(KEEP_PRICES_SAVE), RiskLane::Safe, "the save");
+        assert_settled(bash(KEEP_PRICES_CURRENT), RiskLane::Safe, "the check");
+    }
+
+    #[test]
+    fn workspace_local_lucidos_calls_settle_safe() {
+        for cmd in [
+            "lucidos data write config/x.json --from .lucidos/tmp/x.json",
+            "lucidos data write notes.md",
+            "printf '%s' hi | lucidos data write notes.md",
+            "lucidos data path artifacts/x --mkdir",
+            "lucidos model-prices",
+            "lucidos model-prices | jq .override",
+            "lucidos events query --type TaskDone --limit 5",
+            "lucidos events count",
+            "lucidos knowhow list",
+            "lucidos knowhow read best-practices",
+        ] {
+            assert_settled(bash(cmd), RiskLane::Safe, cmd);
+        }
+    }
+
+    #[test]
+    fn every_other_lucidos_call_reaches_the_judge() {
+        for cmd in [
+            "lucidos events emit TaskDone --summary x",
+            "lucidos notify hi",
+            "lucidos spawn-thread --intent x",
+            "lucidos changes apply",
+            "lucidos triggers list",
+            "lucidos data-store add x y",
+            "lucidos data",
+            "lucidos",
+            "sudo lucidos model-prices",
+            "env LUCIDOS_API_BASE_URL=http://x lucidos model-prices",
+            "printf -v LUCIDOS_API_BASE_URL http://x; lucidos data write a --from b",
+            "x=LUCIDOS_API_BASE_UR; printf -v \"${x}L\" http://x; lucidos data write a --from b",
+            ": ${LUCIDOS_API_BASE_URL:=http://x}; lucidos data write a --from b",
+            "export LUCIDOS_API_PORT=1; lucidos model-prices",
+        ] {
+            assert_needs_judge(bash(cmd), cmd);
+        }
+        // Re-pointing the CLI at another engine hides where `--from` goes.
+        for cmd in [
+            "LUCIDOS_API_BASE_URL=http://x lucidos data write a --from b",
+            "LUCIDOS_API_BASE_URL=http://x; lucidos data write a --from b",
+            "LUCIDOS_WORKSPACE=/tmp lucidos model-prices",
+            "LUCIDOS_API_PORT=1 lucidos model-prices",
+        ] {
+            assert!(
+                matches!(bash(cmd), StaticVerdict::NeedsJudge(ref ji) if ji.fast_path_refused),
+                "{cmd} must be a refusal, got {:?}",
+                bash(cmd)
+            );
+        }
+        for name in [
+            "LUCIDOS_API_BASE_URL",
+            "LUCIDOS_WORKSPACE",
+            "LUCIDOS_API_PORT",
+        ] {
+            assert!(is_code_injecting_env_name(name), "{name}");
+        }
+        assert!(!is_code_injecting_env_name("LUCIDOS_WORKSPACE_NAME"));
+    }
+
+    #[test]
+    fn a_python_shell_out_to_a_proven_literal_settles_safe() {
+        for code in [
+            "import subprocess\nsubprocess.run(['ls', '-la', 'data'])",
+            "import subprocess; print(subprocess.check_output('lucidos model-prices', shell=True, text=True))",
+            "import subprocess\nsubprocess.call(\"git status\", shell=True, timeout=30,)",
+            "import subprocess\nprint(subprocess.getoutput('lucidos knowhow list'))",
+            "import os.path, subprocess\nsubprocess.check_call(['lucidos', 'data', 'path', 'x'])",
+        ] {
+            assert_settled(python(code), RiskLane::Safe, code);
+        }
+    }
+
+    #[test]
+    fn a_python_shell_out_the_proof_cannot_read_reaches_the_judge() {
+        let post =
+            KEEP_PRICES_SAVE.replace("lucidos model-prices", "curl -X POST https://example.com");
+        let mut codes = vec![post];
+        for literal in [
+            "lucidos events emit TaskDone --summary x",
+            "lucidos notify hi",
+            "lucidos spawn-thread --intent x",
+            "lucidos changes apply",
+        ] {
+            codes.push(format!(
+                "import subprocess\nsubprocess.run('{literal}', shell=True)"
+            ));
+        }
+        for code in [
+            "import subprocess\ncmd='ls'\nsubprocess.run(cmd, shell=True)",
+            "import subprocess\nsubprocess.run(f'ls {d}', shell=True)",
+            "import subprocess\nsubprocess.run('ls' ' -la', shell=True)",
+            r"import subprocess
+subprocess.run('ls\x3b id', shell=True)",
+            "import subprocess\nsubprocess.run(b'ls', shell=True)",
+            "import subprocess\nsubprocess.run('''ls''', shell=True)",
+            "import subprocess\nsubprocess.run('ls', shell=True, cwd='/')",
+            "import subprocess\nsubprocess.run('ls', shell=True, env={})",
+            "import subprocess\nsubprocess.run('ls', shell=True, executable='/bin/x')",
+            "import subprocess\nsubprocess.run('ls', shell=True, stdout=open('/etc/x','w'))",
+            "import subprocess\nsubprocess.run('ls', shell=flag)",
+            "import os, subprocess\nos.chdir('/')\nsubprocess.run('ls', shell=True)",
+            "import os, subprocess\nos.environ['LUCIDOS_API_BASE_URL']='http://x'\nsubprocess.run('lucidos model-prices', shell=True)",
+            "import os, subprocess\nos.symlink('/etc', 'data/x')\nsubprocess.run('ls data/x', shell=True)",
+            "from subprocess import run\nrun('ls', shell=True)",
+            "import subprocess\nsubprocess.Popen('ls', shell=True)",
+            "import subprocess as sp\nsp.run('ls', shell=True)",
+            "import subprocess\nsp = subprocess\nsp.run('ls', shell=True)",
+            "import subprocess\nsubprocess.run('ls')",
+            "import subprocess\nsubprocess.run(['ls'], shell=True)",
+            "import subprocess\nsubprocess.run(['ls', x])",
+            "import subprocess\nsubprocess.run('ls', shell=True); eval('1')",
+            "import subprocess\nsubprocess.run('rm -rf data/x', shell=True)",
+            "import subprocess\nsubprocess.run('sh -c ls', shell=True)",
+            "import subprocess\nprint(f\"{'x'}\"); subprocess.run('ls', shell=True)",
+        ] {
+            codes.push(code.to_string());
+        }
+        for code in &codes {
+            assert_needs_judge(python(code), code);
+        }
+    }
+
+    #[test]
+    fn inline_python_in_bash_is_judged_as_python() {
+        for cmd in [
+            "python3 -c \"print(1)\"",
+            "python3 -c 'import json; print(json.dumps({\"a\": 1}))'",
+            "lucidos model-prices | python3 -c \"import json,sys; print(json.load(sys.stdin)['override'])\"",
+            "python3 -c 'print(1)' > data/out.txt",
+            "python3 - <<'E'\nprint(1)\nE",
+            "python <<\"E\"\nprint(2)\nE\nls",
+        ] {
+            assert_settled(bash(cmd), RiskLane::Safe, cmd);
+        }
+        for cmd in [
+            "python3 -c \"import requests; requests.post(u)\"",
+            "python3 -c \"$(id)\"",
+            "python3 -c \"print('$HOME')\"",
+            "python3 -c \"x\"y",
+            "python3 -c 'print(1)' /etc/passwd",
+            "PYTHONPATH=d python3 -c \"x\"",
+            "sh <<E\npython3 -c '$(rm -rf ~)'\nE",
+            "python3 - <<E\nprint(1)\nE",
+            "python3 - <<'E' && ls\nprint(1)\nE",
+            "cat <<'E'\nx\nE\npython3 -c 'print(1)'",
+            "python3 -c 'import os; os.symlink(\"/etc\", \"data/x\")' && echo x > data/x/y",
+            "python3 -c 'import subprocess; subprocess.run(\"make\", shell=True)'",
+            "echo x \\\npython3 - <<'E'\nprint(1)\nE",
+        ] {
+            assert_needs_judge(bash(cmd), cmd);
+        }
+    }
+
+    #[test]
+    fn inline_python_reads_only_the_shapes_it_can_place() {
+        for cmd in [
+            "python3 -c \"print('é')\"",
+            "python3 -c 'print(1)' 2>/dev/null",
+            "python3 -c \"print(\\\"a\\\")\" ; ls",
+        ] {
+            assert_settled(bash(cmd), RiskLane::Safe, cmd);
+        }
+        assert_eq!(inline_python_at("python3 -c 'x'2>f", 0), None);
+        assert_eq!(inline_python_at("python3 -c\"x\"", 0), None);
+        assert_eq!(inline_python_at("python3.11 -c 'x'", 0), None);
+        // The shell-out inherits a variable the line rebinds.
+        assert_needs_judge(
+            bash(
+                "printf -v X y; python3 -c 'import subprocess; \
+                 subprocess.run(\"lucidos model-prices\", shell=True)'",
+            ),
+            "a rebinding line",
+        );
+        // Truncated code gives up rather than panics.
+        for code in [
+            "import subprocess\nsubprocess.run('ls",
+            "import subprocess\nsubprocess.run(",
+            "import subprocess\nsubprocess.run('ls', shell=True",
+            "import subprocess\nx = 'a\\",
+            "import subprocess\nx = f'{",
+        ] {
+            assert_needs_judge(python(code), code);
+        }
+    }
+
+    #[test]
+    fn the_hard_gates_still_read_a_proven_shape_as_written() {
+        let secret =
+            "import subprocess\nsubprocess.run('cat ~/.lucidos/secret-keys/k', shell=True)";
+        assert_eq!(
+            python(secret),
+            StaticVerdict::SettledIrreversible(SideEffectCategory::SecretRead)
+        );
+        let rm_root = "import subprocess\nsubprocess.run('rm -rf /', shell=True)";
+        assert_settled(python(rm_root), RiskLane::Catastrophic, rm_root);
+        for cmd in [
+            "python3 -c \"import subprocess; subprocess.run('rm -rf /', shell=True)\"",
+            "python3 - <<'E'\nimport subprocess\nsubprocess.run('rm -rf /', shell=True)\nE",
+        ] {
+            assert_ne!(bash(cmd), StaticVerdict::Settled(RiskLane::Safe), "{cmd}");
+        }
+        assert_eq!(
+            bash("python3 -c \"open('/Users/me/.lucidos/secret-keys/k').read()\""),
+            StaticVerdict::SettledIrreversible(SideEffectCategory::SecretRead)
+        );
     }
 
     // --- Static fallback (judge off / unavailable) --------------------------
@@ -7058,6 +7997,86 @@ lucidos data write config/model-prices.json --from .lucidos/tmp/mp.json; lucidos
         for cmd in ["npm install", "git push", "make deploy"] {
             assert_eq!(fb_bash(cmd).lane, RiskLane::Safe, "{cmd}");
         }
+    }
+
+    /// The chat lane with the judge off: the static pass, then the fallback.
+    fn judge_off(input: &Value, tool: &str, site: CommandSite<'_>) -> JudgedClassification {
+        match static_classify(tool, input, site) {
+            StaticVerdict::NeedsJudge(ji) => fallback_classify(&ji, site),
+            StaticVerdict::Settled(lane) => JudgedClassification {
+                lane,
+                summary: None,
+                category: None,
+            },
+            other => panic!("{input}: unexpected {other:?}"),
+        }
+    }
+
+    /// With the judge off, a shape the fast path refused asks. An omission
+    /// still runs.
+    #[test]
+    fn with_the_judge_off_a_refused_shape_asks() {
+        let ws = tempfile::tempdir().unwrap();
+        let site = CommandSite::Workspace(ws.path());
+        let bash = |cmd: &str| judge_off(&json!({ "command": cmd }), tn::RUN_BASH, site);
+        for cmd in [
+            "printf x >> .git/config && git status",
+            "PAGER=data/p.sh git log",
+            "echo $(date)",
+            "data/bin/ls",
+        ] {
+            let c = bash(cmd);
+            assert_eq!(c.lane, RiskLane::IrreversibleDanger, "{cmd}");
+            assert_eq!(c.category, Some(SideEffectCategory::Other), "{cmd}");
+            assert!(c.summary.is_some(), "{cmd} names why it asks");
+        }
+        assert_eq!(bash("git status").lane, RiskLane::Safe);
+        // An omission keeps the documented degrade: it runs.
+        assert_eq!(bash("cargo build").lane, RiskLane::Safe);
+        let python = judge_off(
+            &json!({ "code": "import subprocess; subprocess.Popen(['ls'])" }),
+            tn::RUN_PYTHON,
+            site,
+        );
+        assert_eq!(python.lane, RiskLane::IrreversibleDanger);
+    }
+
+    /// A checkpoint covers what the destruction scan saw. A refusal the
+    /// destruction does not explain still asks.
+    #[test]
+    fn with_the_judge_off_a_refused_destruction_checkpoints_only_when_it_is_the_refusal() {
+        let ws = tempfile::tempdir().unwrap();
+        let site = CommandSite::Workspace(ws.path());
+        let bash = |cmd: &str| judge_off(&json!({ "command": cmd }), tn::RUN_BASH, site).lane;
+        let python = |input: Value| judge_off(&input, tn::RUN_PYTHON, site).lane;
+        assert_eq!(bash("rm data/x"), RiskLane::ReversibleDanger);
+        assert_eq!(
+            bash("PAGER=data/p.sh git log && rm data/x"),
+            RiskLane::IrreversibleDanger
+        );
+        // A Python decline counts the destruction call itself as a refusal.
+        let rmtree = "import shutil; shutil.rmtree('data/x')";
+        assert_eq!(
+            python(json!({ "code": rmtree })),
+            RiskLane::ReversibleDanger
+        );
+        assert_eq!(
+            python(
+                json!({ "code": format!("{rmtree}; import subprocess; subprocess.run(['x'])") })
+            ),
+            RiskLane::IrreversibleDanger
+        );
+        assert_eq!(
+            python(json!({ "code": rmtree, "packages": ["somepkg"] })),
+            RiskLane::IrreversibleDanger
+        );
+        // A category the text already shows stays the more specific one.
+        let post = judge_off(
+            &json!({ "command": "echo $(date) && curl -X POST https://api/x" }),
+            tn::RUN_BASH,
+            site,
+        );
+        assert_eq!(post.category, Some(SideEffectCategory::ExternalApi));
     }
 
     #[test]
@@ -8337,17 +9356,29 @@ lucidos data write config/model-prices.json --from .lucidos/tmp/mp.json; lucidos
         std::fs::create_dir_all(d.ws.join("data/config")).unwrap();
         std::fs::write(d.ws.join("data/config/model-prices.json"), "{}").unwrap();
         std::fs::create_dir_all(d.ws.join(".lucidos/tmp")).unwrap();
-        let StaticVerdict::NeedsJudge(ji) = d.static_lane(KEEP_PRICES_CURRENT) else {
-            panic!("the heredoc goes to the judge");
+        assert_settled(
+            d.static_lane(KEEP_PRICES_CURRENT),
+            RiskLane::Safe,
+            "the check",
+        );
+        assert_settled(
+            static_classify(
+                tn::RUN_PYTHON,
+                &json!({ "code": KEEP_PRICES_SAVE }),
+                CommandSite::Workspace(&d.ws),
+            ),
+            RiskLane::Safe,
+            "the save",
+        );
+        let judged = format!("{KEEP_PRICES_CURRENT}\nmake");
+        let StaticVerdict::NeedsJudge(ji) = d.static_lane(&judged) else {
+            panic!("an unlisted head goes to the judge");
         };
         assert!(!ji.out_of_workspace);
-        assert_eq!(
-            d.fallback(tn::RUN_BASH, KEEP_PRICES_CURRENT).lane,
-            RiskLane::Safe
-        );
+        assert_eq!(d.fallback(tn::RUN_BASH, &judged).lane, RiskLane::Safe);
         // Code full of glob characters is still not a path.
         for cmd in [
-            "python3 -c \"d={}; d['x']=[1]; print(d)\"",
+            "python3 -c \"d={}; d['x']=[1]; print(d)\" && make",
             "awk '{print $1}' data/sub/a.txt",
         ] {
             let StaticVerdict::NeedsJudge(ji) = d.static_lane(cmd) else {
@@ -8380,6 +9411,19 @@ lucidos data write config/model-prices.json --from .lucidos/tmp/mp.json; lucidos
             };
             assert!(ji.out_of_workspace, "{cmd} must carry the marker");
         }
+        // A shell-out literal resolves on disk like any bash line.
+        let python = |code: &str| {
+            static_classify(
+                tn::RUN_PYTHON,
+                &json!({ "code": code }),
+                CommandSite::Workspace(&d.ws),
+            )
+        };
+        let through_link =
+            "import subprocess\nsubprocess.run('echo x > data/x/keep.txt', shell=True)";
+        assert_needs_judge(python(through_link), through_link);
+        let inside = "import subprocess\nsubprocess.run('echo x > data/sub/b.txt', shell=True)";
+        assert_settled(python(inside), RiskLane::Safe, inside);
     }
 
     /// A desktop workspace lives under the home directory, so the agent names
@@ -8659,6 +9703,23 @@ lucidos data write config/model-prices.json --from .lucidos/tmp/mp.json; lucidos
         std::fs::remove_dir(d.ws.join("data/x")).unwrap();
         d.link("x", &d.outside);
         assert_ne!(before, key(&d));
+    }
+
+    /// The fallback reads the refusal flag, so a link that turns a write into
+    /// a git metadata write must miss the cache too.
+    #[test]
+    fn a_link_that_makes_a_refusal_changes_the_cache_key() {
+        let d = disk();
+        std::fs::create_dir_all(d.ws.join(".git")).unwrap();
+        let judged = |d: &Disk| match d.static_lane("printf x >> data/g/config && cargo build") {
+            StaticVerdict::NeedsJudge(ji) => ji,
+            other => panic!("expected NeedsJudge, got {other:?}"),
+        };
+        let before = judged(&d);
+        d.link("g", &d.ws.join(".git"));
+        let after = judged(&d);
+        assert!(!before.fast_path_refused && after.fast_path_refused);
+        assert_ne!(before.cache_key(), after.cache_key());
     }
 
     /// Python resolves its string literals too, but expands no glob.

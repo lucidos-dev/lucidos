@@ -27,7 +27,7 @@ import { Disclosure } from '../shared/Disclosure';
 import { HELD_CALLBACK_NOTE, statusLabel as getStatusLabel, isActive as isStatusActive, isTerminated } from '../../store/exchange-status';
 import type { ExchangeStatus } from '../../store/exchange-status';
 import { formatMessageTimestamp } from '../../utils/formatTime';
-import { renderMarkdown } from '../../utils/renderMarkdown';
+import { markdownEngine, renderMarkdown } from '../../utils/renderMarkdown';
 import { linkifyPaths } from '../../utils/linkifyPaths';
 import { handleMarkdownLinkClick } from '../shared/markdownLinkClick';
 import { FormRequestRow } from './FormRequestRow';
@@ -244,9 +244,11 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   const responseHtmlCombined = streamingHtml || responseHtml;
   const hasResponse = !!responseHtmlCombined || isEngineLimit;
 
+  // The memos below draw again, formatted, once the markdown engine lands.
+  const markdown = markdownEngine.value;
   const userMessageHtml = useMemo(
     () => linkifyPaths(renderMarkdown(userMessage), artifactPaths, apps),
-    [userMessage, artifactPaths, apps],
+    [userMessage, artifactPaths, apps, markdown],
   );
 
   const hasEvents = events.length > 0;
@@ -417,7 +419,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
       }
     }
     return map;
-  }, [bodyPieces, artifactPaths, apps]);
+  }, [bodyPieces, artifactPaths, apps, markdown]);
 
   const responseHtmlLinkified = useMemo(
     // The streaming buffer's html changes every token, so its linkify opts out

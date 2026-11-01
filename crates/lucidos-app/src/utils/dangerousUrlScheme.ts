@@ -10,7 +10,7 @@
  * and `openExternalUrl` in `utils/openExternalUrl.ts`.
  *
  * NOT the only scheme classifier, and do not merge it with the other one.
- * `stripDangerousUrlSchemes` (`utils/renderMarkdown.ts`) screens an HREF inside
+ * `stripDangerousUrlSchemes` (`utils/markdownEngine.ts`) screens an HREF inside
  * rendered markdown, and denies a different set: it drops `data:`, which is a
  * legitimate thing to OPEN but never a legitimate link target. Widening either
  * to match the other breaks the case the difference exists for.

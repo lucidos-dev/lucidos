@@ -504,6 +504,8 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         "CacheKeepAliveStatusChanged" => EventClass::Metadata,
         // The user's per-thread keep-alive switch. A setting, not work.
         "CacheKeepAliveTurnedOff" | "CacheKeepAliveTurnedOn" => EventClass::Metadata,
+        // A forecast of the next wake. The keep-alive reads it; nothing moves.
+        "WakeExpected" => EventClass::Metadata,
         _ => return None,
     })
 }
@@ -636,6 +638,8 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "CacheKeepAliveStatusChanged",
         "CacheKeepAliveTurnedOff",
         "CacheKeepAliveTurnedOn",
+        // The expected wake. Persisted because the keep-alive plans from it.
+        "WakeExpected",
         // Voice-session lifecycle. Persisted because the pair IS the record:
         // there is no session table, and the boot sweep finds an unpaired
         // start by reading these back.
@@ -1029,6 +1033,7 @@ pub fn resolve_transition(
         | "CacheKeepAliveStatusChanged"
         | "CacheKeepAliveTurnedOff"
         | "CacheKeepAliveTurnedOn"
+        | "WakeExpected"
         // Voice-session lifecycle. Voice is a MODE of a thread (ADR 0148), so
         // neither half moves it: the section and the status belong to the
         // agent's turn, and a live microphone is not a turn. An end that

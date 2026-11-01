@@ -146,7 +146,8 @@
 
 # ── knobs ───────────────────────────────────────────────────────────────
 #   LUCIDOS_E2E_SWAP_MAX_GB          swap in use that stops the run (default 1)
-#   LUCIDOS_E2E_FREE_FLOOR_MIN_GB    absolute available-memory floor (default 8)
+#   LUCIDOS_E2E_FREE_FLOOR_MIN_GB    absolute available-memory floor (default 8),
+#                                    also the build gate's line
 #   LUCIDOS_E2E_FREE_FLOOR_PCT       available floor as a share of RAM (default 20)
 #   LUCIDOS_E2E_COLLAPSE_MIN_GB      absolute collapse level (default 2)
 #   LUCIDOS_E2E_COLLAPSE_PCT         collapse level as a share of RAM (default 5)
@@ -1499,8 +1500,8 @@ _host_mem_wait_cap() {
     esac
 }
 
-# Judge the host once. $1 is the available line in GB: the pre-flight gate's
-# 8 GB for a build, the running guard's scaled floor for a resume. Returns 0
+# Judge the host once. $1 is the available line in GB: host_memory_build_line_gb
+# for a build, the running guard's scaled floor for a resume. Returns 0
 # for GO. On NO-GO it returns 1 and prints one reason per line.
 #
 # The rule is the pre-flight gate's, arm for arm, and host_memory_guard_test.sh
@@ -1561,6 +1562,16 @@ EOF2
     return 1
 }
 
+# The build gate's available line in GB: the absolute floor, unscaled. It is
+# the pre-flight gate's 8 GB unless LUCIDOS_E2E_FREE_FLOOR_MIN_GB sets another,
+# which the pre-flight gate ignores. A GitHub runner sets a lower one
+# (scripts/e2e-github-shard.sh).
+host_memory_build_line_gb() {
+    local line="${LUCIDOS_E2E_FREE_FLOOR_MIN_GB:-$HOST_MEMORY_FREE_FLOOR_ABS_GB}"
+    _host_mem_is_number "$line" || line="$HOST_MEMORY_FREE_FLOOR_ABS_GB"
+    printf '%s' "$line"
+}
+
 # The build memory gate. Wait for the host to read GO, then return 0. Past the
 # deadline, print one ERROR line naming every reason and return 72. $1 names
 # the build in every line it prints.
@@ -1572,12 +1583,13 @@ EOF2
 #                                   0 refuses at the first NO-GO)
 #   LUCIDOS_BUILD_MEMORY_POLL_SECS  seconds between readings (default 30)
 host_memory_build_gate() {
-    local label="${1:-a cargo build}" limit poll start now elapsed=0 reasons announced=""
+    local label="${1:-a cargo build}" limit poll start now elapsed=0 reasons announced="" line
     limit="$(_host_mem_wait_cap "${LUCIDOS_BUILD_MEMORY_WAIT_SECS:-}" 900)"
     poll="$(_host_mem_secs_or "${LUCIDOS_BUILD_MEMORY_POLL_SECS:-}" 30)"
+    line="$(host_memory_build_line_gb)"
     start="$(_host_mem_now)"
     while :; do
-        if reasons="$(host_memory_gate_verdict "$HOST_MEMORY_FREE_FLOOR_ABS_GB")"; then
+        if reasons="$(host_memory_gate_verdict "$line")"; then
             if [ -n "$announced" ]; then
                 echo "[build-memory-gate] the host recovered after $(($(_host_mem_now) - start))s, starting $label"
             fi

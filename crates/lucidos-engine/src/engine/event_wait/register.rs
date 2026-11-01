@@ -24,6 +24,8 @@ use chrono::{Duration, Utc};
 use serde_json::Value;
 use uuid::Uuid;
 
+use super::keep_alive::{CacheKeepAliveMode, KeepWarmKinds, WaitAgent, WaitType};
+use super::wait_durations::WaitHistory;
 use super::LiveWait;
 use crate::core::event_subscription::{
     validate_subscribable_event_type, EventSubscription, SubscriptionSurface,
@@ -31,6 +33,7 @@ use crate::core::event_subscription::{
 use crate::engine::event_bus::committed_event_horizon;
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::LucidosEngine;
+use crate::runtime::CodingAgent;
 
 /// Ceiling on `timeout_secs`. There is no unbounded wait: a wait that outlives
 /// every reason anyone had for it is indistinguishable from a stalled thread.
@@ -199,11 +202,46 @@ impl LucidosEngine {
             ));
         }
 
-        AwaitEventOutcome::Registered(registered_tool_result_text(
-            &wait,
-            lookback.as_ref(),
-            &warnings,
-        ))
+        let text = registered_tool_result_text(&wait, lookback.as_ref(), &warnings);
+        AwaitEventOutcome::Registered(match self.expected_wake_request(&wait).await {
+            Some(request) => format!("{text}\n\n{request}"),
+            None => text,
+        })
+    }
+
+    /// What a registration adds when the keep-alive could keep this wait warm:
+    /// a request for the expected wake, with the history to estimate it from.
+    /// `None` with the keep-alive off, for a kind it never keeps warm, and for
+    /// a Codex thread.
+    async fn expected_wake_request(&self, wait: &LiveWait) -> Option<String> {
+        if self.keep_alive_mode().await != CacheKeepAliveMode::On {
+            return None;
+        }
+        let kinds = KeepWarmKinds::of(wait.on.iter().map(|s| s.event_type.as_str()))?;
+        let agent = self.wait_agent_of(wait.thread_id).await?;
+        let history = self
+            .keep_alive_durations
+            .current()
+            .history(agent, WaitType::Events(kinds));
+        Some(expected_wake_request_text(agent, history.as_ref()))
+    }
+
+    /// The agent that runs `thread_id`, as the wait durations key it. `None`
+    /// for a Codex thread, and when the read fails: the request is advisory.
+    async fn wait_agent_of(&self, thread_id: Uuid) -> Option<WaitAgent> {
+        let row: Option<(bool, Option<String>)> = sqlx::query_as(
+            "SELECT is_coding_agent, coding_agent FROM thread_summaries WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .fetch_optional(&self.pool)
+        .await
+        .inspect_err(|e| crate::log!("[EventWait] Agent read failed for thread {thread_id}: {e}"))
+        .ok()?;
+        match row? {
+            (false, _) => Some(WaitAgent::Lucidos),
+            (true, Some(agent)) if agent == CodingAgent::Codex.as_str() => None,
+            (true, _) => Some(WaitAgent::ClaudeCode),
+        }
     }
 
     /// Read the watermark and build the [`LiveWait`]. Nothing is emitted or
@@ -490,6 +528,27 @@ pub(super) fn registered_tool_result_text(
         return body;
     }
     format!("WARNING: {}\n\n{body}", warnings.join("\nWARNING: "))
+}
+
+/// The expected wake request, in the words each agent acts on.
+pub(super) fn expected_wake_request_text(
+    agent: WaitAgent,
+    history: Option<&WaitHistory>,
+) -> String {
+    let ask = match agent {
+        WaitAgent::Lucidos => {
+            "Before this turn ends, call expect_wake with when you expect to wake."
+        }
+        WaitAgent::ClaudeCode => {
+            "Before you finish, run `lucidos expect-wake <duration> --reason \"...\"` with \
+             when you expect to wake."
+        }
+    };
+    let figures = history.map_or_else(
+        || "No past waits like this one to go by.".to_string(),
+        WaitHistory::describe,
+    );
+    format!("{ask} {figures}")
 }
 
 /// The report itself: what already happened, how long ago, and what the model

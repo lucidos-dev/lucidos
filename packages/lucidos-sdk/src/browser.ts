@@ -5,6 +5,7 @@ import { installAppPullToRefresh } from './pullToRefresh';
 import { installAppPaneSwipe } from './paneSwipe';
 import { installLinkPressGuard } from './linkPressGuard';
 import { installAppLinkRouting } from './appLinks';
+import { installExternalLinksListener, traceAppLink } from './externalLinks';
 import { installAppScrollReport } from './appScroll';
 import { installTooltips } from './tooltip';
 import { primeDevicePreferences } from './ui';
@@ -90,12 +91,18 @@ if (typeof document !== 'undefined') {
   installAppScrollReport();
 
   // A swipe that starts on a link must not open it. Installed before the click
-  // listener below, so that one never sees the click. A frame has no engine
-  // log of its own, so the breadcrumb goes to the console.
+  // listener below, so that one never sees the click. A frame has no log the
+  // engine can read, so the breadcrumbs go to the host as well as the console.
   installLinkPressGuard(window, {
-    onSwallowed: (info) => console.info('[lucidos-sdk] link-click-after-swipe', info),
+    onLinkTouch: (info) => traceAppLink('touch', { ...info }),
+    onSwallowed: (info) => {
+      console.info('[lucidos-sdk] link-click-after-swipe', info);
+      traceAppLink('swallowed', { ...info });
+    },
   });
 
-  // Links in the frame: downloads, web pages and new-tab targets.
+  // Links in the frame: downloads, web pages and new-tab targets. The host's
+  // answer decides whether a web page opens from the frame or from the host.
+  installExternalLinksListener();
   installAppLinkRouting();
 }

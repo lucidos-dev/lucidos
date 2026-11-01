@@ -416,6 +416,261 @@ function appIsFullscreen(): boolean {
   return appPseudoFullscreen.value || nativeFullscreenElement() !== null;
 }
 
+/** Own `--app-height` and `--keyboard-band` for the mobile shell, and return
+ *  the teardown. Exported so a test can drive it against a fake viewport. */
+export function trackAppHeight(): (() => void) | undefined {
+  const vv = window.visualViewport;
+  if (!vv) return;
+  // -1 sentinel ensures the initial setHeight() call writes the CSS variable
+  // instead of being short-circuited by the equality guard inside setHeight.
+  let lastSetHeight = -1;
+
+  // px, not rem: --app-height is a physical viewport measurement that must
+  // NOT scale with --user-ui-scale. Using rem caused the app shell to exceed
+  // the viewport when applyUiScale() changed the base font-size after mount.
+  const setHeight = (h: number) => {
+    if (h === lastSetHeight) return;
+    lastSetHeight = h;
+    document.documentElement.style.setProperty('--app-height', `${h}px`);
+  };
+
+  // One computation site, so every write makes the same keyboard-aware
+  // decision. A rotation or mount with the keys up must keep the shrunk
+  // height. Writing innerHeight blindly would put the prompt behind the keys.
+  const layoutViewportKey = () => `${window.innerWidth}x${window.innerHeight}`;
+  let measuredLayoutViewport = '';
+  const currentAppHeight = () => {
+    measuredLayoutViewport = layoutViewportKey();
+    return computeAppHeight({
+      vvHeight: vv.height,
+      innerHeight: window.innerHeight,
+      activeElementOpensKeyboard: opensSoftwareKeyboard(document.activeElement),
+    });
+  };
+
+  const bandMemory = keyboardBandMemory();
+  const layoutViewport = () => ({ width: window.innerWidth, height: window.innerHeight });
+  let lastSetBand = -1;
+  // Each scroller's band hold (`heldBandPx`): the content height it anchors,
+  // and the scroll listener and mutation observer that re-measure it.
+  interface Hold { px: number; anchorContentPx: number; recheck: () => void; observer: MutationObserver }
+  const holds = new Map<HTMLElement, Hold>();
+  const releaseHold = (el: HTMLElement) => {
+    const hold = holds.get(el);
+    if (!hold) return;
+    el.removeEventListener('scroll', hold.recheck);
+    hold.observer.disconnect();
+    el.style.removeProperty('--keyboard-band-hold');
+    holds.delete(el);
+  };
+  const updateHold = (el: HTMLElement, bandPx: number) => {
+    const paddingPx = parseFloat(getComputedStyle(el).paddingBottom) || 0;
+    const hold = holds.get(el);
+    const px = heldBandPx({
+      paddingPx,
+      scrollTop: el.scrollTop,
+      scrollHeight: el.scrollHeight,
+      clientHeight: el.clientHeight,
+      bandPx,
+      heldPx: hold?.px,
+      anchorContentPx: hold?.anchorContentPx,
+    });
+    if (px === 0 || !el.isConnected) { releaseHold(el); return; }
+    if (hold?.px === px) return;
+    if (hold) hold.px = px;
+    else {
+      const recheck = () => updateHold(el, lastSetBand);
+      // Content that shrinks under the hold may move no scrollTop, so no
+      // scroll event says so. A mutation is the other way it shows up.
+      const observer = new MutationObserver(recheck);
+      observer.observe(el, { childList: true, subtree: true, characterData: true, attributes: true });
+      holds.set(el, { px, anchorContentPx: el.scrollHeight - paddingPx, recheck, observer });
+      el.addEventListener('scroll', recheck, { passive: true });
+    }
+    el.style.setProperty('--keyboard-band-hold', `${px}px`);
+  };
+  // A lower band checks every padded scroller; a higher one only needs to
+  // retire the holds it now covers. Both re-check the held ones, which is
+  // what retires a hold whose scroller has left the page.
+  const holdScrollAnchors = (px: number) => {
+    const scrollers = new Set(holds.keys());
+    if (px < lastSetBand) {
+      document.querySelectorAll<HTMLElement>('.mobile-swipe-pane .content-pane-body')
+        .forEach((el) => scrollers.add(el));
+    }
+    for (const el of scrollers) updateHold(el, px);
+  };
+  const setBand = (px: number) => {
+    if (px === lastSetBand) return;
+    holdScrollAnchors(px);
+    lastSetBand = px;
+    document.documentElement.style.setProperty('--keyboard-band', `${px}px`);
+  };
+  const syncBand = () => {
+    const band = keyboardBandPx({
+      vvHeight: vv.height,
+      innerHeight: window.innerHeight,
+      activeElementOpensKeyboard: opensSoftwareKeyboard(document.activeElement),
+    });
+    bandMemory.note(band, layoutViewport());
+    setBand(band);
+  };
+  /** Reserve the slack now, on the best figure available. */
+  const armBand = (e: FocusEvent) => {
+    if (!opensSoftwareKeyboard(e.target)) return;
+    setBand(bandMemory.reserve(layoutViewport()));
+  };
+
+  /** The last height ANY observer here acted on. See the poll below, whose
+   *  whole job is the change nothing else saw. */
+  let observedHeight = vv.height;
+
+  const onResize = () => {
+    observedHeight = vv.height;
+    // The keyboard opening or closing changes --app-height, which shortens or
+    // lengthens the transcript's viewport. The reader is left exactly where
+    // they are: the content above them has not moved, so the same scrollTop
+    // still shows them the same thing. (This used to re-pin a bottom reader
+    // to the new bottom; see scrollState's header for why nothing does that
+    // any more.)
+    setHeight(currentAppHeight());
+    syncBand();
+    // A keyboard close leaves WKWebView routing touches against the
+    // keyboard-up geometry, and the page cannot read that. Relayout frees it.
+    // Called last, so the bounce starts from the height just written.
+    noteViewportResize({ height: vv.height, layoutViewport: window.innerHeight });
+  };
+  // A rotation, or iOS correcting `innerHeight` with only a window resize. A
+  // portrait wake after a landscape suspend reports the landscape height at
+  // first, and no visual-viewport resize follows the fix (ADR 0610).
+  const onLayoutViewportChange = () => {
+    observedHeight = vv.height;
+    setHeight(currentAppHeight());
+    syncBand();
+  };
+  // A window resize that moved nothing since the last write is a re-announce.
+  // Inside a focus window, before the keys rise, acting on it would run
+  // `syncBand` on a full-height reading and wipe the reserve `armBand` made.
+  const onWindowResize = () => {
+    if (layoutViewportKey() !== measuredLayoutViewport) onLayoutViewportChange();
+  };
+  // The keyboard leaving is a focus change, and it may fire no resize at all
+  // when a hardware keyboard was in play. Recompute from live metrics so the
+  // slack cannot outlive the keys.
+  //
+  // A move between two fields is NOT that. The keys stay up, and dropping the
+  // padding for even one frame shortens the scroll range: a container near
+  // its end is clamped, and the content jumps by a keyboard's height. So the
+  // handoff is left alone, as `useHideOnScroll` leaves its own.
+  const onFocusOut = (e: FocusEvent) => {
+    if (opensSoftwareKeyboard(e.relatedTarget)) return;
+    syncBand();
+  };
+  // An iOS resume often drops the keyboard and fires no visual-viewport
+  // resize. Without this recompute the shell keeps its keyboard-up height.
+  //
+  // Two things go wrong at a wake, and both need handling:
+  //
+  //   1. `vv.height` is often pinned at the stale shrunk value. So the wake
+  //      writes through `computeAppHeight`, never a raw `vv.height`.
+  //   2. iOS keeps focus on the textarea across the suspend, with the keys
+  //      down. That ghost focus would make a late resize re-stamp the shrunk
+  //      height, so the wake blurs it. The user taps again to type.
+  //
+  // The blur runs only when `vv.height` looks shrunk, or gives no reading
+  // (iOS 27 reports 0). A quick return to a focused search box keeps focus.
+  //
+  // Resetting lastSetHeight forces the write even when the value is cached.
+  const onWake = () => {
+    const vvLooksShrunk =
+      !readableVisualViewport() || viewportIsKeyboardShrunk(vv.height, window.innerHeight);
+    const active = document.activeElement;
+    if (vvLooksShrunk && active instanceof HTMLElement && opensSoftwareKeyboard(active)) {
+      active.blur();
+    }
+    lastSetHeight = -1;
+    observedHeight = vv.height;
+    setHeight(currentAppHeight());
+    syncBand();
+    // A resume is a keyboard close the fold would otherwise never see: the
+    // comment above says iOS fires no resize here. Told after the height is
+    // written, so the bounce starts from the restored one, as `onResize`
+    // does.
+    //
+    // Which half depends on whether iOS left the height PINNED. A pinned one
+    // offers the fold no edge, so the stamp goes on this handler's word. A
+    // corrected one already carries the restored reading the fold wants.
+    // Handing it over is the only way that close is ever seen.
+    if (vvLooksShrunk) noteKeyboardClosed();
+    else noteWakeViewport({ height: vv.height, layoutViewport: window.innerHeight });
+  };
+  const onVisibilityChange = () => {
+    if (document.visibilityState === 'visible') onWake();
+  };
+  // The backstop for a close iOS announces to nobody. It stands in for the
+  // resize that never came, so it runs `onResize`'s own three steps in the
+  // same order.
+  //
+  // It lives HERE because those steps need the height owner. A poll parked
+  // elsewhere would bounce off the keyboard-shrunk --app-height and restore
+  // it. The shell would stay at half height, with the black band `onWake`
+  // documents above. This effect is mobile-only, so no desktop pays for it.
+  //
+  // Behind the perf gate (utils/perfQueue.ts), which owns every timer a
+  // diagnostic costs. Read live, so the toggle needs no reload. It goes with
+  // the dead-press probe (docs/temporary-measures.md), since ADR 0262 found
+  // the close it watches for was never the cause.
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  const stopPoll = () => {
+    if (pollTimer === null) return;
+    clearInterval(pollTimer);
+    pollTimer = null;
+  };
+  const pollViewport = () => {
+    if (document.visibilityState === 'hidden') return;
+    // The gate can drop with nothing announcing it, so an active tick reads
+    // it. Without this the interval outlives what armed it.
+    if (!perfRecordingOn()) { stopPoll(); return; }
+    // The change NOTHING else saw, which is the silent close this exists for.
+    // A handled one already moved `observedHeight`. Acting on it again would
+    // run `syncBand` with the keys down inside a live focus window, wiping
+    // the reserve `armBand` just made.
+    if (vv.height === observedHeight) return;
+    observedHeight = vv.height;
+    setHeight(currentAppHeight());
+    syncBand();
+    notePolledViewport({ height: vv.height, layoutViewport: window.innerHeight });
+  };
+  const startPoll = () => {
+    if (pollTimer === null) pollTimer = setInterval(pollViewport, KEYBOARD_POLL_MS);
+  };
+  const unsubscribeGate = onPerfEnabledChange((on) => (on ? startPoll() : stopPoll()));
+  if (perfRecordingOn()) startPoll();
+  vv.addEventListener('resize', onResize);
+  window.addEventListener('orientationchange', onLayoutViewportChange);
+  window.addEventListener('resize', onWindowResize);
+  document.addEventListener('visibilitychange', onVisibilityChange);
+  window.addEventListener('pageshow', onWake);
+  document.addEventListener('focusin', armBand, { passive: true });
+  document.addEventListener('focusout', onFocusOut, { passive: true });
+  setHeight(currentAppHeight());
+  syncBand();
+  return () => {
+    stopPoll();
+    unsubscribeGate();
+    vv.removeEventListener('resize', onResize);
+    window.removeEventListener('orientationchange', onLayoutViewportChange);
+    window.removeEventListener('resize', onWindowResize);
+    document.removeEventListener('visibilitychange', onVisibilityChange);
+    window.removeEventListener('pageshow', onWake);
+    document.removeEventListener('focusin', armBand);
+    document.removeEventListener('focusout', onFocusOut);
+    for (const el of Array.from(holds.keys())) releaseHold(el);
+    document.documentElement.style.removeProperty('--app-height');
+    document.documentElement.style.removeProperty('--keyboard-band');
+  };
+}
+
 /** Mobile-only swipeable container with three full-screen views.
  *
  *  Architecture: CSS transform (not scroll) — mobileView signal is the
@@ -624,263 +879,7 @@ export function MobileSwipeContainer() {
   }, []);
 
   // Track visual viewport for iOS keyboard handling (--app-height).
-  useEffect(() => {
-    const vv = window.visualViewport;
-    if (!vv) return;
-    // -1 sentinel ensures the initial setHeight() call writes the CSS variable
-    // instead of being short-circuited by the equality guard inside setHeight.
-    let lastSetHeight = -1;
-
-    // px, not rem: --app-height is a physical viewport measurement that must
-    // NOT scale with --user-ui-scale. Using rem caused the app shell to exceed
-    // the viewport when applyUiScale() changed the base font-size after mount.
-    const setHeight = (h: number) => {
-      if (h === lastSetHeight) return;
-      lastSetHeight = h;
-      document.documentElement.style.setProperty('--app-height', `${h}px`);
-    };
-
-    // One computation site so onResize, onOrientationChange, the initial
-    // write, and the wake-time recompute all use the same keyboard-aware
-    // decision. Routing onOrientationChange / initial through this fixes the
-    // case where the user has the keyboard up at rotation or component mount
-    // — writing innerHeight blindly would stamp the full layout viewport
-    // over the keyboard-shrunk visual viewport, occluding the prompt area
-    // behind the keyboard until the next vv.resize repaired it.
-    const currentAppHeight = () => computeAppHeight({
-      vvHeight: vv.height,
-      innerHeight: window.innerHeight,
-      activeElementOpensKeyboard: opensSoftwareKeyboard(document.activeElement),
-    });
-
-    const bandMemory = keyboardBandMemory();
-    const layoutViewport = () => ({ width: window.innerWidth, height: window.innerHeight });
-    let lastSetBand = -1;
-    // Each scroller's band hold (`heldBandPx`): the content height it anchors,
-    // and the scroll listener and mutation observer that re-measure it.
-    interface Hold { px: number; anchorContentPx: number; recheck: () => void; observer: MutationObserver }
-    const holds = new Map<HTMLElement, Hold>();
-    const releaseHold = (el: HTMLElement) => {
-      const hold = holds.get(el);
-      if (!hold) return;
-      el.removeEventListener('scroll', hold.recheck);
-      hold.observer.disconnect();
-      el.style.removeProperty('--keyboard-band-hold');
-      holds.delete(el);
-    };
-    const updateHold = (el: HTMLElement, bandPx: number) => {
-      const paddingPx = parseFloat(getComputedStyle(el).paddingBottom) || 0;
-      const hold = holds.get(el);
-      const px = heldBandPx({
-        paddingPx,
-        scrollTop: el.scrollTop,
-        scrollHeight: el.scrollHeight,
-        clientHeight: el.clientHeight,
-        bandPx,
-        heldPx: hold?.px,
-        anchorContentPx: hold?.anchorContentPx,
-      });
-      if (px === 0 || !el.isConnected) { releaseHold(el); return; }
-      if (hold?.px === px) return;
-      if (hold) hold.px = px;
-      else {
-        const recheck = () => updateHold(el, lastSetBand);
-        // Content that shrinks under the hold may move no scrollTop, so no
-        // scroll event says so. A mutation is the other way it shows up.
-        const observer = new MutationObserver(recheck);
-        observer.observe(el, { childList: true, subtree: true, characterData: true, attributes: true });
-        holds.set(el, { px, anchorContentPx: el.scrollHeight - paddingPx, recheck, observer });
-        el.addEventListener('scroll', recheck, { passive: true });
-      }
-      el.style.setProperty('--keyboard-band-hold', `${px}px`);
-    };
-    // A lower band checks every padded scroller; a higher one only needs to
-    // retire the holds it now covers. Both re-check the held ones, which is
-    // what retires a hold whose scroller has left the page.
-    const holdScrollAnchors = (px: number) => {
-      const scrollers = new Set(holds.keys());
-      if (px < lastSetBand) {
-        document.querySelectorAll<HTMLElement>('.mobile-swipe-pane .content-pane-body')
-          .forEach((el) => scrollers.add(el));
-      }
-      for (const el of scrollers) updateHold(el, px);
-    };
-    const setBand = (px: number) => {
-      if (px === lastSetBand) return;
-      holdScrollAnchors(px);
-      lastSetBand = px;
-      document.documentElement.style.setProperty('--keyboard-band', `${px}px`);
-    };
-    const syncBand = () => {
-      const band = keyboardBandPx({
-        vvHeight: vv.height,
-        innerHeight: window.innerHeight,
-        activeElementOpensKeyboard: opensSoftwareKeyboard(document.activeElement),
-      });
-      bandMemory.note(band, layoutViewport());
-      setBand(band);
-    };
-    /** Reserve the slack now, on the best figure available. */
-    const armBand = (e: FocusEvent) => {
-      if (!opensSoftwareKeyboard(e.target)) return;
-      setBand(bandMemory.reserve(layoutViewport()));
-    };
-
-    /** The last height ANY observer here acted on. See the poll below, whose
-     *  whole job is the change nothing else saw. */
-    let observedHeight = vv.height;
-
-    const onResize = () => {
-      observedHeight = vv.height;
-      // The keyboard opening or closing changes --app-height, which shortens or
-      // lengthens the transcript's viewport. The reader is left exactly where
-      // they are: the content above them has not moved, so the same scrollTop
-      // still shows them the same thing. (This used to re-pin a bottom reader
-      // to the new bottom; see scrollState's header for why nothing does that
-      // any more.)
-      setHeight(currentAppHeight());
-      syncBand();
-      // A keyboard close leaves WKWebView routing touches against the
-      // keyboard-up geometry, and the page cannot read that. Relayout frees it.
-      // Called last, so the bounce starts from the height just written.
-      noteViewportResize({ height: vv.height, layoutViewport: window.innerHeight });
-    };
-    const onOrientationChange = () => {
-      observedHeight = vv.height;
-      setHeight(currentAppHeight());
-      syncBand();
-    };
-    // The keyboard leaving is a focus change, and it may fire no resize at all
-    // when a hardware keyboard was in play. Recompute from live metrics so the
-    // slack cannot outlive the keys.
-    //
-    // A move between two fields is NOT that. The keys stay up, and dropping the
-    // padding for even one frame shortens the scroll range: a container near
-    // its end is clamped, and the content jumps by a keyboard's height. So the
-    // handoff is left alone, as `useHideOnScroll` leaves its own.
-    const onFocusOut = (e: FocusEvent) => {
-      if (opensSoftwareKeyboard(e.relatedTarget)) return;
-      syncBand();
-    };
-    // iOS PWA suspend/resume often dismisses the on-screen keyboard without
-    // firing a visualViewport `resize` event. Without a wake-time recompute,
-    // --app-height stays at the keyboard-shrunk value and .app-shell renders
-    // at half the viewport (visible black band below the prompt) until reload.
-    //
-    // Two things both go wrong on iOS PWA wake and BOTH need fixing — the
-    // prior fix only covered (1):
-    //
-    //   1. window.visualViewport.height is often pinned at the stale shrunk
-    //      value at wake time, so going through onResize() (which used to
-    //      trust vv.height) would re-stamp the small value. window.innerHeight
-    //      is the layout viewport — doesn't shrink for the iOS keyboard and
-    //      is reliably restored on resume — so use it as the truth on wake.
-    //
-    //   2. iOS preserves focus on the textarea across suspend even when the
-    //      on-screen keyboard is dismissed. Ghost-focused state then fools
-    //      computeAppHeight's keyboard check (viewportIsKeyboardShrunk
-    //      AND opensSoftwareKeyboard(activeElement) = both true) when a
-    //      delayed vv.resize finally fires — the helper returns vv.height
-    //      and onResize writes the stale shrunk value back into --app-height.
-    //      Explicit blur clears the ghost focus; the user re-taps to reopen
-    //      the keyboard naturally, matching the actual on-screen state.
-    //
-    // The blur is scoped to the case where vv.height appears shrunk relative
-    // to the layout viewport — that's the only scenario where keyboard-related
-    // ghost focus matters. Without the scope, a quick tab-switch return while
-    // a search modal or settings input is focused would dismiss its focus
-    // for no benefit (no keyboard-related state to clear). A viewport with no
-    // reading (iOS 27 reports 0) cannot rule a pinned one out, so it blurs too.
-    //
-    // Reset lastSetHeight so the CSS write happens even when innerHeight
-    // matches the cached value.
-    const onWake = () => {
-      const vvLooksShrunk =
-        !readableVisualViewport() || viewportIsKeyboardShrunk(vv.height, window.innerHeight);
-      const active = document.activeElement;
-      if (vvLooksShrunk && active instanceof HTMLElement && opensSoftwareKeyboard(active)) {
-        active.blur();
-      }
-      lastSetHeight = -1;
-      observedHeight = vv.height;
-      setHeight(currentAppHeight());
-      syncBand();
-      // A resume is a keyboard close the fold would otherwise never see: the
-      // comment above says iOS fires no resize here. Told after the height is
-      // written, so the bounce starts from the restored one, as `onResize`
-      // does.
-      //
-      // Which half depends on whether iOS left the height PINNED. A pinned one
-      // offers the fold no edge, so the stamp goes on this handler's word. A
-      // corrected one already carries the restored reading the fold wants.
-      // Handing it over is the only way that close is ever seen.
-      if (vvLooksShrunk) noteKeyboardClosed();
-      else noteWakeViewport({ height: vv.height, layoutViewport: window.innerHeight });
-    };
-    const onVisibilityChange = () => {
-      if (document.visibilityState === 'visible') onWake();
-    };
-    // The backstop for a close iOS announces to nobody. It stands in for the
-    // resize that never came, so it runs `onResize`'s own three steps in the
-    // same order.
-    //
-    // It lives HERE because those steps need the height owner. A poll parked
-    // elsewhere would bounce off the keyboard-shrunk --app-height and restore
-    // it. The shell would stay at half height, with the black band `onWake`
-    // documents above. This effect is mobile-only, so no desktop pays for it.
-    //
-    // Behind the perf gate (utils/perfQueue.ts), which owns every timer a
-    // diagnostic costs. Read live, so the toggle needs no reload. It goes with
-    // the dead-press probe (docs/temporary-measures.md), since ADR 0262 found
-    // the close it watches for was never the cause.
-    let pollTimer: ReturnType<typeof setInterval> | null = null;
-    const stopPoll = () => {
-      if (pollTimer === null) return;
-      clearInterval(pollTimer);
-      pollTimer = null;
-    };
-    const pollViewport = () => {
-      if (document.visibilityState === 'hidden') return;
-      // The gate can drop with nothing announcing it, so an active tick reads
-      // it. Without this the interval outlives what armed it.
-      if (!perfRecordingOn()) { stopPoll(); return; }
-      // The change NOTHING else saw, which is the silent close this exists for.
-      // A handled one already moved `observedHeight`. Acting on it again would
-      // run `syncBand` with the keys down inside a live focus window, wiping
-      // the reserve `armBand` just made.
-      if (vv.height === observedHeight) return;
-      observedHeight = vv.height;
-      setHeight(currentAppHeight());
-      syncBand();
-      notePolledViewport({ height: vv.height, layoutViewport: window.innerHeight });
-    };
-    const startPoll = () => {
-      if (pollTimer === null) pollTimer = setInterval(pollViewport, KEYBOARD_POLL_MS);
-    };
-    const unsubscribeGate = onPerfEnabledChange((on) => (on ? startPoll() : stopPoll()));
-    if (perfRecordingOn()) startPoll();
-    vv.addEventListener('resize', onResize);
-    window.addEventListener('orientationchange', onOrientationChange);
-    document.addEventListener('visibilitychange', onVisibilityChange);
-    window.addEventListener('pageshow', onWake);
-    document.addEventListener('focusin', armBand, { passive: true });
-    document.addEventListener('focusout', onFocusOut, { passive: true });
-    setHeight(currentAppHeight());
-    syncBand();
-    return () => {
-      stopPoll();
-      unsubscribeGate();
-      vv.removeEventListener('resize', onResize);
-      window.removeEventListener('orientationchange', onOrientationChange);
-      document.removeEventListener('visibilitychange', onVisibilityChange);
-      window.removeEventListener('pageshow', onWake);
-      document.removeEventListener('focusin', armBand);
-      document.removeEventListener('focusout', onFocusOut);
-      for (const el of Array.from(holds.keys())) releaseHold(el);
-      document.documentElement.style.removeProperty('--app-height');
-      document.documentElement.style.removeProperty('--keyboard-band');
-    };
-  }, []);
+  useEffect(trackAppHeight, []);
 
   return (
     <div class="mobile-swipe-wrapper">

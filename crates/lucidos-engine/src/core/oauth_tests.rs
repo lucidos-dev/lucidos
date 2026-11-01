@@ -1428,24 +1428,42 @@ fn active_flow(task: tokio::task::JoinHandle<()>, holds_port: bool) -> Option<Ac
     })
 }
 
+/// Holds a flow's listener and records the moment its sockets are closed.
+struct ListenerCloseProbe {
+    listener: Option<CallbackListener>,
+    closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for ListenerCloseProbe {
+    fn drop(&mut self) {
+        drop(self.listener.take());
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// The headline invariant: pressing *Grant access* a second time must always be
 /// able to start. It could not, for up to 120 seconds, because the previous
 /// flow's task was spawned detached and held the fixed port with nothing able to
 /// reclaim it.
 ///
-/// The rebind here is immediate and unretried on purpose. That is what makes the
-/// test fail if `release_callback_port` ever drops its `await` and only calls
-/// `abort()`: cancellation would then be in flight while the bind runs, and the
-/// socket would still be open often enough to matter.
+/// The sockets must be closed when the release returns, not merely due to close.
+/// This fails if `release_callback_port` drops its `await` and only calls
+/// `abort()`: this current-thread runtime never polls the cancellation first.
+/// The test watches the listener itself and never rebinds its port by number.
+/// Any process on the host may claim a freed ephemeral port.
 #[tokio::test]
-async fn releasing_the_callback_port_frees_it_for_an_immediate_rebind() {
-    let listener = CallbackListener::bind(0).await.unwrap();
-    let port = listener.local_addrs()[0].port();
+async fn releasing_the_callback_port_closes_it_before_returning() {
+    let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probe = ListenerCloseProbe {
+        listener: Some(CallbackListener::bind(0).await.unwrap()),
+        closed: closed.clone(),
+    };
 
     // Stand in for a flow parked on the port waiting out its 120s timeout.
     let mut slot = active_flow(
         tokio::spawn(async move {
-            let _held = listener;
+            let _held = probe;
             std::future::pending::<()>().await;
         }),
         true,
@@ -1459,10 +1477,10 @@ async fn releasing_the_callback_port_frees_it_for_an_immediate_rebind() {
         "a flow that was still waiting is superseded, and names its form request"
     );
     assert!(slot.is_none(), "the slot is emptied, not left dangling");
-
-    CallbackListener::bind(port)
-        .await
-        .expect("the port must be free the moment the release returns");
+    assert!(
+        closed.load(std::sync::atomic::Ordering::Acquire),
+        "the port must be free the moment the release returns"
+    );
 }
 
 /// A flow's task outlives its ownership of the socket: the listener is dropped

@@ -541,7 +541,7 @@
     text-transform: none;
 }
 
-/* ── Settings → Access → Add a device ──────────────────────────────────────
+/* ── Settings → Access → Pair a device ──────────────────────────────────────
    A live pairing code, as the three ways to use it: scan the QR, type the
    digits, open the address. The QR is the point of the section, so it is the
    big card and the two fallbacks stack beside it. Above them sit the countdown
@@ -551,7 +551,7 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-md);
-    /* The Connect URLs rows above sit at .list-row's --space-lg gutter. This
+    /* The list rows on this page sit at .list-row's --space-lg gutter. This
        block stands in for a row, so it keeps that edge rather than opening a
        second one halfway down the page. */
     padding: var(--space-sm) var(--space-lg);

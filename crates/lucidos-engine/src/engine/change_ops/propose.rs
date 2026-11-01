@@ -684,11 +684,13 @@ impl LucidosEngine {
         };
 
         let origin = MessageOrigin::engine(match hold {
+            // Handed-up or carried work is finished, and a plan-only branch
+            // awaits the user: nothing to send the agent back for.
+            ProposalHold::Plan(PlanHold::PlanOnlyAwaitingApproval)
+            | ProposalHold::IntegratedIntoParent
+            | ProposalHold::CarriedBySuccessor => return Ok(()),
             ProposalHold::Plan(_) => EngineReason::MissingPlan,
             ProposalHold::HardeningMissing => EngineReason::MissingHardening,
-            // Handed-up or carried work is finished: nothing to send the
-            // agent back for.
-            ProposalHold::IntegratedIntoParent | ProposalHold::CarriedBySuccessor => return Ok(()),
         });
         let text = hold.agent_nudge();
         let anchor = self

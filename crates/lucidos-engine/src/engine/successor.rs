@@ -155,11 +155,14 @@ fn latest_capture_started(thread: &str, predicate: &str) -> String {
     )
 }
 
+/// When the capture `e` began: its `created` less its `duration_ms`.
+pub(crate) const CAPTURE_STARTED: &str =
+    "e.created - make_interval(secs => COALESCE((e.payload->>'duration_ms')::float8, 0) / 1000)";
+
 /// [`latest_capture_started`] over every session of `thread`.
 fn latest_capture_started_in_any_session(thread: &str, predicate: &str) -> String {
     format!(
-        "(SELECT e.created \
-                 - make_interval(secs => COALESCE((e.payload->>'duration_ms')::float8, 0) / 1000) \
+        "(SELECT {CAPTURE_STARTED} \
             FROM events e \
            WHERE e.thread_id = {thread} AND {predicate} \
            ORDER BY e.sequence DESC LIMIT 1)"
@@ -171,22 +174,37 @@ pub(crate) fn last_turn_started_sql(thread: &str) -> String {
     latest_capture_started(thread, MAIN_SESSION_CAPTURE)
 }
 
-/// A SQL scalar: when the latest *real* request of `thread` began. That is a
-/// main-session turn request that no keep-alive anchor started. A resume
-/// beat's hidden turn does not count, and a copy beat is no turn capture. The
+/// A SQL predicate over the capture `e`: a *real* request, a main-session turn
+/// request that no keep-alive anchor started. A resume beat's hidden turn does
+/// not count, and a copy beat is no turn capture.
+fn real_request_sql() -> String {
+    format!(
+        "{MAIN_SESSION_CAPTURE} AND NOT EXISTS ( \
+           SELECT 1 FROM events a \
+            WHERE a.id = NULLIF(e.payload->>'request_event_id', '')::uuid \
+              AND a.event_type = 'PromptInjected' \
+              AND a.payload->'origin'->'reason'->>'kind' = '{}')",
+        crate::engine::thread_events::CACHE_KEEP_ALIVE_REASON_KIND
+    )
+}
+
+/// A SQL scalar: when the latest *real* request of `thread` began. The
 /// per-thread keep-alive switch holds until this moves (ADR 0554). It reads
 /// every session: a new session must not undo a request that re-armed it.
 pub(crate) fn last_real_request_started_sql(thread: &str) -> String {
-    latest_capture_started_in_any_session(
-        thread,
-        &format!(
-            "{MAIN_SESSION_CAPTURE} AND NOT EXISTS ( \
-               SELECT 1 FROM events a \
-                WHERE a.id::text = e.payload->>'request_event_id' \
-                  AND a.event_type = 'PromptInjected' \
-                  AND a.payload->'origin'->'reason'->>'kind' = '{}')",
-            crate::engine::thread_events::CACHE_KEEP_ALIVE_REASON_KIND
-        ),
+    latest_capture_started_in_any_session(thread, &real_request_sql())
+}
+
+/// A SQL scalar: when the first *real* request of `thread` after the event
+/// at `sequence` began, in any session. NULL until one has. A card's wait
+/// ends there, since that request reads the cache.
+pub(crate) fn first_real_request_started_after_sql(thread: &str, sequence: &str) -> String {
+    format!(
+        "(SELECT {CAPTURE_STARTED} \
+            FROM events e \
+           WHERE e.thread_id = {thread} AND e.sequence > {sequence} AND {} \
+           ORDER BY e.sequence LIMIT 1)",
+        real_request_sql()
     )
 }
 
@@ -481,6 +499,40 @@ pub(crate) fn pending_handoff_sql(thread: &str) -> String {
                     AND NOT EXISTS (SELECT 1 FROM events handoff_end \
                           WHERE handoff_end.thread_id = {thread} \
                             AND {}))",
+        ends_handoff_sql("handoff_end", "pending_handoff")
+    )
+}
+
+/// `SessionHandedOff` and every type `ends_handoff_sql` matches. The partial
+/// index `idx_events_handoff_lifecycle` lists the same types, so the planner
+/// can answer `pending_handoff_threads_sql` from it.
+const HANDOFF_LIFECYCLE_EVENT_TYPES: [&str; 4] = [
+    "SessionHandedOff",
+    "SessionStarted",
+    "ResponseCanceled",
+    "ResponseFailed",
+];
+
+/// A SQL query: the `thread_id` of every thread with a pending handoff, the
+/// set `pending_handoff_sql` tests one thread against. It costs one index
+/// probe per `SessionHandedOff`, whatever the thread count. The `LIMIT 1`
+/// keeps the planner from turning the end probe into a scan of every end event.
+/// It never yields NULL, so a caller may test membership with `NOT IN`.
+pub(crate) fn pending_handoff_threads_sql() -> String {
+    let lifecycle = HANDOFF_LIFECYCLE_EVENT_TYPES
+        .iter()
+        .map(|event_type| format!("'{event_type}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT pending_handoff.thread_id FROM events pending_handoff \
+           LEFT JOIN LATERAL (SELECT 1 AS ended FROM events handoff_end \
+                 WHERE handoff_end.thread_id = pending_handoff.thread_id \
+                   AND handoff_end.event_type IN ({lifecycle}) \
+                   AND {} LIMIT 1) handoff_ended ON TRUE \
+          WHERE pending_handoff.event_type = 'SessionHandedOff' \
+            AND pending_handoff.thread_id IS NOT NULL \
+            AND handoff_ended.ended IS NULL",
         ends_handoff_sql("handoff_end", "pending_handoff")
     )
 }

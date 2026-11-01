@@ -6,8 +6,8 @@
  * Share API requires transient user activation, and activation survives neither
  * a `postMessage` hop nor an `await`, so a host-side share (or one behind a
  * preference fetch) would be refused on every single app link while chat links
- * kept working. Everything else routes to the host, which owns the one external
- * -link choke point.
+ * kept working. A plain browser tab opens from the frame for the same reason.
+ * Everything else routes to the host.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
@@ -17,6 +17,7 @@ const navigate = vi.hoisted(
 );
 
 const { ui } = await import('./ui');
+const { adoptHostExternalLinks, SAFARI_SCHEME_PREFIX } = await import('./externalLinks');
 
 const TARGET = 'https://example.com/docs';
 
@@ -232,6 +233,248 @@ describe('ui.openExternal', () => {
     await ui.openExternal(TARGET);
 
     expect(share).not.toHaveBeenCalled();
+    expect(navigate).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * The host said this frame may open web pages itself. WebKit gives a tab only
+ * to a `window.open` made inside the tap. So the open must run before the
+ * handler returns, and the host route must not be asked as well.
+ */
+describe('ui.openExternal: the frame opens the tab itself', () => {
+  /** A `window` whose `open` hands back `opened`, or null when blocked. */
+  function stubWindowOpen(opened: { closed: boolean; opener: unknown } | null) {
+    const open = vi.fn((_url: string, _target: string) => opened);
+    vi.stubGlobal('window', { open });
+    return open;
+  }
+
+  beforeEach(() => {
+    navigate.mockClear();
+    stubDesktopBrowser();
+  });
+
+  afterEach(() => {
+    adoptHostExternalLinks(null);
+    vi.unstubAllGlobals();
+  });
+
+  it('opens synchronously in the tap and posts no navigate', async () => {
+    adoptHostExternalLinks({ frameOpens: 'tab' });
+    const opened = { closed: false, opener: {} as unknown };
+    const open = stubWindowOpen(opened);
+
+    const done = ui.openExternal(TARGET);
+    // No await before this: the open must happen inside the click task.
+    expect(open).toHaveBeenCalledWith(TARGET, '_blank');
+    await done;
+
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it('severs opener so the page cannot reach back into the app', async () => {
+    adoptHostExternalLinks({ frameOpens: 'tab' });
+    const opened = { closed: false, opener: {} as unknown };
+    stubWindowOpen(opened);
+
+    await ui.openExternal(TARGET);
+
+    expect(opened.opener).toBeNull();
+  });
+
+  it('counts the tab as opened when the popup refuses an opener write', async () => {
+    adoptHostExternalLinks({ frameOpens: 'tab' });
+    const opened = {
+      closed: false,
+      get opener(): unknown {
+        return {};
+      },
+      set opener(_value: unknown) {
+        throw new DOMException('cross-origin', 'SecurityError');
+      },
+    };
+    stubWindowOpen(opened);
+
+    await expect(ui.openExternal(TARGET)).resolves.toBeUndefined();
+
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['null', null],
+    ['an already closed window', { closed: true, opener: null }],
+  ])('falls back to the host route when the open returns %s', async (_label, opened) => {
+    adoptHostExternalLinks({ frameOpens: 'tab' });
+    stubWindowOpen(opened);
+
+    await ui.openExternal(TARGET);
+
+    expect(navigate).toHaveBeenCalledWith('/ui/navigate', {
+      target: 'url',
+      params: { url: TARGET },
+    });
+  });
+
+  it.each(['mailto:someone@example.com', 'javascript:alert(1)', 'tel:+4700000000'])(
+    'never opens %s from the frame',
+    async (url) => {
+      adoptHostExternalLinks({ frameOpens: 'tab' });
+      const open = stubWindowOpen({ closed: false, opener: null });
+
+      await ui.openExternal(url);
+
+      expect(open).not.toHaveBeenCalled();
+      expect(navigate).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([
+    ['no push at all', undefined],
+    ['a host answer', { frameOpens: 'host' }],
+    ['a malformed answer', { frameOpens: 'yes' }],
+    ['the retired boolean answer', { opensInFrame: true }],
+  ])('keeps the host route after %s', async (_label, push) => {
+    if (push !== undefined) adoptHostExternalLinks(push);
+    const open = stubWindowOpen({ closed: false, opener: null });
+
+    await ui.openExternal(TARGET);
+
+    expect(open).not.toHaveBeenCalled();
+    expect(navigate).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * In an installed iOS PWA set to Safari, the host asks the frame to hand web
+ * pages to the Safari app itself. The hand-off is a `window.open` of the
+ * `x-safari-` URL, which iOS only honours inside the tap.
+ */
+describe('ui.openExternal: the frame hands off to Safari itself', () => {
+  function stubWindowOpen(opened: { closed: boolean; opener: unknown } | null) {
+    const open = vi.fn((_url: string, _target: string) => opened);
+    const postMessage = vi.fn();
+    vi.stubGlobal('window', { open, location: { origin: 'http://localhost' }, parent: { postMessage } });
+    return { open, postMessage };
+  }
+
+  beforeEach(() => {
+    navigate.mockClear();
+    stubIOSPwa();
+    adoptHostExternalLinks({ frameOpens: 'safari' });
+  });
+
+  afterEach(() => {
+    adoptHostExternalLinks(null);
+    vi.unstubAllGlobals();
+  });
+
+  it('opens x-safari-<url> synchronously in the tap and posts no navigate', async () => {
+    const { open, postMessage } = stubWindowOpen({ closed: false, opener: {} });
+
+    const done = ui.openExternal(TARGET);
+    expect(open).toHaveBeenCalledWith(`${SAFARI_SCHEME_PREFIX}${TARGET}`, '_blank');
+    await done;
+
+    expect(navigate).not.toHaveBeenCalled();
+    expect(postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        op: 'log.app-link',
+        args: expect.objectContaining({ step: 'frame-opened', href: TARGET, opens: 'safari' }),
+      }),
+      expect.anything(),
+    );
+  });
+
+  it('falls back to the host route and traces it when the open returns null', async () => {
+    const { postMessage } = stubWindowOpen(null);
+
+    await ui.openExternal(TARGET);
+
+    expect(navigate).toHaveBeenCalledWith('/ui/navigate', { target: 'url', params: { url: TARGET } });
+    expect(postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        op: 'log.app-link',
+        args: expect.objectContaining({ step: 'frame-open-blocked', href: TARGET, opens: 'safari' }),
+      }),
+      expect.anything(),
+    );
+  });
+
+  it('never prefixes a mailto: link', async () => {
+    const { open } = stubWindowOpen({ closed: false, opener: null });
+
+    await ui.openExternal('mailto:someone@example.com');
+
+    expect(open).not.toHaveBeenCalled();
+    expect(navigate).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * An app opened as its own tab has no host to push an answer. In a plain
+ * browser it opens the page itself, inside the tap, as a framed app does.
+ */
+describe('ui.openExternal: a top-level app page opens the tab itself', () => {
+  /** A top-level `window` (its own parent) whose `open` hands back `opened`. */
+  function stubTopLevelWindow(
+    opened: { closed: boolean; opener: unknown } | null,
+    extra: Record<string, unknown> = {},
+  ) {
+    const open = vi.fn((_url: string, _target: string) => opened);
+    const win: Record<string, unknown> = { open, ...extra };
+    win.parent = win;
+    vi.stubGlobal('window', win);
+    return open;
+  }
+
+  beforeEach(() => {
+    navigate.mockClear();
+    stubDesktopBrowser();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('opens synchronously in the tap with no host answer', async () => {
+    const open = stubTopLevelWindow({ closed: false, opener: {} });
+
+    const done = ui.openExternal(TARGET);
+    expect(open).toHaveBeenCalledWith(TARGET, '_blank');
+    await done;
+
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the host route when the open is blocked', async () => {
+    stubTopLevelWindow(null);
+
+    await ui.openExternal(TARGET);
+
+    expect(navigate).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the host route in an installed iOS PWA', async () => {
+    stubIOSPwa();
+    const open = stubTopLevelWindow({ closed: false, opener: null }, {
+      matchMedia: () => ({ matches: true }),
+    });
+
+    await ui.openExternal(TARGET);
+
+    expect(open).not.toHaveBeenCalled();
+    expect(navigate).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the host route in the desktop app', async () => {
+    const open = stubTopLevelWindow({ closed: false, opener: null }, {
+      __TAURI_INTERNALS__: {},
+    });
+
+    await ui.openExternal(TARGET);
+
+    expect(open).not.toHaveBeenCalled();
     expect(navigate).toHaveBeenCalledTimes(1);
   });
 });

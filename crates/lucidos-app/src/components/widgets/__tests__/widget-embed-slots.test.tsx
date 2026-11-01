@@ -17,7 +17,7 @@ vi.mock('../../../hooks/useOnScreenInTranscript', () => ({
 }));
 
 const { renderMarkdown, renderMarkdownInline } = await import('../../../utils/renderMarkdown');
-const { COPY_ID_NONCE, WIDGET_EMBED_SLOT_ATTR } = await import('../../../utils/markedConfig');
+const { COPY_ID_NONCE, WIDGET_EMBED_SLOT_ATTR } = await import('../../../utils/markdownMarkers');
 const { ReplyHtml } = await import('../useWidgetEmbedSlots');
 const { appsById: widgetApps } = await import('../../../store/appsById');
 const { WIDGET_UNAVAILABLE_TEXT } = await import('../InlineWidget');

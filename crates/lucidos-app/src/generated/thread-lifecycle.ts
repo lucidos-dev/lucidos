@@ -135,6 +135,7 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   CacheKeepAliveStatusChanged: 'metadata',
   CacheKeepAliveTurnedOff: 'metadata',
   CacheKeepAliveTurnedOn: 'metadata',
+  WakeExpected: 'metadata',
   VoiceSessionStarted: 'metadata',
   VoiceSessionEnded: 'metadata',
   SpokenReplyGenerated: 'metadata',

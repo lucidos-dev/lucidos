@@ -417,8 +417,9 @@ async fn switch_estimate_warns_only_when_the_switch_rewrites_a_warm_cache() {
     assert_eq!(unknown.status().as_u16(), 404);
 }
 
-/// The cache-warmth read counts down a fresh cache write. A thread with no
-/// main-session call is cold, and a write that reported no lifetime unknown.
+/// The cache-warmth read counts down a fresh cache write, and names the TTL
+/// evidence. A thread with no main-session call is cold, and a write that
+/// reported no lifetime unknown.
 #[tokio::test]
 async fn cache_warmth_counts_down_a_fresh_cache_write() {
     let _mode = KEEP_ALIVE_MODE.lock().await;
@@ -488,6 +489,11 @@ async fn cache_warmth_counts_down_a_fresh_cache_write() {
         "a fresh 5-minute write: {left}"
     );
     assert_eq!(
+        fresh_body["ttl"],
+        json!({"lifetime": "5m", "evidence": "reported"}),
+        "a warm cache names the lifetime it was measured on, and what says so"
+    );
+    assert_eq!(
         fresh_body["keep_alive"],
         json!({"state": "not_kept", "reason": "off"}),
         "the keep-alive is off by default"
@@ -496,6 +502,10 @@ async fn cache_warmth_counts_down_a_fresh_cache_write() {
     assert!(cold["remaining_secs"].is_null(), "no call, no warmth");
     assert_eq!(lifetime_unknown["warmth"], "unknown");
     assert!(lifetime_unknown["remaining_secs"].is_null());
+    assert!(
+        lifetime_unknown["ttl"].is_null(),
+        "no evidence, no lifetime"
+    );
     assert_eq!(
         lifetime_unknown["keep_alive"],
         json!({"state": "not_kept", "reason": "off"}),
@@ -516,7 +526,7 @@ async fn cache_warmth_counts_down_a_fresh_cache_write() {
 async fn the_keep_alive_switch_is_recorded_under_the_device() {
     let _mode = KEEP_ALIVE_MODE.lock().await;
     let client = user_client().await;
-    set_keep_alive_mode(&client, Some("break-even")).await;
+    set_keep_alive_mode(&client, Some("on")).await;
     let pool = connect().await;
     let thread_id = Uuid::new_v4();
     seed_cc_thread_summary(&pool, thread_id, "waiting_for_user_answer").await;

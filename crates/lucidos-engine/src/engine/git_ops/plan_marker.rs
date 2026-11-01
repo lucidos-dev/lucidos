@@ -522,8 +522,9 @@ pub(crate) struct ApprovedPlan {
 }
 
 /// Delete the plan record once its change applied, alongside
-/// `consume_harden_marker`. A `proposed` marker stays: a plan-only Apply landed
-/// the plan before approval, and `approve_plan` still has to find it.
+/// `consume_harden_marker`. A `proposed` marker stays: a plan recorded while
+/// the Apply ran belongs to the next round, and `approve_plan` still has to
+/// find it.
 pub(crate) async fn consume_plan_marker(pool: &sqlx::PgPool, repo_root: &Path, branch_name: &str) {
     if let Err(e) = sqlx::query(
         "DELETE FROM planned_branches WHERE repo_root = $1 AND branch_name = $2 \

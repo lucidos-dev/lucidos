@@ -23,6 +23,8 @@ mod agent_surface;
 mod background_task;
 mod dispatcher;
 pub(crate) mod keep_alive;
+mod pending_wake;
+mod ping_plan;
 mod register;
 mod remembered_requests;
 mod wait_durations;
@@ -30,6 +32,13 @@ mod wait_durations;
 pub(crate) use agent_surface::CancelEventWaitOutcome;
 pub(crate) use background_task::StoppedTask;
 pub(crate) use keep_alive::KeepAliveBeats;
+/// Re-exported so the expected wake decision's tests can build a pending wake.
+#[cfg(test)]
+pub(crate) use keep_alive::WaitAgent;
+pub(crate) use pending_wake::PendingWake;
+#[cfg(test)]
+pub(crate) use pending_wake::{MissedEstimate, PendingChild, PendingWait};
+pub(crate) use ping_plan::ReEstimates;
 /// Re-exported so the knowhow pins in `engine::value_pins_tests` can read it.
 #[cfg(test)]
 pub(crate) use register::MAX_LIVE_WAITS_PER_THREAD;

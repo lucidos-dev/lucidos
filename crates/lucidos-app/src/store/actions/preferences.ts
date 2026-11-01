@@ -1546,9 +1546,11 @@ export function setCaptureContext(enabled: boolean): Promise<void> {
 
 // --- Cache cards ---
 
-/** Whether the transcript draws the Cache kept warm card and the cache-warm line. */
+/** Whether the transcript draws the Cache kept warm card and the cache-warm
+ *  line. A sub-setting of the keep-alive, so the cards never draw while it is
+ *  off. */
 export function currentCacheCards(): boolean {
-  return currentPreference('cache_cards') === 'true';
+  return currentCacheKeepAliveOn() && currentPreference('cache_cards') === 'true';
 }
 
 export function setCacheCards(enabled: boolean): Promise<void> {
@@ -1643,7 +1645,8 @@ export type BackgroundModelKey =
   | 'model_summary_compaction'
   | 'model_command_judge'
   | 'model_read_decision'
-  | 'model_wake_decision';
+  | 'model_wake_decision'
+  | 'model_expected_wake_decision';
 
 /** The reasoning half of each background *model selection*. */
 export type BackgroundReasoningKey =
@@ -1656,7 +1659,8 @@ export type BackgroundReasoningKey =
   | 'reasoning_summary_compaction'
   | 'reasoning_command_judge'
   | 'reasoning_read_decision'
-  | 'reasoning_wake_decision';
+  | 'reasoning_wake_decision'
+  | 'reasoning_expected_wake_decision';
 
 /** A background row's stored *model selection*, each half `null` while unset.
  *  The engine resolves an unset half, inheritance and the configured providers
@@ -1743,17 +1747,13 @@ export function setCodingAgentPermissionMode(mode: CcPermissionMode): Promise<vo
   return savePreference('coding_agent_claude_permission_mode', mode);
 }
 
-/** When the cache keep-alive gives up on a waiting Claude Code session. */
-export const CACHE_KEEP_ALIVE_MODES = PREFERENCE_CATALOG.cache_keep_alive_mode.values;
-export type CacheKeepAliveMode = PreferenceValues<'cache_keep_alive_mode'>;
-
-/** Workspace-scoped. */
-export function currentCacheKeepAliveMode(): CacheKeepAliveMode {
-  return currentPreference('cache_keep_alive_mode');
+/** Whether the cache keep-alive pings a waiting thread. Workspace-scoped. */
+export function currentCacheKeepAliveOn(): boolean {
+  return currentPreference('cache_keep_alive_mode') === 'on';
 }
 
-export function setCacheKeepAliveMode(mode: CacheKeepAliveMode): Promise<void> {
-  return savePreference('cache_keep_alive_mode', mode);
+export function setCacheKeepAliveOn(on: boolean): Promise<void> {
+  return savePreference('cache_keep_alive_mode', on ? 'on' : 'off');
 }
 
 // --- New-workspace welcome + starter suggestions ---

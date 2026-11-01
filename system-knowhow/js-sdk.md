@@ -142,7 +142,7 @@ What your frame does not get, and why:
   app that needs either must run in its own tab.
 - **The OS share sheet** (a browser limit). `navigator.share` is refused, and
   iOS refuses the delegation anyway. Call `lucidos.ui.openExternal(url)`, which
-  opens the link through the host.
+  opens the link in a new tab, or through the host where the host must choose.
 
 Popups and OAuth are untouched. In its own browser tab an app is a top-level
 document, not a frame, so it keeps every direct path.
@@ -2327,19 +2327,26 @@ document.querySelector('#docs-btn').addEventListener('click', () => {
 
 Two rules:
 
-- **Call it synchronously from the click handler.** When the user has chosen the
-  "Ask" external-link target, a standalone tab can open the OS share sheet.
-  That requires a live user gesture. An isolated iframe cannot share and uses
-  host navigation instead. Do async work first, then open from a later interaction.
+- **Call it synchronously from the click handler.** WebKit gives a tab, or the
+  hand-off to the Safari app, only to an open made inside the tap. A plain
+  browser tab opens the page itself, framed or not, or the share sheet in "Ask"
+  mode. In an installed iOS PWA set to `safari`, a framed app opens
+  `x-safari-<url>` itself, the same way. The desktop app, and an installed iOS
+  PWA in `ask` mode, open through the host instead. So do async work first,
+  then open from a later interaction.
 - **Don't fall back to `window.open`.** Inside an installed iOS PWA `window.open`
   cannot leave the app: WebKit renders an in-app web view with no address bar,
   no tabs and no shared Safari session. The user's `external_link_target`
   preference (`safari` / `ask` / `in-app`, default `safari`) controls that
   overlay, so a fallback overrides their choice.
 
-Non-http(s) URLs (`mailto:`, `tel:`) go to the platform unchanged. The promise
-resolves once the open is dispatched. A user dismissing the share sheet resolves
-normally rather than rejecting.
+Non-http(s) URLs (`mailto:`, `tel:`) go to the platform unchanged. If the
+browser blocks the frame's own open, the host opens it or shows a toast whose
+Open button retries. Every link tap in an app frame also writes
+`[Client/app-link]` lines to the engine log: the touch, the route and the
+outcome. Look there when a link does nothing. The promise resolves once the
+open is dispatched. A user dismissing the share sheet resolves normally rather
+than rejecting.
 
 ### Starting a fresh chat with a prefilled prompt
 

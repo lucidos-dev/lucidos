@@ -8,8 +8,9 @@ header or code comment holds. The rule is `.claude/rules/dev-runtime.md`.
 The gateway reverse-proxies `/<slug>/` as a pure streaming forward. It strips
 the slug, adds `X-Forwarded-Prefix: /<slug>/` and rewrites no body. The
 reserved sigil namespace `/~/` holds the picker, the control API and health.
-`/` redirects into the sole workspace, or serves the picker when there are
-several.
+`/` redirects a credentialed caller into the sole workspace. It serves the
+picker when there are several, and to a caller with no credential, so a
+stranger never learns a slug from it.
 
 The picker lists every workspace ever launched. A stopped workspace stays
 listed and lazy-starts on a proxy hit or an explicit open. The gateway

@@ -1392,6 +1392,45 @@ async fn forward_request_does_not_auto_follow_30x() {
     );
 }
 
+/// A `Location` can carry a credential in its query string, so a refusal
+/// to follow one must not echo it back to the caller.
+#[tokio::test]
+async fn a_refused_redirect_does_not_echo_the_location() {
+    for location in [
+        "http://[::1?token=redirect-secret",
+        "data:text/plain?token=redirect-secret",
+    ] {
+        let base = spawn_redirecting_upstream(302, location).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = unreachable_pool();
+        let bus = crate::test_support::offline_event_bus();
+        let ctx = offline_scope_ctx(tmp.path(), &pool, &bus);
+        let scoped = ScopedPipeline::bind(&ctx, "comfort", base, Vec::new(), false)
+            .await
+            .expect("a loopback upstream binds");
+
+        let err = forward_with_redirects(
+            "comfort",
+            &scoped,
+            &CallBudget::start(test_timeout()),
+            &Method::GET,
+            "start",
+            None,
+            &HeaderMap::new(),
+            &Bytes::new(),
+        )
+        .await
+        .expect_err("a Location with no usable host must be refused");
+
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY, "{location}");
+        assert!(
+            !err.1.contains("redirect-secret"),
+            "the 502 body echoed the Location: {}",
+            err.1
+        );
+    }
+}
+
 // ---- Response header policy --------------------------------------------
 
 /// Spawn an upstream that answers once with `headers` on a `200`.
@@ -3825,8 +3864,8 @@ async fn a_reply_without_the_credential_passes_byte_identical() {
     assert_eq!(&body[..], b"plain upstream body");
 }
 
-/// A refused redirect quotes its `Location` back to the caller. A `Location`
-/// carrying the injected credential must not take it along.
+/// A refused redirect names the proxy only, never its `Location`. A
+/// `Location` carrying the injected credential must not reach the caller.
 #[tokio::test]
 async fn a_refused_redirect_does_not_quote_the_injected_credential() {
     let location = format!("data:text/plain,{ECHOED_TOKEN}");
@@ -3838,7 +3877,7 @@ async fn a_refused_redirect_does_not_quote_the_injected_credential() {
         .expect_err("a Location with no host is refused");
 
     assert_eq!(err.0, StatusCode::BAD_GATEWAY);
-    assert!(err.1.contains("data:text/plain,"), "{}", err.1);
+    assert!(!err.1.contains("data:text/plain,"), "{}", err.1);
     assert_carries_no_injected_credential("the refusal", &err.1);
 }
 

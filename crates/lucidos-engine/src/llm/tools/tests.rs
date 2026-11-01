@@ -1470,6 +1470,7 @@ const FROZEN_WIRE_ORDER: &[&str] = &[
     "view_image",
     "generate_image",
     "request_read",
+    "expect_wake",
 ];
 
 /// The whole engine-authored array, in the order `chat::process::run` splices

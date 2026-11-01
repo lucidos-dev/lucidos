@@ -25,7 +25,7 @@ let inertBody: HTMLElement | null | undefined;
 
 /** A fresh inert body, or `null` where this environment has none.
  *
- *  Exported because `utils/renderMarkdown.ts` needs the same probe. It does
+ *  Exported because `utils/markdownEngine.ts` needs the same probe. It does
  *  NOT share this module's body: each caller memoizes its own, so neither can
  *  read markup the other left behind. */
 export function makeInertBody(): HTMLElement | null {

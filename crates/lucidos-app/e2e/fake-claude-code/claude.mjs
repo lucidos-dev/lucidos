@@ -2,7 +2,7 @@
 // A fake Claude Code CLI for e2e runs on GitHub runners, which have no
 // logged-in Claude Code. It speaks the stream-json lines the engine parses
 // (runtime/claude_code_parse.rs) and answers `Say exactly: "X"` with X.
-// `claude auth status` answers as a first-party login.
+// `claude --version` answers with FAKE_VERSION.
 // `Fail to start: "X"` makes the first turn die the way a CLI that cannot reach
 // its gateway does: X on stderr, exit code 1, and no `system/init` line.
 // `Name your session's branch` answers with the branch the message's session
@@ -25,7 +25,7 @@ import { realpathSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 
-export const FAKE_VERSION = '0.0.0-fake';
+export const FAKE_VERSION = '2.1.311';
 export const NO_RULE_REPLY = 'fake-claude-code: no rule for this prompt';
 export const NO_SESSION_CONTEXT_REPLY = 'fake-claude-code: no session context';
 export const NO_EFFORT = 'none';
@@ -43,10 +43,6 @@ export const MODELS = [
   { value: 'opus', resolvedModel: 'claude-opus-5-5', displayName: 'Opus 5.5', description: 'Opus 5.5', supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },
   { value: 'haiku', resolvedModel: 'claude-haiku-4-5', displayName: 'Haiku 4.5', description: 'Haiku 4.5' },
 ];
-
-// What `claude auth status` prints. The engine reads `apiProvider` at spawn to
-// learn whether the agent's progress notes reach the user.
-export const AUTH_STATUS = { loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty' };
 
 const SLASH_COMMANDS = ['compact', 'context', 'cost', 'init', 'review'];
 
@@ -182,10 +178,6 @@ export function createSession(argv, cwd, turnMs = DEFAULT_TURN_MS, effort = NO_E
 function main(argv) {
   if (argv.includes('--version')) {
     process.stdout.write(`${FAKE_VERSION} (Claude Code)\n`);
-    return;
-  }
-  if (argv[0] === 'auth' && argv[1] === 'status') {
-    process.stdout.write(`${JSON.stringify(AUTH_STATUS)}\n`);
     return;
   }
   const turnMs = Number(process.env.FAKE_CLAUDE_CODE_TURN_MS ?? DEFAULT_TURN_MS);
