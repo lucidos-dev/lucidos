@@ -3176,3 +3176,81 @@ async fn the_catch_up_scan_pages_past_non_matching_rows_and_terminates() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+#[tokio::test]
+async fn restore_floor_prevents_archived_waits_rearming_on_every_boot() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let old = emit_subscribe(&bus, Uuid::new_v4(), vec![sub("ChangeProposed", None)]).await;
+    sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, $2, now(), MAX(sequence) FROM events")
+        .bind(Uuid::new_v4())
+        .bind(crate::core::snapshot::handle::Handle::generate().as_str())
+        .execute(&pool).await.unwrap();
+    let new = emit_subscribe(&bus, Uuid::new_v4(), vec![sub("ChangeProposed", None)]).await;
+    for _ in 0..2 {
+        let waits = LiveWaits::new();
+        assert_eq!(rebuild_live_waits(&pool, &waits).await.unwrap(), 1);
+        assert!(waits.take(old).await.is_none());
+        assert!(waits.take(new).await.is_some());
+    }
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn restore_floor_excludes_old_resolution_reentries_but_keeps_new_ones() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let old = Uuid::new_v4();
+    subscribe_and_resolve_without_waking(&bus, &pool, old).await;
+    assert_eq!(lost_wait_reentries(&pool).await.unwrap().len(), 1);
+    sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, $2, now(), MAX(sequence) FROM events")
+        .bind(Uuid::new_v4())
+        .bind(crate::core::snapshot::handle::Handle::generate().as_str())
+        .execute(&pool).await.unwrap();
+    let new = Uuid::new_v4();
+    subscribe_and_resolve_without_waking(&bus, &pool, new).await;
+    for _ in 0..2 {
+        let lost = lost_wait_reentries(&pool).await.unwrap();
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].thread_id, new);
+    }
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// A subscription armed in the restored snapshot never loads into the live
+/// cache, so the restore settle has to end it. Otherwise its thread shows a
+/// wait nobody can stop (ADR 0612 decision 8).
+#[tokio::test]
+async fn restore_settle_cancels_archived_waits_once_and_keeps_new_ones() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    let old = emit_subscribe(&bus, thread, vec![sub("ChangeProposed", None)]).await;
+    settle_restored_waits(&pool, &bus).await.unwrap();
+    let canceled = || async {
+        sqlx::query_scalar::<_, String>(
+            "SELECT payload->>'wait_id' FROM events WHERE event_type = 'EventWaitCanceled' \
+             AND payload->>'cause' = 'snapshot_restored'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+    };
+    assert!(canceled().await.is_empty(), "a normal boot cancels nothing");
+    sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, $2, now(), MAX(sequence) FROM events")
+        .bind(Uuid::new_v4())
+        .bind(crate::core::snapshot::handle::Handle::generate().as_str())
+        .execute(&pool).await.unwrap();
+    let new = emit_subscribe(&bus, thread, vec![sub("ChangeProposed", None)]).await;
+    for _ in 0..2 {
+        settle_restored_waits(&pool, &bus).await.unwrap();
+        assert_eq!(canceled().await, [old.to_string()]);
+    }
+    let waits = LiveWaits::new();
+    assert_eq!(rebuild_live_waits(&pool, &waits).await.unwrap(), 1);
+    assert!(waits.take(new).await.is_some());
+    pool.close().await;
+    teardown_test_db(&db).await;
+}

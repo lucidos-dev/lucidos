@@ -29,6 +29,7 @@
 import { useEffect, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import {
+  isPairingSecret,
   PAIRING_CODE_DIGITS,
   takePairingCodeFromUrl,
   takeUnspentPairingCodeFromUrl,
@@ -462,7 +463,8 @@ function PairingForm({ onPaired, notice }: { onPaired: () => void; notice?: stri
   const [scanned] = useState(() => takeUnspentPairingCodeFromUrl());
   // Read once: an installed app cannot stop being one mid-screen.
   const [onPhoneSource] = useState(() => onPhoneCodeSource(isStandalone()));
-  const [code, setCode] = useState(scanned ?? '');
+  // A launch secret is redeemed, never shown: it fits no digit box.
+  const [code, setCode] = useState(scanned && !isPairingSecret(scanned) ? scanned : '');
   // Suggested, not demanded: the browser knows what it is, so offer that and
   // let the user overwrite it. Empty when the browser is unrecognised, which
   // leaves the gateway's own naming in charge.
@@ -505,7 +507,7 @@ function PairingForm({ onPaired, notice }: { onPaired: () => void; notice?: stri
       return;
     }
     setError(null);
-    setCode(pasted);
+    adopt(pasted);
   };
 
   /** Answers whether the code was accepted, so a caller can uncover the form. */
@@ -526,6 +528,14 @@ function PairingForm({ onPaired, notice }: { onPaired: () => void; notice?: stri
     } finally {
       setBusy(false);
     }
+  };
+
+  // A long secret fits no digit box and is not something a person checks by
+  // eye, so it goes straight to the gateway. A short code fills the boxes and
+  // waits for Pair, because the user is looking at the field.
+  const adopt = (token: string) => {
+    if (isPairingSecret(token)) void redeem(token);
+    else setCode(token);
   };
 
   const submit = (e: Event) => {
@@ -587,9 +597,9 @@ function PairingForm({ onPaired, notice }: { onPaired: () => void; notice?: stri
           </p>
           <PairingScanner
             onCode={(scannedCode) => {
-              setCode(scannedCode);
               setError(null);
               setScanning(false);
+              adopt(scannedCode);
             }}
           />
           <button class="pairing-secondary" type="button" onClick={() => setScanning(false)}>

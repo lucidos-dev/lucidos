@@ -14,8 +14,8 @@ Three things let the total grow:
 
 - Each target carried full debuginfo for every crate.
 - The retention gate kept an applied or abandoned thread's `target/` until the
-  thread was archived or free disk fell below 20 GB.
-- Under soft pressure, Tier 1 still waited for 24 h of idle. Only below 5 GB
+  thread was archived or free disk fell below the soft threshold (20 GB on a large volume).
+- Under soft pressure, Tier 1 still waited for 24 h of idle. Only below the hard threshold (5 GB on a large volume)
   did that drop to 1 h, and the worker ran every 15 minutes.
 
 Plan: [`docs/plans/2026-09-27-worktree-targets-stop-multiplying-disk.md`](../plans/2026-09-27-worktree-targets-stop-multiplying-disk.md).
@@ -94,7 +94,8 @@ it cannot touch live sessions anyway.
 
 Plan: [`docs/plans/2026-09-27-hard-disk-pressure-strips-targets-at-once.md`](../plans/2026-09-27-hard-disk-pressure-strips-targets-at-once.md).
 
-Below `FREE_DISK_HARD_BYTES` the Tier 1 idle window is zero, the same as the
+Below the hard threshold (`DiskThresholds::for_volume`, capped at
+`FREE_DISK_HARD_BYTES`) the Tier 1 idle window is zero, the same as the
 Tier 0 grace. A session that just finished `/harden` or e2e leaves 15 to
 25 GB. A burst of them fills the last few GB well inside a 1 h window.
 

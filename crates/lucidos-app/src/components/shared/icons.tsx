@@ -521,14 +521,7 @@ export function ForwardIcon() {
   );
 }
 
-export function SearchIcon({ className, size }: { className?: string; size?: string } = {}) {
-  return (
-    <svg class={className} {...(size ? { width: size, height: size } : {})} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-      <circle cx="7" cy="7" r="4.5" />
-      <path d="M10.5 10.5L14 14" />
-    </svg>
-  );
-}
+export { SearchIcon } from './SearchIcon';
 
 export function ComposeIcon() {
   return (
@@ -1094,17 +1087,6 @@ export function LucidosMarkIcon() {
         <rect x="54" y="54" width="29" height="29" rx="7" />
         <path d="M68.5 12 C71 25 74 28.5 87 31 C74 33.5 71 37 68.5 50 C66 37 63 33.5 50 31 C63 28.5 66 25 68.5 12 Z" />
       </g>
-    </svg>
-  );
-}
-
-/** A *widget*: a panel with a header bar, the small answer on a thread's
- *  shelf (ADR 0402). Its chip on the widget shelf and its bar both draw it. */
-export function WidgetIcon() {
-  return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <rect x="3" y="4" width="18" height="16" rx="2" />
-      <path d="M3 9h18M9 9v11" />
     </svg>
   );
 }

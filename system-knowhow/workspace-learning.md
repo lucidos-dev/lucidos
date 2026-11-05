@@ -68,7 +68,14 @@ Friction signals to pull:
 | App errors | App emits its own error events, or `ToolResult` errors in app-spawned threads |
 | User corrections in chats | `MessageReceived` immediately following a `ResponseGenerated` / `ResponseAborted` / `ToolResult` whose text reads like a correction ("no", "don't", "stop", "actually", "that's wrong", "instead", "you misunderstood") |
 | Coding-agent sessions ending without a useful change | `CodingAgentIdled` followed by `ChangeDiscarded`, or no `ChangeProposed` at all when one was clearly expected |
+| Snapshot failures | `SnapshotCaptureFailed` and `SnapshotChecked` with `passed: false`; group by workspace and fixed reason. |
 | Engine crashes / supervisor respawns | `EngineSupervisorRespawned`: the bash supervisor saw the previous engine pid die with a non-graceful exit (SIGKILL, panic, OOM, process-group kill). Payload carries `exit_code` (137 = SIGKILL, 143 = SIGTERM via 128+N, etc.) and `died_at`. Always `[engine]` scope. One occurrence is reportable below the ≥3 threshold (catastrophic-single rule). |
+
+For local snapshot friction, query `SnapshotCaptureFailed` and failed
+`SnapshotChecked` (`passed: false`). A capture reason of `interrupted` means
+startup settled an unfinished durable job; it is not proof that no archive was
+published. Use the handle to inspect its status before retrying. `SnapshotProgress`
+is transient and has no history to query.
 
 Trigger intent text lives in `TriggerCreated` payloads (`run.intent`). Pull it when you assess trigger findings.
 

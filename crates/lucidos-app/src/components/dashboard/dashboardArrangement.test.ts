@@ -5,7 +5,7 @@ import { toArranged } from '../../store/actions/dashboards';
 import { dashboardTileKey } from '../../store/widgets';
 
 function tile(appId: string, extra: Partial<WidgetDashboardTile> = {}): WidgetDashboardTile {
-  return { kind: 'widget', app_id: appId, name: appId, reusable: true, reveal: 'on-load', sizes: ['small', 'medium'], pinned: true, size: 'medium', ...extra };
+  return { kind: 'widget', app_id: appId, name: appId, reusable: true, reveal: 'on-load', sizes: ['small', 'medium'], size: 'medium', ...extra };
 }
 
 function shortcut(appId: string, extra: Partial<AppDashboardTile> = {}): AppDashboardTile {

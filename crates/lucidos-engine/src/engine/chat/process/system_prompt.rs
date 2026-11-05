@@ -462,6 +462,8 @@ Change an intent only when the user's goal changes, and never put technical deta
 SCRIPT FILES (under apps/, triggers/, knowhow/scripts/):
 - Every script the engine spawns gets the `lucidos` CLI on PATH and LUCIDOS_WORKSPACE set, and so do your own `run_bash` and `run_python`: the CLI is yours to call, not just a script's. Write data with `lucidos data write`, not raw HTTP to the engine, and emit or read domain events with `lucidos events emit` / `lucidos events query`. Full reference: load_knowhow('system-knowhow/lucidos-cli').
 
+ENGINE HOST: run_bash and run_python run on a `__ENGINE_HOST_OS__` (`__ENGINE_HOST_ARCH__`) host, which need not be the user's device. Never assume it is.
+
 FILE FORMATTING:
 Clean structured markdown: ## headings, bullet lists, **bold** for key values.
 
@@ -671,6 +673,8 @@ fn static_prompt_body(
         .replace("__NAMES_NOT_IDS_RULE__", NAMES_NOT_IDS_RULE)
         .replace("__NO_IMPERSONATION_RULE__", NO_IMPERSONATION_RULE)
         .replace("__REPEATED_ACTION_RULE__", REPEATED_ACTION_RULE)
+        .replace("__ENGINE_HOST_OS__", std::env::consts::OS)
+        .replace("__ENGINE_HOST_ARCH__", std::env::consts::ARCH)
         .replace("__MAX_TOOL_CALLS__", &max_tool_calls.to_string())
         .replace(
             "__MAX_CONCURRENT_CHILDREN_PER_THREAD__",
@@ -1093,13 +1097,13 @@ pub(crate) fn system_prompt_footprint(
     let engine_build = ENGINE_BUILD_POINTER.chars().count()
         + BUILD_STATES
             .into_iter()
-            .map(|(update, behind, wedged)| {
-                engine_build_block(&version_status(update, behind, wedged))
+            .map(|(update, behind)| {
+                engine_build_block(&version_status(update, behind))
                     .chars()
                     .count()
             })
             .max()
-            .expect("four states");
+            .expect("three states");
     // The URL itself is a runtime reading, so only the pointer and the
     // block's delimiters are engine text.
     let client_url = CLIENT_URL_POINTER.chars().count() + client_url_block("").chars().count();
@@ -1189,7 +1193,7 @@ mod tests {
     /// - **135** for the `ENGINE BUILD` split. One 374-character section
     ///   became a 307-character pointer plus a 202-character tail block: the
     ///   pointer says where the reading is, the block says what it reads. In
-    ///   return the four states stop rewriting the whole 21,668-token system
+    ///   return the three states stop rewriting the whole 21,668-token system
     ///   tier when the build flips mid-window.
     /// - **204** for the client-URL sentence, which was never in this meter at
     ///   all. It is always-loaded text and now says so.
@@ -1725,7 +1729,15 @@ mod tests {
     /// Raised by 566 to a measured 133,688 for the `expect_wake` tool (ADR
     /// 0603), which the cache keep-alive plans its pings from. Its description
     /// was cut to four short sentences first.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 133_688;
+    ///
+    /// Lowered by 4 to a measured 133,684: the backups routing line names
+    /// snapshots in fewer characters.
+    ///
+    /// Raised by 70 to a measured 133,754 on a `macos` (`aarch64`) build for
+    /// the ENGINE HOST line, net of slack freed since the last measure.
+    /// Without it, a cloud agent took the user's Mac browser for its own
+    /// host. A `linux` (`x86_64`) build measures 1 less.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 133_754;
 
     /// The gate set the ratchet bills.
     ///
@@ -2530,6 +2542,29 @@ mod tests {
             section.contains("only when neither covers the task, and say so"),
             "the browser is the fallback, and the user must hear when it is \
              used:\n{section}"
+        );
+    }
+
+    /// On a Linux cloud instance the agent told the user "your Mac runs
+    /// Lucidos", because the only machine it was shown was the browser's.
+    /// The prompt must name the host the tools really run on.
+    #[test]
+    fn the_prompt_names_the_engine_host_and_parts_it_from_the_users_device() {
+        let body = static_prompt_body(false, 500, CHILD_CAP, ContextMode::Off, false, "");
+        let from = body
+            .find("ENGINE HOST:")
+            .expect("the prompt no longer has an ENGINE HOST section");
+        let section = &body[from..];
+        let section = &section[..section.find("\n\n").unwrap_or(section.len())];
+
+        let host = format!("`{}` (`{}`)", std::env::consts::OS, std::env::consts::ARCH);
+        assert!(
+            section.contains(&host),
+            "the section must name this engine's own OS and arch:\n{section}"
+        );
+        assert!(
+            section.contains("need not be the user's device"),
+            "the section must part the host from the user's device:\n{section}"
         );
     }
 

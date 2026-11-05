@@ -780,6 +780,33 @@ impl LucidosEngine {
         database_url: &str,
         provider_ctx: crate::llm::ProviderBuildContext,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        crate::core::snapshot::boot_guard::ensure_normal_boot(database_url)?;
+        Self::new_inner(workspace_path, database_url, provider_ctx, None).await
+    }
+
+    /// Only restricted, owner-locked verification can mint this capability.
+    pub async fn new_with_restore(
+        workspace_path: PathBuf,
+        database_url: &str,
+        provider_ctx: crate::llm::ProviderBuildContext,
+        restore_boot: crate::core::snapshot::first_boot::VerifiedRestoreBoot<'_>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        restore_boot.validate_binding(&workspace_path, database_url)?;
+        Self::new_inner(
+            workspace_path,
+            database_url,
+            provider_ctx,
+            Some(restore_boot),
+        )
+        .await
+    }
+
+    async fn new_inner(
+        workspace_path: PathBuf,
+        database_url: &str,
+        provider_ctx: crate::llm::ProviderBuildContext,
+        restore_boot: Option<crate::core::snapshot::first_boot::VerifiedRestoreBoot<'_>>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Install the subprocess-origin token before anything spawns a
         // subprocess. See `api::actor` module docs.
         crate::api::actor::init_agent_origin_secret(Uuid::new_v4().to_string());
@@ -863,8 +890,14 @@ impl LucidosEngine {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(50)
             .acquire_timeout(std::time::Duration::from_secs(60))
-            .idle_timeout(std::time::Duration::from_secs(600))
-            .max_lifetime(std::time::Duration::from_secs(1800))
+            // Every workspace's engine shares one Postgres, and each backend
+            // costs it ~20 MB, so a burst must not keep its backends open.
+            // sqlx hands out the oldest idle connection first, so steady light
+            // traffic keeps every one warm and idle_timeout alone never fires.
+            // The short max_lifetime retires them, and the pool reopens only
+            // what concurrent demand needs.
+            .idle_timeout(std::time::Duration::from_secs(60))
+            .max_lifetime(std::time::Duration::from_secs(300))
             .after_connect(|conn, _meta| {
                 Box::pin(async move {
                     // Tune HNSW search: higher ef_search = better recall at slight latency cost
@@ -921,6 +954,7 @@ impl LucidosEngine {
             }
             return Err(e.into());
         }
+        crate::core::snapshot::restore_database::finish_access_after_migrations(&pool).await?;
         crate::core::migration_marker::record_migrated(&workspace_path, database_url, &pool).await;
         // Every stored secret is sealed. Without its key the engine refuses to
         // serve, because serving would lose them (ADR 0509).
@@ -966,7 +1000,22 @@ impl LucidosEngine {
         // backfill can route through `replay_historical_event` instead of
         // bypassing the bus.
         let (event_bus, parent_callback_rx) = event_bus::EventBus::new(pool.clone());
+        // Restored apply authority must be durably ended before any boot job
+        // or subscriber can dispatch work. A failure keeps normal boot closed.
+        crate::engine::restore_boot::settle_before_dispatch(&event_bus, restore_boot.as_ref())
+            .await?;
+        crate::engine::restore_boot::complete_before_dispatch(&event_bus, restore_boot).await?;
         crate::core::secret_reference::install_notice_bus(&event_bus);
+        // Recover durable archive jobs under both locks before HTTP or the
+        // scheduler can start another archive operation. Reuse this slot in Engine.
+        let archive_job_slot = crate::core::snapshot::ArchiveJobSlot::default();
+        crate::core::snapshot::service::Session::recover_at_boot(
+            database_url,
+            crate::api::base_path::workspace_id(),
+            archive_job_slot.clone(),
+            event_bus.clone(),
+        )
+        .await?;
 
         // One-shot, idempotent: convert legacy base64 image payloads
         // (MessageReceived.user_images, thread_summaries.compose_images) to
@@ -1243,15 +1292,34 @@ impl LucidosEngine {
                 Vec::new()
             }
         };
+        // A restore may keep temp merge trees. If its record cannot be read,
+        // keep every tree this boot: an unreadable file must neither authorize
+        // deletion nor stop the engine from starting.
+        let database_options = pool.connect_options();
+        let retained_worktrees = database_options
+            .get_database()
+            .ok_or_else(|| crate::core::snapshot::BoxError::from("no database name"))
+            .and_then(crate::core::snapshot::store::Store::database_root)
+            .and_then(|root| {
+                crate::core::snapshot::worktree_exemptions::read(&root, &workspace_path)
+            });
+        let stale_merges = match &retained_worktrees {
+            Ok(_) => stale_merges,
+            Err(e) => {
+                log!("[Startup] cannot read restore worktree exemptions ({e}); keeping stale merge state");
+                Vec::new()
+            }
+        };
+        let retained_worktrees = retained_worktrees.unwrap_or_default();
         for change in stale_merges {
             if let Some(merge) = change.merge_worktree() {
                 let change_repo = std::path::PathBuf::from(&change.repo_root);
-                let cleared = crate::engine::git_ops::clear_temp_merge_state(
+                let cleared = clear_unretained_temp_merge_state(
                     &change_repo,
                     std::path::Path::new(&merge.path),
                     &merge.temp_branch,
                     &change.branch_name,
-                    "[Startup]",
+                    &retained_worktrees,
                 )
                 .await;
                 if let Some(tid) = change.thread_id {
@@ -1269,11 +1337,12 @@ impl LucidosEngine {
                         .await;
                 }
                 match cleared {
-                    Ok(()) => log!(
+                    TempMergeCleanup::Retained => {}
+                    TempMergeCleanup::Cleared(Ok(())) => log!(
                         "[Startup] Cleaned up stale merge worktree for change {}",
                         change.id
                     ),
-                    Err(e) => log!(
+                    TempMergeCleanup::Cleared(Err(e)) => log!(
                         "[Startup] Stale merge state for change {} needs manual cleanup ({}): the merge columns are cleared, so nothing points at it any more",
                         change.id,
                         e
@@ -1360,20 +1429,12 @@ impl LucidosEngine {
             ..
         } = provider_build_ctx.clone();
 
-        let (llm, web_search) =
-            match crate::llm::build_active_provider(Some(&pool), &provider_build_ctx).await? {
-                crate::llm::ProviderBuildOutcome::Install {
-                    llm,
-                    web_search,
-                    selection,
-                } => {
-                    log!("[Startup] LLM provider installed: {:?}", selection);
-                    (llm, web_search)
-                }
-                crate::llm::ProviderBuildOutcome::FailFast => {
-                    return Err(crate::llm::NO_PROVIDER_AT_BOOT.into())
-                }
-            };
+        let crate::llm::ProviderBuildOutcome {
+            llm,
+            web_search,
+            selection,
+        } = crate::llm::build_active_provider(Some(&pool), &provider_build_ctx).await?;
+        log!("[Startup] LLM provider installed: {:?}", selection);
 
         // Wrap the active provider in the swappable handle BEFORE the struct is
         // assembled, so the credential subscriber below shares the very handle
@@ -1410,7 +1471,7 @@ impl LucidosEngine {
         crate::llm::claude_gateway::telemetry::exporter::spawn_exporter(
             event_bus.subscribe(),
             pool.clone(),
-            claude_gateway_access,
+            claude_gateway_access.clone(),
         )
         .await;
 
@@ -1490,12 +1551,13 @@ impl LucidosEngine {
             vertex_location,
             vertex_token_cache,
             model_registry: engine_model_registry,
+            claude_gateway_access,
             openai_api_key,
             summarizing_threads: Default::default(),
             rebuilding_memory: AtomicBool::new(false),
             cancel_rebuild: AtomicBool::new(false),
             shutting_down,
-            backup_in_progress: AtomicBool::new(false),
+            archive_job_slot,
             database_health: Default::default(),
             build_state: std::sync::RwLock::new(crate::engine::engine_version::BuildState::Idle),
             version_tracking,
@@ -1664,5 +1726,89 @@ impl LucidosEngine {
             }),
             Err(_) => HashMap::new(),
         }
+    }
+}
+/// What startup did with one stale temp merge pair.
+enum TempMergeCleanup {
+    /// A snapshot restore kept the pair, so startup left it alone.
+    Retained,
+    Cleared(Result<(), String>),
+}
+
+/// Clear a crashed apply's temp merge pair unless a snapshot restore kept it.
+async fn clear_unretained_temp_merge_state(
+    repo: &std::path::Path,
+    worktree: &std::path::Path,
+    temp_branch: &str,
+    change_branch: &str,
+    retained: &std::collections::BTreeSet<std::path::PathBuf>,
+) -> TempMergeCleanup {
+    if retained.iter().any(|path| worktree.starts_with(path)) {
+        log!("[Startup] Preserving temp merge worktree retained by snapshot restore");
+        return TempMergeCleanup::Retained;
+    }
+    TempMergeCleanup::Cleared(
+        crate::engine::git_ops::clear_temp_merge_state(
+            repo,
+            worktree,
+            temp_branch,
+            change_branch,
+            "[Startup]",
+        )
+        .await,
+    )
+}
+
+#[cfg(test)]
+mod restore_cleanup_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn startup_keeps_retained_merge_tree_and_branch_but_cleans_unretained_state() {
+        use crate::engine::git_ops::git_ran_ok;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_ran_ok(&["init", "-b", "main"], root).await.unwrap();
+        git_ran_ok(
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+            root,
+        )
+        .await
+        .unwrap();
+        let tree = root.join("merge-tree");
+        let path = tree.to_str().unwrap();
+        git_ran_ok(&["worktree", "add", "-b", "merge-temp", path], root)
+            .await
+            .unwrap();
+        let retained = std::collections::BTreeSet::from([tree.clone()]);
+        assert!(matches!(
+            clear_unretained_temp_merge_state(root, &tree, "merge-temp", "main", &retained).await,
+            TempMergeCleanup::Retained
+        ));
+        assert!(tree.is_dir());
+        git_ran_ok(&["rev-parse", "--verify", "merge-temp"], root)
+            .await
+            .unwrap();
+        assert!(matches!(
+            clear_unretained_temp_merge_state(
+                root,
+                &tree,
+                "merge-temp",
+                "main",
+                &Default::default()
+            )
+            .await,
+            TempMergeCleanup::Cleared(Ok(()))
+        ));
+        assert!(!tree.exists());
     }
 }

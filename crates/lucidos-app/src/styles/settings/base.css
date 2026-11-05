@@ -690,6 +690,16 @@
     margin-inline-end: -0.1em;
 }
 
+/* A gateway pairing secret is 30 characters, so the code's display size would
+   push it past the card. Smaller, and free to break, since it is pasted rather
+   than read aloud. */
+.add-device-code.add-device-secret {
+    font-size: var(--font-size-sm);
+    letter-spacing: 0;
+    margin-inline-end: 0;
+    overflow-wrap: anywhere;
+}
+
 /* A pairing URL carries no spaces, so it has nowhere to break: without
    `anywhere` it sets one unbreakable line and pushes the card past the pane. */
 .add-device-url {

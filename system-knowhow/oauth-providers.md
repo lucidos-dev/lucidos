@@ -1,6 +1,6 @@
 ---
 name: OAuth Providers Registry
-description: OAuth 2.0 provider rules, beside the endpoint rows in the sibling oauth-providers.json: connect_oauth_account, the oauth_client credential, the loopback redirect URI, PKCE vs a client secret, and Microsoft Entra AADSTS errors. Load before collecting an OAuth credential, when a connection fails, or to add a provider.
+description: OAuth 2.0 provider rules, beside the endpoint rows in oauth-providers.json: connect_oauth_account, the oauth_client credential, loopback and web redirect URIs, PKCE vs a client secret, and Microsoft Entra AADSTS errors. Load before collecting an OAuth credential, when a connection fails, or to add a provider.
 ---
 
 # OAuth providers registry
@@ -116,6 +116,40 @@ Anything else (a different port, a different path, a trailing slash, `https`)
 is rejected when the flow starts, with an error that lists these three. Tell the
 user to register the URI **exactly**, character for character.
 
+The loopback URI serves **a browser on a computer running Lucidos**. That holds
+for a remote workspace too, opened through this computer's Lucidos: the local
+gateway catches the redirect and passes it on.
+
+### Web redirect URI: a phone or another computer
+
+A browser on a machine that runs no Lucidos (a phone, an iPad, a laptop opening
+a remote address) cannot reach a loopback URI. Lucidos then sends a **web
+redirect URI** instead: the address the browser uses, plus `/~/oauth/callback`.
+
+```
+https://mymac.tailnet-name.ts.net/~/oauth/callback
+```
+
+It works only when all three hold:
+
+1. The browser reaches Lucidos over **https**. Providers refuse a plain `http`
+   redirect to anything but loopback. See `remote-access.md`.
+2. The URI is registered on a **Web** client type in the provider's console.
+   Desktop and native clients accept loopback only.
+3. The credential carries the **client secret** (a Web client is confidential)
+   and lists the URI under **Web redirect URIs**, one per line. Opened over
+   https, the credential modal offers an **Add this address** button for the
+   current page.
+
+Register the loopback URI on the same Web client too, so one credential serves
+both. When something is missing, Connect refuses at once with one sentence:
+
+| Refusal starts with | Fix |
+|---|---|
+| "`<provider>` can return only to Lucidos over https" | Open Lucidos at the gateway's https address, or on a computer running it. |
+| "Register `<uri>` on a Web client" | Register that exact URI, then add it under Web redirect URIs. |
+| "A web redirect URI needs a Web client with a client secret" | Add the secret to the credential. |
+
 ### Confidential vs public client
 
 Lucidos picks the OAuth client type from **one thing: whether the credential has
@@ -217,7 +251,7 @@ what the row says.
   Set `redirect_uri` on the credential, and pass scopes to
   `connect_oauth_account` when you connect. `state` is generated per
   authorization and must come back on the callback. A pinned value would break
-  the callback (see "One authorization at a time" below).
+  the callback (see "Who catches the callback" below).
 - Write `none` for a provider that rejects a parameter it does not recognize.
   That sends neither default.
 - A migration backfilled `token_access_type=offline` on each **Dropbox client
@@ -225,32 +259,29 @@ what the row says.
   then renews correctly with no edit. Any other provider that needs a value must
   be set by hand (or by you, on the credential) before reconnecting.
 
-### One authorization at a time
+### Who catches the callback
 
-The callback listener binds a **fixed** loopback port (14981), because the
-redirect URI must be registered with the provider ahead of time. So a workspace
-engine can have **at most one authorization in flight**, whatever the provider.
-That holds whether `connect_oauth_account` started it or a Connect / Reconnect /
-*Grant access* button did.
+The redirect URI names a **fixed** loopback port (14981), because it must be
+registered with the provider ahead of time.
 
-Two consequences:
-
-- **Starting a new authorization cancels the previous one.** If the user
-  abandoned a consent screen (or never finished a flow you started), the next
-  one supersedes it rather than failing. The abandoned flow reports *"This
+- **Under a gateway (the normal case), the gateway holds the port** for its
+  whole life. It routes each callback to the right workspace by its `state`, so
+  any number of workspaces, local or remote, can connect accounts at once. When
+  two Lucidos installs share a computer, the first to bind it passes callbacks
+  it cannot place to the other.
+- **An engine run with no gateway binds the port itself, one authorization at a
+  time.** Starting a new one cancels the previous one, which reports *"This
   authorization was canceled, most likely because a newer one was started"*.
   That is expected, not an error to chase.
-- **A port clash that survives that is another program.** Almost always it is a
-  second Lucidos workspace part-way through connecting an account. Workspaces
-  run concurrently, each with its own engine, and share this one machine-wide
-  port. The error says so. Finish or abandon the other one; this credential
+- **`AddrInUse` means another program holds the port.** Most often it is an
+  older Lucidos install on the same computer, whose engine still binds it per
+  flow. Finish or abandon that flow, or upgrade that install; this credential
   needs no fix.
 
-Each authorization also carries its own random `state`, and the listener ignores
-any callback that does not echo it back. So nothing can redeem a stale redirect
-from a superseded flow, or a request from anything else that reaches the
-loopback port. There is nothing to configure; this is why `authorize_params`
-refuses `state`.
+Each authorization carries its own random `state`, and Lucidos ignores any
+callback that does not echo it back. So nothing can redeem a stale redirect, or
+a request from anything else that reaches the loopback port. There is nothing to
+configure; this is why `authorize_params` refuses `state`.
 
 ### Notes on scopes
 
@@ -326,7 +357,7 @@ fine and fails only at the token exchange. Two symptoms, one cause:
 
 Pick one of the two coherent setups and make both halves agree:
 
-**Desktop / public (recommended, since Lucidos runs on the user's machine):**
+**Desktop / public (recommended when the browser and Lucidos share one machine):**
 1. Portal → *Authentication* → add a **Mobile and desktop applications**
    platform with `http://127.0.0.1:14981/oauth/callback`.
 2. Set *Allow public client flows* to **Yes**.

@@ -42,7 +42,11 @@ Several structural questions had to be decided to wire this up.
 2. **The engine serves the bundled frontend** behind `LUCIDOS_STATIC_DIR` (SPA
    fallback to `index.html`). The webview navigates to the engine URL, so the UI,
    the HTTP API, SSE, and the service worker are all **same-origin**.
-3. **First-run before a provider exists uses `LUCIDOS_BOOT_WITHOUT_PROVIDER`.** The
+3. **Superseded by [ADR 0613](0613-providerless-engine-bootstrap.md):** every
+   launch mode now boots unconfigured, and provider changes take effect live.
+   The following records the original decision.
+
+   **First-run before a provider exists uses `LUCIDOS_BOOT_WITHOUT_PROVIDER`.** The
    engine normally panics with no LLM provider; the launcher sets this flag so a
    packaged build boots instead of crashing. It boots into an
    `UnconfiguredProvider` sentinel that returns a clear "No LLM provider

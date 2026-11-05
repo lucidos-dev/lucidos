@@ -39,6 +39,17 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Repository gates
 
+- **A stale published engine fails the source build, including e2e setup.**
+  A reviewer asks non-background callers to tolerate a stale artifact after
+  the bounded rebuild. That would run tests against an engine that does not
+  represent the checkout. E2e builds from its isolated worktree or pinned
+  commit; a live Apply elsewhere cannot advance its HEAD. The build-only
+  subprocess's exit 75 names HEAD movement, while e2e setup maps a failed
+  build to a failure before any tests run. Re-flag only if an unrelated live
+  checkout controls the e2e build inputs.
+
+  (`scripts/lib/workspace.sh`, `scripts/lib/e2e.sh`, ADR 0617.)
+
 - **Codegen checks coverage on the test executables that contain its writers.**
   A reviewer asks for freshness-only checks on every test-profile artifact.
   The CLI writer and clap tree share a binary test target; exempting it would
@@ -4117,12 +4128,11 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Settled architecture questions
 
-- **A widget shown before the opt-in shelf has no chip until pinned.** A
-  reviewer reads `fold_thread_widgets` starting every `WidgetShown` unpinned
-  and asks for a migration that keeps old chips. ADR 0407 chose this on
-  purpose: the shelf is opt-in, and the widget's inline card stays in the
-  transcript. Re-flag only if the shelf stops being opt-in.
-  (`engine/widgets.rs`.)
+- **A legacy pin migrates to nothing.** A reviewer reads that old
+  `WidgetPinned` rows draw no chip and asks for a migration that turns each
+  into a dashboard tile. ADR 0621 chose this on purpose: one-offs would flood
+  a dashboard, and the widget's inline card stays in the transcript. Only
+  Home's old pins seed the dashboards. (`engine/dashboard.rs`.)
 
 - **No shared turn-lifecycle orchestrator across the agent-session loop and
   the chat agentic loop** — ADR 0003. The seam already exists
@@ -4773,3 +4783,50 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   the same change, so no stored status lacks the field. Re-flag only when
   `main` already emits the variant without the field.
   (`crates/lucidos-engine/src/engine/thread_events/keep_alive_status.rs`.)
+
+- **Workspace discovery fails closed at its traversal bound.** An unreadable
+  subtree or 2,048 visited directories blocks a destructive command. The approved
+  workspace-cleanup plan deliberately bounds discovery this way, including
+  large dependency trees. Operand parsing must avoid scanning destinations and
+  unrelated command words; do not weaken the bound to permit an unverified
+  deletion. Re-flag when a harmless operand triggers discovery or a traversal
+  bypasses the bound. (`engine/command_guard/workspace_floor.rs`.)
+
+- **Unreadable sealed remote credentials stop gateway startup deliberately.**
+  The gateway must not silently drop remote pairings or replace a missing key.
+  ADR 0618 requires an actionable refusal and restoration of the original key.
+  An empty remote store still loads without a key, so new installations work.
+  Re-flag if startup hides the error or overwrites sealed credentials.
+  (`crates/lucidos-gateway/src/remote_gateways.rs`.)
+
+- **Cleanup requires exact database and activity observations, even for manual selection.**
+  Missing databases or unavailable activity deliberately disable freezing.
+  The approved workspace-cleanup plan requires failed observations to preserve resources.
+  Re-flag only if the failure is hidden or partial observations authorize deletion.
+  (`crates/lucidos-gateway/src/cleanup_actions.rs`, `observed_workspace_fingerprint`.)
+
+- **Resource publication excludes competing gateways throughout cleanup effects.**
+  `ResourcePublicationLock` deliberately spans dumps, moves, drops and restore.
+  Releasing it between observation and effects lets another registration claim the resource.
+  Contention returns an actionable conflict before mutation, including across source and packaged gateways.
+  Re-flag only if an effect runs without exclusion or the conflict is hidden.
+  (`crates/lucidos-gateway/src/cleanup_actions.rs`.)
+
+- **An eval resume without its original owner pin must refuse driving.**
+  Pins retain original authority or explicit absence forever; legacy missing pins prove neither.
+  Inferring absence during resume would silently replace the run's authority.
+  The approved cleanup contract preserves resources and reports the refusal.
+  Re-flag only if a resume refreshes authority or deletes without a validated original pin.
+  (`crates/lucidos-eval/src/gateway.rs`, `pin_run_owner`.)
+
+- **A batch format introduced in the current branch has no legacy production batches.**
+  Cleanup batches first land with this branch; main has no cleanup_actions module.
+  Revising their confirmation contract before landing needs no upgrade bypass.
+  Re-flag when main already publishes batches under the replaced contract.
+  (crates/lucidos-gateway/src/cleanup_actions.rs.)
+
+- **Named cleanup confirmation deliberately matches the displayed phrase exactly.**
+  Names and paths can contain Unicode; copying the displayed phrase preserves its form.
+  A different normalization must not silently authorize a distinct filesystem name.
+  Re-flag when copying the displayed phrase cannot confirm the same frozen resource.
+  (crates/lucidos-app/src/components/picker/CleanupManager.tsx.)

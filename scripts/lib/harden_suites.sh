@@ -659,7 +659,7 @@ hs_select_full_tier_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest
         case "$p" in
             scripts/codegen.sh | scripts/lib/codegen*.sh | scripts/lib/codegen_blocks.py | crates/lucidos-engine/build.rs) codegen=1 ;;
             install.sh | uninstall.sh | scripts/lib/service.sh | scripts/lib/stage_runtime*.sh | \
-                scripts/lib/stage_runtime*.py | scripts/build-headless.sh | scripts/lib/install_test.sh | \
+                scripts/lib/stage_runtime*.py | scripts/lib/linux_dev_install_test.py | scripts/build-headless.sh | scripts/lib/install_test.sh | \
                 scripts/lib/headless_tarball.sh | scripts/lib/install_common.sh) install=1 ;;
             scripts/release.sh | scripts/lib/release_draft.sh) release=1 ;;
             scripts/harden-suites.sh | scripts/lib/harden_suites*.sh | scripts/lib/proc_tree.sh | scripts/lib/touched_specs*.sh | \
@@ -721,6 +721,59 @@ hs_select_full_tier_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest
     return 0
 }
 
+# True on a host that can run mobile-webkit itself: macOS, per the OS's own
+# answer. HS_UNAME_CMD replaces uname in the tests.
+hs_runs_webkit_here() {
+    [ "$(${HS_UNAME_CMD:-uname} -s)" = Darwin ]
+}
+
+# A passing touched-spec verdict carries into the next round. A record line is
+# "<suite> <spec> <commit>": the spec passed in that suite at that commit.
+# <record>.untracked/<commit> holds the untracked fingerprint that run started on.
+
+# Print the record lines still valid now. A line is valid when its commit is an
+# ancestor of HEAD and every path changed since passes hs_unsafe_paths. Changed
+# paths include untracked files, so a line with no fingerprint never carries.
+hs_carried_valid() { # <root> <record-file> <compile-inputs-file> <allowlist-disabled: 0|1>
+    local root=$1 record=$2 inputs=$3 disabled=$4 suite spec sha snap ok="" bad=""
+    [ -s "$record" ] || return 0
+    while read -r suite spec sha; do
+        [ -n "$sha" ] || continue
+        case " $ok " in *" $sha "*) ;; *)
+            case " $bad " in *" $sha "*) continue ;; esac
+            snap="$record.untracked/$sha"
+            if [ -f "$snap" ] && git -C "$root" merge-base --is-ancestor "$sha" HEAD 2> /dev/null \
+                && [ -z "$(hs_changed_paths "$root" "$sha" "$snap" \
+                    | hs_unsafe_paths "$inputs" "$disabled" | head -1)" ]; then
+                ok="$ok $sha"
+            else
+                bad="$bad $sha"
+                continue
+            fi
+            ;;
+        esac
+        echo "$suite $spec $sha"
+    done < "$record"
+}
+
+# Record the specs a suite passed, replacing any older line for the same spec,
+# with the run's untracked fingerprint. Drops fingerprints no line names.
+hs_record_carry() { # <record-file> <suite> <commit> <specs-file> <untracked-at-start-file>
+    local record=$1 suite=$2 sha=$3 specs=$4 untracked=$5 spec tmp snap
+    [ -s "$specs" ] || return 0
+    tmp="$record.tmp"
+    mkdir -p "$(dirname "$record")" "$record.untracked"
+    { [ ! -f "$record" ] || awk -v s="$suite" 'NR == FNR { drop[$0] = 1; next } !(($1 == s) && ($2 in drop))' "$specs" "$record"; } > "$tmp"
+    while IFS= read -r spec; do
+        [ -n "$spec" ] && echo "$suite $spec $sha" >> "$tmp"
+    done < "$specs"
+    mv "$tmp" "$record"
+    cp "$untracked" "$record.untracked/$sha"
+    for snap in "$record.untracked"/*; do
+        awk -v c="${snap##*/}" '$3 == c { found = 1 } END { exit !found }' "$record" || rm -f "$snap"
+    done
+}
+
 # Read spec names on stdin and print the ones mobile-webkit runs.
 hs_webkit_specs() {
     local spec
@@ -737,6 +790,45 @@ hs_specs_command() { # <specs-file> [flags]
         [ -n "$spec" ] && cmd="$cmd -f $(printf '%q' "$spec")"
     done < "$1"
     echo "$cmd"
+}
+
+# Write the specs a touched-spec suite runs to <state>/<suite>.specs, which the
+# verdict reads. A retry round runs the specs that failed. Any other round runs
+# the touched specs, less the ones <state>/carried holds for the suite, which
+# <state>/<suite>.carried lists. A suite with none left is marked
+# <suite>.all-carried and runs nothing.
+hs_prepare_touched() { # <suite> <state>
+    local suite=$1 state=$2 all="$2/$1.wanted" left="$2/$1.specs" carried="$2/$1.carried"
+    : > "$carried"
+    if [ -s "$state/$suite.retry" ]; then
+        cp "$state/$suite.retry" "$all"
+    else
+        if [ "$suite" = e2e-touched-webkit ]; then
+            hs_webkit_specs < "$state/touched-specs" > "$all"
+        else
+            cp "$state/touched-specs" "$all"
+        fi
+        [ ! -s "$state/carried" ] || awk -v s="$suite" '$1 == s { print $2 }' "$state/carried" > "$carried"
+    fi
+    grep -v -x -F -f "$carried" "$all" > "$left"
+    if [ ! -s "$left" ] && [ -s "$carried" ]; then
+        : > "$state/$suite.all-carried"
+    fi
+    return 0
+}
+
+# The command line for a touched-spec suite, from the specs hs_prepare_touched
+# left. e2e-touched-webkit runs them on a macOS host itself, and sends them to
+# GitHub from any other (see hs_suite_command).
+hs_touched_suite_command() { # <suite> <state>
+    local suite=$1 state=$2 specs="$2/$1.specs"
+    if [ "$suite" = e2e-touched ]; then
+        hs_specs_command "$specs"
+    elif hs_runs_webkit_here; then
+        echo "ENGINE_CARGO_PROFILE=e2e $(hs_specs_command "$specs" "--webkit")"
+    else
+        hs_specs_command "$specs" "--github --webkit --commit $(cat "$state/start-sha")"
+    fi
 }
 
 # The engine tests a failed round named, by exact name.
@@ -794,20 +886,26 @@ hs_crates_command() { # <state-dir>
 #
 # e2e-touched runs on this host, a filtered run without mobile-webkit
 # (e2e_github_handoff), which sends a busy host's run to GitHub (ADR 0584).
-# e2e-touched-webkit sends the specs mobile-webkit runs
-# to GitHub as the run starts, pinned to its start commit.
+# e2e-touched-webkit runs the specs mobile-webkit runs. A macOS host runs them
+# itself on the e2e cargo profile, and e2e_github_handoff still gives a busy
+# host's run to GitHub. Any other host sends them to GitHub as the run starts,
+# pinned to its start commit.
 hs_suite_command() { # <suite> <early|normal> <state-dir>
-    local suite=$1 mode=$2 state=$3 skips="" m specs
+    local suite=$1 mode=$2 state=$3 skips="" m
+    if hs_is_e2e_suite "$suite"; then
+        hs_prepare_touched "$suite" "$state" 2> /dev/null
+        if [ -f "$state/$suite.all-carried" ]; then
+            echo "echo 'every spec carried from an earlier passing round'"
+            return 0
+        fi
+    fi
     if [ -n "${HS_STUB_CMD:-}" ]; then
         printf '%q %q\n' "$HS_STUB_CMD" "$suite"
         return 0
     fi
-    if [ -s "$state/$suite.retry" ]; then
-        if hs_names_engine_tests "$suite"; then
-            hs_engine_tests_command "$state/$suite.retry"
-            return 0
-        fi
-        hs_is_e2e_suite "$suite" && specs="$state/$suite.retry"
+    if [ -s "$state/$suite.retry" ] && hs_names_engine_tests "$suite"; then
+        hs_engine_tests_command "$state/$suite.retry"
+        return 0
     fi
     case "$suite" in
         lint) hs_lint_command "$state" ;;
@@ -834,14 +932,7 @@ hs_suite_command() { # <suite> <early|normal> <state-dir>
         vite) echo "cd crates/lucidos-app && npx vite build" ;;
         vitest) echo "cd crates/lucidos-app && npm test --ignore-scripts" ;;
         first-paint) echo "cd crates/lucidos-app && node first-paint-growth.mjs check" ;;
-        e2e-touched) hs_specs_command "${specs:-$state/touched-specs}" ;;
-        e2e-touched-webkit)
-            if [ -z "${specs:-}" ]; then
-                specs="$state/webkit-specs"
-                hs_webkit_specs < "$state/touched-specs" > "$specs"
-            fi
-            hs_specs_command "$specs" "--github --webkit --commit $(cat "$state/start-sha")"
-            ;;
+        e2e-touched | e2e-touched-webkit) hs_touched_suite_command "$suite" "$state" ;;
         install) echo "bash scripts/lib/install_test.sh" ;;
         release) echo "bash scripts/lib/release_draft_test.sh && bash scripts/lib/release_rc_gate_test.sh" ;;
         harden-suites) echo "bash scripts/lib/harden_suites_test.sh && bash scripts/lib/touched_specs_test.sh" ;;

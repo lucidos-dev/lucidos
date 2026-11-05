@@ -30,8 +30,9 @@ import {
 import { parseServerFrame } from './frames';
 import { CAPTURE_FRAME_SAMPLES, SAMPLE_RATE_HZ, floatToPcm16 } from './pcm';
 import type { AudioDevice, CallPorts, CallSocket } from './ports';
-import { CALL_REFUSED, NO_ROUTE_FOR_A_CALL, setupRefusal } from './refusals';
+import { CALL_REFUSED, CallSetupError, NO_ROUTE_FOR_A_CALL, setupRefusal } from './refusals';
 import { errorDetail } from '../utils/errorDetail';
+import { sourceGeneration } from '../utils/restoreSourceGeneration';
 
 /**
  * How many captured frames may wait for the socket before the oldest go.
@@ -256,6 +257,14 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
 
   async function open(threadId: string): Promise<void> {
     const mine = ++generation;
+    // Permission and ticket waits belong to this press, even if stream
+    // admission learns a new workspace generation while either is pending.
+    const pressedGeneration = sourceGeneration();
+    const checkRestore = () => {
+      if (sourceGeneration() !== pressedGeneration) {
+        throw new CallSetupError('Workspace restored; start a new call after reviewing retained work.');
+      }
+    };
     let device: AudioDevice;
     try {
       device = await options.ports.openAudio(captured, options.microphone?.() ?? null);
@@ -282,7 +291,9 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
     // ticket. A refusal tears down, which releases the microphone just opened.
     let ticket: string;
     try {
+      checkRestore();
       ticket = await options.ports.mintCallTicket(threadId);
+      checkRestore();
     } catch (err) {
       if (mine === generation) input({ kind: 'failed', message: setupRefusal(err) });
       return;

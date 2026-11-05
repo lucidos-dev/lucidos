@@ -3,7 +3,7 @@ import type { ThreadSection, ThreadInitiator, ThreadAggregate, EventWaitSummary,
 import type { ThreadStatus } from '../generated/thread-lifecycle';
 import type { ComposeSelectionOverride } from '../store/composeSelections';
 import type { CacheKeepAliveStatus, UnproposedReason } from '../generated/thread-event-wire';
-import type { AppKind } from '../store/types';
+import type { AppKind, WidgetSize } from '../store/types';
 
 /** What a coding-agent thread's branch holds, as the engine projects it (ADR
  *  0400). `none`: no work against main. `unproposed`: work with no pending
@@ -516,6 +516,15 @@ export type PairStamp = {
   provider: string;
 };
 
+/** The newest size picked for one widget instance's cards in a thread.
+ *  Mirrors Rust `CardSize` in `engine/widgets.rs`. */
+export type CardSize = {
+  sequence: number;
+  app_id: string;
+  params?: Record<string, unknown>;
+  size: WidgetSize;
+};
+
 /** Wraps `events[]` with `currentAggregate` so the historical-replay path
  *  applies meta from a fetched snapshot — same source-of-truth model as live
  *  SSE per-event aggregate. Without it, refresh paths can't reconstruct meta
@@ -535,6 +544,9 @@ export type ThreadEventsSnapshot = {
   /** Sent only for a PAGE. The events that stamped the thread's pair may sit
    *  behind it. The rung pill reads them from here, not the account default. */
   pairStamps?: PairStamp[];
+  /** Sent only for a PAGE. The pick that sized a widget instance's cards may
+   *  sit behind it. `widgetCardSize` reads these beside the loaded events. */
+  cardSizes?: CardSize[];
 };
 
 export interface FetchThreadEventsOptions {

@@ -61,6 +61,10 @@ tool unreachable.
   Docker cluster. E2E GitHub mode sets it on macOS runners,
   which have no Docker. Read by `shared_pg_psql` (`scripts/lib/workspace.sh`),
   `e2e/db-helpers.ts` and `api_support/mod.rs`. Unset means Docker.
+- `LUCIDOS_BOOT_WITHOUT_PROVIDER` — obsolete and ignored (ADR 0613). Every
+  launch mode boots without a provider. Health reports `llm_configured: false`,
+  and chat points to Settings → Models → Providers. Provider configuration
+  takes effect live. Older launchers may still set this variable.
 - `LUCIDOS_MODEL` — LLM model (default `claude-opus-5-5@default`). `[1m]` = 1M context. `gpt-*` = OpenAI.
 - `VERTEX_PROJECT_ID` / `VERTEX_REGION` — GCP (default region `europe-west1`). The project also resolves WITHOUT this env var, so a packaged build works from a user's existing `gcloud auth application-default login`: the engine reads the ADC file (`$GOOGLE_APPLICATION_CREDENTIALS` → `$CLOUDSDK_CONFIG`/`~/.config/gcloud/application_default_credentials.json`) and refreshes the access token itself — no `gcloud` binary — and resolves the project from the ADC `quota_project_id` or the gcloud config `[core] project` (resolution order: env → ADC/config files → `gcloud config` subprocess). Only the `authorized_user` ADC type is read in-engine; other types fall back to the `gcloud` subprocess (dev only). See `crates/lucidos-engine/src/llm/vertex/adc.rs`.
   - Region resolution order: the `vertex_region` preference, then a
@@ -130,6 +134,7 @@ tool unreachable.
   It also decides the scheme the engine serves on its TCP port, since a loopback engine gets its TLS cert stripped. The gateway's own hop is the engine socket either way (ADR 0445).
 - **Engine credentials are files, not variables.** `~/.lucidos/local-token` (full authority) and `~/.lucidos/hook-socket-token` (webhook delivery only) are minted mode 0600 at boot, by the gateway or an engine that starts first. The dependency-free `lucidos-local-token` crate owns both. They are only CHECKED when the engine's resolved bind is not loopback (`api::local_auth`), so on a default launch nothing presents or needs them. The CLI, the gateway proxy hop and the hook socket already send the right one; nothing else should.
 - `LUCIDOS_HOOK_PORT` (set by the gateway, read by the gateway and the engine). The port the *hook socket* binds, the listener that answers webhook deliveries and nothing else (ADR 0097). Unset, it is the gateway's own port plus ten, so 5261 in dev and 5262 packaged, which keeps the two coexisting as their gateways do. The gateway resolves it once and passes it to every engine it spawns, so `scheduler/webhook_ingress` never re-derives the port it probes. `0` switches the socket off, so the probe has nothing to probe, and an unparseable value does the same with a log line: a listener on a port nobody meant to open is worse than none. Always bound to `127.0.0.1`: `tailscale funnel` proxies from this machine, so loopback is what it reaches.
+- `LUCIDOS_PUBLIC_PORT` (read by the gateway). The port of the *public listener*: a loopback listener that serves the whole gateway. Every request on it counts as public, so a typed pairing code is refused there (ADR 0615). A tunnel or reverse proxy points at it. Unset, it is the gateway's own port plus thirty: 5281 in dev, 5282 packaged. `0` switches it off, and an unparseable value does the same with a log line.
 - `LUCIDOS_TAILSCALE_BIN` (absolute path to the Tailscale CLI) overrides the
   built-in candidate probe in `lucidos_tailscale::resolve_tailscale_binary`.
   That probe has one copy, shared by the engine, the gateway and the desktop app.

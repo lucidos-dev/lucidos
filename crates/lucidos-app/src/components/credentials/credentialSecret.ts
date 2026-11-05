@@ -1,4 +1,5 @@
 import type { AuthType } from '../../store/types';
+import { OAUTH_WEB_CALLBACK_PATH } from '../../generated/gateway-constants';
 
 /** Editable secret field values for every auth type, flattened into one shape.
  *  Only the subset relevant to the active auth type is populated/read. */
@@ -25,6 +26,10 @@ export interface CredentialFields {
   authorizeParams: string;
   /** Blank means the default loopback callback URI. */
   redirectUri: string;
+  /** *Web redirect URIs*, one per line: `https://<origin>/~/oauth/callback`,
+   *  for a browser on a computer not running Lucidos. Each needs a Web client,
+   *  which has a client secret. */
+  webRedirectUris: string;
 }
 
 export function emptyFields(): CredentialFields {
@@ -40,6 +45,7 @@ export function emptyFields(): CredentialFields {
     userinfoMethod: '',
     authorizeParams: '',
     redirectUri: '',
+    webRedirectUris: '',
   };
 }
 
@@ -59,6 +65,7 @@ export function parseSecret(authType: AuthType, authValue: string): CredentialFi
     f.userinfoMethod = pick(p, 'userinfo_method');
     f.authorizeParams = pick(p, 'authorize_params');
     f.redirectUri = pick(p, 'redirect_uri');
+    f.webRedirectUris = pickList(p, 'web_redirect_uris').join('\n');
   } else if (authType === 'password') {
     const p = safeJson(authValue);
     f.username = pick(p, 'username');
@@ -87,11 +94,12 @@ export function buildSecret(authType: AuthType, f: CredentialFields): string {
       !f.userinfoUrl &&
       !f.userinfoMethod &&
       !f.authorizeParams &&
-      !f.redirectUri
+      !f.redirectUri &&
+      !f.webRedirectUris.trim()
     ) {
       return '';
     }
-    const blob: Record<string, string> = { client_id: f.clientId };
+    const blob: Record<string, string | string[]> = { client_id: f.clientId };
     // A blank client secret is meaningful, not missing: the engine reads its
     // absence as "public client" and authenticates the exchange with PKCE
     // instead. Clearing the field on an existing credential is how you switch a
@@ -107,6 +115,8 @@ export function buildSecret(authType: AuthType, f: CredentialFields): string {
     }
     if (f.authorizeParams) blob.authorize_params = f.authorizeParams;
     if (f.redirectUri) blob.redirect_uri = f.redirectUri;
+    const webRedirectUris = webRedirectUriLines(f.webRedirectUris);
+    if (webRedirectUris.length > 0) blob.web_redirect_uris = webRedirectUris;
     return JSON.stringify(blob);
   }
   if (authType === 'password') {
@@ -114,6 +124,18 @@ export function buildSecret(authType: AuthType, f: CredentialFields): string {
     return JSON.stringify({ username: f.username, password: f.password });
   }
   return f.value;
+}
+
+/** The web redirect URIs a field holds: one per line, trimmed, no blanks and
+ *  no repeats. */
+export function webRedirectUriLines(text: string): string[] {
+  return [...new Set(text.split('\n').map((line) => line.trim()).filter(Boolean))];
+}
+
+/** The web redirect URI for a page at `origin`, the one a provider returns this
+ *  browser to. It must match the engine's choice character for character. */
+export function webRedirectUriFor(origin: string): string {
+  return `${origin}${OAUTH_WEB_CALLBACK_PATH}`;
 }
 
 /** Whether a secret field holds a *secret reference* rather than the value.
@@ -134,4 +156,9 @@ function safeJson(s: string): Record<string, unknown> {
 function pick(o: Record<string, unknown>, k: string): string {
   const v = o[k];
   return typeof v === 'string' ? v : '';
+}
+
+function pickList(o: Record<string, unknown>, k: string): string[] {
+  const v = o[k];
+  return Array.isArray(v) ? v.filter((item): item is string => typeof item === 'string') : [];
 }

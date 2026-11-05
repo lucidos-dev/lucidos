@@ -160,7 +160,7 @@ async fn stranded_removal_does_not_accelerate_under_disk_pressure() {
     insert_old_event(&pool, thread_id, 30).await; // 30s idle
 
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    worker.free_hard_bytes = u64::MAX; // force under_hard
+    worker.hard_cap_bytes = u64::MAX; // force under_hard
 
     let rx = bus.subscribe();
     worker.run_once().await;

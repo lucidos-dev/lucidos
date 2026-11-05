@@ -11,24 +11,25 @@ export function deviceDatabaseName(base: string, workspaceId: string | null): st
 }
 
 export interface DeviceDatabase {
-  /** One transaction on one object store. Resolves with the request's result
-   *  once the transaction commits, and rejects if it fails or aborts. */
+  /** One transaction over the named stores; the callback receives the first.
+   *  Resolves with the request's result once the transaction commits, and
+   *  rejects if it fails or aborts. */
   transact<T>(
-    storeName: string,
+    storeName: string | string[],
     mode: IDBTransactionMode,
     body: (store: IDBObjectStore) => IDBRequest<T> | void,
   ): Promise<T | undefined>;
 }
 
-/** Open lazily, at version 1, creating the object stores on first open. */
-export function openDeviceDatabase(name: string, createStores: (db: IDBDatabase) => void): DeviceDatabase {
+/** Open lazily. Upgrades run exclusively after older connections close. */
+export function openDeviceDatabase(name: string, createStores: (db: IDBDatabase, transaction: IDBTransaction) => void, version = 1): DeviceDatabase {
   let opening: Promise<IDBDatabase> | null = null;
 
   function open(): Promise<IDBDatabase> {
     if (opening) return opening;
     const attempt = new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open(name, 1);
-      req.onupgradeneeded = () => createStores(req.result);
+      const req = indexedDB.open(name, version);
+      req.onupgradeneeded = () => createStores(req.result, req.transaction!);
       req.onsuccess = () => {
         const db = req.result;
         // Another tab is deleting or upgrading the database. The next write
@@ -59,7 +60,7 @@ export function openDeviceDatabase(name: string, createStores: (db: IDBDatabase)
       const db = await open();
       return new Promise((resolve, reject) => {
         const tx = db.transaction(storeName, mode);
-        const req = body(tx.objectStore(storeName));
+        const req = body(tx.objectStore(typeof storeName === 'string' ? storeName : storeName[0]));
         tx.oncomplete = () => resolve(req ? req.result : undefined);
         tx.onerror = () => reject(tx.error);
         tx.onabort = () => reject(tx.error ?? new DOMException('The write was aborted', 'AbortError'));

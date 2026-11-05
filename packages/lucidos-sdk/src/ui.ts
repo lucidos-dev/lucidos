@@ -27,6 +27,7 @@ import { inIOSStandalone } from './platform';
 import { applyAutocorrectPreference } from './autocorrectStamp';
 import { sse } from './sse';
 import { Select, enhanceSelects } from './select';
+import { ModelPicker } from './modelPicker';
 import { disableTooltips } from './tooltip';
 import { focusedThread, onFocusedThreadChange } from './focusedThread';
 import { pageOpensTabs, pageHandsOffToSafari, openTabNow, openSafariNow, traceAppLink } from './externalLinks';
@@ -1014,6 +1015,7 @@ export const ui = {
 
   /** Themed dropdown, replacing native `<select>` so popups can be styled. */
   Select,
+  ModelPicker,
 
   /**
    * Enhance every `<select class="lucidos-select">` under `root` (default

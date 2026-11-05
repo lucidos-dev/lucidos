@@ -258,10 +258,14 @@ pub(crate) async fn paired() -> Paired {
         test_engine::serve(&engine_dir, engine(seen.clone(), held)),
     );
     let cert = localhost_cert();
-    let port = serve_https(crate::server::gateway_router(b.clone()), &cert).await;
+    let port = serve_https(
+        crate::remote_gateways::tests::proxy_guard(crate::server::gateway_router(b.clone())),
+        &cert,
+    )
+    .await;
     let b_address = format!("https://localhost:{port}");
 
-    let code = b.paired_gateways().mint_code(None).unwrap();
+    let code = b.paired_gateways().mint_secret(None).unwrap();
     let GatewayRedemption::Paired {
         pairing_id,
         credential,
@@ -275,15 +279,18 @@ pub(crate) async fn paired() -> Paired {
 
     let a_dir = tempfile::tempdir().unwrap();
     let a = GatewayState::for_tests_with_static_dir(Some(a_dir.path().to_path_buf()));
-    a.relay_client().trust_for_test(cert.cert.pem().as_bytes());
+    a.peer_connection()
+        .trust_for_test(cert.cert.pem().as_bytes());
     a.remote_gateways()
         .add(RemoteGateway {
             name: "cloud".to_string(),
             address: b_address.clone(),
             pairing_id: pairing_id.clone(),
             credential: credential.clone(),
+            headers: crate::remote_gateways::tests::proxy_headers(),
             gateway_protocol: 1,
             added_at: "2020-01-01T00:00:00Z".to_string(),
+            rotation: Default::default(),
         })
         .unwrap();
     a.write_paired_devices_for_test(|paired| {
@@ -380,6 +387,7 @@ async fn client_sent_device_prefix_and_relay_headers_are_stripped_on_both_hops()
         .device_get(
             "/dev@cloud/api/v1/threads/list",
             &[
+                ("x-proxy-token", "forged-proxy-token"),
                 ("x-lucidos-device-id", "forged-device"),
                 ("x-lucidos-device-label", "Forged"),
                 ("x-forwarded-prefix", "/elsewhere/"),
@@ -542,8 +550,10 @@ async fn an_unreachable_remote_gateway_sends_a_page_load_to_the_list() {
             address,
             pairing_id: p.pairing_id.clone(),
             credential: p.credential.clone(),
+            headers: Default::default(),
             gateway_protocol: 1,
             added_at: "2020-01-01T00:00:00Z".to_string(),
+            rotation: Default::default(),
         })
         .unwrap();
     let page = p
@@ -553,6 +563,12 @@ async fn an_unreachable_remote_gateway_sends_a_page_load_to_the_list() {
     assert_eq!(page.headers()[header::LOCATION], "/~/?pick");
     let call = p.device_get("/dev@down/api/v1/threads/list", &[]).await;
     assert_eq!(call.status(), StatusCode::BAD_GATEWAY);
+    let body = axum::body::to_bytes(call.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["remote_gateway"], "down");
+    assert_eq!(body["reason_kind"], "refused");
 }
 
 #[tokio::test]
@@ -615,6 +631,7 @@ async fn to_b(p: &Paired, path: &str, headers: HeaderMap) -> reqwest::StatusCode
             p.b_address
         ))
         .headers(headers)
+        .header("x-proxy-token", "proxy-secret")
         .send()
         .await
         .unwrap()
@@ -690,6 +707,40 @@ async fn a_claim_with_no_device_reaches_only_public_app_assets() {
 }
 
 #[tokio::test]
+async fn a_claim_with_no_device_reaches_the_oauth_callback_and_no_sibling_route() {
+    let p = paired().await;
+    let anonymous = credential_and_claim(&p.credential, &fresh(None), &p.credential);
+    for sibling in [
+        "/dev/api/v1/internal/oauth/callback/x?state=%2Fdev%40cloud%2F~n",
+        "/dev/api/v1/internal/oauth?state=%2Fdev%40cloud%2F~n",
+        "/dev/oauth/callback?state=%2Fdev%40cloud%2F~n",
+    ] {
+        assert_eq!(to_b(&p, sibling, anonymous.clone()).await, 401, "{sibling}");
+    }
+    assert!(p.last_seen().is_none());
+
+    let callback = "/dev/api/v1/internal/oauth/callback?code=c&state=%2Fdev%40cloud%2F~n&x=leak";
+    assert_eq!(to_b(&p, callback, anonymous).await, 200);
+    let seen = p.last_seen().unwrap();
+    assert!(
+        seen.starts_with("get /api/v1/internal/oauth/callback?code=c&state=%2fdev%40cloud%2f~n\n"),
+        "{seen}"
+    );
+    assert!(!seen.contains("x-forwarded-prefix"), "{seen}");
+}
+
+#[tokio::test]
+async fn a_relayed_callback_whose_state_names_another_workspace_reaches_nothing() {
+    let p = paired().await;
+    let anonymous = credential_and_claim(&p.credential, &fresh(None), &p.credential);
+    for state in ["%2Fdev%2F~n", "%2Fother%40cloud%2F~n", "n"] {
+        let path = format!("/dev/api/v1/internal/oauth/callback?code=c&state={state}");
+        assert_eq!(to_b(&p, &path, anonymous.clone()).await, 404, "{state}");
+    }
+    assert!(p.last_seen().is_none());
+}
+
+#[tokio::test]
 async fn the_relay_is_one_way_a_credential_opens_nothing_on_its_holder() {
     let p = paired().await;
     // A holds the credential. Presented to A, it is no device and no gateway.
@@ -730,4 +781,77 @@ fn a_remote_frame_capability_is_passed_on_by_shape_alone() {
     assert!(!carries_a_remote_frame_capability(&req("GET", &local)));
     let dotted = format!("/dev@cloud/~cap/{token}/../../~/api/v1/remote-gateways");
     assert!(!carries_a_remote_frame_capability(&req("GET", &dotted)));
+}
+
+// ── The local-browser stamp crosses the relay signed ────────────────────────
+
+const LOCAL_STAMP: &str = "x-lucidos-local-browser: 1\n";
+
+/// A paired device's request to A over loopback, from a browser on A's machine.
+fn local_device_request(p: &Paired, path: &str) -> axum::http::Request<Body> {
+    let mut req = axum::http::Request::builder()
+        .uri(path)
+        .header(header::COOKIE, p.cookie())
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut().insert(crate::pairing::Peer {
+        remote: "127.0.0.1:50000".parse().unwrap(),
+        local: "127.0.0.1:8080".parse().unwrap(),
+        public_listener: false,
+    });
+    req
+}
+
+#[tokio::test]
+async fn a_browser_on_as_machine_reaches_bs_engine_stamped_local() {
+    let p = paired().await;
+    let response = p
+        .to_a(local_device_request(&p, "/dev@cloud/api/v1/threads/list"))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let seen = p.last_seen().unwrap();
+    assert_eq!(seen.matches(LOCAL_STAMP).count(), 1, "{seen}");
+    assert!(!seen.contains(HEADER_RELAY_LOCAL_BROWSER), "{seen}");
+}
+
+#[tokio::test]
+async fn a_forged_local_browser_stamp_is_stripped_on_both_hops() {
+    let p = paired().await;
+    let response = p
+        .device_get(
+            "/dev@cloud/api/v1/threads/list",
+            &[
+                (crate::oauth_callback::HEADER_LOCAL_BROWSER, "1"),
+                (HEADER_RELAY_LOCAL_BROWSER, "00"),
+            ],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let seen = p.last_seen().unwrap();
+    assert!(!seen.contains("local-browser"), "{seen}");
+}
+
+#[tokio::test]
+async fn b_honours_a_local_browser_stamp_only_under_the_pairing_credential() {
+    let p = paired().await;
+    let path = "/dev/api/v1/threads/list";
+    let claim = fresh(Some(device("device-1")));
+    let stamped = |key: &str| {
+        let mut headers = credential_and_claim(&p.credential, &claim, &p.credential);
+        let stamp = sign_local_browser(key, &claim.encode());
+        headers.insert(HEADER_RELAY_LOCAL_BROWSER, stamp.parse().unwrap());
+        headers
+    };
+
+    assert_eq!(to_b(&p, path, stamped("not-the-credential")).await, 200);
+    assert!(!p.last_seen().unwrap().contains("local-browser"));
+
+    let mut replayed = credential_and_claim(&p.credential, &claim, &p.credential);
+    let signature = sign(&p.credential, &claim.encode());
+    replayed.insert(HEADER_RELAY_LOCAL_BROWSER, signature.parse().unwrap());
+    assert_eq!(to_b(&p, path, replayed).await, 200);
+    assert!(!p.last_seen().unwrap().contains("local-browser"));
+
+    assert_eq!(to_b(&p, path, stamped(&p.credential)).await, 200);
+    assert!(p.last_seen().unwrap().contains(LOCAL_STAMP));
 }

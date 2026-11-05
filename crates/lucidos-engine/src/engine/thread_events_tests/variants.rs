@@ -928,3 +928,35 @@ fn widget_events_carry_the_app_id_and_nothing_else() {
         assert!(evt.is_persisted());
     }
 }
+
+/// I6 of the one-render plan: a card's size is a persisted thread event that
+/// round-trips its instance and size, so a reload and another device read it.
+#[test]
+fn an_inline_widget_size_round_trips() {
+    use crate::engine::thread_lifecycle::{classify_event, EventClass};
+    let evt = ThreadEvent::InlineWidgetSized {
+        app_id: "player".into(),
+        params: Some([("clip".to_string(), serde_json::json!("a.mp3"))].into()),
+        size: crate::core::apps::WidgetSize::Large,
+    };
+    let v = serde_json::to_value(&evt).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({
+            "type": "InlineWidgetSized",
+            "app_id": "player",
+            "params": {"clip": "a.mp3"},
+            "size": "large"
+        })
+    );
+    assert!(matches!(
+        serde_json::from_value::<ThreadEvent>(v).unwrap(),
+        ThreadEvent::InlineWidgetSized { ref app_id, params: Some(_), size: crate::core::apps::WidgetSize::Large }
+            if app_id == "player"
+    ));
+    assert!(evt.is_persisted());
+    assert_eq!(
+        classify_event("InlineWidgetSized"),
+        Some(EventClass::Metadata)
+    );
+}

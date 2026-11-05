@@ -218,11 +218,12 @@ body {
     height: auto;
 }
 
-/* A dashboard tile sets the widget's box and draws its surface (ADR 0432).
-   The page is see-through, so a transparent widget's own drawing is its shape.
-   The SDK keeps it from scrolling inside the tile. */
-html[data-widget-place="dashboard"],
-html[data-widget-place="dashboard"] body {
+/* A widget box, a thread card or a dashboard tile, sets the widget's box and
+   draws its surface (ADR 0432). Only a box has a size. The page is
+   see-through, so a transparent widget's own drawing is its shape. The SDK
+   keeps it from scrolling inside the box. */
+html[data-widget-size],
+html[data-widget-size] body {
     background: transparent;
 }
 

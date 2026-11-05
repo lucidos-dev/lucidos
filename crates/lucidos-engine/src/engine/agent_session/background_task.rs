@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::engine::agent_session::child_reports::ChildReport;
 use crate::engine::event_bus::{BusEvent, EmittedEvent, LagReplay, ReplayScope};
-use crate::engine::event_wait::StoppedTask;
+use crate::engine::event_wait::{OwnerTurn, StoppedTask};
 use crate::engine::thread_events::MessageOrigin;
 use crate::engine::tools::bash_background::{BackgroundBashRegistry, CompletionDelivery, TaskSpec};
 use crate::engine::LucidosEngine;
@@ -177,10 +177,6 @@ impl LucidosEngine {
         // The agent's own permission check saw only `lucidos background-task
         // run -- …`, and its Bash guard read head `lucidos`. This is the one
         // place that reads the real command.
-        if let Some(reason) = crate::engine::command_guard::catastrophic_reason_for_command(command)
-        {
-            return Err(format!("Refused: the command is {reason}."));
-        }
         let cwd = {
             let sessions = self.agent_sessions.lock().await;
             sessions
@@ -195,6 +191,14 @@ impl LucidosEngine {
                     .to_string(),
             );
         };
+        if let Some(reason) =
+            crate::engine::command_guard::catastrophic_reason_for_command_at(command, Some(&cwd))
+        {
+            return Err(format!("Refused: the command is {reason}."));
+        }
+        if crate::engine::command_guard::command_reads_secret(command) {
+            return Err("Refused: background tasks cannot read Lucidos secrets.".to_string());
+        }
         let timeout_secs = timeout_secs
             .unwrap_or(BG_MAX_TIMEOUT_SECS)
             .clamp(1, BG_MAX_TIMEOUT_SECS);
@@ -216,7 +220,9 @@ impl LucidosEngine {
             });
         }
 
-        let covered = self.arm_wait_for_running_background_tasks(thread_id).await;
+        let covered = self
+            .arm_wait_for_running_background_tasks(thread_id, OwnerTurn::Running)
+            .await;
         let still_running = self.bash_background.is_running(&task_id).await;
         match settle_start(&task_id, &covered, still_running) {
             Settled::Watched => Ok(BackgroundTaskStart::Watched {

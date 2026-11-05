@@ -19,6 +19,7 @@ name = "lucidos-gateway"
 path = "src/main.rs"
 
 [dependencies]
+lucidos-secret-store = { path = "../lucidos-secret-store" }
 lucidos-tailscale = { path = "../lucidos-tailscale" }
 lucidos-home = { path = "../lucidos-home" }
 lucidos-local-token = { path = "../lucidos-local-token" }

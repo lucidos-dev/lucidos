@@ -112,11 +112,14 @@ describe('a code that arrived in the launch URL', () => {
     expect(gateSrc).toMatch(/if \(!paired\) setAutoPair\('done'\);/);
   });
 
-  it('is the only code redeemed without a tap', () => {
-    // A paste and a scan each already cost one, and the user is looking at the
-    // field. Both fill it and stop.
-    expect(gateSrc).toMatch(/setError\(null\);\s*setCode\(pasted\);/);
-    expect(gateSrc).toMatch(/setCode\(scannedCode\);\s*setError\(null\);\s*setScanning\(false\);/);
+  it('is the only short code redeemed without a tap', () => {
+    // A pasted or scanned short code fills the field and stops: the user is
+    // looking at it. A long secret fits no box, so it goes straight through.
+    expect(gateSrc).toMatch(/setError\(null\);\s*adopt\(pasted\);/);
+    expect(gateSrc).toMatch(/setScanning\(false\);\s*adopt\(scannedCode\);/);
+    expect(gateSrc).toMatch(
+      /if \(isPairingSecret\(token\)\) void redeem\(token\);\s*else setCode\(token\);/,
+    );
   });
 });
 

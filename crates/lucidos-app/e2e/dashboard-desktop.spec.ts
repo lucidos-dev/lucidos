@@ -189,8 +189,8 @@ test.describe('dashboard on desktop', () => {
     const m = await box(tile(page, ids.medium));
     expect(Math.abs(m.height - s.height)).toBeLessThan(2);
     // The fade marks the clip. Opening it full size is the tile menu's job.
-    await expect(tile(page, ids.medium).locator('.dashboard-tile-fade')).toBeVisible();
-    await expect(tile(page, ids.medium).locator('.dashboard-tile-fade button')).toHaveCount(0);
+    await expect(tile(page, ids.medium).locator('.widget-box-fade')).toBeVisible();
+    await expect(tile(page, ids.medium).locator('.widget-box-fade button')).toHaveCount(0);
     const html = frame(page, ids.medium).locator('html');
     expect(await html.evaluate((el) => getComputedStyle(el).overflow)).toBe('hidden');
     const t = await box(tile(page, ids.medium));
@@ -488,9 +488,9 @@ test.describe('dashboard on desktop', () => {
       const loaded = await frame(page, ids.medium).locator('#load').textContent();
 
       await page.locator('.dashboard-edit').click();
-      const pill = tile(page, ids.medium).locator('.dashboard-size-pill button');
+      const pill = tile(page, ids.medium).locator('.widget-size-pill button');
       await expect(pill).toHaveText(['S', 'M', 'L']);
-      await tile(page, ids.medium).locator('.dashboard-size-pill button[aria-label="large"]').click();
+      await tile(page, ids.medium).locator('.widget-size-pill button[aria-label="large"]').click();
       await expect(tile(page, ids.medium)).toHaveAttribute('data-size', 'large');
       await expect(frame(page, ids.medium).locator('html')).toHaveAttribute('data-widget-size', 'large');
       await expect(frame(page, ids.medium).locator('#load')).toHaveText(loaded ?? '');

@@ -698,10 +698,14 @@ impl LucidosEngine {
                 // It is a persisted *form request*, not a transient navigation:
                 // a client that missed the frame still finds it on its next
                 // stream open, for as long as the flow is listening.
-                let actor = self
-                    .last_used_device(thread_id, device_id)
-                    .await
-                    .map(|id| super::navigate::device_actor(&id));
+                let page_device = self.last_used_device(thread_id, device_id).await;
+                // The callback routes back to wherever that device reached us.
+                let route = oauth::CallbackRoute::for_browser(
+                    page_device
+                        .as_deref()
+                        .and_then(crate::core::oauth_callback::browser_for_device),
+                );
+                let actor = page_device.map(|id| super::navigate::device_actor(&id));
                 let open_auth_url = async |auth_url: &str, request_id: uuid::Uuid| {
                     let payload = serde_json::json!({
                         "target": "url",
@@ -729,6 +733,7 @@ impl LucidosEngine {
                     &provider,
                     scopes,
                     actor.clone(),
+                    route,
                     open_auth_url,
                 )
                 .await?;

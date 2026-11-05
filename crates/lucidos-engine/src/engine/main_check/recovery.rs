@@ -8,6 +8,8 @@ use uuid::Uuid;
 /// One stored event the main check's state depends on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum MainCheckRecord {
+    /// Restoring retains historical verdicts but expires pending follow-up work.
+    RestoreBoundary,
     Started(CheckRange),
     RunLinked {
         check_id: Uuid,
@@ -47,6 +49,7 @@ pub(super) fn fold(records: &[MainCheckRecord]) -> Recovered {
     let mut linked: Option<(Uuid, RunLink)> = None;
     for record in records {
         match record {
+            MainCheckRecord::RestoreBoundary => check.expire_followup(),
             MainCheckRecord::Started(range) => check.replay_started(range.clone()),
             MainCheckRecord::RunLinked { check_id, link } => {
                 linked = Some((*check_id, link.clone()));
@@ -269,5 +272,16 @@ mod tests {
         assert_eq!(recovered.check.running(), None);
         assert_eq!(recovered.check.red(), None);
         assert_eq!(recovered.check.passed(), None);
+    }
+    #[test]
+    fn restore_floor_expires_owed_work_and_retains_verdicts() {
+        let mut records = vec![started(1, "a", "b"), ended(1, failed(8)), landed(None, "b")];
+        assert!(fold(&records).check.dirty());
+        records.push(MainCheckRecord::RestoreBoundary);
+        let restored = fold(&records);
+        assert!(!restored.check.dirty());
+        assert!(restored.check.red().is_some());
+        records.push(landed(None, "c"));
+        assert!(fold(&records).check.dirty(), "new work remains owed");
     }
 }

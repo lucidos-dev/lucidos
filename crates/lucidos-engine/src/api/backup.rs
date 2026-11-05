@@ -476,8 +476,15 @@ pub async fn create_backup(
     State(state): State<AppState>,
     Json(req): Json<BackupRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let guard = crate::scheduler::BackupGuard::try_acquire(&state.engine)
-        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "Backup already in progress"))?;
+    let guard = crate::scheduler::BackupGuard::try_acquire(&state.engine).ok_or_else(|| {
+        let slot = &state.engine.archive_job_slot;
+        let message = if slot.is_running(crate::core::snapshot::ArchiveJobKind::Backup) {
+            "Backup already in progress"
+        } else {
+            "A workspace snapshot job is running. Try the backup again when it finishes."
+        };
+        ApiError::new(StatusCode::CONFLICT, message)
+    })?;
 
     // Validate sync — guard drops on early return so the flag is released.
     let provider = resolve_provider(&req.provider, &state.pool)?;
@@ -527,7 +534,7 @@ pub async fn list_backups(
 /// `latest_backup` come from persisted state, not ephemeral SSE.
 #[derive(Serialize)]
 pub struct BackupStatusResponse {
-    /// True while a backup is in progress (mirrors `engine.backup_in_progress`).
+    /// True while the workspace archive-job slot is occupied by a backup.
     pub running: bool,
     /// Persisted outcome of the last run, or null if never recorded.
     pub last_run: Option<backup::BackupLastRun>,
@@ -593,8 +600,8 @@ pub async fn get_backup_status(
 
     let running = state
         .engine
-        .backup_in_progress
-        .load(std::sync::atomic::Ordering::SeqCst);
+        .archive_job_slot
+        .is_running(crate::core::snapshot::ArchiveJobKind::Backup);
     let last_run = backup::load_last_run(&state.pool).await;
     // Tolerate a list failure (e.g. Drive unreachable): the page must still
     // render running/last_run, just without the latest-backup line.
@@ -1261,7 +1268,7 @@ mod tests {
     }
 
     /// `running` must pass straight through to the response in both states —
-    /// the handler feeds it the `engine.backup_in_progress` AtomicBool.
+    /// the handler feeds it whether the shared archive-job slot holds a backup.
     #[test]
     fn build_status_mirrors_running_flag() {
         let now = Utc::now();

@@ -70,7 +70,6 @@ const CONSUMER_EXEMPT: Record<string, Exemption> = {
   'components/widgets/InlineWidget.tsx': { tag: 'single-value', why: "an inline widget's bar holds its name empty until the widget is read" },
   'components/widgets/DashboardItem.tsx': { tag: 'structure-first', why: 'the Add to dashboard row draws at once, inert until its dashboard is read' },
   'components/widgets/WidgetPickerItems.tsx': { tag: 'structure-first', why: 'anchored menu rows; a hidden note holds a line until the widgets land' },
-  'components/widgets/WidgetShelf.tsx': { tag: 'single-value', why: 'the title row stays as it was until its widget chips land' },
   'components/widgets/OptionWidgetFrame.tsx': { tag: 'structure-first', why: "an option's frame box holds its room until the manifest says how it reveals" },
   'components/shared/AppIcon.tsx': { tag: 'single-value', why: 'an icon slot shows the monogram tile until the apps list lands' },
   'components/plugins/PluginInstallPanel.tsx': { tag: 'structure-first', why: "the receipt's Open buttons name the app by id until the apps list lands" },

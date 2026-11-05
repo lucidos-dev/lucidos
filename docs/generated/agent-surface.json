@@ -102,6 +102,8 @@
         "flags": [
           "help",
           "reason",
+          "snapshot",
+          "target-workspace",
           "thread"
         ],
         "hidden": false,
@@ -1974,6 +1976,70 @@
           },
           {
             "aliases": [],
+            "commands": [
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "check"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "create"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "delete"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "get"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "list"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "restore"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "restore-status"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "status"
+              }
+            ],
+            "flags": [],
+            "hidden": false,
+            "name": "snapshot"
+          },
+          {
+            "aliases": [],
             "commands": [],
             "flags": [],
             "hidden": false,
@@ -2324,7 +2390,7 @@
                 "commands": [],
                 "flags": [],
                 "hidden": false,
-                "name": "pin"
+                "name": "size"
               },
               {
                 "aliases": [],
@@ -2332,20 +2398,6 @@
                 "flags": [],
                 "hidden": false,
                 "name": "stop-reusing"
-              },
-              {
-                "aliases": [],
-                "commands": [],
-                "flags": [],
-                "hidden": false,
-                "name": "thread"
-              },
-              {
-                "aliases": [],
-                "commands": [],
-                "flags": [],
-                "hidden": false,
-                "name": "unpin"
               }
             ],
             "flags": [],
@@ -2366,6 +2418,21 @@
             "flags": [],
             "hidden": false,
             "name": "workspace-prompt-footprint"
+          },
+          {
+            "aliases": [],
+            "commands": [
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "review"
+              }
+            ],
+            "flags": [],
+            "hidden": false,
+            "name": "workspaces"
           }
         ],
         "flags": [],
@@ -3254,6 +3321,184 @@
       },
       {
         "aliases": [],
+        "commands": [
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "json",
+              "workspace"
+            ],
+            "hidden": false,
+            "name": "check"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "json",
+              "keep",
+              "label",
+              "wait",
+              "workspace"
+            ],
+            "hidden": false,
+            "name": "create"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "json",
+              "workspace"
+            ],
+            "hidden": false,
+            "name": "delete"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "json",
+              "workspace"
+            ],
+            "hidden": false,
+            "name": "get"
+          },
+          {
+            "aliases": [],
+            "commands": [
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "check"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "create"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "delete"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "get"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "help"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "list"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "restore"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "restore-status"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "status"
+              }
+            ],
+            "flags": [],
+            "hidden": false,
+            "name": "help"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "json",
+              "workspace"
+            ],
+            "hidden": false,
+            "name": "list"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "expected-workspace-id",
+              "help",
+              "json",
+              "port",
+              "reason",
+              "wait",
+              "workspace"
+            ],
+            "hidden": false,
+            "name": "restore"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "json",
+              "port",
+              "workspace"
+            ],
+            "hidden": false,
+            "name": "restore-status"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "json",
+              "wait",
+              "workspace"
+            ],
+            "hidden": false,
+            "name": "status"
+          }
+        ],
+        "flags": [
+          "help"
+        ],
+        "hidden": false,
+        "name": "snapshot"
+      },
+      {
+        "aliases": [],
         "commands": [],
         "flags": [
           "cc",
@@ -4125,7 +4370,8 @@
               "dashboard",
               "help",
               "label",
-              "params"
+              "params",
+              "size"
             ],
             "hidden": false,
             "name": "dashboard-add"
@@ -4199,7 +4445,7 @@
                 "commands": [],
                 "flags": [],
                 "hidden": false,
-                "name": "pin"
+                "name": "size"
               },
               {
                 "aliases": [],
@@ -4207,20 +4453,6 @@
                 "flags": [],
                 "hidden": false,
                 "name": "stop-reusing"
-              },
-              {
-                "aliases": [],
-                "commands": [],
-                "flags": [],
-                "hidden": false,
-                "name": "thread"
-              },
-              {
-                "aliases": [],
-                "commands": [],
-                "flags": [],
-                "hidden": false,
-                "name": "unpin"
               }
             ],
             "flags": [],
@@ -4252,13 +4484,12 @@
             "flags": [
               "app-id",
               "help",
-              "label",
               "params",
-              "shown-event-id",
+              "size",
               "thread-id"
             ],
             "hidden": false,
-            "name": "pin"
+            "name": "size"
           },
           {
             "aliases": [],
@@ -4269,29 +4500,6 @@
             ],
             "hidden": false,
             "name": "stop-reusing"
-          },
-          {
-            "aliases": [],
-            "commands": [],
-            "flags": [
-              "help",
-              "thread-id"
-            ],
-            "hidden": false,
-            "name": "thread"
-          },
-          {
-            "aliases": [],
-            "commands": [],
-            "flags": [
-              "app-id",
-              "help",
-              "label",
-              "params",
-              "thread-id"
-            ],
-            "hidden": false,
-            "name": "unpin"
           }
         ],
         "flags": [
@@ -4340,6 +4548,48 @@
         ],
         "hidden": false,
         "name": "workspace-prompt-footprint"
+      },
+      {
+        "aliases": [],
+        "commands": [
+          {
+            "aliases": [],
+            "commands": [
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "help"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "review"
+              }
+            ],
+            "flags": [],
+            "hidden": false,
+            "name": "help"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "port"
+            ],
+            "hidden": false,
+            "name": "review"
+          }
+        ],
+        "flags": [
+          "help"
+        ],
+        "hidden": false,
+        "name": "workspaces"
       }
     ],
     "flags": [
@@ -4396,6 +4646,14 @@
       "TreeBackfillCapRaised",
       "TreeBackfillEnded",
       "ChangesUpdated",
+      "SnapshotProgress",
+      "SnapshotRestoreRequested",
+      "WorkspaceRestored",
+      "SnapshotCreated",
+      "SnapshotCaptureFailed",
+      "SnapshotChecked",
+      "SnapshotKeepChanged",
+      "SnapshotDeleted",
       "BackupProgress",
       "BackupCompleted",
       "BackupFailed",
@@ -4442,6 +4700,7 @@
       "TimezoneSet",
       "RepositoryImported",
       "TriggerCompleted",
+      "TriggerSlotsSkipped",
       "ChangeDiscarded",
       "DeviceVisible",
       "DeviceHidden",
@@ -4677,6 +4936,7 @@
       "WidgetShown",
       "WidgetPinned",
       "WidgetUnpinned",
+      "InlineWidgetSized",
       "ThreadMcpServerEnabled",
       "ThreadMcpServerDisabled",
       "HomeBoardArranged"
@@ -4690,6 +4950,7 @@
     "configure",
     "data",
     "events",
+    "modelRequest",
     "notifications",
     "oauth",
     "params",

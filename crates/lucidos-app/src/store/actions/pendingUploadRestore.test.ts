@@ -1,3 +1,4 @@
+import { observeSourceGeneration } from '../../utils/restoreSourceGeneration';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 (globalThis as any).URL.createObjectURL = () => 'blob:fake';
@@ -41,6 +42,7 @@ import {
   type PendingUploadRecord,
 } from '../pendingUploadRecords';
 import { PAGE_OWNER_LOCK_PREFIX } from '../pageOwner';
+import { createMemoryUnsentMessageBackend, _resetUnsentMessageRecordsForTesting, type UnsentMessageBackend } from '../unsentMessageRecords';
 import {
   addPendingUpload,
   detachPendingUpload,
@@ -76,6 +78,7 @@ function thread(id: string, state: 'composing' | 'active' | 'discarded' = 'compo
 }
 
 let backend: PendingUploadBackend;
+let messages: UnsentMessageBackend;
 const originalFetch = globalThis.fetch;
 
 async function seed(...records: PendingUploadRecord[]): Promise<void> {
@@ -87,6 +90,9 @@ const warnings = () => toasts.value.filter((t) => t.type === 'warning').map((t) 
 const chipIds = (threadId = LIVE) => getPendingUploads(threadId).map((u) => u.localId);
 
 beforeEach(() => {
+  observeSourceGeneration(null);
+  messages = createMemoryUnsentMessageBackend();
+  _resetUnsentMessageRecordsForTesting(messages);
   backend = createMemoryPendingUploadBackend();
   _resetPendingUploadRecordsForTesting(backend);
   _resetPendingUploadRestoreForTesting();
@@ -101,6 +107,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  observeSourceGeneration(null);
   globalThis.fetch = originalFetch;
   _resetImageUploadRunsForTesting();
   _resetPendingUploadsForTesting();
@@ -193,13 +200,27 @@ describe('restorePendingUploads', () => {
     expect(warnings()).toEqual(['An image attached before the reload was dropped: it waited more than 7 days.']);
   });
 
-  it('forgets a landed image the draft already holds, quietly', async () => {
+  it('retains landed bytes the draft holds past the ordinary age cap', async () => {
     setDraft(LIVE, { text: '', image_hashes: ['h1'], mode: 'lucidos' });
-    await seed(record('u-1', { landedHash: 'h1' }));
+    await seed(record('u-1', { landedHash: 'h1', createdAt: NOW - PENDING_UPLOAD_MAX_AGE_MS - 1 }));
     const outcome = await restorePendingUploads(NOW);
     expect(outcome.restored).toBe(0);
-    expect(await storedIds()).toEqual([]);
+    expect(await storedIds()).toEqual(['u-1']);
     expect(chipIds()).toEqual([]);
+    expect(warnings()).toEqual([]);
+  });
+
+  it.each(['sending', 'unsent'] as const)('retains old landed bytes referenced by a durable %s even before its missing thread is restored', async (phase) => {
+    threadMap.value = new Map();
+    await seed(record('u-1', { landedHash: 'h1', createdAt: NOW - PENDING_UPLOAD_MAX_AGE_MS - 1 }));
+    await messages.put({ eventId: 'send-1', threadId: LIVE, ownerId: EARLIER_PAGE, phase, failedRetries: 0,
+      body: { message: 'keep photo', mode: 'human', image_hashes: ['h1'] },
+      sentAt: new Date(NOW).toISOString(), settlement: { kind: 'follow-up' } });
+    const outcome = await restorePendingUploads(NOW);
+    expect(outcome.gone + outcome.expired + outcome.restored).toBe(0);
+    expect(await storedIds()).toEqual(['u-1']);
+    expect(chipIds()).toEqual([]);
+    expect(uploadThreadBlob).not.toHaveBeenCalled();
     expect(warnings()).toEqual([]);
   });
 
@@ -325,4 +346,39 @@ describe('droppedImagesMessage', () => {
       + ' 2 sends queued before the reload were not sent: an image is lost or the draft changed. Check the draft, then send.',
     );
   });
+});
+
+it('retains late historical uploads and queues without checking, expiring or replaying them', async () => {
+  observeSourceGeneration('current');
+  const old = record('late-old', { createdAt: 0 });
+  const queue = { threadId: LIVE, ownerId: EARLIER_PAGE, text: '', localIds: [old.localId], intent: { useCodingAgent: false, context: null } };
+  await seed(old);
+  await backend.putQueuedUploadSend(queue);
+  const outcome = await restorePendingUploads(NOW);
+  expect(outcome.restored).toBe(0);
+  expect(outcome.expired).toBe(0);
+  expect(await backend.listUploads()).toEqual([old]);
+  expect(await backend.listQueuedUploadSends()).toEqual([queue]);
+  expect(ensureThreadByIdInMap).not.toHaveBeenCalled();
+  expect(uploadThreadBlob).not.toHaveBeenCalled();
+  expect(queuedUploadSends.peek().size).toBe(0);
+});
+
+it('allows a current-generation upload to survive an ordinary page reload', async () => {
+  observeSourceGeneration('current');
+  await seed(record('current-image', { sourceGeneration: 'current' }));
+  expect((await restorePendingUploads(NOW)).restored).toBe(1);
+  expect(chipIds()).toEqual(['current-image']);
+});
+
+it('rechecks origin after a draft lookup crosses a restore', async () => {
+  await seed(record('lookup-race', { createdAt: 0 }));
+  vi.mocked(ensureThreadByIdInMap).mockImplementationOnce(async () => {
+    observeSourceGeneration('restored-during-lookup');
+    return false;
+  });
+  const outcome = await restorePendingUploads(NOW);
+  expect(outcome.gone + outcome.expired + outcome.restored).toBe(0);
+  expect(await storedIds()).toEqual(['lookup-race']);
+  expect(uploadThreadBlob).not.toHaveBeenCalled();
 });

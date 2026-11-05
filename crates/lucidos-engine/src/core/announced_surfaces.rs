@@ -136,6 +136,13 @@ pub const RUNTIME_CREATED_TABLES: &[(&str, &str)] = &[(
 /// table.
 pub const TABLES: &[TableRule] = &[
     TableRule {
+        table: "snapshot_restore_boundary",
+        owners: &["core/snapshot/boundary.rs"],
+        announcement: Announcement::Silent {
+            reason: "Observed verified external restore journal identity and archived event floor before dispatch; WorkspaceRestored announces completed settlement.",
+        },
+    },
+    TableRule {
         table: "apply_all_batches",
         owners: &["engine/apply_all_driver.rs"],
         announcement: Announcement::Announced {

@@ -99,6 +99,25 @@
       font-variant-numeric: tabular-nums;
       white-space: nowrap;
     }
+    /* In a widget box, a thread card or a dashboard tile, the box is the
+       surface: the row sits centred in it with a larger play button. */
+    html[data-widget-size], html[data-widget-size] body { height: 100%; }
+    html[data-widget-size] body {
+      display: flex;
+      align-items: center;
+      padding: 0 var(--space-lg);
+      box-sizing: border-box;
+    }
+    html[data-widget-size] .player {
+      flex: 1;
+      min-width: 0;
+      gap: 0.75rem;
+      padding: 0;
+      border: none;
+      background: none;
+    }
+    html[data-widget-size] .play { width: 2.5rem; height: 2.5rem; }
+    html[data-widget-size] .play svg { width: 1rem; height: 1rem; }
     .error {
       color: var(--text-secondary);
       font-size: var(--font-size-sm);

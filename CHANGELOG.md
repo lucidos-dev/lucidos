@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.56.0 — 2026-11-05
+
+### Added
+
+- Local workspace snapshots. Take a snapshot from Settings, the CLI or the agent, and restore the workspace to it later. A restore keeps what you typed since, and you can undo it.
+- Workspace cleanup. The workspace picker lists every workspace with its size and origin, and you delete them in batches you confirm on your device. Deleted workspaces go to a Trash you can restore from or empty.
+- The in-app workspace switcher lists workspaces on paired remote gateways, so you can hop to one without leaving for the picker.
+- A paired remote gateway can sit behind an access proxy such as Cloudflare Access. Set the headers it needs in Settings or the picker.
+- Apps can show the host model picker through the SDK, with model, effort and provider.
+- Apps, scripts and the CLI can call your Claude gateway through the `claude-gateway` builtin proxy.
+- OAuth sign-in works from a phone or another machine. A browser away from the gateway uses a web redirect URI you list on the credential.
+- When a scheduled trigger misses a run, for example while the Mac slept, you get one notice that names the gap.
+- A scheduled backup missed while the engine was off runs once when the engine starts.
+
+### Changed
+
+- Pairing uses a long secret in the QR code and the pairing link. The 8-digit code works only from this machine, and Settings > Access names the port a tunnel should point to.
+- Under a gateway, the gateway owns the OAuth callback port and routes each callback to the workspace that started it.
+- A widget has one box, the same on a thread card and a dashboard tile. Its card size is kept per thread, and Add to dashboard adds it at that size.
+- The low-disk warning scales with the volume size: a quarter and a tenth of the volume, up to 20 GiB and 5 GiB.
+- Switch to new version always delivers the new engine, or retries a fresh build itself, and shows the build log while it works.
+- The engine starts with no model provider set up, so Settings is always reachable.
+- The agent knows which machine the engine runs on, and no longer assumes it is your device.
+- Deleting a protected workspace needs a confirmation on your device, whatever tool asks.
+
+### Fixed
+
+- A coding agent that ends its turn while its background task runs is woken when the task finishes.
+- A thread waiting on its own child threads shows its todo list as waiting, not abandoned.
+- In flight lists an unread thread whose work is still running.
+- A 1M-context model reached through the Claude gateway proxy works.
+- A script failure notice leads with the script's own error, and credential warnings name only secrets the script looks up.
+- The Linux source install sets up its dependencies and starts on more distributions.
+- The brand badge's spinner sits centred at every UI scale.
+- On an iPhone, the welcome screen lines up with the composer after a scale change.
+
+### Removed
+
+- Pin to thread and the widget shelf. Embed a widget in a reply, or add it to a dashboard.
 ## v0.55.1 — 2026-11-01
 
 ### Changed

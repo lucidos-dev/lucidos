@@ -31,6 +31,7 @@ const ABORT_CAUSE_FLAGS = {
   process_killed: true,
   stale_settle: true,
   session_dropped: true,
+  snapshot_restored: true,
   unknown: true,
 } satisfies Record<AbortCause, true>;
 const ABORT_CAUSES = Object.keys(ABORT_CAUSE_FLAGS) as AbortCause[];

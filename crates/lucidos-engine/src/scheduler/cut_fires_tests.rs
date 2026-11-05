@@ -1,4 +1,28 @@
 use super::*;
+
+#[tokio::test]
+async fn restore_floor_excludes_archived_transient_cuts_but_keeps_new_fires() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let old = Uuid::new_v4();
+    start(&bus, old, false).await;
+    abort(&bus, old, AbortCause::EngineShutdown, false).await;
+    assert_eq!(find_cut_fires(&pool).await.unwrap().len(), 1);
+    // Test-only observed-boundary fixture. Production writes are journal-bound.
+    sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, $2, now(), COALESCE(MAX(sequence),0) FROM events")
+        .bind(Uuid::new_v4())
+        .bind(crate::core::snapshot::handle::Handle::generate().as_str())
+        .execute(&pool).await.unwrap();
+    assert!(find_cut_fires(&pool).await.unwrap().is_empty());
+    let new = Uuid::new_v4();
+    start(&bus, new, false).await;
+    abort(&bus, new, AbortCause::EngineShutdown, false).await;
+    let fires = find_cut_fires(&pool).await.unwrap();
+    assert_eq!(fires.len(), 1);
+    assert_eq!(fires[0].thread_id, new);
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
 use crate::engine::event_bus::EventBus;
 use sqlx::PgPool;
 
@@ -149,7 +173,7 @@ async fn negative(case: &str) {
         "old" => {
             // Test-only historical fixture; production timestamps remain bus-owned.
             sqlx::query("UPDATE events SET created = now() - make_interval(secs => $2) WHERE aggregate_id = $1 AND event_type = 'ResponseAborted'")
-                .bind(thread.to_string()).bind((CUT_FIRE_LOOKBACK_SECS + 1) as f64).execute(&pool).await.unwrap();
+                .bind(thread.to_string()).bind((BOOT_REPORT_LOOKBACK_SECS + 1) as f64).execute(&pool).await.unwrap();
         }
         "script" => {
             sqlx::query("UPDATE thread_summaries SET source = 'chat' WHERE thread_id = $1")
@@ -800,4 +824,24 @@ async fn a_cut_retry_is_reported_but_never_retried_across_more_boots() {
     assert_eq!(notices, 2);
     pool.close().await;
     teardown_test_db(&db).await;
+}
+
+pub(crate) async fn seed_snapshot_cut(bus: &EventBus) -> Uuid {
+    let id = Uuid::new_v4();
+    start(bus, id, false).await;
+    abort(bus, id, AbortCause::EngineShutdown, false).await;
+    assert!(find_cut_fires(bus.pool())
+        .await
+        .unwrap()
+        .iter()
+        .any(|f| f.thread_id == id));
+    id
+}
+
+pub(crate) async fn assert_snapshot_cut_excluded(pool: &PgPool, id: Uuid) {
+    assert!(!find_cut_fires(pool)
+        .await
+        .unwrap()
+        .iter()
+        .any(|f| f.thread_id == id));
 }

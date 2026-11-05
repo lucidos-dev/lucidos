@@ -44,6 +44,7 @@ struct CallTicket {
     device_id: String,
     thread_id: Uuid,
     expires_at: Instant,
+    generation: Option<Uuid>,
 }
 
 /// The live call tickets, keyed by ticket.
@@ -61,7 +62,12 @@ impl CallTickets {
     ///
     /// Expired entries go on the way through, so unused tickets cannot
     /// accumulate. A poisoned mutex answers `None` rather than panicking.
-    pub(super) fn mint(&self, device_id: &str, thread_id: Uuid) -> Option<String> {
+    pub(super) fn mint(
+        &self,
+        device_id: &str,
+        thread_id: Uuid,
+        generation: Option<Uuid>,
+    ) -> Option<String> {
         let ticket = super::secret_reveal::fresh_token();
         let mut guard = self.inner.lock().ok()?;
         let now = Instant::now();
@@ -71,6 +77,7 @@ impl CallTickets {
             CallTicket {
                 device_id: device_id.to_string(),
                 thread_id,
+                generation,
                 expires_at: now + TICKET_TTL,
             },
         );
@@ -81,11 +88,11 @@ impl CallTickets {
     ///
     /// `api::mutating_gate` asks this to name an upgrade that carries no
     /// device header. The handler then redeems.
-    pub(super) fn peek_device(&self, ticket: &str) -> Option<String> {
+    pub(super) fn peek_device(&self, ticket: &str, generation: Option<Uuid>) -> Option<String> {
         let guard = self.inner.lock().ok()?;
         guard
             .get(ticket)
-            .filter(|t| t.expires_at > Instant::now())
+            .filter(|t| t.expires_at > Instant::now() && t.generation == generation)
             .map(|t| t.device_id.clone())
     }
 
@@ -94,9 +101,16 @@ impl CallTickets {
     /// The entry goes whichever way this lands. A ticket presented on the
     /// wrong thread has been mishandled, and a second try is not a case to
     /// support.
-    pub(super) fn redeem(&self, ticket: &str, thread_id: Uuid) -> Option<String> {
+    pub(super) fn redeem(
+        &self,
+        ticket: &str,
+        thread_id: Uuid,
+        generation: Option<Uuid>,
+    ) -> Option<String> {
         let entry = self.inner.lock().ok()?.remove(ticket)?;
-        (entry.expires_at > Instant::now() && entry.thread_id == thread_id)
+        (entry.expires_at > Instant::now()
+            && entry.thread_id == thread_id
+            && entry.generation == generation)
             .then_some(entry.device_id)
     }
 }
@@ -158,6 +172,10 @@ pub(super) async fn mint(
         crate::log!("[Voice] Refusing a call ticket for an app document or an unnamed page");
         return Err(ApiError::new(StatusCode::FORBIDDEN, NOT_FROM_THE_SHELL));
     }
+    let generation = crate::core::snapshot::boundary::read(pool)
+        .await
+        .map_err(ApiError::db)?
+        .map(|boundary| boundary.restore_id);
     let actor = super::actor::require_owner_device_for(
         headers,
         pool,
@@ -173,7 +191,7 @@ pub(super) async fn mint(
     };
     super::voice::refuse_call_on(pool, sessions, thread_id).await?;
     tickets
-        .mint(device_id, thread_id)
+        .mint(device_id, thread_id, generation)
         .ok_or_else(|| ApiError::internal("The call ticket store is poisoned."))
 }
 
@@ -191,9 +209,13 @@ mod tests {
     fn a_ticket_spends_once_on_its_own_thread() {
         let tickets = CallTickets::new();
         let home = Uuid::new_v4();
-        let ticket = tickets.mint(PHONE, home).expect("a ticket");
-        assert_eq!(tickets.redeem(&ticket, home).as_deref(), Some(PHONE));
-        assert_eq!(tickets.redeem(&ticket, home), None, "a ticket spends once");
+        let ticket = tickets.mint(PHONE, home, None).expect("a ticket");
+        assert_eq!(tickets.redeem(&ticket, home, None).as_deref(), Some(PHONE));
+        assert_eq!(
+            tickets.redeem(&ticket, home, None),
+            None,
+            "a ticket spends once"
+        );
     }
 
     /// A ticket presented on another thread is spent by the attempt, so it
@@ -202,21 +224,21 @@ mod tests {
     fn a_ticket_on_another_thread_is_refused_and_spent() {
         let tickets = CallTickets::new();
         let home = Uuid::new_v4();
-        let ticket = tickets.mint(PHONE, home).expect("a ticket");
-        assert_eq!(tickets.redeem(&ticket, Uuid::new_v4()), None);
-        assert_eq!(tickets.redeem(&ticket, home), None);
+        let ticket = tickets.mint(PHONE, home, None).expect("a ticket");
+        assert_eq!(tickets.redeem(&ticket, Uuid::new_v4(), None), None);
+        assert_eq!(tickets.redeem(&ticket, home, None), None);
     }
 
     #[test]
     fn a_peek_names_the_device_without_spending() {
         let tickets = CallTickets::new();
         let home = Uuid::new_v4();
-        let ticket = tickets.mint(PHONE, home).expect("a ticket");
-        assert_eq!(tickets.peek_device(&ticket).as_deref(), Some(PHONE));
-        assert_eq!(tickets.peek_device("not-a-ticket"), None);
-        assert_eq!(tickets.redeem(&ticket, home).as_deref(), Some(PHONE));
+        let ticket = tickets.mint(PHONE, home, None).expect("a ticket");
+        assert_eq!(tickets.peek_device(&ticket, None).as_deref(), Some(PHONE));
+        assert_eq!(tickets.peek_device("not-a-ticket", None), None);
+        assert_eq!(tickets.redeem(&ticket, home, None).as_deref(), Some(PHONE));
         assert_eq!(
-            tickets.peek_device(&ticket),
+            tickets.peek_device(&ticket, None),
             None,
             "a spent ticket names nobody"
         );
@@ -226,7 +248,7 @@ mod tests {
     fn an_expired_ticket_is_refused() {
         let tickets = CallTickets::new();
         let home = Uuid::new_v4();
-        let ticket = tickets.mint(PHONE, home).expect("a ticket");
+        let ticket = tickets.mint(PHONE, home, None).expect("a ticket");
         tickets
             .inner
             .lock()
@@ -234,8 +256,30 @@ mod tests {
             .get_mut(&ticket)
             .expect("the entry")
             .expires_at = Instant::now() - Duration::from_secs(1);
-        assert_eq!(tickets.peek_device(&ticket), None);
-        assert_eq!(tickets.redeem(&ticket, home), None);
+        assert_eq!(tickets.peek_device(&ticket, None), None);
+        assert_eq!(tickets.redeem(&ticket, home, None), None);
+    }
+
+    #[test]
+    fn generation_changes_refuse_old_tickets_even_with_the_same_device() {
+        let tickets = CallTickets::new();
+        let home = Uuid::new_v4();
+        let restored = Some(Uuid::new_v4());
+        let old = tickets.mint(PHONE, home, None).unwrap();
+        assert_eq!(tickets.peek_device(&old, restored), None);
+        assert_eq!(tickets.redeem(&old, home, restored), None);
+        assert_eq!(tickets.redeem(&old, home, None), None);
+        let current = tickets.mint(PHONE, home, restored).unwrap();
+        assert_eq!(
+            tickets.peek_device(&current, restored).as_deref(),
+            Some(PHONE)
+        );
+        assert_eq!(tickets.peek_device(&current, None), None);
+        assert_eq!(tickets.peek_device(&current, Some(Uuid::new_v4())), None);
+        assert_eq!(
+            tickets.redeem(&current, home, restored).as_deref(),
+            Some(PHONE)
+        );
     }
 
     #[test]

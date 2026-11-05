@@ -476,8 +476,8 @@ async fn hard_pressure_removes_an_archived_tree_inside_the_grace() {
     let before = tip(&fx.root, &branch).await;
     let rx = fx.bus.subscribe();
     let mut worker = make_worker(fx.pool.clone(), fx.bus.clone(), fx.root.clone());
-    worker.free_hard_bytes = u64::MAX;
-    worker.free_soft_bytes = u64::MAX;
+    worker.hard_cap_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
 
     worker.run_once().await;
 

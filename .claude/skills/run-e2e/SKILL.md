@@ -118,6 +118,8 @@ asks for it, and no `npm ci` when the dependencies already match.
   reruns the same selection on GitHub at the HEAD recorded at the start, and
   prints `[e2e] host busy`. Any other exit is the run's verdict. `--local`
   and a dirty tree keep the waits.
+- **`--webkit` on a macOS host runs here.** `/harden` adds
+  `ENGINE_CARGO_PROFILE=e2e` for that leg (ADR 0616).
 - **`--github` sends a filtered run to GitHub.** Use it when both slots are
   busy, for a mobile-webkit spec, or to confirm a fix on Linux and macOS
   (`./scripts/e2e-browser.sh --github -f <spec>`). Wait for the lock only for
@@ -134,7 +136,8 @@ asks for it, and no `npm ci` when the dependencies already match.
   or 4.5 min with WebKit. A Rust change compiles incrementally, and a WebKit
   run then takes 10-13 min. Run it as a polled background task either way.
 - **Exit 76 means no verdict**: the push was refused, the run never started or
-  was cancelled, or a shard left no output. Report it. Never read it as green.
+  was cancelled, or a shard left no output. The driver first reruns the failed
+  jobs once (ADR 0616). Report a second miss. Never read it as green.
 - **The output stays** under `test-results/github/<run-id>/`. For a failed
   shard, `gh run download <run> --repo lucidos-dev/lucidos -n e2e-traces-<shard>`
   fetches its Playwright traces and engine log.

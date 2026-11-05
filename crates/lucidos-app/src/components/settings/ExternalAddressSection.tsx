@@ -35,6 +35,14 @@ export function externalAddressNote(info: ExternalAddressInfo, tailnetDefault: s
     : 'Empty, so pairing uses Tailscale once this machine is on a tailnet.';
 }
 
+/** Pure: where a tunnel or reverse proxy on this machine should point, or
+ *  `null` when the gateway runs no public listener (ADR 0615). */
+export function publicListenerNote(info: ExternalAddressInfo): string | null {
+  if (info.public_port === null) return null;
+  return `A tunnel or reverse proxy on this machine should point at http://127.0.0.1:${info.public_port}. `
+    + 'Lucidos treats everything arriving there as public, so a typed pairing code is refused and the QR or link pairs instead.';
+}
+
 /** The External address section of Settings → Access (ADR 0550).
  *
  *  The setting is the GATEWAY's, one per gateway, so this reads and writes it
@@ -184,6 +192,9 @@ function ExternalAddressRow({
           </>
         )}
       </SkText>
+      {info && publicListenerNote(info) && (
+        <div class="settings-row-note" data-role="public-listener-note">{publicListenerNote(info)}</div>
+      )}
     </div>
   );
 }

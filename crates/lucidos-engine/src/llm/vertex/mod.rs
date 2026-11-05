@@ -25,6 +25,7 @@ use tokio::process::Command;
 pub mod adc;
 mod claude;
 mod gemini;
+pub(crate) use gemini::sdk_request_defaults;
 
 /// Shared access token cache for all VertexProvider instances in the same project.
 /// gcloud tokens are project-scoped, so one cache serves all models.

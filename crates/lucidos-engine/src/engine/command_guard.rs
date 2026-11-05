@@ -1,9 +1,9 @@
 //! Command guard: a pre-dispatch safety gate over the Lucidos Agent's bash and
 //! python tools. See ADR 0002 for the decision it implements.
 //!
-//! Classification is two-tier, the hybrid of ADR 0002:
+//! Classification is layered, extending the hybrid of ADR 0002:
 //!
-//!  * [`static_classify`] is the deterministic, zero-cost pass. It settles the
+//!  * [`static_classify`] is the deterministic pass. It settles the
 //!    two ends, a catastrophic deny-list that hard-blocks and an
 //!    obviously-safe allowlist that runs now, and hands the *ambiguous middle*
 //!    to the judge.
@@ -17,8 +17,10 @@
 //! coding-agent permission model. `ReversibleDanger` snapshots the workspace on
 //! a safety ref and runs, leaving a one-click Undo.
 //!
-//! The whole gate is off unless the workspace turns on the `command_guard`
-//! preference, so it ships dark. The judge has its own sub-toggle.
+//! The catastrophic floor and secret-read gate apply even with `command_guard`
+//! off. The preference enables the remaining checks. The judge has its own sub-toggle.
+
+mod workspace_floor;
 
 use crate::llm::tool_names as tn;
 use serde::{Deserialize, Serialize};
@@ -212,7 +214,7 @@ struct OnDisk<'a> {
     cwds: &'a [PathBuf],
 }
 
-/// The outcome of the static (zero-cost, deterministic) classification pass.
+/// The outcome of the static, deterministic classification pass.
 /// Either the lane is settled outright, or the command is the *ambiguous
 /// middle* and is handed to the LLM judge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -623,10 +625,9 @@ fn tail_runs_more_commands(tail: &str) -> bool {
         || has_command_substitution(tail)
 }
 
-/// The two secret paths under the Lucidos home, `.lucidos/secret-keys` and
-/// `.lucidos/pg-shared-password`. Matched as a suffix, so `~`, `$HOME`,
+/// Secret and snapshot paths under the Lucidos home. Matched as a suffix, so `~`, `$HOME`,
 /// `${HOME}` and an absolute home all match.
-static SECRET_PATHS: LazyLock<[String; 2]> = LazyLock::new(|| {
+static SECRET_PATHS: LazyLock<[String; 4]> = LazyLock::new(|| {
     let home = lucidos_home::HOME_DIR_NAME;
     [
         format!(
@@ -634,6 +635,8 @@ static SECRET_PATHS: LazyLock<[String; 2]> = LazyLock::new(|| {
             crate::core::secret_store::key_store::KEY_DIR_NAME
         ),
         format!("{home}/{}", lucidos_local_token::SHARED_PG_PASSWORD_FILE),
+        format!("{home}/snapshots"),
+        format!("{home}/{}", lucidos_local_token::LOCAL_TOKEN_FILE),
     ]
 });
 
@@ -672,7 +675,7 @@ pub fn command_reads_secret(command: &str) -> bool {
     mentions_secret_path(command) || mentions_secret_path(&unwrap_shell_command(command))
 }
 
-/// The static, deterministic, zero-cost classification pass.
+/// The static, deterministic classification pass.
 ///
 /// Only the four bash/python command-running tools are inspected; every other
 /// tool is `Settled(Safe)` (the guard never gates reads, edits, HTTP, etc.).
@@ -716,7 +719,7 @@ fn static_classify_at(
     // this, a wrapped command reads as head `bash`, skips the catastrophic
     // hard-block, and with the judge off falls through to Safe.
     let unwrapped = unwrap_shell_command(raw);
-    if catastrophic_reason(&unwrapped).is_some() {
+    if catastrophic_reason_at(&unwrapped, 0, root).is_some() {
         return StaticVerdict::Settled(RiskLane::Catastrophic);
     }
     if command_reads_secret(raw) {
@@ -2389,7 +2392,7 @@ fn python_program_proof(code: &str, disk: Option<OnDisk<'_>>, depth: usize) -> P
 
 /// What one shell literal a Python call runs proves to be.
 fn shell_literal_proof(cmd: &str, disk: Option<OnDisk<'_>>, depth: usize) -> Proof {
-    if catastrophic_reason(&unwrap_shell_command(cmd)).is_some() {
+    if catastrophic_reason_at(&unwrap_shell_command(cmd), 0, disk.map(|d| d.root)).is_some() {
         Proof::Catastrophic
     } else if command_reads_secret(cmd)
         || bash_fast_path_at(cmd, disk, &TrustedHeads::NONE, depth).is_some()
@@ -3618,7 +3621,7 @@ fn redirect_targets(segment: &str) -> impl Iterator<Item = &str> {
 /// NOT caught here — it belongs to the ask/judge lane in a later phase, not the
 /// deterministic hard-block.
 fn catastrophic_reason(command: &str) -> Option<&'static str> {
-    catastrophic_reason_at(command, 0)
+    catastrophic_reason_at(command, 0, None)
 }
 
 /// [`catastrophic_reason`] for a whole shell command line, a wrapper included.
@@ -3630,8 +3633,18 @@ pub(crate) fn catastrophic_reason_for_command(command: &str) -> Option<&'static 
     catastrophic_reason(&unwrap_shell_command(command))
 }
 
+pub(crate) fn catastrophic_reason_for_command_at(
+    command: &str,
+    cwd: Option<&Path>,
+) -> Option<&'static str> {
+    match cwd {
+        None => catastrophic_reason_for_command(command),
+        Some(cwd) => catastrophic_reason_at(&unwrap_shell_command(command), 0, Some(cwd)),
+    }
+}
+
 /// [`catastrophic_reason`], carrying the substitution-recursion depth.
-fn catastrophic_reason_at(command: &str, depth: usize) -> Option<&'static str> {
+fn catastrophic_reason_at(command: &str, depth: usize, cwd: Option<&Path>) -> Option<&'static str> {
     if is_fork_bomb(command) {
         return Some("a fork bomb (a recursive self-spawning process that exhausts the machine)");
     }
@@ -3651,12 +3664,18 @@ fn catastrophic_reason_at(command: &str, depth: usize) -> Option<&'static str> {
         if let Some(reason) = catastrophic_rm_or_chmod(&inner) {
             return Some(reason);
         }
+        if let Some(reason) = workspace_floor::reason(&inner, cwd) {
+            return Some(reason);
+        }
+    }
+    if let Some(reason) = workspace_floor::reason(command, cwd) {
+        return Some(reason);
     }
     // A substitution runs its body, and every scan above reads the OUTER head,
     // so `echo $(rm -rf /)` resolves to `echo`. Classify each body too.
     if depth < MAX_SUBSTITUTION_DEPTH {
         for body in substitution_bodies(command) {
-            if let Some(reason) = catastrophic_reason_at(body, depth + 1) {
+            if let Some(reason) = catastrophic_reason_at(body, depth + 1, cwd) {
                 return Some(reason);
             }
         }
@@ -5417,7 +5436,9 @@ pub fn grant_covers_command(
     trusted: &TrustedHeads,
     allowed: impl Fn(&str) -> bool,
 ) -> bool {
-    if command_reads_secret(command) || catastrophic_reason_for_command(command).is_some() {
+    if command_reads_secret(command)
+        || catastrophic_reason_for_command_at(command, site.root()).is_some()
+    {
         return false;
     }
     if allowed(label) {
@@ -5488,6 +5509,67 @@ mod tests {
     use serde_json::json;
 
     const TEXT_ONLY: CommandSite<'static> = CommandSite::TextOnly { root: None };
+
+    #[test]
+    fn cleanup_floor_blocks_every_tool_and_broad_grant_without_running_commands() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws = temp.path().join("workspace");
+        std::fs::create_dir_all(ws.join(".lucidos")).unwrap();
+        std::fs::create_dir_all(ws.join("data")).unwrap();
+        for command in [
+            format!("rm -rf {}", ws.display()),
+            format!("git status && bash -c 'mv {} /tmp/archive'", ws.display()),
+            format!("import shutil; shutil.rmtree('{}')", ws.display()),
+            "psql -c 'DROP DATABASE lucidos_example'".into(),
+            "dropdb lucidos_example".into(),
+            "pg_ctl -D /tmp/lucidos_example stop".into(),
+            "curl -X DELETE http://localhost/~/api/v1/control/workspaces/example".into(),
+            "curl -X POST http://localhost/~/api/v1/control/cleanup/batches".into(),
+            "curl -X POST http://localhost/~/api/v1/control/trash/empty".into(),
+        ] {
+            for tool in [
+                tn::RUN_BASH,
+                tn::RUN_BASH_BACKGROUND,
+                tn::RUN_PYTHON,
+                tn::RUN_PYTHON_BACKGROUND,
+            ] {
+                let input = json!({"command": command, "code": command});
+                assert_eq!(
+                    static_classify(tool, &input, CommandSite::Workspace(temp.path())),
+                    StaticVerdict::Settled(RiskLane::Catastrophic),
+                    "{tool}: {command}"
+                );
+            }
+            assert!(
+                catastrophic_reason_for_command_at(&command, Some(temp.path())).is_some(),
+                "{command}"
+            );
+            assert!(
+                !grant_covers_command(
+                    "Bash",
+                    &command,
+                    CommandSite::Workspace(temp.path()),
+                    &TrustedHeads::NONE,
+                    |_| true
+                ),
+                "{command}"
+            );
+        }
+        for secret in [
+            "cat ~/.lucidos/local-token",
+            "cat ~/.lucidos/pg-shared-password",
+        ] {
+            assert!(command_reads_secret(secret));
+            assert!(!grant_covers_command(
+                "Bash",
+                secret,
+                TEXT_ONLY,
+                &TrustedHeads::NONE,
+                |_| true
+            ));
+        }
+        assert!(ws.exists());
+    }
 
     fn bash(cmd: &str) -> StaticVerdict {
         static_classify(tn::RUN_BASH, &json!({ "command": cmd }), TEXT_ONLY)
@@ -6271,11 +6353,17 @@ mod tests {
     }
 
     #[test]
-    fn rm_is_never_catastrophic_without_root_target() {
-        // Not catastrophic (no recursive-root match) → the judge sees them.
-        for cmd in ["rm /", "rm -f /", "rm -rf /home/user/project"] {
-            assert_needs_judge(bash(cmd), cmd);
+    fn rm_workspace_ancestors_hit_the_floor_and_other_targets_reach_the_judge() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws = temp.path().join("workspace");
+        std::fs::create_dir_all(ws.join(".lucidos")).unwrap();
+        std::fs::create_dir_all(ws.join("data")).unwrap();
+        for flags in ["", "-f", "-rf"] {
+            let cmd = format!("rm {flags} {}", temp.path().display());
+            assert_settled(bash(&cmd), RiskLane::Catastrophic, &cmd);
         }
+        let cmd = format!("rm -rf {}", temp.path().join("not-a-workspace").display());
+        assert_needs_judge(bash(&cmd), &cmd);
     }
 
     // --- Catastrophic: fork bombs ------------------------------------------
@@ -7420,12 +7508,17 @@ mod tests {
 
     #[test]
     fn python_side_effect_shapes_go_to_judge() {
+        let temp = tempfile::tempdir().unwrap();
+        let subprocess = format!(
+            "import subprocess; subprocess.run(['rm','-rf','{}'])",
+            temp.path().join("not-a-workspace").display()
+        );
         for code in [
             "import requests; requests.post('https://api.example.com/x', json={})",
             "requests.delete(url)",
             "import smtplib; s = smtplib.SMTP('localhost')",
             "import httpx; httpx.put(url, content=b'x')",
-            "import subprocess; subprocess.run(['rm','-rf','/etc'])",
+            &subprocess,
             "import os; os.system('echo hi')",
         ] {
             assert_needs_judge(python(code), code);
@@ -8692,7 +8785,10 @@ subprocess.run('ls\x3b id', shell=True)",
         }
     }
 
-    const SECRET_READS: [&str; 10] = [
+    const SECRET_READS: [&str; 13] = [
+        "cat ~/.lucidos/snapshots/demo/snap_test/db.dump",
+        "ls ${HOME}/.lucidos//./snapshots",
+        "rm -r /home/u/.lucidos/snapshots/demo",
         "cat ~/.lucidos/secret-keys/db",
         "cat $HOME/.lucidos/secret-keys/db",
         "cat ${HOME}/.lucidos/secret-keys/db",
@@ -8726,6 +8822,7 @@ subprocess.run('ls\x3b id', shell=True)",
             "cat ~/.lucidos/ports",
             "cat data/secret-keys.md",
             "cat .lucidos/secret-keys-notes",
+            "cat .lucidos/snapshots-notes",
         ] {
             assert_ne!(
                 bash(cmd),

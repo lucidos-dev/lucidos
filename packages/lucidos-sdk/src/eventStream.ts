@@ -173,6 +173,24 @@ export function eventStreamTargets(apiBase: string): EventStreamTargets {
   };
 }
 
+// A document retains its first authoritative stream identity across reconnects.
+// A restored hello cannot lend new authority to old document state.
+class PongOrigin {
+  generation: string | null | undefined;
+  private changed = false;
+  observe(data: string): void {
+    try {
+      const frame = JSON.parse(data);
+      if (frame?.type !== 'StreamHello') return;
+      const generation = frame.data?.restore_generation;
+      if (generation !== null && typeof generation !== 'string') return;
+      if (this.generation === undefined) this.generation = generation;
+      else if (this.generation !== generation) this.changed = true;
+    } catch { /* malformed frames confer no authority */ }
+  }
+  get ready(): boolean { return this.generation !== undefined && !this.changed; }
+}
+
 /** POST a pong. Shared by the direct transport and the worker, so the two
  *  cannot drift on shape or on the `keepalive` flag.
  *
@@ -183,10 +201,11 @@ export function postPong(
   pongUrl: string,
   notificationId: string,
   answer: PongAnswer,
+  generation: string | null,
 ): void {
   void fetch(pongUrl, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'x-lucidos-restore-generation': generation ?? 'none' },
     body: JSON.stringify({ notification_id: notificationId, ...answer }),
     keepalive: true,
   }).catch((e) => {
@@ -203,6 +222,7 @@ export function openDirectEventStream(
   targets: EventStreamTargets,
   handlers: EventStreamHandlers,
 ): EventStream {
+  const origin = new PongOrigin();
   const es = new EventSource(targets.streamUrl);
   // A stream that goes quiet without erroring, such as a half-open connection
   // after a phone sleeps, never reaches `onerror`. Silence is the only signal.
@@ -212,6 +232,7 @@ export function openDirectEventStream(
   });
   es.onmessage = (event: MessageEvent) => {
     liveness.touch();
+    origin.observe(event.data as string);
     handlers.onFrame(event.data as string);
   };
   es.addEventListener(SSE_KEEPALIVE_EVENT, () => liveness.touch());
@@ -226,8 +247,9 @@ export function openDirectEventStream(
       es.close();
     },
     ownsReconnect: false,
-    submitPong: (notificationId, answer) =>
-      postPong(targets.pongUrl, notificationId, answer),
+    submitPong: (notificationId, answer) => {
+      if (origin.ready) postPong(targets.pongUrl, notificationId, answer, origin.generation!);
+    },
     revalidate: () => (liveness.silentMs() >= LATE_JOIN_STALL_AFTER_MS ? 'stale' : 'live'),
     restart: () => {
       liveness.stop();
@@ -276,6 +298,7 @@ export function openSharedEventStream(
   handlers: EventStreamHandlers,
   opts: { pongs: boolean },
 ): EventStream {
+  const origin = new PongOrigin();
   const hello: FromPort = {
     t: 'hello',
     pongs: opts.pongs,
@@ -302,8 +325,10 @@ export function openSharedEventStream(
       link.heard = true;
       // Any message at all proves the worker is still there.
       stopWaitingForAnswer();
-      if (msg.t === 'frame') handlers.onFrame(msg.data);
-      else if (msg.t === 'open') handlers.onOpen();
+      if (msg.t === 'frame') {
+        origin.observe(msg.data);
+        handlers.onFrame(msg.data);
+      } else if (msg.t === 'open') handlers.onOpen();
       else if (msg.t === 'error') {
         handlers.onError(
           typeof msg.silentMs === 'number'
@@ -382,7 +407,7 @@ export function openSharedEventStream(
     },
     ownsReconnect: true,
     submitPong: (notificationId, answer) => {
-      link.port.postMessage({ t: 'pong', notificationId, answer });
+      if (origin.ready) link.port.postMessage({ t: 'pong', notificationId, answer, sourceGeneration: origin.generation });
     },
     revalidate: () => {
       askWorker({ t: 'check' });

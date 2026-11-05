@@ -20,6 +20,7 @@
     "baseUrl": ".",
     "paths": {
       "@/*": ["src/*"],
+      "@lucidos/restore-generation": ["../../packages/lucidos-sdk/src/_restoreGeneration.ts"],
       "@lucidos/app-scroll": ["../../packages/lucidos-sdk/src/appScroll.ts"],
       "@lucidos/appearance": ["../../packages/lucidos-sdk/src/appearance.ts"],
       "@lucidos/context-menu": ["../../packages/lucidos-sdk/src/contextMenu.ts"],
@@ -28,6 +29,7 @@
       "@lucidos/find": ["../../packages/lucidos-sdk/src/find.ts"],
       "@lucidos/font-faces": ["../../packages/lucidos-sdk/src/fontFaces.ts"],
       "@lucidos/geometry": ["../../packages/lucidos-sdk/src/geometry.ts"],
+      "@lucidos/motion": ["./src/utils/motion.ts"],
       "@lucidos/haptic": ["../../packages/lucidos-sdk/src/haptic.ts"],
       "@lucidos/one-sound": ["../../packages/lucidos-sdk/src/oneSound.ts"],
       "@lucidos/pane-swipe": ["../../packages/lucidos-sdk/src/paneSwipe.ts"],

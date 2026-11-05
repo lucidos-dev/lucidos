@@ -18,6 +18,7 @@
 // opens file search and not the print dialog. The app's own handlers still
 // receive the key, already marked `defaultPrevented`.
 
+import { consumeLocalOverlayEscape } from './_localOverlayEscape';
 import { onHostPush, postToHost } from './_bridge';
 
 /** Wire type for a forwarded keydown. Hardcoded as a string literal on the host
@@ -121,7 +122,7 @@ export function installKeyboardForwarding(): () => void {
   if (typeof window === 'undefined' || window.parent === window) return () => {};
   const offBindings = onHostPush(KEYBINDINGS_CHANNEL, adoptHostBindings);
   const onKeyDown = (e: KeyboardEvent) => {
-    if (!isForwardableKeydown(e)) return;
+    if (consumeLocalOverlayEscape(e) || !isForwardableKeydown(e)) return;
     if (matchesHostBinding(e)) e.preventDefault();
     postToHost(toForwardedKeydown(e));
   };

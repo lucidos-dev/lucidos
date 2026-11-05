@@ -1073,3 +1073,51 @@ fn a_main_check_failed_row_without_failures_still_reads() {
         .get("failures")
         .is_none());
 }
+
+#[tokio::test]
+async fn snapshot_events_persist_outcomes_but_only_broadcast_progress() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callbacks) = EventBus::new(pool.clone());
+    let mut receiver = bus.subscribe();
+    for name in [
+        "SnapshotProgress",
+        "SnapshotRestoreRequested",
+        "WorkspaceRestored",
+        "SnapshotCreated",
+        "SnapshotCaptureFailed",
+        "SnapshotChecked",
+        "SnapshotDeleted",
+    ] {
+        let value = serde_json::json!({
+            "type": name,
+            "data": {
+                "workspace_id": "demo-workspace",
+                "handle": "snap_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "recovery": "snap_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+                "retained_worktrees": ["retained-thread"],
+                "job_id": Uuid::nil(),
+                "restore_id": Uuid::new_v4(),
+                "action": "capture",
+                "passed": false,
+                "reason": if name == "SnapshotDeleted" { "retention" } else { "interrupted" },
+                "actor": { "kind": "device", "device_id": "demo-device" }
+            }
+        });
+        let event: SystemEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(event.event_type(), name);
+        assert_eq!(event.aggregate(), "snapshot");
+        assert_eq!(event.aggregate_id(), "snap_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert!(SystemEvent::is_reserved_type_name(name));
+        assert_eq!(event.is_persisted(), name != "SnapshotProgress");
+        bus.emit(BusEvent::System(event)).await.unwrap();
+        let received = receiver.recv().await.unwrap();
+        assert_eq!(received.seq.is_some(), name != "SnapshotProgress");
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = $1")
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, i64::from(name != "SnapshotProgress"));
+    }
+    teardown_test_db(&db_name).await;
+}

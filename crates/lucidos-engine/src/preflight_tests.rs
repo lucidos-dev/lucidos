@@ -224,3 +224,23 @@ async fn a_preflight_error_carries_no_row_data() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+#[tokio::test]
+async fn missing_pg_clients_name_the_tool_and_remedy_without_credentials() {
+    let absent = tempfile::tempdir().unwrap();
+    for name in ["pg_dump", "pg_restore"] {
+        let error = run_pg_tool(
+            name,
+            "postgres://example:secret-value@localhost/example",
+            None,
+            |cmd| *cmd = std::process::Command::new(absent.path().join(name)),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(name), "{error}");
+        assert!(error.contains("postgresql-client"), "{error}");
+        assert!(error.contains("server"), "{error}");
+        assert!(!error.contains("secret-value"), "{error}");
+    }
+}

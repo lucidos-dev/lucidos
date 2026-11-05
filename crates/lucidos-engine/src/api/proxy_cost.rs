@@ -31,7 +31,7 @@ const GEMINI_API_HOST: &str = "generativelanguage.googleapis.com";
 /// Where a proxied request went.
 pub(crate) enum Upstream<'a> {
     /// A builtin provider proxy. Every one is a model provider.
-    Builtin,
+    Builtin { name: &'a str },
     /// An `apis.json` entry, known only by its base URL.
     Configured { base_url: &'a str },
 }
@@ -39,7 +39,7 @@ pub(crate) enum Upstream<'a> {
 impl Upstream<'_> {
     fn is_model_provider(&self) -> bool {
         match self {
-            Self::Builtin => true,
+            Self::Builtin { .. } => true,
             Self::Configured { base_url } => is_model_host(base_url),
         }
     }
@@ -55,6 +55,19 @@ impl Upstream<'_> {
 pub(crate) fn prepare_request(upstream: &Upstream<'_>, headers: &mut HeaderMap) {
     if upstream.is_model_provider() {
         headers.remove(ACCEPT_ENCODING);
+    }
+    if matches!(
+        upstream,
+        Upstream::Builtin {
+            name: "claude-gateway"
+        }
+    ) {
+        headers.insert(
+            axum::http::header::USER_AGENT,
+            crate::llm::lucidos_user_agent()
+                .parse()
+                .expect("valid Lucidos User-Agent"),
+        );
     }
 }
 
@@ -134,7 +147,7 @@ pub(crate) async fn record_model_call(
         record(
             engine,
             owner,
-            call.answered_by(&parts.headers),
+            call.answered_by(&parts.headers).with_upstream(&upstream),
             request_body,
         );
     }
@@ -161,6 +174,7 @@ pub(crate) fn record(
                 CallDetail {
                     served_model: call.served_model,
                     request_id: call.request_id,
+                    provider: call.provider,
                     ..CallDetail::default()
                 },
             )
@@ -179,6 +193,7 @@ pub(crate) fn is_event_stream(headers: &HeaderMap) -> bool {
 /// What one forwarded call reported.
 #[derive(Debug, PartialEq)]
 pub(crate) struct ReportedCall {
+    pub(crate) provider: Option<String>,
     pub(crate) usage: ApiUsage,
     /// The model the request asked for, else the one the reply named.
     pub(crate) model: String,
@@ -189,6 +204,12 @@ pub(crate) struct ReportedCall {
 }
 
 impl ReportedCall {
+    fn with_upstream(mut self, upstream: &Upstream<'_>) -> Self {
+        if let Upstream::Builtin { name } = upstream {
+            self.provider = Some((*name).to_string());
+        }
+        self
+    }
     /// This call, with the request id the upstream's reply headers carry.
     pub(crate) fn answered_by(self, headers: &HeaderMap) -> Self {
         Self {
@@ -218,6 +239,7 @@ fn reported(reply: &[u8], streamed: bool, request_body: &[u8], path: &str) -> Op
         .or_else(|| served_model.clone())
         .unwrap_or_default();
     Some(ReportedCall {
+        provider: None,
         usage,
         model,
         served_model,

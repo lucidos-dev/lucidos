@@ -12,6 +12,7 @@
  * used to replace the footer wholesale, which hid restore in precisely the
  * situation it exists for (ADR 0015: a user with a backup and no workspace).
  */
+import { RemoteHeadersEditor } from '../settings/RemoteHeadersEditor';
 
 import type { Ref, VNode } from 'preact';
 import { Disclosure } from '../shared/Disclosure';
@@ -86,7 +87,7 @@ export function pickerFooter(p: PickerFooterProps): VNode {
   const canRestore = !p.busy && p.blocker === null;
   const remoteBlocker = remoteGatewayBlocker(p.remoteDraft);
   const canAddRemote = !p.busy && remoteBlocker === null;
-  const remoteField = (label: string, key: keyof RemoteGatewayDraft, placeholder: string) => (
+  const remoteField = (label: string, key: 'address' | 'code' | 'name', placeholder: string) => (
     <label class="ws-picker-field">
       <span class="ws-picker-field-label">{label}</span>
       <input
@@ -295,7 +296,8 @@ export function pickerFooter(p: PickerFooterProps): VNode {
           </p>
           <p class="ws-picker-note ws-picker-note-warn">{TRUST_NOTE}</p>
           {remoteField('Address', 'address', 'https://lucidos.example.com')}
-          {remoteField('Gateway pairing code', 'code', '8 digits')}
+          <RemoteHeadersEditor rows={p.remoteDraft.headers ?? []} onChange={headers => p.onRemoteDraft({ headers })} disabled={p.busy} />
+          {remoteField('Gateway pairing secret', 'code', 'lgp_…')}
           {remoteField('Short name', 'name', 'cloud')}
           {p.pairedRemote && (
             <p class="ws-picker-note">Paired with {p.pairedRemote}.</p>

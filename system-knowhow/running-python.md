@@ -199,6 +199,20 @@ Do **not** use a one-option `ask_user_question` to get resumed instead. That mak
 
 ## The command guard (dangerous commands are gated)
 
+The catastrophic floor applies even when the command guard is off. Grants cannot
+bypass it. This includes workspace roots and their ancestors, shared Lucidos
+database destruction, and HTTP calls that delete workspaces or operate cleanup
+and Trash routes. The caller's own coding-agent worktree is exempt from workspace
+root protection. Reading the local token or shared Postgres password is a secret
+read, which grants also cannot cover. Coding-agent permission checks and
+background tasks enforce this floor too.
+
+The floor reads command text and workspace paths. It is not an OS sandbox:
+a program that builds a target at runtime can escape its text checks. Agents
+may report cleanup candidates. A protected workspace deletion needs a paired
+device and its exact typed name. A harness may delete only an ephemeral entry
+whose registration minted its owner token.
+
 When a workspace turns on the command guard, every `run_bash` / `run_bash_background` / `run_python` / `run_python_background` call is checked before it runs. A fast static pass settles the obvious cases (catastrophic vs. obviously-safe). A cheap LLM **judge** classifies everything in between. The lanes:
 
 - **Catastrophic → refused.** These are **refused without running**, with a failed tool result explaining why:
@@ -222,7 +236,9 @@ When a workspace turns on the command guard, every `run_bash` / `run_bash_backgr
 
 Each yes is remembered for that exact line, so the same server never asks twice. A changed command, argument or env value asks again. `lucidos mcp start` from a shell approves nothing, so an unapproved line is still refused. `mcp(action="list")` shows each server's line, whether it is approved, and the static check's verdict.
 
-The guard is deliberately narrow. These all run with no prompt: reads anywhere on the machine (outside the workspace too, by design), a plain `curl https://…` GET, writes under `data/`, and redirects to `/dev/null`. Pure-compute Python that installs no packages runs unprompted too. An in-workspace *deletion* also runs unprompted, with the Undo above. The judge asks only when it can't tell a command is safe. The guard is off by default, so most workspaces never see it.
+The guard is deliberately narrow. These all run with no prompt: reads anywhere on the machine (outside the workspace too, by design), a plain `curl https://…` GET, writes under `data/`, and redirects to `/dev/null`. Pure-compute Python that installs no packages runs unprompted too. An in-workspace *deletion* also runs unprompted, with the Undo above. The judge asks only when it can't tell a command is safe.
+
+The additional checks are off by default. The catastrophic floor and secret-read gate remain on.
 
 **With the judge turned off, the static pass decides alone, and it asks more often.** A command it cannot see through asks the user, and on a trigger it needs the `other` grant. That covers a command substitution (`$(…)`), a path-qualified head (`data/bin/tool`) and a code-injecting `VAR=` preamble. It also covers Python that installs packages, shells out, or uses a network or mail library. A head it simply does not know (`cargo build`) still runs. An in-workspace deletion keeps the Undo lane, unless the same command holds one of those shapes.
 
@@ -268,7 +284,7 @@ Each looks reasonable alone, fails the same way every time, and wastes a turn:
 
 ## Errors
 
-`run_python` (the sync foreground tool) auto-trims long tracebacks. It keeps the first and last `File "..."` frame and the final `ExceptionClass: message` line, and drops the middle. Then it caps the error at its last 4 KB, behind a `[... N bytes of stderr omitted ...]` marker, so one huge line cannot flood your context. The stderr tail stays on disk at `.lucidos/exhaust/<run_id>/stderr.txt` for seven days.
+`run_python` (the sync foreground tool) auto-trims long tracebacks. It keeps the first and last `File "..."` frame and the final `ExceptionClass: message` line, and drops the middle. Then it caps the error at its last 4 KB, behind a `[... N bytes of stderr omitted ...]` marker, so one huge line cannot flood your context. The stderr tail stays on disk at `.lucidos/exhaust/<run_id>/stderr.txt` for seven days. Many scripts log errors to stdout. So when stderr is empty, the error shows the last 4 KB of stdout, under a label.
 
 `run_python_background` does not auto-trim. Its stderr flows through `bash_output`
 raw, so chained import errors can fill the context.

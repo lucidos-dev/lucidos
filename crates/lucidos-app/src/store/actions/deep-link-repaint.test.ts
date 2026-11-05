@@ -16,8 +16,8 @@ import type { DeepLinkTarget } from './notification-deeplink';
 // docs/plans/2026-09-17-a-deep-link-repaints-what-it-landed.md.
 
 const repaintLandedContent = vi.fn<() => void>();
-const markReadOptimistic = vi.fn<(id: string) => void>();
-const viewNotification = vi.fn<(id: string) => Promise<void>>(async () => {});
+const markReadOptimistic = vi.fn<(id: string, generation?: string) => void>();
+const viewNotification = vi.fn<(id: string, generation?: string) => Promise<void>>(async () => {});
 const handleNavigationRequest = vi.fn<(nav: { target: string }) => void>();
 
 vi.mock('../../utils/pageResume', async () => {
@@ -32,8 +32,8 @@ vi.mock('./notifications', async () => {
   const actual = await vi.importActual<typeof import('./notifications')>('./notifications');
   return {
     ...actual,
-    markReadOptimistic: (id: string) => markReadOptimistic(id),
-    viewNotification: (id: string) => viewNotification(id),
+    markReadOptimistic: (id: string, generation?: string) => markReadOptimistic(id, generation),
+    viewNotification: (id: string, generation?: string) => viewNotification(id, generation),
   };
 });
 vi.mock('./navigation-request', async () => {
@@ -94,5 +94,21 @@ describe('a deep link repaints what it landed', () => {
     // paint and no reason to touch the compositor.
     expect(dispatchDeepLink({ notification: null, tap: null })).toBe(false);
     expect(repaintLandedContent).not.toHaveBeenCalled();
+  });
+});
+
+describe('push provenance reaches the read owner', () => {
+  it('passes the parsed SW and URL origin through navigate and detail branches', async () => {
+    const { parseDeepLinkFromSwMessage, parseDeepLinkFromUrl } = await import('./notification-deeplink');
+    for (const generation of ['none', 'unknown', '11111111-1111-4111-8111-111111111111']) {
+      const fromSw = parseDeepLinkFromSwMessage({ notification_id: NOTIF_ID,
+        restore_generation: generation === 'none' ? null : generation, tap: navigateToApp.tap })!;
+      dispatchDeepLink(fromSw);
+      expect(markReadOptimistic).toHaveBeenLastCalledWith(NOTIF_ID, generation);
+      const fromUrl = parseDeepLinkFromUrl(new URL(
+        'https://example.com/?notification=' + NOTIF_ID + '&restore_generation=' + generation));
+      dispatchDeepLink(fromUrl);
+      expect(viewNotification).toHaveBeenLastCalledWith(NOTIF_ID, generation);
+    }
   });
 });

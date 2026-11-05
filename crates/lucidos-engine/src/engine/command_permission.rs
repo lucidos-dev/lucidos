@@ -217,7 +217,16 @@ pub fn command_is_allowed(
             command_guard::grant_covers_command("Bash", command, site, &TrustedHeads::NONE, allowed)
         }
         tn::RUN_PYTHON | tn::RUN_PYTHON_BACKGROUND => {
-            !command_guard::command_reads_secret(command) && allowed("Python")
+            !command_guard::command_reads_secret(command)
+                && command_guard::catastrophic_reason_for_command_at(
+                    command,
+                    match site {
+                        CommandSite::Workspace(root) => Some(root),
+                        CommandSite::TextOnly { root } => root,
+                    },
+                )
+                .is_none()
+                && allowed("Python")
         }
         _ => false,
     }
@@ -658,7 +667,7 @@ pub async fn emit_command_permission_resolved(
 /// judge verdicts by [`JudgeInput::cache_key`], so a re-emitted identical
 /// command within one response doesn't re-pay the LLM call. Loop-local — dropped at the end of the response, no GC needed.
 pub(crate) struct CommandGuardCtx<'a> {
-    /// Master `command_guard` toggle. `false` → the guard is a no-op.
+    /// Enables the judge and reversible checks. The catastrophic floor and secret gate remain on.
     pub enabled: bool,
     /// `command_guard_judge` sub-toggle. `false` → the ambiguous middle uses the
     /// static fallback list instead of the LLM judge.
@@ -857,8 +866,8 @@ pub async fn command_checkpoint_origin(
 
 impl LucidosEngine {
     /// The command guard's pre-dispatch decision for one bash/python tool call
-    /// or MCP server setup (ADR 0002). With the guard off (`ctx.enabled` false) only a secret read
-    /// is gated. Everything else is `Proceed`, so the agentic loop needs no
+    /// or MCP server setup (ADR 0002). With the guard off (`ctx.enabled` false), the catastrophic floor and secret reads
+    /// remain gated. Other commands are `Proceed`, so the agentic loop needs no
     /// branch of its own on the `command_guard` preference.
     ///
     /// Resolves the final [`RiskLane`] via the static fast-path and — for the
@@ -917,6 +926,17 @@ impl LucidosEngine {
                 (tn::RUN_BASH, &shell_input)
             }
         };
+        // The catastrophic floor is unconditional, including preference-off calls.
+        if matches!(
+            command_guard::static_classify(
+                tool_name,
+                input,
+                CommandSite::Workspace(self.workspace_path())
+            ),
+            StaticVerdict::Settled(RiskLane::Catastrophic)
+        ) {
+            return GuardDecision::Refuse(command_guard::catastrophic_refusal(tool_name, input));
+        }
         // A secret read is gated even with the guard off, since it ships off.
         if !ctx.enabled && !tool_call_reads_secret(tool_name, input) {
             return GuardDecision::Proceed;

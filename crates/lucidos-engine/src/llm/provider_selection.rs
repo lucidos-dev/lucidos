@@ -29,9 +29,6 @@ pub struct ProviderSelectionInputs {
     pub has_local: bool,
     /// Lucidos is signed in to the configured Claude gateway.
     pub has_claude_gateway: bool,
-    /// `LUCIDOS_BOOT_WITHOUT_PROVIDER` is truthy — a packaged build lets the
-    /// engine boot before any provider is configured (instead of crashing).
-    pub boot_without_provider: bool,
 }
 
 impl ProviderSelectionInputs {
@@ -54,18 +51,14 @@ pub enum ProviderSelection {
     Mock,
     /// At least one real provider is configured → `RoutingProvider`.
     Real,
-    /// No real provider, but the build is allowed to boot without one →
+    /// No real provider →
     /// `UnconfiguredProvider` (boots, clear error on chat, drives onboarding).
     Unconfigured,
-    /// No real provider and not allowed to boot without one → fail-fast panic
-    /// (dev/docker default).
-    FailFast,
 }
 
 /// Decide which provider to install. `mock` wins outright (it is the explicit
 /// test opt-in); otherwise a real provider is preferred; otherwise the
-/// boot-without-provider gate chooses between booting unconfigured and the
-/// fail-fast panic.
+/// engine boots unconfigured so Settings remains reachable.
 pub fn select_provider(inputs: ProviderSelectionInputs) -> ProviderSelection {
     if inputs.model_is_mock {
         return ProviderSelection::Mock;
@@ -73,18 +66,14 @@ pub fn select_provider(inputs: ProviderSelectionInputs) -> ProviderSelection {
     if inputs.has_real_provider() {
         return ProviderSelection::Real;
     }
-    if inputs.boot_without_provider {
-        ProviderSelection::Unconfigured
-    } else {
-        ProviderSelection::FailFast
-    }
+    ProviderSelection::Unconfigured
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Base case: nothing configured, gate off.
+    /// Base case: nothing configured.
     fn none() -> ProviderSelectionInputs {
         ProviderSelectionInputs {
             model_is_mock: false,
@@ -96,7 +85,6 @@ mod tests {
             has_opencode_free: false,
             has_local: false,
             has_claude_gateway: false,
-            boot_without_provider: false,
         }
     }
 
@@ -106,12 +94,11 @@ mod tests {
         let i = ProviderSelectionInputs {
             model_is_mock: true,
             has_vertex: true,
-            boot_without_provider: true,
             ..none()
         };
         assert_eq!(select_provider(i), ProviderSelection::Mock);
 
-        // Even with no real provider and the gate off (the E2E shape).
+        // Even with no real provider (the E2E shape).
         assert_eq!(
             select_provider(ProviderSelectionInputs {
                 model_is_mock: true,
@@ -140,12 +127,9 @@ mod tests {
     }
 
     #[test]
-    fn no_provider_with_gate_boots_unconfigured_not_mock() {
-        // The packaged-style config: no real provider, gate on, not mock.
-        let i = ProviderSelectionInputs {
-            boot_without_provider: true,
-            ..none()
-        };
+    fn no_provider_boots_unconfigured_not_mock() {
+        // No real provider, no mock opt-in.
+        let i = ProviderSelectionInputs { ..none() };
         let sel = select_provider(i);
         assert_eq!(sel, ProviderSelection::Unconfigured);
         // The whole point of the fix: this must NOT pick Mock.
@@ -153,8 +137,8 @@ mod tests {
     }
 
     #[test]
-    fn no_provider_without_gate_fails_fast() {
-        // Dev/docker default: no real provider, gate off → fail-fast panic.
-        assert_eq!(select_provider(none()), ProviderSelection::FailFast);
+    fn no_provider_without_gate_boots_unconfigured() {
+        // Source launches must reach Settings without a provider opt-in.
+        assert_eq!(select_provider(none()), ProviderSelection::Unconfigured);
     }
 }

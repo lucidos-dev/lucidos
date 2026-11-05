@@ -92,6 +92,10 @@ impl ManagedCert {
 pub struct CertStore {
     current: RwLock<Option<Arc<ManagedCert>>>,
     addresses: RwLock<Vec<IpAddr>>,
+    /// This node's tailnet addresses while tailscaled reports it joined,
+    /// whether or not a certificate serves. Pairing reads them to recognise a
+    /// direct tailnet peer by the address it reached.
+    tailnet_addresses: RwLock<Vec<IpAddr>>,
     /// The non-loopback addresses the gateway listens on. An optional address
     /// counts only while it is bound.
     listeners: RwLock<Vec<IpAddr>>,
@@ -123,6 +127,22 @@ impl CertStore {
         if let Ok(mut current) = self.addresses.write() {
             *current = addresses;
         }
+    }
+
+    /// Record what tailscaled last said this node's addresses are. Empty when
+    /// it is not joined.
+    pub fn set_tailnet_addresses(&self, addresses: Vec<IpAddr>) {
+        if let Ok(mut current) = self.tailnet_addresses.write() {
+            *current = addresses;
+        }
+    }
+
+    /// Is `local` an address of this machine that tailscaled reported?
+    pub fn is_tailnet_address(&self, local: IpAddr) -> bool {
+        let local = local.to_canonical();
+        self.tailnet_addresses
+            .read()
+            .is_ok_and(|addresses| addresses.iter().any(|a| a.to_canonical() == local))
     }
 
     pub fn set_listeners(&self, listeners: Vec<IpAddr>) {

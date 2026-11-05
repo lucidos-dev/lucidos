@@ -2,7 +2,7 @@
 //! trying (ADR 0014, 2026-07-29 + 2026-08-03 addenda).
 //!
 //! The sibling [`crate::boot_phase`] narrates boot *progress*; this narrates a
-//! boot that did not get there. Three producers write one of these:
+//! boot that did not get there. These producers write one of these:
 //!
 //!   * **engine-reported** and always [`Terminal`]: a dying engine POSTs the
 //!     reason to `/~/api/v1/control/workspaces/:id/boot-failure` on its way out,
@@ -13,6 +13,9 @@
 //!     spawn failed. [`crate::postgres::ProvisionErrorKind`] classifies it. An
 //!     environment condition that can clear (Docker Desktop still starting) is
 //!     [`Retrying`], while one that cannot (no `docker` on PATH) is [`Terminal`].
+//!   * **offline restore**, always [`Terminal`]: restore and recovery both
+//!     stopped without a journal phase that permits engine startup. The signed
+//!     journal remains authoritative; this observation explains why it is blocked.
 //!   * **the give-up**, always [`Terminal`]: the restart budget ran out. The
 //!     last provisioning attempt or the supervisor restates a cause that could
 //!     have cleared ([`BootFailure::gave_up`]). With none recorded, the
@@ -52,8 +55,8 @@ pub struct BootFailure {
 }
 
 impl BootFailure {
-    /// A failure no retry can fix. Both producers reach this: the engine's
-    /// reported message, and a provisioning error classified terminal.
+    /// A failure no automatic retry can fix: an engine report, terminal
+    /// provisioning error, or exhausted offline restore recovery.
     pub fn terminal(cause: impl Into<String>) -> Self {
         Self {
             cause: cause.into(),

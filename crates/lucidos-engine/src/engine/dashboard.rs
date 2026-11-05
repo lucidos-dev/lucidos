@@ -10,24 +10,23 @@
 //! - **The dashboard events**, `DashboardTileAdded`, `DashboardTileRemoved`
 //!   and `DashboardArranged`, applied on top.
 //!
-//! A tile keys on its *widget instance*, as a shelf chip does. An app is a tile
+//! A tile keys on its *widget instance*. An app is a tile
 //! too, shown as an *app shortcut*. The app's manifest says which, at read
 //! time, so no event records it.
+
+use std::sync::LazyLock;
 
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::PgPool;
 
 use crate::core::apps::{App, TileSize, WidgetSize};
-use crate::core::AppManager;
+use crate::core::{AppManager, AppReveal};
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::{
     ArrangedTile, Dashboard, LegacyArrangedTile, MessageOrigin, ThreadEvent,
 };
-use crate::engine::widgets::{
-    self, InstanceKey, ThreadWidget, WidgetCheckFailed, WidgetInstance, WidgetParams,
-    STORED_WIDGET_EVENT_TYPES,
-};
+use crate::engine::widgets::{self, InstanceKey, WidgetCheckFailed, WidgetInstance, WidgetParams};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -37,7 +36,7 @@ pub struct FoldedTile {
     pub app_id: String,
     pub params: Option<WidgetParams>,
     pub label: Option<String>,
-    /// `None` until an arrange gives one: the widget's default size.
+    /// `None` until an add or an arrange gives one: the widget's default size.
     pub size: Option<TileSize>,
 }
 
@@ -116,10 +115,14 @@ impl FoldedDashboards {
                 app_id,
                 params,
                 label,
+                size,
                 ..
             } => self.add(
                 *dashboard,
-                FoldedTile::new(app_id, params.clone(), label.clone()),
+                FoldedTile {
+                    size: size.map(TileSize::from),
+                    ..FoldedTile::new(app_id, params.clone(), label.clone())
+                },
             ),
             SystemEvent::DashboardTileRemoved {
                 dashboard,
@@ -236,22 +239,34 @@ pub fn fold_dashboards(seed: &[ThreadEvent], events: &[SystemEvent]) -> FoldedDa
     dashboards
 }
 
+/// Every `event_type` the seed folds: the legacy pin and unpin names, those
+/// their `serde(alias)` still reads, and `HomeBoardArranged`.
+static SEED_EVENT_TYPES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    ThreadEvent::RESERVED_TYPE_NAMES
+        .iter()
+        .chain(ThreadEvent::LEGACY_TYPE_NAME_ALIASES)
+        .copied()
+        .filter(|name| {
+            matches!(
+                ThreadEvent::from_stored(name, serde_json::json!({ "app_id": "" })),
+                Ok(ThreadEvent::WidgetPinned { .. } | ThreadEvent::WidgetUnpinned { .. })
+            )
+        })
+        .chain(["HomeBoardArranged"])
+        .collect()
+});
+
 /// The home thread's events the seed folds. None before Home exists.
 async fn seed_events(pool: &PgPool) -> Result<Vec<ThreadEvent>, BoxError> {
     let Some(home) = crate::engine::home_thread::home_thread_id(pool).await? else {
         return Ok(Vec::new());
     };
-    let types: Vec<&str> = STORED_WIDGET_EVENT_TYPES
-        .iter()
-        .copied()
-        .chain(["HomeBoardArranged"])
-        .collect();
     let rows: Vec<(String, Value)> = sqlx::query_as(
         "SELECT event_type, payload FROM events \
          WHERE thread_id = $1 AND event_type = ANY($2) ORDER BY sequence",
     )
     .bind(home)
-    .bind(&types)
+    .bind(SEED_EVENT_TYPES.as_slice())
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -296,19 +311,67 @@ pub async fn folded_dashboards(pool: &PgPool) -> Result<FoldedDashboards, BoxErr
     ))
 }
 
-/// One tile on a dashboard: a widget, as a shelf chip reads it, or an app
-/// shortcut. The app's manifest kind picks the variant.
+/// One tile on a dashboard: a widget or an app shortcut. The app's manifest
+/// kind picks the variant.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum DashboardTile {
     Widget {
         #[serde(flatten)]
-        widget: ThreadWidget,
+        widget: WidgetTile,
         /// Always one the widget declares: an undeclared stored size fits the
         /// nearest smaller declared one, else the nearest larger.
         size: WidgetSize,
     },
     App(AppShortcut),
+}
+
+/// A widget on a dashboard: its instance, as its manifest describes it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WidgetTile {
+    pub app_id: String,
+    /// The instance's params. Absent means none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<WidgetParams>,
+    /// The tile's label, newest first. Absent means the name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub name: String,
+    /// The validated `App::icon`, a path inside the widget's folder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    pub reusable: bool,
+    /// The plugin that ships this widget. Such a widget offers no Stop reusing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_plugin_id: Option<String>,
+    /// A *built-in widget*, which no menu may change (ADR 0415).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub built_in: bool,
+    /// When the frame's cover lifts, from the manifest, as for any app.
+    pub reveal: AppReveal,
+    /// Its *widget sizes*, first the default (ADR 0432).
+    pub sizes: Vec<WidgetSize>,
+    /// Its tile is see-through, so it draws its own shape.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub transparent: bool,
+}
+
+impl WidgetTile {
+    fn of(app: App, params: Option<WidgetParams>, label: Option<String>) -> Self {
+        Self {
+            origin_plugin_id: app.origin_plugin().map(str::to_string),
+            app_id: app.id,
+            params,
+            label,
+            name: app.name,
+            icon: app.icon,
+            reusable: app.reusable,
+            built_in: app.built_in,
+            reveal: app.reveal,
+            sizes: app.sizes,
+            transparent: app.transparent,
+        }
+    }
 }
 
 /// An app on a dashboard: its icon and name, always a quarter tile.
@@ -361,10 +424,7 @@ pub async fn dashboard(
                 .and_then(TileSize::widget_size)
                 .map_or(WidgetSize::default_of(&app.sizes), |s| s.fit(&app.sizes));
             DashboardTile::Widget {
-                widget: ThreadWidget {
-                    pinned: true,
-                    ..ThreadWidget::of(app, tile.params.clone(), tile.label.clone())
-                },
+                widget: WidgetTile::of(app, tile.params.clone(), tile.label.clone()),
                 size,
             }
         } else if tile.params.is_none() {
@@ -385,10 +445,11 @@ pub async fn dashboard_holding(pool: &PgPool, app_id: &str) -> Result<Option<Das
         .find(|d| folded.tiles(*d).iter().any(|t| t.app_id == app_id)))
 }
 
-/// Adding a tile to a dashboard, or removing one.
+/// Adding a tile to a dashboard, or removing one. An add with no size starts
+/// the tile at the widget's default size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DashboardChange {
-    Add,
+    Add { size: Option<WidgetSize> },
     Remove,
 }
 
@@ -415,13 +476,21 @@ pub async fn check_dashboard_change(
         &InstanceKey::new(&instance.app_id, instance.params.as_ref()),
     );
     match change {
-        DashboardChange::Add => {
+        DashboardChange::Add { size } => {
             let app = widgets::tile_app(app_manager, &instance.app_id)?;
             if app.is_widget() {
                 widgets::check_widget_params(&app, instance.params.as_ref()).map_err(Refused)?;
+                if let Some(size) = size {
+                    widgets::check_declared_size(&app, size).map_err(Refused)?;
+                }
             } else if instance.params.as_ref().is_some_and(|p| !p.is_empty()) {
                 return Err(Refused(format!(
                     "App '{}' takes no params. An app joins a dashboard as a shortcut.",
+                    instance.app_id
+                )));
+            } else if size.is_some() {
+                return Err(Refused(format!(
+                    "App '{}' takes no size. An app shortcut is always a quarter.",
                     instance.app_id
                 )));
             }
@@ -471,11 +540,12 @@ pub async fn apply_dashboard_change(
     } = instance;
     let params = params.filter(|p| !p.is_empty());
     let event = match change {
-        DashboardChange::Add => SystemEvent::DashboardTileAdded {
+        DashboardChange::Add { size } => SystemEvent::DashboardTileAdded {
             dashboard,
             app_id,
             params,
             label,
+            size,
             actor,
         },
         DashboardChange::Remove => SystemEvent::DashboardTileRemoved {

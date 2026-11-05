@@ -30,6 +30,7 @@ fn declarative_envelope_has_web_push_magic_and_notification_object() {
     // `notification.navigate` tap target. The iOS SW `push` handler may still
     // run to render the visible banner, so the declarative URL has to be right.
     let payload = build_push_payload(
+        None,
         "Hi",
         "There",
         None,
@@ -153,15 +154,48 @@ fn payload_app_badge_reflects_the_resolved_badge_count() {
     // a closed iOS PWA. The envelope carries whatever `app_badge_for` resolved
     // for this subscription: the workspace's own count, or the cross-workspace
     // total for a gateway-served install.
-    let payload = build_push_payload("T", "B", None, None, None, None, &Tap::Modal, None, Some(3));
+    let payload = build_push_payload(
+        None,
+        "T",
+        "B",
+        None,
+        None,
+        None,
+        None,
+        &Tap::Modal,
+        None,
+        Some(3),
+    );
     assert_eq!(payload["app_badge"], 3);
 
     // 0 is emitted (clears the badge when everything is read), not omitted.
-    let cleared = build_push_payload("T", "B", None, None, None, None, &Tap::Modal, None, Some(0));
+    let cleared = build_push_payload(
+        None,
+        "T",
+        "B",
+        None,
+        None,
+        None,
+        None,
+        &Tap::Modal,
+        None,
+        Some(0),
+    );
     assert_eq!(cleared["app_badge"], 0);
 
     // None → field omitted entirely (count unreadable; don't touch the badge).
-    let absent = build_push_payload("T", "B", None, None, None, None, &Tap::Modal, None, None);
+    let absent = build_push_payload(
+        None,
+        "T",
+        "B",
+        None,
+        None,
+        None,
+        None,
+        &Tap::Modal,
+        None,
+        None,
+    );
     assert!(absent.get("app_badge").is_none());
 }
 
@@ -171,6 +205,7 @@ fn payload_minimal_has_title_body_and_modal_tap() {
     // routes off it and the wake-push payload must match byte-for-byte
     // for tag-replace to dedupe cleanly.
     let payload = build_push_payload(
+        None,
         "Hi",
         "There",
         None,
@@ -195,6 +230,7 @@ fn payload_minimal_has_title_body_and_modal_tap() {
 fn payload_includes_thread_id_for_deep_link() {
     let tid = uuid::Uuid::parse_str("12345678-1234-5678-1234-567812345678").unwrap();
     let payload = build_push_payload(
+        None,
         "Claude is asking",
         "Pick one",
         None,
@@ -216,6 +252,7 @@ fn payload_omits_thread_id_when_link_absent() {
     // Regression guard: the SW relies on `if (data.thread_id)` — never emit
     // the key as a literal string "null" or empty value.
     let payload = build_push_payload(
+        None,
         "Hi",
         "There",
         None,
@@ -237,6 +274,7 @@ fn payload_carries_all_fields_when_provided() {
     let tid = uuid::Uuid::new_v4();
     let eid = uuid::Uuid::new_v4();
     let payload = build_push_payload(
+        None,
         "T",
         "B",
         Some(nid),
@@ -260,6 +298,7 @@ fn payload_includes_event_id_when_set() {
     let eid = uuid::Uuid::new_v4();
     let tap = nav_thread(&tid.to_string(), Some(&eid.to_string()));
     let payload = build_push_payload(
+        None,
         "Claude is asking",
         "Pick one",
         None,
@@ -279,13 +318,25 @@ fn payload_includes_event_id_when_set() {
 fn payload_omits_event_id_when_not_provided() {
     let tid = uuid::Uuid::new_v4();
     let tap = nav_thread(&tid.to_string(), None);
-    let payload = build_push_payload("Hi", "There", None, None, Some(tid), None, &tap, None, None);
+    let payload = build_push_payload(
+        None,
+        "Hi",
+        "There",
+        None,
+        None,
+        Some(tid),
+        None,
+        &tap,
+        None,
+        None,
+    );
     assert!(payload["notification"]["data"].get("event_id").is_none());
 }
 
 #[test]
 fn payload_always_includes_tap_even_when_modal_default() {
     let payload = build_push_payload(
+        None,
         "Hi",
         "There",
         None,
@@ -307,6 +358,7 @@ fn payload_includes_navigate_tap_for_cta_app() {
     let nid = uuid::Uuid::new_v4();
     let tap = nav_app("habit-tracker");
     let payload = build_push_payload(
+        None,
         "Time to check in",
         "Log today's habits",
         Some(nid),
@@ -348,7 +400,7 @@ fn wake_payload_carries_wake_flag_plus_original_content() {
         created_at: chrono::Utc::now(),
         tap: nav_thread(&tid.to_string(), Some(&eid.to_string())),
     };
-    let payload = build_wake_payload(&n, None, None);
+    let payload = build_wake_payload(None, &n, None, None);
     assert_eq!(payload["wake"], true);
     assert_eq!(payload["web_push"], 8030);
     let notif = &payload["notification"];
@@ -371,6 +423,7 @@ fn payload_includes_navigate_tap_for_cta_thread() {
     let tid = uuid::Uuid::new_v4();
     let tap = nav_thread(&tid.to_string(), None);
     let payload = build_push_payload(
+        None,
         "Claude is asking",
         "Pick one",
         Some(nid),
@@ -406,6 +459,7 @@ fn declarative_navigate_falls_back_to_scope_relative_query_when_scope_missing() 
     let eid = uuid::Uuid::new_v4();
     let tap = nav_thread(&tid.to_string(), Some(&eid.to_string()));
     let payload = build_push_payload(
+        None,
         "T",
         "B",
         Some(nid),
@@ -440,6 +494,7 @@ fn declarative_navigate_uses_absolute_scope_url_for_ios() {
     let eid = uuid::Uuid::new_v4();
     let tap = nav_thread(&tid.to_string(), Some(&eid.to_string()));
     let payload = build_push_payload(
+        None,
         "T",
         "B",
         Some(nid),
@@ -468,6 +523,7 @@ fn declarative_navigate_uses_absolute_scope_url_for_ios() {
 fn declarative_navigate_normalizes_scope_url_before_query_append() {
     let nid = uuid::Uuid::new_v4();
     let payload = build_push_payload(
+        None,
         "T",
         "B",
         Some(nid),
@@ -480,7 +536,7 @@ fn declarative_navigate_normalizes_scope_url_before_query_append() {
     );
     assert_eq!(
         payload["notification"]["navigate"],
-        format!("https://lucidos.test/dev/?notification={nid}")
+        format!("https://lucidos.test/dev/?notification={nid}&restore_generation=none")
     );
 }
 
@@ -491,6 +547,7 @@ fn declarative_navigate_omits_tap_param_for_modal_kind() {
     // dispatcher defaults missing tap to modal. Keeps URLs short.
     let nid = uuid::Uuid::new_v4();
     let payload = build_push_payload(
+        None,
         "T",
         "B",
         Some(nid),
@@ -516,7 +573,18 @@ fn declarative_navigate_root_when_no_params() {
     // — a scope-relative ref that resolves to the workspace (`/<slug>/`) root
     // on iOS. A bare "/" would escape to the origin root (the gateway picker),
     // the same multi-workspace trap the parametrized URLs avoid.
-    let payload = build_push_payload("T", "B", None, None, None, None, &Tap::Modal, None, None);
+    let payload = build_push_payload(
+        None,
+        "T",
+        "B",
+        None,
+        None,
+        None,
+        None,
+        &Tap::Modal,
+        None,
+        None,
+    );
     assert_eq!(payload["notification"]["navigate"], ".");
     assert_eq!(payload["notification"]["data"]["navigate"], ".");
 }
@@ -528,6 +596,7 @@ fn a_relayed_subscription_taps_through_the_outside_origin() {
     let tid = uuid::Uuid::new_v4();
     let tap = nav_thread(&tid.to_string(), None);
     let payload = build_push_payload(
+        None,
         "T",
         "B",
         None,
@@ -554,6 +623,7 @@ fn a_relayed_subscription_taps_through_the_outside_origin() {
 #[test]
 fn declarative_navigate_scope_root_when_no_params_and_scope_present() {
     let payload = build_push_payload(
+        None,
         "T",
         "B",
         None,
@@ -579,6 +649,7 @@ fn declarative_notification_tag_carries_notification_id_for_dedup() {
     // gets the same dedup as the SW path.
     let nid = uuid::Uuid::new_v4();
     let payload = build_push_payload(
+        None,
         "T",
         "B",
         Some(nid),
@@ -597,7 +668,18 @@ fn declarative_notification_tag_falls_back_to_default_when_no_id() {
     // Legacy callers without a notification_id still need a tag — the
     // engine fills in "lucidos-notification" so the OS dedup channel
     // exists.
-    let payload = build_push_payload("T", "B", None, None, None, None, &Tap::Modal, None, None);
+    let payload = build_push_payload(
+        None,
+        "T",
+        "B",
+        None,
+        None,
+        None,
+        None,
+        &Tap::Modal,
+        None,
+        None,
+    );
     assert_eq!(payload["notification"]["tag"], "lucidos-notification");
 }
 
@@ -618,6 +700,7 @@ fn declarative_notification_data_carries_hash_navigate_url_for_chrome_sw() {
     let tid = uuid::Uuid::new_v4();
     let tap = nav_thread(&tid.to_string(), None);
     let payload = build_push_payload(
+        None,
         "T",
         "B",
         Some(nid),
@@ -703,6 +786,7 @@ fn real_world_overflow_payload(body: &str) -> serde_json::Value {
     let eid = uuid::Uuid::new_v4();
     let tap = nav_thread(&tid.to_string(), Some(&eid.to_string()));
     build_push_payload_fitted(
+        None,
         "Nightly pipeline: GREEN ✅",
         body,
         Some(nid),
@@ -740,6 +824,7 @@ fn s4_5_crate_ceiling_constant_matches_what_build_actually_enforces() {
 fn s4_5_overflowing_body_still_builds_a_deliverable_message() {
     let body = overflowing_notification_body(2862);
     let unfitted = build_push_payload(
+        None,
         "Nightly pipeline: GREEN ✅",
         &body,
         Some(uuid::Uuid::new_v4()),
@@ -809,6 +894,7 @@ fn s4_5_short_body_passes_through_byte_identical() {
     let tap = nav_thread(&tid.to_string(), None);
     let body = "Pick one of the three options";
     let unfitted = build_push_payload(
+        None,
         "Claude is asking",
         body,
         Some(nid),
@@ -820,6 +906,7 @@ fn s4_5_short_body_passes_through_byte_identical() {
         Some(2),
     );
     let fitted = build_push_payload_fitted(
+        None,
         "Claude is asking",
         body,
         Some(nid),
@@ -848,6 +935,7 @@ fn s4_5_truncation_is_utf8_safe_with_multibyte_content() {
         body.push_str(&"é".repeat(pad));
         body.push_str(&"✅".repeat(200));
         let payload = build_push_payload_fitted(
+            None,
             "Pipeline ✅",
             &body,
             Some(uuid::Uuid::new_v4()),
@@ -885,6 +973,7 @@ fn s4_5_truncation_preserves_every_structural_envelope_field() {
     let eid = uuid::Uuid::new_v4();
     let tap = nav_thread(&tid.to_string(), Some(&eid.to_string()));
     let payload = build_push_payload_fitted(
+        None,
         "Nightly pipeline: GREEN ✅",
         &body,
         Some(nid),
@@ -936,7 +1025,7 @@ fn a_markdown_body_reaches_the_banner_as_plain_text() {
         created_at: chrono::Utc::now(),
         tap: Tap::Modal,
     };
-    let payload = build_wake_payload(&n, None, None);
+    let payload = build_wake_payload(None, &n, None, None);
     assert_eq!(
         payload["notification"]["body"],
         "The fix is live.\n\n• Weight: normal\n\nWhat next?"
@@ -963,7 +1052,8 @@ fn s4_5_wake_payload_of_an_overflowing_body_also_builds() {
         created_at: chrono::Utc::now(),
         tap: nav_thread(&tid.to_string(), Some(&eid.to_string())),
     };
-    let payload = build_wake_payload(&n, Some("https://lucidos.test/dev/"), Some(7)).to_string();
+    let payload =
+        build_wake_payload(None, &n, Some("https://lucidos.test/dev/"), Some(7)).to_string();
     assert!(
         payload.len() <= MAX_PUSH_PAYLOAD_BYTES,
         "fitted wake payload is {} B, over the ceiling",
@@ -996,8 +1086,10 @@ fn s4_5_wake_budget_is_tighter_than_the_original_send() {
         created_at: chrono::Utc::now(),
         tap: Tap::Modal,
     };
-    let wake = build_wake_payload(&n, Some("https://lucidos.test/dev/"), Some(7));
+    let generation = Some(uuid::Uuid::new_v4());
+    let wake = build_wake_payload(generation, &n, Some("https://lucidos.test/dev/"), Some(7));
     let send = build_push_payload_fitted(
+        generation,
         &n.title,
         &body,
         Some(n.id),
@@ -1007,6 +1099,14 @@ fn s4_5_wake_budget_is_tighter_than_the_original_send() {
         &n.tap,
         Some("https://lucidos.test/dev/"),
         Some(7),
+    );
+    assert_eq!(
+        wake["notification"]["data"]["restore_generation"],
+        serde_json::json!(generation)
+    );
+    assert_eq!(
+        send["notification"]["data"]["restore_generation"],
+        serde_json::json!(generation)
     );
     let wake_body = wake["notification"]["body"].as_str().unwrap();
     let send_body = send["notification"]["body"].as_str().unwrap();
@@ -1034,6 +1134,7 @@ fn s4_5_escape_heavy_body_keeps_what_actually_fits() {
     ] {
         let body = unit.repeat(2862 / unit.len());
         let payload = build_push_payload_fitted(
+            None,
             "Nightly pipeline",
             &body,
             Some(uuid::Uuid::new_v4()),
@@ -1056,6 +1157,7 @@ fn s4_5_escape_heavy_body_keeps_what_actually_fits() {
         // each unit costs serialized. Anything close to that is a good fit; an
         // empty (or near-empty) body is the bug this test exists for.
         let envelope = build_push_payload(
+            None,
             "Nightly pipeline",
             "",
             Some(uuid::Uuid::new_v4()),
@@ -1092,6 +1194,7 @@ fn s4_5_envelope_inside_the_safety_reserve_still_keeps_what_fits() {
     let nid = uuid::Uuid::new_v4();
     let envelope_of = |title: &str| {
         build_push_payload(
+            None,
             title,
             "",
             Some(nid),
@@ -1116,6 +1219,7 @@ fn s4_5_envelope_inside_the_safety_reserve_still_keeps_what_fits() {
     );
 
     let payload = build_push_payload_fitted(
+        None,
         &title,
         &overflowing_notification_body(2862),
         Some(nid),
@@ -1146,6 +1250,7 @@ fn s4_5_envelope_alone_over_the_ceiling_degrades_instead_of_panicking() {
     // The guard must hand back an empty body rather than panic or underflow.
     let title = "T".repeat(MAX_PUSH_PAYLOAD_BYTES + 500);
     let payload = build_push_payload_fitted(
+        None,
         &title,
         &overflowing_notification_body(2862),
         Some(uuid::Uuid::new_v4()),
@@ -1169,14 +1274,36 @@ fn s4_5_body_fits_exactly_at_the_ceiling_is_not_truncated() {
     // guard must pass it through rather than shave it "just in case".
     let mut body = String::new();
     let build = |b: &str| {
-        build_push_payload("T", b, None, None, None, None, &Tap::Modal, None, None).to_string()
+        build_push_payload(
+            None,
+            "T",
+            b,
+            None,
+            None,
+            None,
+            None,
+            &Tap::Modal,
+            None,
+            None,
+        )
+        .to_string()
     };
     while build(&body).len() < MAX_PUSH_PAYLOAD_BYTES {
         body.push('a');
     }
     assert_eq!(build(&body).len(), MAX_PUSH_PAYLOAD_BYTES);
-    let fitted =
-        build_push_payload_fitted("T", &body, None, None, None, None, &Tap::Modal, None, None);
+    let fitted = build_push_payload_fitted(
+        None,
+        "T",
+        &body,
+        None,
+        None,
+        None,
+        None,
+        &Tap::Modal,
+        None,
+        None,
+    );
     assert_eq!(fitted["notification"]["body"], body);
     assert!(build_real_web_push_message(&fitted.to_string()).is_ok());
 }
@@ -1621,4 +1748,56 @@ fn the_service_worker_falls_back_to_the_same_tag() {
     let sw = include_str!("../../../lucidos-app/public/sw.js");
     let needle = format!("const DEFAULT_NOTIFICATION_TAG = '{DEFAULT_NOTIFICATION_TAG}';");
     assert!(sw.contains(&needle), "sw.js must carry `{needle}`");
+}
+
+#[test]
+fn payload_provenance_survives_fitting() {
+    for generation in [None, Some(uuid::Uuid::new_v4())] {
+        let payload = build_push_payload_fitted(
+            generation,
+            "Title",
+            &"body".repeat(2000),
+            None,
+            None,
+            None,
+            None,
+            &Tap::Modal,
+            None,
+            None,
+        );
+        assert_eq!(
+            payload["notification"]["data"]["restore_generation"],
+            serde_json::json!(generation)
+        );
+        assert!(payload.to_string().len() <= MAX_PUSH_PAYLOAD_BYTES);
+    }
+}
+
+#[test]
+fn navigate_urls_preserve_push_generation() {
+    for generation in [None, Some(uuid::Uuid::new_v4())] {
+        let payload = build_push_payload_fitted(
+            generation,
+            "Title",
+            &"body".repeat(2000),
+            Some(uuid::Uuid::new_v4()),
+            None,
+            None,
+            None,
+            &Tap::Modal,
+            None,
+            None,
+        );
+        let token = generation.map_or_else(|| "none".to_string(), |id| id.to_string());
+        for navigate in [
+            &payload["notification"]["navigate"],
+            &payload["notification"]["data"]["navigate"],
+        ] {
+            assert!(navigate
+                .as_str()
+                .unwrap()
+                .contains(&format!("restore_generation={token}")));
+        }
+        assert!(payload.to_string().len() <= MAX_PUSH_PAYLOAD_BYTES);
+    }
 }

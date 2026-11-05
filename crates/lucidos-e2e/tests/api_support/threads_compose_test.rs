@@ -1061,3 +1061,43 @@ async fn a_send_consumes_its_draft_at_accept_and_the_ack_reports_it() {
         "the epoch moved once"
     );
 }
+
+/// A delayed recovery request from another generation must create neither a
+/// destination nor a creation event, even if the supplied content is valid.
+#[tokio::test]
+async fn recovered_draft_refuses_a_foreign_restore_generation() {
+    let client = user_client().await;
+    let id = Uuid::new_v4();
+    let response = client
+        .post(threads_url())
+        .json(&json!({
+            "id": id,
+            "mode": "lucidos",
+            "recovered_compose": {
+                "generation": Uuid::new_v4(),
+                "text": "preserved draft",
+                "image_hashes": [],
+                "selection": {"model": "example-model"}
+            }
+        }))
+        .send()
+        .await
+        .expect("recovery response");
+    assert_eq!(response.status(), 412);
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("test database");
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM thread_summaries WHERE thread_id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let events: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE aggregate_id = $1")
+        .bind(id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!((rows, events), (0, 0));
+    pool.close().await;
+}

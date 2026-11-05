@@ -45,7 +45,7 @@ fn method_mutates(method: &Method) -> bool {
 /// already the module's own spelling, so the list answers it correctly. The
 /// mount is stripped exactly once: a route that merely repeats it deeper down
 /// is a different route and stays gated.
-fn mounted_route(matched: &str) -> &str {
+pub(super) fn mounted_route(matched: &str) -> &str {
     matched
         .strip_prefix(super::API_V1_PREFIX)
         .unwrap_or(matched)
@@ -104,7 +104,7 @@ fn is_exempt(route: &str) -> bool {
 pub(super) const MUTATING_SOCKET_ROUTES: &[&str] = &["/voice"];
 
 /// Does a request to `route` change something?
-fn request_mutates(method: &Method, route: &str) -> bool {
+pub(super) fn request_mutates(method: &Method, route: &str) -> bool {
     method_mutates(method) || MUTATING_SOCKET_ROUTES.contains(&route)
 }
 
@@ -126,11 +126,19 @@ async fn refuse_unidentified(
         return Ok(());
     }
     // Peeked, not spent: the handler redeems the ticket and re-checks it.
+    let generation = if MUTATING_SOCKET_ROUTES.contains(&route) {
+        crate::core::snapshot::boundary::read(pool)
+            .await
+            .map_err(super::error::ApiError::db)?
+            .map(|boundary| boundary.restore_id)
+    } else {
+        None
+    };
     let socket_claim = (MUTATING_SOCKET_ROUTES.contains(&route)
         && !headers.contains_key(super::actor::HEADER_DEVICE_ID))
     .then(|| super::voice_ticket::ticket_in(uri))
     .flatten()
-    .and_then(|ticket| tickets.peek_device(&ticket));
+    .and_then(|ticket| tickets.peek_device(&ticket, generation));
     if let Err(refusal) =
         super::actor::require_user_actor(headers, pool, socket_claim.as_deref()).await
     {

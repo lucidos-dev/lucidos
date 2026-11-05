@@ -536,7 +536,7 @@ are in `system-knowhow/building-an-app.md` § Responsive by default.
 
 `lucidos._capture()` needs nothing from your app. The SDK draws the page through an SVG `foreignObject`. So the browser renders the snapshot, and any CSS it paints comes out right, CSS Color 4 included. It embeds your fonts and images by reading them over the host bridge. One it cannot read (another host, or a route outside the app reach table) paints empty.
 
-When the screenshot fails for any reason, the capture degrades to **DOM-only** rather than throwing. It returns an empty `screenshot` plus a `dom` layout snapshot (element positions + classes), prefixed with the failure reason. So the agent still sees the layout.
+When the screenshot fails for any reason, the capture degrades to **DOM-only** rather than throwing. It returns an empty `screenshot` plus a `dom` layout snapshot (element positions + classes), prefixed with the failure reason. The caller still receives the layout and failure reason.
 
 ### Widget shapes
 
@@ -622,6 +622,7 @@ configure the SDK before making calls:
 
 ```js
 lucidos.configure({ baseUrl: 'https://example.com', token: 'your-access-token' });
+lucidos.sse.onOpen(load); // Load workspace data after the generation hello.
 ```
 
 `baseUrl` overrides the auto-derived workspace base path for requests and event
@@ -928,17 +929,24 @@ The engine already holds credentials and routing for every model provider in the
 | `openrouter` | `https://openrouter.ai/api/v1` | `Authorization: Bearer <key>` | path as-is, e.g. `/chat/completions` |
 | `xai` | `https://api.x.ai/v1` | `Authorization: Bearer <key>` | path as-is, e.g. `/chat/completions` |
 | `anthropic` | `https://api.anthropic.com/v1` | `x-api-key: <key>` (or `Authorization: Bearer` for an OAuth credential) | path as-is, e.g. `/messages`; set your own `anthropic-version` header |
+| `claude-gateway` | configured gateway origin plus `/v1` | issuer-bound `Authorization: Bearer`, refreshed inside the engine | only `POST /messages`; set `anthropic-version: 2023-06-01` |
 | `local` | your configured local base (Ollama default `http://localhost:11434/v1`) | `Authorization: Bearer <key>` (omitted if keyless) | path as-is, e.g. `/chat/completions` |
 | `vertex` | `https://<region>-aiplatform.googleapis.com/v1/projects/<project>/locations/<region>` (engine-owned prefix) | `Authorization: Bearer <access-token>` (minted + refreshed server-side) | ONLY the suffix, e.g. `/publishers/anthropic/models/claude-opus-4-8@default:rawPredict` |
 | `typesafe` | `https://api.typesafe.ai/v1` | `Authorization: Bearer <key>` | path as-is, e.g. `/systemone` |
 
-- **Only the credential is injected.** The layer adds just the auth header. `Content-Type`, `anthropic-version` and any attribution headers stay yours to set in `init`.
+- **The engine injects auth.** Set `Content-Type` and `anthropic-version` in `init`. Gateway calls also identify Lucidos and resolve models against the account's managed policy.
 - **`apis.json` overrides the builtin.** A same-name entry in `data/config/apis.json` wins, so you can point `openai` at a mock/gateway or add auth layers.
 - **Vertex is addressed by suffix.** The engine owns the `…/projects/<project>/locations/<region>` prefix (from its own Vertex config, region default `europe-west1`) and mints the OAuth token. Send only `/publishers/<publisher>/models/<model>:<method>`: any other path answers 400, because the token could manage every resource in the project. The region is the engine's configured one. A model that must run elsewhere (e.g. a `global`-only Gemini variant) needs an `apis.json` override.
 - **Not configured → 404.** With no credential/config and no `apis.json` entry, the call returns 404 naming what to set.
 - **Every default base already includes `/v1`.** Send `/models`, never `/v1/models`, which doubles the segment and answers 404. A `local` base you configure yourself may lack it.
 - **`opencode-free` has no proxy.** The keyless free tier serves chat only, and an app must not build on an anonymous endpoint that can vanish without notice (ADR 0104).
-- **`claude-gateway` has no proxy.** The Claude gateway sign-in is the user's own, granted for chat, so no app may spend it.
+- **`claude-gateway` shares the engine's sign-in.** Configure and sign in under Settings → Models → Providers.
+  Send `/messages` with the normal Anthropic body: `model`, `max_tokens`, and `messages`; `stream: true` is supported.
+  Choose a model served to your account. The engine resolves listed snapshots and enforces managed model policy.
+  A model id ending in `[1m]` goes upstream without the suffix, plus the 1M-context `anthropic-beta`.
+
+  It refreshes once after a rejected token. Rate/spend refusals retain their body and `Retry-After`; they never trigger provider fallback.
+  Successful usage-bearing replies are recorded as proxy spend with gateway provider attribution.
 - **The same proxies serve scripts and the agent.** `lucidos proxy <name>` and the `proxy_request` tool resolve names exactly as this route does.
 
 ```js
@@ -1436,19 +1444,19 @@ if (!clip) document.body.textContent = 'No clip given';
 ```ts
 lucidos.widget.size(): 'small' | 'medium' | 'large' | null
 lucidos.widget.onSize(callback: (size) => void): () => void
-lucidos.widget.place(): 'dashboard' | 'inline' | 'shelf' | 'option' | null
+lucidos.widget.place(): 'dashboard' | 'inline' | 'option' | null
 lucidos.widget.visible(): boolean
 lucidos.widget.onVisibility(callback: (visible: boolean) => void): () => void
 ```
 
 What the host told a *widget* about the place it shows in (ADR 0432). The SDK also stamps two attributes on `<html>`, so most widgets adapt in CSS alone:
 
-- **`data-widget-place`**: `dashboard` on a *dashboard*, phone or desktop, `inline` in a thread (a reply's embed included), `shelf` or `option`. Absent in the Canvas, where a widget opens as an app. Before ADR 0496 a dashboard tile read `home`, so a widget that still compares the place to `home` no longer matches.
-- **`data-widget-size`**: the tile's *widget size* on a dashboard, `small`, `medium` or `large`. Absent anywhere else, where `size()` is `null`.
+- **`data-widget-place`**: `dashboard` on a *dashboard*, phone or desktop, `inline` in a thread (a reply's embed included), or `option`. Absent in the Canvas, where a widget opens as an app. Before ADR 0496 a dashboard tile read `home`, so a widget that still compares the place to `home` no longer matches.
+- **`data-widget-size`**: the *widget size* of its *widget box*, `small`, `medium` or `large`, in a thread card and on a dashboard alike. Absent in an option and in the Canvas, where `size()` is `null`.
 
-On a dashboard the tile sets the box and the frame fills it. Draw for the size you are told, with no scroll inside. Content past the tile is clipped under a fade. The tile's menu offers Open in Canvas, which opens the widget full size. A widget whose manifest declares no sizes takes all three (`system-knowhow/building-an-app.md` § Widgets).
+In a thread card and on a dashboard the host sets the box and the frame fills it. Draw for the size you are told, with no scroll inside (§ Sizing a widget). A widget whose manifest declares no sizes takes all three (`system-knowhow/building-an-app.md` § Widgets).
 
-`visible()` turns false while a hidden dashboard keeps the frame loaded, just before it unloads. Stop timers then, and read again when it turns true.
+`visible()` turns false while a frame stays loaded out of sight, such as a card scrolled off or a hidden dashboard, just before it unloads. Stop timers then, and read again when it turns true.
 
 A right-click anywhere in a widget opens the widget's own menu at the pointer (ADR 0528). A finger held on a dashboard tile opens it too, with a haptic tick, and a dashboard tile draws no ⋯. A finger on a tile turns off text selection and iOS's own long-press menu, links included, until the next press. On a right-click, content keeps the native menu, by the host's own rule:
 
@@ -1720,6 +1728,10 @@ interface NavigateUi {
  *  sweep a workspace for leftovers, run `system-knowhow/workspace-audit.md`. */
 type Tap =
   | { kind: 'modal' }
+  // Engine restore notifications: requests admission and confirmation for
+  // the recovery snapshot. Receiving or opening it never executes a restore.
+  // Only the engine writes it: a sent notification with it is refused.
+  | { kind: 'restore-snapshot'; workspace_id: string; handle: string }
   | { kind: 'navigate'; to: NavigateUi };
 
 interface Notification {
@@ -1980,6 +1992,43 @@ interface ThreadSummary {
 | Spawn a new thread from an app | `lucidos.ui.startThread({ prompt })`, plus `coding_agent` and `folder` to preselect a coding target |
 | Open a link outside Lucidos from JS | `lucidos.ui.openExternal(url)` (never `window.open`) |
 
+## lucidos.modelRequest
+
+Builds a typed model-provider request from a `ModelPicker` value without sending
+it. It reads the current registry, resolves the selected route and wire ID, and
+uses engine-owned effort settings. Unknown routes and missing protocol metadata
+reject; credentials remain inside the proxy.
+
+```js
+const req = await lucidos.modelRequest(picker.getValue(), {
+  messages: [{ role: 'user', content: 'Explain this result.' }],
+  system: 'Be concise',
+  stream: false,
+});
+const response = await lucidos.proxy(req.proxy).fetch(req.path, {
+  method: 'POST', headers: req.headers, body: JSON.stringify(req.body),
+});
+if (!response.ok) throw new Error(await response.text());
+const result = await response.json();
+```
+
+Options: `messages` (text-only user/assistant messages), optional `system`,
+`stream` (default false), and `maxTokens`. The returned object has `proxy`,
+`protocol`, `path`, `headers` and a JSON `body`. Null effort preserves the model's
+provider default, including models that think by default. Non-null efforts clamp
+to the route's offered tiers. `maxTokens` overrides the engine's Anthropic reply
+allowance; keep it above any enabled thinking budget. For tools, images or other
+provider-specific payloads, extend the returned body or use `lucidos.proxy`
+directly with the provider's wire contract.
+
+Responses remain provider-native: `anthropic-messages` (including gateway) and
+`vertex-anthropic` return Anthropic messages; `openai-responses` returns Responses;
+`openai-chat-completions` returns chat completions (OpenAI, OpenRouter, xAI and
+local); `vertex-google` returns Google candidates. Streaming returns each
+protocol's event stream; this helper does not parse or normalize replies.
+Vertex requests use publisher-model suffixes; never include a project or region.
+Builtin support is discovered from metadata, including gateway when installed.
+
 ## lucidos.ui: UI Control
 
 ```ts
@@ -2080,27 +2129,28 @@ Four rules:
 The progress bar needs nothing from you. It also keeps running when the 3 s
 fuse lifts the cover before `load`, so a slow page still says it is loading.
 
-### Sizing a widget to its content
+### Sizing a widget
 
-A *widget* shows inline in its thread as an *inline widget*, so its frame fits
-what it draws instead of filling a pane. Nothing to call: when the host marks a
-frame as a widget, the SDK measures `document.body` and reports its height on
-every resize. Design the widget to fit one phone screen, with the answer on its
-top screen.
+A *widget* draws into a *widget box*: a fixed box of its *widget size*. Its
+thread card and its dashboard tile draw the same box at the same size, so the
+widget looks the same in both. The full contract is
+`system-knowhow/building-an-app.md` § Widgets, "The widget box".
 
-- **Inline**, the frame takes the full height you report and never scrolls
-  inside. Past about one phone screen, the card clips with a fade and an
-  Expand button that opens the widget full size in Canvas.
-- **On the shelf**, a pinned widget drops open under the title, capped at 70%
-  of the screen height.
-
-- **Never size the body to the viewport.** `height: 100vh`, `min-height:
-  100%` or a full-height flex body reports the frame's own height, so the
-  frame can never shrink to the content.
-- **Load the SDK.** A widget without `<script src="/api/v1/sdk.js">` reports
-  nothing and keeps a fixed default height.
-- The same widget opened full size in the Canvas pane reports nothing, so
-  there it is an ordinary app.
+- **Read the size, never measure the page.** Style under
+  `html[data-widget-size="small"]` and its siblings, or read
+  `lucidos.widget.size()`. The viewport is the box, so `100%` and `100vh`
+  mean the box.
+- **Fit by showing less, never by shrinking text.** Keep type on the theme
+  tokens, so the UI scale reaches it.
+- **Never scroll inside.** Content past the box is clipped under a fade, and
+  ⋯ › Open in Canvas shows the widget full size.
+- **An option has no size.** There the frame takes the height the SDK
+  reports for `document.body`, so never size the body to the viewport in an
+  option.
+- **Load the SDK.** It stamps the size, and the host reads the content
+  height it reports to decide the fade.
+- The same widget opened full size in the Canvas pane gets no size, so there
+  it is an ordinary app.
 
 ### Reading the thread the user has open
 
@@ -2637,6 +2687,44 @@ The attribute is read on `<html>` or `<body>`, and it applies before any script
 runs. `disableTooltips()` sets the same attribute and drops the tooltip node.
 Both last for the life of the page.
 
+### lucidos.ui.ModelPicker: model, effort and provider
+
+Uses the same stepped picker as Settings and chat, inside the app's own frame.
+Available through `window.lucidos` and `@lucidos/sdk`. The shared
+`.model-selection-field`, `.model-selection-value`, `.dropdown-menu` and
+`.control-list` / `.control-option` classes supply its theme and geometry.
+
+```js
+const picker = lucidos.ui.ModelPicker.create({
+  value: { model: 'your-registry-model', reasoning_effort: null, provider: null },
+  filter: { callableOnly: true },
+  onChange: value => console.log(value),
+  onError: error => console.error(error),
+});
+document.querySelector('.model-field').append(picker.element);
+await picker.ready;
+```
+
+`value` contains a registry `model`, nullable `reasoning_effort` and nullable
+`provider`. A null provider resolves within the filtered routes; the returned
+value names the actual provider. A null effort keeps the provider default.
+Unsupported efforts clamp using the host picker rules. Explicit unavailable
+models or providers reject rather than selecting another route.
+
+Options also accept `disabled`, `label`, and `filter.providers` / `filter.models`
+(string arrays). `callableOnly` restricts to supported builtin proxy protocols;
+it does not hide routes that need credentials. Unknown setup state is shown as
+not set up. Retired models are excluded and chat-ladder models appear first.
+
+The instance exposes `element`, `ready`, `refresh()`, `getValue()`, `setValue(value)`,
+`setDisabled(boolean)`, `open()`, `close()` and `destroy()`. Await `ready` before
+opening. `refresh()` explicitly reloads the registry and rejects on failure;
+load errors disable the field and call `onError`. Programmatic `setValue` never
+calls `onChange`; while loading it is validated when that load completes.
+
+Destroy removes the picker and its listeners. Escape steps back before closing;
+only the final choice commits. The app owns persistence of the selected value.
+
 ### lucidos.ui.Select: themed dropdown
 
 Replaces a native `<select>` (whose popup the OS draws and CSS can't reach) with a themed dropdown. Supports keyboard nav, type-to-select, and light and dark mode.
@@ -2730,6 +2818,22 @@ so call it again after adding new ones.
 ## lucidos.sse: Real-time Events
 
 Subscribe to server-sent events for live updates.
+
+Direct SDK clients use the stream's workspace restore generation for HTTP
+provenance. Start standalone data loading inside `lucidos.sse.onOpen(load)`;
+this connects the stream and waits for its generation hello before calling
+`load`, on first load and reconnect. `connect()` alone does not wait for hello.
+
+A request begun
+before that generation was observed keeps its original provenance; it is never
+upgraded or retried automatically. If a connected page observes a different
+generation, reload it and review intent before submitting again. Responses
+whose headers or body arrive across that change are rejected. Isolated app
+frames use the host's restore admission instead.
+
+Starting a direct HTTP call before the first stream hello binds the page to
+the original generation. A later restored hello closes that page's HTTP
+transport too; it cannot authorize old page state for a subsequent call.
 
 ```ts
 lucidos.sse.connect(): void

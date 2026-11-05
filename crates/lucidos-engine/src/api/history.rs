@@ -26,6 +26,14 @@ pub(super) async fn global_events(State(state): State<AppState>, headers: Header
     // has gone stale.
     let conn_guard = state.engine.sse_connections.connect();
     let rx = state.engine.event_bus.subscribe();
+    // Subscribe first, then read the durable generation. Every event buffered
+    // during this read follows the hello, including on the gzip transport.
+    // An unreadable boundary must never look like a workspace without restores.
+    let boundary = match crate::core::snapshot::boundary::read(state.engine.pool()).await {
+        Ok(boundary) => boundary,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let hello = stream_hello(boundary.as_ref().map(|boundary| boundary.restore_id));
     let json_stream = BroadcastStream::new(rx).map(move |r| {
         // `move` captures `conn_guard` by value; it lives as long as this
         // closure (i.e. as long as the stream), then Drop decrements the count.
@@ -38,12 +46,22 @@ pub(super) async fn global_events(State(state): State<AppState>, headers: Header
             }
         }
     });
+    let json_stream = tokio_stream::once(hello).chain(json_stream);
 
     if accepts_gzip(&headers) {
         gzipped_sse_response(json_stream)
     } else {
         plain_sse_response(json_stream)
     }
+}
+
+/// Connection metadata, not a domain event: never persisted or replayed.
+fn stream_hello(generation: Option<uuid::Uuid>) -> String {
+    serde_json::json!({
+        "type": "StreamHello",
+        "data": { "restore_generation": generation }
+    })
+    .to_string()
 }
 
 /// One frame on the wire. `data:` frames carry an event; the keep-alive frame
@@ -425,6 +443,19 @@ async fn respawn_this_engine(
     );
     let mut cmd = tokio::process::Command::new(&script);
     cmd.args(["-w", &ws, "--engine-only"]);
+    let exe = crate::engine::engine_version::published_engine_exe().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "Cannot resolve the published engine path." })),
+        )
+    })?;
+    let dir = crate::engine::engine_version::published_launch_dir(&exe).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Launch the engine from the checkout's published .launch/<profile>/<variant>/ path before switching versions." })),
+        )
+    })?;
+    cmd.arg("--publish-to").arg(dir);
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -478,6 +509,45 @@ pub(super) async fn engine_version_status(
     State(state): State<AppState>,
 ) -> Json<crate::engine::engine_version::VersionStatus> {
     Json(state.engine.version_status().await)
+}
+
+/// Build output only, bounded to its last 64 KiB. Kept separate from the
+/// engine log so diagnostics do not disclose unrelated chat or runtime output.
+async fn engine_build_log(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let output = read_build_log(
+        &state
+            .workspace_path
+            .join(crate::engine::engine_version::ENGINE_BUILD_LOG_PATH),
+    )
+    .await?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], output))
+}
+
+const BUILD_LOG_BYTES: u64 = 64 * 1024;
+
+async fn read_build_log(path: &std::path::Path) -> Result<String, (StatusCode, String)> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let unavailable = |_| {
+        (
+            StatusCode::NOT_FOUND,
+            "Build output is not available yet.".to_string(),
+        )
+    };
+    let mut file = tokio::fs::File::open(path).await.map_err(unavailable)?;
+    let len = file.metadata().await.map_err(unavailable)?.len();
+    file.seek(std::io::SeekFrom::Start(
+        len.saturating_sub(BUILD_LOG_BYTES),
+    ))
+    .await
+    .map_err(unavailable)?;
+    let mut bytes = Vec::new();
+    file.take(BUILD_LOG_BYTES)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(unavailable)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// `GET /api/v1/engine/changelog`: every published release's notes, newest
@@ -1075,8 +1145,8 @@ fn emit_chain_and_trigger(headers: &HeaderMap) -> (u32, Option<String>) {
 
 /// Routes for the engine-level surfaces this module's handlers own:
 /// `/health`, `/restart`, `/workspaces`, `/history`, `/messages`,
-/// `/session/messages`, the three `/engine/*` routes (version-status,
-/// changelog, rebuild), and the `/events*` surface (global SSE stream +
+/// `/session/messages`, the `/engine/*` routes (version-status,
+/// changelog, rebuild, build-log), and the `/events*` surface (global SSE stream +
 /// event-store queries).
 ///
 /// Four `/events/:event_id/*` routes join them: `context`, `tool-result`,
@@ -1089,6 +1159,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/engine/version-status", get(engine_version_status))
         .route("/engine/changelog", get(engine_changelog))
         .route("/engine/rebuild", post(engine_rebuild))
+        .route("/engine/build-log", get(engine_build_log))
         .route("/workspaces", get(list_workspaces))
         .route("/events", get(global_events))
         .route("/history", get(get_history))
@@ -1119,6 +1190,249 @@ pub(super) fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn build_log_is_bounded_and_missing_output_is_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("build.log");
+        assert_eq!(
+            read_build_log(&path).await.unwrap_err().0,
+            StatusCode::NOT_FOUND
+        );
+        let mut bytes = vec![b'x'; usize::try_from(BUILD_LOG_BYTES).unwrap() + 16 * 1024];
+        bytes.extend_from_slice(b"publish failed");
+        tokio::fs::write(&path, bytes).await.unwrap();
+        let text = read_build_log(&path).await.unwrap();
+        assert_eq!(text.len(), usize::try_from(BUILD_LOG_BYTES).unwrap());
+        assert!(text.ends_with("publish failed"));
+    }
+
+    /// Real construction and handlers, isolated from the user's HOME and keys.
+    #[tokio::test]
+    async fn providerless_boot_health_chat_and_live_configuration() {
+        use crate::{core::prefs, llm::ProviderBuildContext, test_support::*};
+        const CHILD: &str = "LUCIDOS_TEST_PROVIDERLESS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let output = tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                tokio::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "api::history::tests::providerless_boot_health_chat_and_live_configuration",
+                        "--nocapture",
+                    ])
+                    // Match the engine runtime stack for the chat orchestrator future.
+                    .env("RUST_MIN_STACK", "16777216")
+                    .env(CHILD, "1")
+                    .env("GIT_AUTHOR_NAME", "Test User")
+                    .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                    .env("GIT_COMMITTER_NAME", "Test User")
+                    .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                    .env("HOME", home.path())
+                    .env_remove("LUCIDOS_GATEWAY_DATA")
+                    .env_remove("LUCIDOS_BOOT_WITHOUT_PROVIDER")
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (pool, db) = setup_test_db().await;
+        for pref in crate::llm::provider_build::PROVIDER_ENABLED_SWITCHES {
+            seed_preference(&pool, pref.key(), "false").await.unwrap();
+        }
+        seed_preference(&pool, prefs::OPENCODE_FREE_ENABLED.key(), "false")
+            .await
+            .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            crate::engine::LucidosEngine::new(
+                workspace.path().to_path_buf(),
+                &test_db_url(&db),
+                ProviderBuildContext {
+                    default_model: prefs::CHAT_MODEL.default_text().into(),
+                    model_is_mock: false,
+                    vertex_project_id: String::new(),
+                    vertex_location: crate::llm::vertex::location_handle(String::new()),
+                    vertex_token_cache: None,
+                    model_registry: Default::default(),
+                    not_served: Default::default(),
+                    claude_gateway_access: None,
+                },
+            )
+            .await
+            .expect("engine boots without provider or opt-in"),
+        );
+        engine.set_self_arc(&engine);
+        let scheduler = crate::scheduler::SchedulerManager::new(engine.clone(), pool.clone())
+            .await
+            .unwrap();
+        let state = AppState {
+            engine: engine.clone(),
+            pool: pool.clone(),
+            event_store: engine.event_store().clone(),
+            embedder: crate::memory::EmbedderSlot::empty(),
+            memory_index: None,
+            workspace_path: workspace.path().to_path_buf(),
+            app_manager: engine.shared_app_manager(),
+            scheduler: Arc::new(tokio::sync::Mutex::new(scheduler)),
+            started_at: chrono::Utc::now(),
+            pending_oauth_flows: Default::default(),
+            reveal_tokens: Default::default(),
+            call_tickets: Default::default(),
+        };
+        let (status, Json(body)) = health(State(state.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["llm_configured"], false);
+        let thread = uuid::Uuid::new_v4();
+        let _result = engine
+            .process_message_with_steps(
+                "Hello",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+                None,
+                Some(thread),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                crate::engine::thread_events::ActorMode::Human,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                crate::engine::FollowUpUrgency::Normal,
+                None,
+            )
+            .await;
+        let failure: serde_json::Value = sqlx::query_scalar("SELECT payload FROM events WHERE thread_id = $1 AND event_type = 'ResponseFailed' ORDER BY sequence DESC LIMIT 1")
+            .bind(thread).fetch_one(&pool).await.expect("chat emits visible failure");
+        assert!(
+            failure.to_string().contains("No LLM provider configured"),
+            "{failure}"
+        );
+        assert!(
+            failure
+                .to_string()
+                .contains("Settings → Models → Providers"),
+            "{failure}"
+        );
+        // A local URL needs no credential or network call to exercise hot-swap.
+        for (key, value) in [
+            (prefs::LOCAL_BASE_URL.key(), "http://127.0.0.1:1/v1"),
+            (prefs::PROVIDER_ENABLED_LOCAL.key(), "true"),
+        ] {
+            crate::core::PreferenceStore::set(&pool, &engine.event_bus, key, value, None)
+                .await
+                .unwrap();
+        }
+        async fn wait_configured(engine: &crate::engine::LucidosEngine, expected: bool) {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while engine.llm_configured() != expected {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("provider subscriber updates live handle");
+        }
+        wait_configured(&engine, true).await;
+        crate::core::PreferenceStore::set(
+            &pool,
+            &engine.event_bus,
+            prefs::PROVIDER_ENABLED_LOCAL.key(),
+            "false",
+            None,
+        )
+        .await
+        .unwrap();
+        wait_configured(&engine, false).await;
+        assert_eq!(health(State(state)).await.1 .0["llm_configured"], false);
+        engine.mark_shutting_down();
+        drop(engine);
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[test]
+    fn stream_hello_exposes_only_the_durable_generation() {
+        let generation = uuid::Uuid::new_v4();
+        let hello: serde_json::Value =
+            serde_json::from_str(&stream_hello(Some(generation))).unwrap();
+        assert_eq!(
+            hello,
+            serde_json::json!({
+                "type": "StreamHello", "data": { "restore_generation": generation }
+            })
+        );
+        let hello: serde_json::Value = serde_json::from_str(&stream_hello(None)).unwrap();
+        assert!(hello["data"]["restore_generation"].is_null());
+    }
+
+    #[tokio::test]
+    async fn restore_generation_precedes_domain_frames_on_both_transports() {
+        use async_compression::tokio::bufread::GzipDecoder;
+        use tokio::io::{AsyncReadExt, BufReader};
+        use tokio_util::io::StreamReader;
+
+        for gzip in [false, true] {
+            let generation = uuid::Uuid::new_v4();
+            let hello = stream_hello(Some(generation));
+            let domain = "{\"type\":\"ThreadEvent\",\"data\":{}}".to_owned();
+            let frames = tokio_stream::once(hello.clone())
+                .chain(tokio_stream::once(domain.clone()))
+                .chain(futures::stream::pending());
+            let response = if gzip {
+                gzipped_sse_response(frames)
+            } else {
+                plain_sse_response(frames)
+            };
+            let body = response
+                .into_body()
+                .into_data_stream()
+                .map(|chunk| chunk.map_err(std::io::Error::other));
+            let reader = StreamReader::new(body);
+            let mut reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead>> = if gzip {
+                Box::pin(GzipDecoder::new(BufReader::new(reader)))
+            } else {
+                Box::pin(reader)
+            };
+            let expected = format!("data: {hello}\n\ndata: {domain}\n\n");
+            let mut wire = Vec::new();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !String::from_utf8_lossy(&wire).contains(&format!("data: {domain}\n\n")) {
+                    let mut chunk = [0; 1024];
+                    let count = reader.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    wire.extend_from_slice(&chunk[..count]);
+                }
+            })
+            .await
+            .unwrap();
+            let wire = String::from_utf8(wire)
+                .unwrap()
+                .replace("event: keepalive\ndata:\n\n", "");
+            assert_eq!(wire, expected);
+        }
+    }
 
     /// A stub `status.sh` with the given body, executable, in its own dir.
     ///

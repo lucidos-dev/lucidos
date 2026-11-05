@@ -106,13 +106,18 @@ test.describe('the cache-warm line gaps', () => {
     const { width } = page.viewportSize()!;
     await page.setViewportSize({ width, height: SHORT_WINDOW_PX });
     await expect.poll(() => scrollTranscriptToEnd(page), { timeout: 10_000 }).toBe(true);
-    // null until the resize has settled (see measureGaps).
-    await expect.poll(() => measureGaps(page), { timeout: 10_000 }).not.toBeNull();
-    const gaps = (await measureGaps(page))!;
+    // null until the resize has settled (see measureGaps). The poll keeps the
+    // settled measurement: a second call after it can land between two layout
+    // steps and return null again.
+    let gaps: Gaps | null = null;
+    await expect
+      .poll(async () => (gaps = await measureGaps(page)), { timeout: 10_000 })
+      .not.toBeNull();
+    const { above, below } = gaps!;
 
-    expect(gaps.above, 'the card sits below the last turn').toBeGreaterThan(0);
-    expect(gaps.below, 'the composer sits below the card').toBeGreaterThan(0);
-    expect(Math.abs(gaps.above - gaps.below), `gap above ${gaps.above}px, gap below ${gaps.below}px`)
+    expect(above, 'the card sits below the last turn').toBeGreaterThan(0);
+    expect(below, 'the composer sits below the card').toBeGreaterThan(0);
+    expect(Math.abs(above - below), `gap above ${above}px, gap below ${below}px`)
       .toBeLessThanOrEqual(TOLERANCE_PX);
   });
 });

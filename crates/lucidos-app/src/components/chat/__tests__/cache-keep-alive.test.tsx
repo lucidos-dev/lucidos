@@ -619,6 +619,40 @@ describe('the keep-alive explainer', () => {
     expect(document.querySelector('.keep-alive-math-toggle')).toBeNull();
   });
 
+  const unprimed = warming({
+    beats: 0, budget_beats: 17, beat_every_secs: 260, cost_usd: 0, context_tokens: 134_000, ping_usd: 0.0267, reread_usd: 0.6682,
+  });
+
+  it('compares an open run with no odds against the reread, up to the expected wake', async () => {
+    // 65 minutes at a ping every 260 s is 15 pings, inside the budget of 17.
+    const text = await explain({ ...unprimed, expected_wake: { at: '2026-10-19T10:05:00Z', source: 'agent' } } as CacheKeepAliveStatus);
+    expect(text).toContain('A ping reads 134k tokens for $0.03.');
+    expect(text).toContain('Keeping it warm to the expected wake takes 15 pings, about $0.40, against $0.67 to reread. That saves about $0.27.');
+    expect(document.querySelector('.keep-alive-math-toggle')).toBeNull();
+  });
+
+  it('claims no saving when the expected wake comes before the first ping', async () => {
+    const text = await explain({ ...unprimed, expected_wake: { at: '2026-10-19T09:03:00Z', source: 'agent' } } as CacheKeepAliveStatus);
+    expect(text).toContain('The expected wake comes before the first ping, so the cache is still warm without one.');
+    expect(text).not.toContain('saves');
+  });
+
+  it('charges every ping when the plan stops before the expected wake', async () => {
+    // 120 minutes at a ping every 260 s needs 27 pings, past the budget of 17.
+    const text = await explain({ ...unprimed, expected_wake: { at: '2026-10-19T11:00:00Z', source: 'agent' } } as CacheKeepAliveStatus);
+    expect(text).toContain('The plan stops after 17 pings, before the expected wake, so the reply rereads anyway: keeping it warm costs about $0.45 more.');
+  });
+
+  it('prices the whole plan of an open run with no odds and no expected wake', async () => {
+    const text = await explain(unprimed);
+    expect(text).toContain('A ping reads 134k tokens for $0.03. The whole plan of 17 pings costs at most $0.45, against $0.67 to reread.');
+  });
+
+  it('says what a ping costs on a closed run with no odds', async () => {
+    const text = await explain({ ...stopped, ping_usd: 0.0267, reread_usd: 0.6682 } as CacheKeepAliveStatus);
+    expect(text).toContain('A ping reads 262k tokens for $0.03. Rereading 262k tokens costs $0.67.');
+  });
+
   it('says only what an ended run saved, not the reread again', async () => {
     const text = await explain({ ...ended, context_tokens: 118_000, reread_usd: 0.7375 } as CacheKeepAliveStatus);
     expect(text).toContain('Saved about $0.57.');

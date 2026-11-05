@@ -519,15 +519,14 @@ impl PythonRuntime {
                 child.wait()
             )
         };
-        let ((stdout, stdout_total), (stderr, _), status) =
-            match tokio::time::timeout(self.execution_timeout, run).await {
-                Ok((out, err, Ok(status))) => (out, err, status),
-                Ok((_, _, Err(e))) => return Err(format!("Failed to execute Python: {}", e)),
-                Err(_) => return Err(self.on_execution_timeout(run_dir)),
-            };
+        let (out, err, status) = match tokio::time::timeout(self.execution_timeout, run).await {
+            Ok((out, err, Ok(status))) => (out, err, status),
+            Ok((_, _, Err(e))) => return Err(format!("Failed to execute Python: {}", e)),
+            Err(_) => return Err(self.on_execution_timeout(run_dir)),
+        };
 
-        let stdout = finalize_stream(&stdout, stdout_total);
-        let stderr = sanitize_for_jsonb(&String::from_utf8_lossy(&stderr));
+        let stdout = finalize_stream(&out.kept, out.total);
+        let stderr = sanitize_for_jsonb(&String::from_utf8_lossy(&err.kept));
 
         if let Err(e) = fs::write(run_dir.join("stdout.txt"), &stdout) {
             log!("[Python] Failed to write stdout debug log: {}", e);
@@ -542,8 +541,10 @@ impl PythonRuntime {
             // Stripping middle frames + tail-clipping pre-traceback noise
             // keeps the LLM context lean. The kept stderr tail is on disk
             // at exhaust_path/<task_id>/stderr.txt for debugging.
-            let trimmed = truncate_python_error(&stderr);
-            Err(format!("Python error:\n{}", trimmed))
+            let stdout_end = sanitize_for_jsonb(&String::from_utf8_lossy(&out.end));
+            let error =
+                script_error_output(&truncate_python_error(&stderr), &stdout_end, out.total);
+            Err(format!("Python error:\n{}", error))
         }
     }
 
@@ -782,36 +783,44 @@ enum Keep {
     Tail,
 }
 
-/// Read a pipe to EOF, keeping at most [`KEPT_BYTES_CAP`] bytes from the end
-/// `keep` names. Returns the kept bytes and how many the stream carried.
+/// What [`read_capped`] read from one pipe.
+#[derive(Default)]
+struct CapturedStream {
+    /// At most [`KEPT_BYTES_CAP`] bytes, from the end [`Keep`] names.
+    kept: Vec<u8>,
+    /// The stream's last [`PY_ERROR_BYTE_BUDGET`] bytes, whatever `kept`
+    /// holds, since a failing script's log ends with its error.
+    end: Vec<u8>,
+    /// How many bytes the stream carried.
+    total: u64,
+}
+
+/// Read a pipe to EOF.
 async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
     pipe: Option<R>,
     keep: Keep,
-) -> (Vec<u8>, u64) {
+) -> CapturedStream {
     use tokio::io::AsyncReadExt;
+    let mut captured = CapturedStream::default();
     let Some(mut pipe) = pipe else {
-        return (Vec::new(), 0);
+        return captured;
     };
-    let mut kept = Vec::new();
-    let mut total = 0u64;
     let mut chunk = [0u8; 8192];
     loop {
         match pipe.read(&mut chunk).await {
             Ok(0) => break,
             Ok(n) => {
-                total += n as u64;
+                captured.total += n as u64;
                 match keep {
                     Keep::Head => {
-                        let room = KEPT_BYTES_CAP.saturating_sub(kept.len());
-                        kept.extend_from_slice(&chunk[..n.min(room)]);
+                        let room = KEPT_BYTES_CAP.saturating_sub(captured.kept.len());
+                        captured.kept.extend_from_slice(&chunk[..n.min(room)]);
                     }
                     Keep::Tail => {
-                        kept.extend_from_slice(&chunk[..n]);
-                        if kept.len() > 2 * KEPT_BYTES_CAP {
-                            kept.drain(..kept.len() - KEPT_BYTES_CAP);
-                        }
+                        append_keeping_tail(&mut captured.kept, &chunk[..n], KEPT_BYTES_CAP)
                     }
                 }
+                append_keeping_tail(&mut captured.end, &chunk[..n], PY_ERROR_BYTE_BUDGET);
             }
             Err(e) => {
                 log!("[Python] Output pipe read failed: {}", e);
@@ -819,11 +828,23 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
             }
         }
     }
-    if let Keep::Tail = keep {
-        let excess = kept.len().saturating_sub(KEPT_BYTES_CAP);
-        kept.drain(..excess);
+    for (buf, cap) in [
+        (&mut captured.end, PY_ERROR_BYTE_BUDGET),
+        (&mut captured.kept, KEPT_BYTES_CAP),
+    ] {
+        let excess = buf.len().saturating_sub(cap);
+        buf.drain(..excess);
     }
-    (kept, total)
+    captured
+}
+
+/// Append `bytes`, draining the front once `buf` holds twice `cap`. The
+/// caller trims `buf` to `cap` at EOF.
+fn append_keeping_tail(buf: &mut Vec<u8>, bytes: &[u8], cap: usize) {
+    buf.extend_from_slice(bytes);
+    if buf.len() > 2 * cap {
+        buf.drain(..buf.len() - cap);
+    }
 }
 
 /// Strip middle frames out of a Python traceback and tail-clip
@@ -845,6 +866,30 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
 /// because a traceback ends in the exception line.
 pub(crate) fn truncate_python_error(stderr: &str) -> String {
     clamp_to_byte_budget(trim_python_error_lines(stderr))
+}
+
+/// What a failed script reports: its stderr, or the end of its stdout when
+/// stderr is empty, since many scripts log their errors to stdout.
+/// `stdout_end` is the end of a stream that carried `stdout_total` bytes.
+pub(crate) fn script_error_output(stderr: &str, stdout_end: &str, stdout_total: u64) -> String {
+    if !stderr.trim().is_empty() {
+        return stderr.to_string();
+    }
+    let end = stdout_end.trim_end();
+    if end.trim().is_empty() {
+        return String::new();
+    }
+    let cut = end.ceil_char_boundary(end.len().saturating_sub(PY_ERROR_BYTE_BUDGET));
+    let omitted = stdout_total.saturating_sub(stdout_end.len() as u64) + cut as u64;
+    let omitted = if omitted > 0 {
+        format!("[... {omitted} bytes of stdout omitted ...]\n")
+    } else {
+        String::new()
+    };
+    format!(
+        "(stderr was empty, so this is the end of stdout)\n{omitted}{}",
+        &end[cut..]
+    )
 }
 
 fn clamp_to_byte_budget(text: String) -> String {

@@ -842,7 +842,7 @@ impl EventBus {
     ) -> Result<(), sqlx::Error> {
         sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
             .bind(THREAD_APPEND_LOCK_CLASS)
-            .bind(thread_id)
+            .bind(thread_id.to_string())
             .execute(&mut **tx)
             .await?;
         Ok(())
@@ -1159,6 +1159,55 @@ impl EventBus {
         Ok(DeliveryOutcome::Emitted(emitted.event_id))
     }
 
+    /// Append a durable operation's announcement under its stable event id.
+    /// A retry returns the committed row without projecting or broadcasting it
+    /// again. Conflicting reuse fails closed. This is a new event append, not
+    /// historical replay: it uses the ordinary projection and append horizon.
+    pub(crate) async fn emit_system_once(
+        &self,
+        event_id: Uuid,
+        event: SystemEvent,
+    ) -> Result<EmitResult, Box<dyn std::error::Error + Send + Sync>> {
+        if !event.is_persisted() {
+            return Err("durable_announcement_requires_persisted_event".into());
+        }
+        let depth = current_event_trigger_depth();
+        let emitting_trigger_id = current_trigger_id();
+        let mut append = self.begin_append().await?;
+        // The horizon lock is already held. Serialize identical identities
+        // across buses/processes before inspecting the committed event. Hash
+        // collisions only serialize unrelated announcements, never deduplicate.
+        sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
+            .bind(0x616e_6e63_i32)
+            .bind(event_id.to_string())
+            .execute(&mut *append.tx)
+            .await?;
+        let existing: Option<(i64, String, String, String, serde_json::Value)> =
+            sqlx::query_as(
+                "SELECT sequence, aggregate, aggregate_id, event_type, payload FROM events WHERE id = $1",
+            )
+            .bind(event_id)
+            .fetch_optional(&mut *append.tx)
+            .await?;
+        if let Some((seq, aggregate, aggregate_id, event_type, payload)) = existing {
+            if aggregate != event.aggregate()
+                || aggregate_id != event.aggregate_id()
+                || event_type != event.stored_event_type()
+                || payload != event.to_payload()
+            {
+                return Err("durable_announcement_identity_conflict".into());
+            }
+            append.tx.rollback().await?;
+            return Ok(EmitResult {
+                event_id,
+                seq,
+                summary_version: None,
+            });
+        }
+        self.append_system_event(append, event_id, event, depth, emitting_trigger_id)
+            .await
+    }
+
     /// Persist and project a system event on `tx`, commit, then broadcast it.
     async fn append_system_event(
         &self,
@@ -1296,7 +1345,34 @@ impl EventBus {
             // Pre-INSERT checks on the snapshot Persist will use. `Err` refuses
             // the event, and `Ok(None)` drops a recognised duplicate. Either
             // one drops the whole atomic emit.
-            //
+            // Recovery creates its destination once, under the append lock.
+            // Validate generation even for a duplicate so old retries cannot
+            // regain authority after another restore.
+            if let ThreadEvent::ThreadStarted {
+                recovered_compose: Some(recovered),
+                ..
+            } = &te
+            {
+                let generation: Option<Uuid> = sqlx::query_scalar(
+                    "SELECT restore_id FROM snapshot_restore_boundary WHERE singleton FOR SHARE",
+                )
+                .fetch_optional(&mut *tx)
+                .await?;
+                if generation != Some(recovered.generation) {
+                    return Err("snapshot_restore_generation_mismatch".into());
+                }
+                let exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM thread_summaries WHERE thread_id = $1)",
+                )
+                .bind(thread_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if exists {
+                    tx.rollback().await?;
+                    return Ok(None);
+                }
+            }
+
             // A `request_event_id` must exist. The frontend cannot group an
             // orphaned reference into an exchange, so log it loudly.
             if let Some(ref req_id) = meta.request_event_id {

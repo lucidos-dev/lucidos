@@ -9,6 +9,7 @@ async fn a_draft(bus: &EventBus, pool: &sqlx::PgPool) -> Uuid {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ThreadStarted {
+            recovered_compose: None,
             mode: "lucidos".into(),
             actor: None,
         },

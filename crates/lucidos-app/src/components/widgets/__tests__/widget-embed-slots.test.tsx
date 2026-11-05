@@ -25,7 +25,7 @@ const { WIDGET_UNAVAILABLE_TEXT } = await import('../InlineWidget');
 const EMBED = '![Marin](app:lucidos-sound-player?params={"clip": "voices/marin.mp3"})';
 const player = {
   id: 'lucidos-sound-player', name: 'Sound player', description: '', reveal: 'on-load' as const,
-  kind: 'widget' as const, reusable: true, built_in: true, params: { clip: { description: 'What to play', required: true } },
+  kind: 'widget' as const, reusable: true, built_in: true, sizes: ['medium' as const], params: { clip: { description: 'What to play', required: true } },
 };
 
 let host: HTMLElement;

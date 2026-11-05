@@ -1835,7 +1835,9 @@ pub(crate) fn parse_send_notification_args(
     args: &serde_json::Value,
     thread_id: uuid::Uuid,
 ) -> Result<SendNotificationArgs, String> {
-    use crate::scheduler::notifications::{default_tap, resolve_thread_tap_id, Tap};
+    use crate::scheduler::notifications::{
+        default_tap, refuse_engine_only_tap, resolve_thread_tap_id, Tap,
+    };
 
     let title = match args.get("title").and_then(|v| v.as_str()) {
         Some(t) if !t.is_empty() => t.to_string(),
@@ -1898,6 +1900,7 @@ pub(crate) fn parse_send_notification_args(
             )
         })?,
     };
+    refuse_engine_only_tap(&tap).map_err(|e| format!("Error: {e}"))?;
 
     // The tap's thread id is the only arg here that the page dereferences
     // LATER, on a device that cannot ask us anything. `link_thread`, not

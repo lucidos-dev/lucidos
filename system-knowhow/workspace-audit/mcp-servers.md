@@ -35,12 +35,12 @@ For each finding, capture: **location** (the server id), **what's wrong**,
 **which reference owns the rule** (link, don't quote), **suggested fix**.
 
 - **Static check `catastrophic, the guard refuses it`.** The command would
-  destroy the machine if it ran. Severity: **broken**. Fix: remove the server.
+  destroy the machine or a protected workspace if it ran. Severity: **broken**. Fix: remove the server.
 - **Static check `may perform …`.** The command looks like an irreversible
   side effect, such as a mutating request or a cloud change. Severity:
   **smell**. Fix: ask the user to read the line and confirm they meant it.
 - **`not approved`.** Nobody approved this exact line. With the guard on, its
-  next start asks. With the guard off, it starts unchecked. Severity:
+  next start asks. With the guard off, the catastrophic floor and secret-read gate still apply. Severity:
   **nit**. Fix: ask the user to read the line, then approve it by clicking
   Start under **Settings → MCP Servers**.
 - **Static check `needs a judgment at start`** on an approved line is not a

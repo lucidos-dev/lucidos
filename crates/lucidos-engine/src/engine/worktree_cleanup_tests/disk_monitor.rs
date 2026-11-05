@@ -3,6 +3,7 @@
 
 use super::common::*;
 use crate::engine::event_bus::EventBus;
+use crate::engine::worktree_cleanup::DiskReading;
 use crate::test_support::{setup_test_db, teardown_test_db};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -156,6 +157,43 @@ async fn ample_free_disk_sends_no_alert() {
     teardown_test_db(&db_name).await;
 }
 
+/// The incident: a 19.5 GB cloud volume with 18.3 GB free alerted against a
+/// fixed 20 GiB threshold. The threshold scales with the volume, so the
+/// alert stays quiet until the disk is really filling.
+#[tokio::test]
+async fn a_small_volume_with_ample_free_space_sends_no_alert() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+    let (_tmp, root) = fresh_workspace().await;
+    let volume = |free| DiskReading {
+        free_bytes: free,
+        total_bytes: 195 * GB / 10,
+    };
+    let (probe, reading) = settable_probe(None);
+    let mut monitor = make_monitor(bus.clone(), root, probe);
+    monitor.free_disk = {
+        let reading = reading.clone();
+        Arc::new(move || (*reading.lock().unwrap()).map(volume))
+    };
+
+    *reading.lock().unwrap() = Some(183 * GB / 10);
+    let rx = bus.subscribe();
+    monitor.check_once().await;
+    let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
+    assert!(notifications.is_empty(), "{notifications:?}");
+
+    // A quarter of 19.5 GiB is 4.9 GiB: below that, the alert is real.
+    *reading.lock().unwrap() = Some(4 * GB);
+    let rx = bus.subscribe();
+    monitor.check_once().await;
+    let alerts = low_disk_alerts(rx).await;
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// Small Lucidos footprint + low volume: the body steers the user to look
 /// elsewhere on their machine, not at Lucidos.
 #[tokio::test]
@@ -255,7 +293,7 @@ async fn a_cleanup_cycle_stalled_on_the_database_does_not_delay_the_alert() {
     let stalled_pool = unresponsive_pool().await;
     let (stalled_bus, _stalled_rx) = EventBus::new(stalled_pool.clone());
     let mut worker = make_worker(stalled_pool, Arc::new(stalled_bus), root.clone());
-    worker.free_soft_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
     let cycle = tokio::spawn(async move { worker.run_once().await });
 
     let (pool, db_name) = setup_test_db().await;

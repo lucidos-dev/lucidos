@@ -154,25 +154,21 @@
     color: var(--text-primary);
 }
 
-/* Fixed cells: a cell keeps --dashboard-cell at every dashboard width, and a
-   narrower dashboard drops a column instead. Only a dashboard too narrow for two
-   cells draws them smaller, never wider. The spare width splits evenly, so
-   the grid is centred and the head's controls end where the grid does.
-   100cqw is the dashboard's content width. */
+/* Fixed cells: the widget cell (useWidgetCell) holds at every dashboard
+   width, and a narrower dashboard drops a column instead. Only a dashboard too
+   narrow for two cells draws them smaller, never wider. The spare width splits
+   evenly, so the grid is centred and the head's controls end where the grid
+   does. 100cqw is the dashboard's content width. */
 .dashboard-head,
 .dashboard-grid {
-    --dashboard-edge: min(
-        var(--dashboard-cell),
-        (100cqw - (var(--dashboard-columns) - 1) * var(--dashboard-gap)) / var(--dashboard-columns)
-    );
     --dashboard-inset: max(
         0px,
-        (100cqw - var(--dashboard-columns) * var(--dashboard-edge) - (var(--dashboard-columns) - 1) * var(--dashboard-gap)) / 2
+        (100cqw - var(--dashboard-columns) * var(--widget-cell) - (var(--dashboard-columns) - 1) * var(--widget-gap)) / 2
     );
     /* A cell edge is its steps and the gaps between them, so a small tile
        (two steps) fills exactly one cell and an app shortcut takes one step. */
     --dashboard-step: calc(
-        (var(--dashboard-edge) - (var(--dashboard-steps-per-cell) - 1) * var(--dashboard-gap)) / var(--dashboard-steps-per-cell)
+        (var(--widget-cell) - (var(--dashboard-steps-per-cell) - 1) * var(--widget-gap)) / var(--dashboard-steps-per-cell)
     );
 }
 
@@ -188,7 +184,7 @@
     grid-template-columns: repeat(var(--dashboard-steps), var(--dashboard-step));
     grid-auto-rows: var(--dashboard-step);
     justify-content: center;
-    gap: var(--dashboard-gap);
+    gap: var(--widget-gap);
     transition: opacity var(--duration-slow) ease;
 }
 
@@ -200,57 +196,20 @@
     pointer-events: none;
 }
 
-/* The tile sets the box and the frame fills it. A report never sizes it, and
-   it never scrolls inside: content past it is clipped under a fade. */
+/* A widget tile is a widget box (chat/widgets.css), placed by the grid. */
 .dashboard-tile {
     position: relative;
     min-width: 0;
     min-height: 0;
-    overflow: hidden;
-    border: 1px solid var(--border-color);
-    border-radius: var(--radius-surface);
-    background: var(--bg-secondary);
-    isolation: isolate;
-}
-
-/* The frame takes the bottom layer and everything the tile draws over it
-   stacks above. Tree order alone fails on iOS: a frame whose widget
-   composites, such as an animated transform, paints over later siblings. */
-.dashboard-tile > .widget-frame-dashboard {
-    position: absolute;
-    inset: 0;
-    z-index: 0;
-}
-
-.dashboard-tile > :not(.widget-frame-dashboard) {
-    z-index: 1;
-}
-
-.dashboard-tile .app-ui-iframe {
-    background: transparent;
-}
-
-.dashboard-tile .app-ui-cover {
-    background: var(--bg-secondary);
-}
-
-/* A widget with its own shape, such as a round clock, draws on the dashboard
-   itself. */
-.dashboard-tile.is-transparent {
-    border-color: transparent;
-    background: transparent;
-}
-
-.dashboard-tile.is-transparent .app-ui-cover {
-    background: var(--bg-primary);
 }
 
 /* An app shortcut draws no frame and no fill: its icon and name sit on the
-   dashboard. The edit outline below still marks its box. */
+   dashboard. The edit outline below still marks its box, so it keeps a border
+   of the same width. */
 .dashboard-tile.is-app-shortcut {
     container-type: size;
-    border-color: transparent;
-    background: transparent;
+    border: 1px solid transparent;
+    border-radius: var(--radius-surface);
 }
 
 .app-shortcut {
@@ -297,19 +256,6 @@
     }
 }
 
-/* Marks a clipped tile. A tap or a scroll here reaches the widget. */
-.dashboard-tile-fade {
-    position: absolute;
-    inset: auto 0 0;
-    height: 3.5rem;
-    background: linear-gradient(to bottom, transparent, var(--bg-secondary));
-    pointer-events: none;
-}
-
-.dashboard-tile.is-transparent .dashboard-tile-fade {
-    background: none;
-}
-
 .dashboard-empty {
     display: flex;
     flex-direction: column;
@@ -326,7 +272,7 @@
     border: 1px dashed var(--accent);
 }
 
-.dashboard-tile.is-editing > .widget-frame-dashboard {
+.dashboard-tile.is-editing > .widget-frame {
     opacity: 0.85;
 }
 
@@ -368,34 +314,18 @@
     cursor: pointer;
 }
 
-.dashboard-size-pill {
+/* An edited tile's pill floats over its foot, at the full control size. */
+.dashboard-tile .widget-size-pill {
     position: absolute;
     bottom: var(--space-sm);
     left: 50%;
-    display: flex;
-    gap: 0.125rem;
-    padding: 0.125rem;
-    border: 1px solid var(--border-color);
-    border-radius: var(--radius-round);
-    background: var(--bg-primary);
     transform: translateX(-50%);
 }
 
-.dashboard-size-pill button {
+.dashboard-tile .widget-size-pill button {
     min-width: 1.75rem;
     padding: 0.125rem 0.5rem;
-    border: none;
-    border-radius: var(--radius-round);
-    background: none;
-    color: var(--text-secondary);
     font-size: var(--font-size-sm);
-    font-weight: 600;
-    cursor: pointer;
-}
-
-.dashboard-size-pill button.is-current {
-    background: var(--accent);
-    color: var(--text-on-accent);
 }
 
 /* --- The dashboard panel: the phone dashboard over the open thread ---

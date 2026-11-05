@@ -38,14 +38,14 @@ pub fn widgets_rules(audience: WidgetAudience) -> String {
     }
 }
 
-/// How the chat agent makes and pins a widget (ADRs 0402, 0407, 0466).
+/// How the chat agent makes a widget (ADRs 0402, 0432, 0466).
 fn making_guidance(automatic: bool) -> String {
     let mut text = String::from(
         "A widget is a small interactive answer: create_app with kind=\"widget\", then embed it \
-         in your reply. It is not on the shelf unless pinned. Fit one phone \
-         screen with no scroll area inside, so its top screen carries the answer; more than \
-         that is an app. Name it by what it does in two or three words (\"Flight picker\"), \
-         and put the specifics inside it. ",
+         in your reply. It draws into a fixed box of its size, the same in its thread card and \
+         on a dashboard: style under html[data-widget-size] and fit by showing less, never by \
+         shrinking text or scrolling inside. More than a large box holds is an app. Name it by \
+         what it does in two or three words (\"Flight picker\"), and put the specifics inside it. ",
     );
     text.push_str(if automatic {
         "Choose one yourself for a comparison, or for a pick among data items such as \
@@ -57,15 +57,14 @@ fn making_guidance(automatic: bool) -> String {
          making one. "
     });
     text.push_str(
-        "Pin it with widgets(action=\"pin\") only when the user will come back to it in this \
-         thread, such as a picker. Lead with one shape, not a table: a .ring, a .bar-run, or \
+        "Lead with one shape, not a table: a .ring, a .bar-run, or \
          a .choice-row to pick from. Skip the title, since its bar shows the name, and draw no \
          border inside the widget. Keep the accent for the one thing that matters. Animate what \
          a tap changes, on the --duration-* tokens, and stay calm under data-motion=\"reduce\". \
          Read data through lucidos.* and listen on lucidos.sse instead of baking it into the \
-         HTML. On a dashboard it is a tile of any size; create_app sizes \
-         narrows that. Arrange a dashboard only when the user asks in this \
-         turn, and never choose a new tile's size.\n\n",
+         HTML. It takes all three sizes unless create_app sizes narrows them. Arrange a \
+         dashboard or resize a card only when the user asks in this turn, and never choose a \
+         size yourself.\n\n",
     );
     text
 }
@@ -200,13 +199,19 @@ mod tests {
         assert!(widget_line(&clock).contains("built in, sizes small, large):"));
     }
 
-    /// The chat agent arranges a dashboard only when asked, and never sizes a
-    /// new tile (ADR 0432).
+    /// The chat agent arranges a dashboard or resizes a card only when asked,
+    /// and never picks a size (ADR 0432, I11). It learns the box contract,
+    /// and nothing offers it a pin (I8).
     #[test]
-    fn the_chat_agent_arranges_a_dashboard_only_when_asked() {
-        let chat = build_widgets_section(&[player()], WidgetAudience::Chat { automatic: true });
-        assert!(chat.contains("Arrange a dashboard only when the user asks in this turn"));
-        assert!(chat.contains("never choose a new tile's size"));
+    fn the_chat_agent_sizes_nothing_unasked_and_pins_nothing() {
+        for automatic in [true, false] {
+            let chat = build_widgets_section(&[player()], WidgetAudience::Chat { automatic });
+            assert!(chat.contains("resize a card only when the user asks in this turn"));
+            assert!(chat.contains("never choose a size yourself"));
+            assert!(chat.contains("fixed box of its size"));
+            assert!(chat.contains("never by shrinking text"));
+            assert!(!chat.contains("pin") && !chat.contains("shelf"), "{chat}");
+        }
     }
 
     /// Both prompts build the section here: the chat agent through its apps

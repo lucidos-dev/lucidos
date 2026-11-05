@@ -2,7 +2,6 @@ import {
   updateAvailable,
   engineNewVersionReady,
   engineVersionPending,
-  engineRebuildWedged,
   mobileView,
   type ApplyPhase,
 } from '../../store/store';
@@ -67,7 +66,7 @@ function brandNotices(): BrandTooltipRow[] {
   if (notices.length === 0 && engineVersionPending.value) {
     notices.push({
       label: 'New code',
-      value: engineRebuildWedged.value ? 'pending · no rebuild can deliver it' : 'pending',
+      value: 'pending',
     });
   }
   return notices;
@@ -162,7 +161,7 @@ export function BrandBadge() {
   const waiting = rows.every((r) => r.queued);
   return (
     <GlyphBadge
-      class={`badge brand-badge${pending ? ' brand-badge-dot' : ''}${pending && engineRebuildWedged.value ? ' brand-badge-wedged' : ''}`}
+      class={`badge brand-badge${pending ? ' brand-badge-dot' : ''}`}
       aria-hidden="true"
     >
       {/* Pending draws no glyph at all: the badge box IS the dot. The `!` is

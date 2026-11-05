@@ -50,8 +50,8 @@ use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::worktree_cleanup::{
     deterministic_worktree_for, directory_size_bytes, inventory_worktrees, is_worktree_dirty,
     prune_build_artifacts, remove_stranded_worktree, remove_worktree_and_optionally_delete_branch,
-    run_recommended_cleanup, volume_free_bytes, worktree_git_admin_missing, BranchDisposal,
-    RecommendedCleanupOutcome, FREE_DISK_HARD_BYTES, FREE_DISK_SOFT_BYTES,
+    run_recommended_cleanup, volume_reading, worktree_git_admin_missing, BranchDisposal,
+    DiskThresholds, RecommendedCleanupOutcome, FREE_DISK_HARD_BYTES, FREE_DISK_SOFT_BYTES,
 };
 
 /// GET /api/v1/disk-usage/worktrees — inventory of all known per-thread worktrees.
@@ -339,6 +339,10 @@ pub(super) async fn cleanup_worktree(
 
 /// GET /api/v1/disk-usage/summary — free-disk stats + thresholds for the page header.
 ///
+/// The thresholds scale with the volume ([`DiskThresholds::for_volume`]), the
+/// same levels the disk monitor and the cleanup worker act on. With no reading
+/// they report the caps.
+///
 /// `free_bytes` and `total_bytes` are `null` when the OS disk-info call fails
 /// (rare; typically only when the workspace volume is unreadable). Frontend
 /// computes per-worktree-total locally from the `/disk-usage/worktrees` rows —
@@ -352,18 +356,17 @@ pub(super) async fn summary(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let workspace = state.engine.workspace_path();
     let dir = worktrees_dir(workspace);
-    let free_bytes = volume_free_bytes(&dir, workspace);
-    let total_bytes = fs2::total_space(&dir)
-        .ok()
-        .or_else(|| fs2::total_space(workspace).ok());
+    let reading = volume_reading(&dir, workspace);
+    let thresholds =
+        DiskThresholds::for_reading(reading, FREE_DISK_SOFT_BYTES, FREE_DISK_HARD_BYTES);
     let workspace_data_bytes = directory_size_bytes(&workspace.join(crate::core::DATA_DIR)).await;
 
     Ok(Json(serde_json::json!({
-        "free_bytes": free_bytes,
-        "total_bytes": total_bytes,
+        "free_bytes": reading.map(|r| r.free_bytes),
+        "total_bytes": reading.map(|r| r.total_bytes),
         "workspace_data_bytes": workspace_data_bytes,
-        "soft_threshold_bytes": FREE_DISK_SOFT_BYTES,
-        "hard_threshold_bytes": FREE_DISK_HARD_BYTES,
+        "soft_threshold_bytes": thresholds.soft_bytes,
+        "hard_threshold_bytes": thresholds.hard_bytes,
         "recommended_cleanup_running": recommended_cleanup_running(),
     })))
 }

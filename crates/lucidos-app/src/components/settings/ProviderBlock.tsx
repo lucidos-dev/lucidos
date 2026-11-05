@@ -83,7 +83,7 @@ export function ProviderBlock(props: {
     // and the switch would sit in a position nothing backs. Two ways in. The
     // engine can ANSWER and refuse the write, and `savePreference` toasts
     // rather than rejecting, so there is no promise to catch. Or it accepts a
-    // write it cannot apply (the FailFast note in `engine/mod.rs`). Dropping
+    // write whose provider rebuild fails (`swap_in_rebuilt_providers`). Dropping
     // the hold shows what is installed, beside the toast that said so.
     const fuse = setTimeout(() => setHeld(null), OVERRIDE_HOLD_MS);
     return () => clearTimeout(fuse);

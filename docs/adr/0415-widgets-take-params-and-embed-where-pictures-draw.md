@@ -1,6 +1,6 @@
 # 0415: Widgets take params and embed wherever a picture draws; built-in widgets ship with Lucidos
 
-- **Status**: Accepted
+- **Status**: Accepted. Amended by [ADR 0621](0621-widgets-one-box-no-pin.md): no pin creates an instance
 - **Date**: 2026-10-10
 
 ## Context

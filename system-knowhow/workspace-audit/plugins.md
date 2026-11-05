@@ -40,6 +40,10 @@ receipts="$receipts| plugin-manifests | $n |\n"
 
 ## Checks
 
+Plugin notifications follow `system-knowhow/plugins.md` § Affected triggers.
+Flag recipes that treat a trigger warning as restore authority as **broken**.
+The restore confirmation belongs to the snapshot flow.
+
 For each finding, capture: **location**, **what's wrong**, **which reference owns the rule** (link, don't quote), **suggested fix**.
 
 Two surfaces, read differently. Per `system-knowhow/plugins.md` § "The `engine` requirement".

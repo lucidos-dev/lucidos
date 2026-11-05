@@ -77,7 +77,7 @@ See also: `system-knowhow/building-an-app.md`, `docs/taxonomy.md` § Apps.
 <!--gloss-app-end-->
 
 ### App icon
-The picture that stands for an *app* or *widget* across Lucidos (apps panel, menu drawer, widget shelf, search). An image file inside the app folder, named by the *app manifest*'s `icon` (`assets/icon.svg`). Without a valid one, a *monogram tile* stands in. Distinct from the *app-icon badge*, which counts on Lucidos's own home-screen or dock icon.
+The picture that stands for an *app* or *widget* across Lucidos (apps panel, menu drawer, a widget's card bar, search). An image file inside the app folder, named by the *app manifest*'s `icon` (`assets/icon.svg`). Without a valid one, a *monogram tile* stands in. Distinct from the *app-icon badge*, which counts on Lucidos's own home-screen or dock icon.
 See also: `system-knowhow/building-an-app.md` § App icon.
 
 ### App-icon badge
@@ -171,7 +171,7 @@ Its report is a *filed report*, which Home reads on its next turn, and *Review* 
 
 **You open it from Home, not from the thread list.** The Home icon leads the thread pane's header, with New thread beside it, and opens it. On a phone it sits beside the Lucidos mark, and the menu that the thread drawer's mark opens carries Home as its first row. The *thread drawer* draws no row for it, but its *sub-threads* show in the drawer's sections as threads of their own.
 
-Home draws no *widget shelf* under its title and takes no pins: a widget you want in view goes on a *dashboard*. A tap on Home opens it. On a desktop it opens only the chat, even in Home, since the dashboard has its own rail and toggle. On a phone, a tap in Home slides the chat down to the dashboard.
+A widget you want in view goes on a *dashboard*. A tap on Home opens it. On a desktop it opens only the chat, even in Home, since the dashboard has its own rail and toggle. On a phone, a tap in Home slides the chat down to the dashboard.
 
 **Only you name it.** You can rename it by hand, from its menu. Lucidos never names it: it gets no automatic title and offers no suggested name, because one topic in a thread that never ends is not its name.
 
@@ -398,14 +398,16 @@ A grid of live *widget* tiles and *app shortcuts* in square cells. **There are t
 
 **On a desktop, the dashboard is a rail at the window's right edge**, the full height of the window, beside the header and the panes. It stays in view whatever the Conversation and the Canvas show. Drag its left edge to resize it: it is two cells wide at least, and wider shows more columns. Its button, the dashboard icon in the window's top-right corner, reads Show dashboard or Hide dashboard and stays put either way. Each device remembers its width and whether it shows (ADRs 0466, 0468).
 
-**Add to dashboard** in a widget's menu adds it to the dashboard of the layout you tap it in, from any thread, Home included. A widget that belongs to its thread becomes reusable first, in the same action, so deleting the thread never empties the tile. Each dashboard also has its own Add, which lists the reusable widgets, then your apps. An app's row in the Apps panel has Add to dashboard too. **Remove from dashboard** takes the tile off that dashboard only. That is how a phone shows fewer tiles than a desktop.
+**Add to dashboard** is the "+ Dashboard" button on a widget's card, or the item in its menu. It adds the widget at the card's size to the dashboard of the layout you tap it in, from any thread, Home included. A widget that belongs to its thread becomes reusable first, in the same action, so deleting the thread never empties the tile. Each dashboard also has its own Add, which lists the reusable widgets, then your apps. An app's row in the Apps panel has Add to dashboard too.
+
+**Remove from dashboard** takes the tile off that dashboard only. That is how a phone shows fewer tiles than a desktop.
 
 **Arrange it in edit mode:** Edit in the dashboard's header, or Edit dashboard in a tile's menu. A long press or a right-click on a tile opens that menu. Drag a tile to move it, tap its size pill to resize it, or remove it. A new widget tile starts at its widget's default size. An app shortcut has no size pill, since it has one size.
 
 **The agent names a dashboard, or takes the default.** Its `widgets` tool reads one with `action="dashboard"`, and changes one with `add_to_dashboard`, `remove_from_dashboard` and `arrange`. It arranges only when you ask. With no dashboard named, it uses the *last used device*'s: an iPhone or an Android phone means `phone`, and anything else `desktop`, an iPad included. A turn with no device, such as a trigger run, must name one.
 
 The CLI has `lucidos widgets dashboard`, `dashboard-add`, `dashboard-remove` and `arrange`. Over HTTP they are `GET /api/v1/dashboard` and `POST /api/v1/widgets/dashboard-add`, `dashboard-remove` and `arrange`, and an omitted dashboard means the calling device's.
-See also: *dashboard panel*, *home thread*, *app shortcut*, *widget size*, *widget shelf*, *last used device*, ADR 0432, ADR 0455, ADR 0466, ADR 0496, ADR 0532, ADR 0538.
+See also: *dashboard panel*, *home thread*, *app shortcut*, *widget size*, *widget box*, *last used device*, ADRs 0432, 0455, 0466, 0496, 0532, 0538 and 0621.
 
 ### Dashboard panel
 The phone *dashboard*, a panel in the *thread pane* over the open thread. A button on the right of the Lucidos mark in the thread header toggles it, with or without a thread open. It fills the thread pane below the header. The header, the Lucidos menu, the menu drawer and a *pane swipe* all keep working while it is open. It slides away with the thread pane and is still open when you swipe back.
@@ -793,7 +795,7 @@ An organisation's own front door to Anthropic's API: the Messages API behind the
 
 Signing in shows a code to confirm on the gateway's page. Lucidos signs in as itself, apart from Claude Code, and keeps and refreshes the tokens. No API response, event, app or provider proxy hands them on. Like every stored secret, they sit sealed in the workspace database, and `LUCIDOS_DATABASE_URL` cannot read them. The URL field starts on the gateway Claude Code's managed settings name, when that file exists, and nothing signs in until you confirm.
 
-The gateway decides which models your account may use, and Lucidos never sends a model it did not list. Its *gateway managed settings* can narrow that list further. When the gateway ends the sign-in, Settings and the failed turn both say to sign in again. Changing the gateway URL signs out of the old one, and signing out asks the gateway to revoke the tokens. Web search and the *builtin provider proxy* do not reach it.
+The gateway decides which models your account may use, and Lucidos never sends a model it did not list. Its *gateway managed settings* can narrow that list further. When the gateway ends the sign-in, Settings and the failed turn both say to sign in again. Changing the gateway URL signs out of the old one, and signing out asks the gateway to revoke the tokens. Web search does not reach it. Apps and scripts use its *builtin provider proxy* with `POST /messages`.
 See also: *provider*, *credential*, *gateway usage telemetry*.
 
 ### Gateway managed settings
@@ -821,7 +823,7 @@ A System One model is picked in the model control of a decision Lucidos makes: t
 Most decisions run on a chat model until you pick, and storing a key moves none of them. One is the exception: the Wake decision runs on OpenAI Decisions while the OpenAI provider is set up, unless you picked a model for it.
 
 ### Builtin provider proxy
-A *provider*'s API exposed through the engine's proxy **without** re-entering the credential in `data/config/apis.json`. Apps reach it with `lucidos.proxy(<name>).fetch(path, init)`, scripts with `lucidos proxy <name>`, and the Lucidos Agent with `proxy_request`. The builtin names are `anthropic`, `local`, `openai`, `openrouter`, `typesafe`, `vertex` and `xai`. `opencode-free` has none (ADR 0104), and neither has `claude-gateway`, so no app can spend a gateway sign-in (ADR 0508).
+A *provider*'s API exposed through the engine's proxy **without** re-entering the credential in `data/config/apis.json`. Apps reach it with `lucidos.proxy(<name>).fetch(path, init)`, scripts with `lucidos proxy <name>`, and the Lucidos Agent with `proxy_request`. The builtin names are `anthropic`, `claude-gateway`, `local`, `openai`, `openrouter`, `typesafe`, `vertex` and `xai`. `opencode-free` has none (ADR 0104). The `claude-gateway` proxy uses the engine's issuer-bound sign-in and managed model policy (ADR 0614).
 
 When `<name>` matches one and no `apis.json` entry exists, the engine forwards to that provider's API root (every default root includes `/v1`). It injects the credential from Settings → Models → Providers server-side, so the secret never reaches the caller. A same-named `apis.json` entry is consulted first and overrides the builtin. The Lucidos Agent's context lists every builtin and whether it is configured. `request_credential` refuses a key a configured builtin already injects (ADR 0350).
 
@@ -853,12 +855,15 @@ See also: *connected account*, *credential*, *derived provider*,
 *OAuth client type*.
 
 ### OAuth redirect URI
-The loopback URL the provider sends the user back to after they authorize. Lucidos must repeat it byte-for-byte when it redeems the authorization code. A temporary listener on a fixed port binds **both** loopback families, so three host forms work: `http://127.0.0.1:14981/oauth/callback` (the default), `http://localhost:14981/oauth/callback`, and `http://[::1]:14981/oauth/callback`. The engine owns port and path. Only the host form is configurable, via the optional `redirect_uri` key on the *credential*. Providers disagree: Spotify rejects the name form, and Microsoft's Entra portal rejects the IP form under its Web platform.
+The URL the provider sends the user back to after they authorize. Lucidos must repeat it byte-for-byte when it redeems the authorization code. For a browser on a computer running Lucidos it is a loopback URL, and three host forms work: `http://127.0.0.1:14981/oauth/callback` (the default), `http://localhost:14981/oauth/callback`, and `http://[::1]:14981/oauth/callback`. The gateway holds that port and routes each callback to its workspace by `state`. Only the host form is configurable, via the optional `redirect_uri` key on the *credential*. Providers disagree: Spotify rejects the name form, and Microsoft's Entra portal rejects the IP form under its Web platform.
 
-The user must register the resolved URI with the provider exactly. Which form a provider wants lives in `system-knowhow/oauth-providers.md`, never in engine code.
+A browser on any other device gets a *web redirect URI* instead. The user must register the resolved URI with the provider exactly. Which form a provider wants lives in `system-knowhow/oauth-providers.md`, never in engine code.
+
+### Web redirect URI
+The *OAuth redirect URI* Lucidos sends when the browser runs on a device with no Lucidos, such as a phone: the browser's own https address plus `/~/oauth/callback`. It works only if the provider has it registered on a Web client. The *credential* must also list it under Web redirect URIs and carry a client secret. Otherwise Connect refuses at once and names the fix. See `system-knowhow/oauth-providers.md`.
 
 ### OAuth client type
-Whether Lucidos authenticates the token exchange as a **confidential client** (sends the `client_secret`) or a **public client** (no secret, PKCE instead, per RFC 8252). It follows only from whether the *credential* carries a `client_secret`, so the engine never needs to know the provider. It must match the app's registration: a web/confidential one rejects a secret-less redemption, and a desktop/native/public one rejects a secret. Lucidos runs on the user's own machine, so public fits best wherever offered. Leaving Client Secret blank in the credential modal selects it.
+Whether Lucidos authenticates the token exchange as a **confidential client** (sends the `client_secret`) or a **public client** (no secret, PKCE instead, per RFC 8252). It follows only from whether the *credential* carries a `client_secret`, so the engine never needs to know the provider. It must match the app's registration: a web/confidential one rejects a secret-less redemption, and a desktop/native/public one rejects a secret. Public fits best wherever offered when the browser runs on the engine host, since the loopback callback reaches it. Leaving Client Secret blank in the credential modal selects it.
 
 ### OS surface
 The notification surface outside the Lucidos UI: an OS-level banner. Two transports, chosen by client:
@@ -909,14 +914,24 @@ The browser cookie carries a window, refreshed each day the device is seen, but 
 See also: *device*, *pairing code*, `system-knowhow/remote-access.md` § Devices pair before Lucidos answers them.
 
 ### Pairing code
-The one-time code that makes a device a *paired device*. It works once and expires in five minutes. Two places produce one to pass on: **Settings → Access → Pair a device** (press **Create a pairing code**), and `lucidos pair` on the machine Lucidos runs on. The desktop app mints a third silently for itself: it reads the local file that proves it is on the machine, and pairs its own window on launch.
+The 8-digit one-time code that makes a device a *paired device*, for a person who has to type. It works once and expires in five minutes. **It works only from another device on the LAN or the tailnet.** On the machine Lucidos runs on, and through a tunnel, a proxy or `tailscale serve`, Lucidos refuses it. It says to scan the QR or open the link instead (ADR 0615). Each code is minted beside a *pairing secret*, and using either spends both.
 
-Both also draw it as a **QR**: the same code wrapped in a reachable address, never a second credential. Typing the digits does the same, so a failed scan is never a dead end.
+Two places produce one to pass on: **Settings → Access → Pair a device** (press **Create a pairing code**), and `lucidos pair` on the machine Lucidos runs on. The desktop app mints a third silently for itself: it reads the local file that proves it is on the machine, and pairs its own window on launch.
+
+Both also draw a **QR**: the *pairing secret* wrapped in a reachable address. On your own network, typing the digits does the same, so a failed scan is never a dead end.
 
 A desktop browser that scans it opens the pairing screen and spends the code at once. A phone browser gets the install steps instead, since the installed app is a different device from the tab. The code rides into that install, so the app pairs itself on first open. Install promptly: the code still lasts five minutes. An app already installed, or whose code ran out, takes one by **Paste** or **Scan QR** on its own pairing screen.
 
 Only a process on that machine can mint one, which stops a stranger pairing in. An already-paired device can mint one too, so you can add a tablet from the sofa. A browser needs a code even on the same machine: proving you are local means reading a file, and a browser cannot. The desktop window is a browser by that test, so its Rust side mints for it.
 See also: *paired device*, `system-knowhow/lucidos-cli.md` § `lucidos pair`, `system-knowhow/remote-access.md` § Settings → Access.
+
+### Pairing secret
+The long one-time secret minted beside every *pairing code*: `ldp_` and 26 more characters. The QR and the pairing link carry it, and the desktop app pairs its own window with it. It is long enough that no flood of guesses can find it, so Lucidos accepts it from any address and never rate limits it. A *gateway pairing secret* is the same idea for a *gateway pairing*, with no code beside it (ADR 0615).
+See also: *pairing code*, *public listener*, `system-knowhow/remote-access.md` § Pair a device.
+
+### Public listener
+A second port on this machine's loopback, the gateway's port plus 30 (**5282** packaged, **5281** dev). Point a tunnel or reverse proxy here, rather than at the main port. It serves everything the main port does, but every request on it counts as public, so a typed *pairing code* is never accepted there. `LUCIDOS_PUBLIC_PORT` moves it, and `0` turns it off (ADR 0615).
+See also: *pairing secret*, *external address*, `system-knowhow/remote-access.md` § Public only behind a front door you own.
 
 ### Pairing address
 The address a *pairing code*'s QR carries, so the new device lands on the gateway that minted the code. Lucidos picks the first that exists, in this order:
@@ -929,16 +944,16 @@ With none, Lucidos shows the code alone.
 See also: *pairing code*, *external address*, `system-knowhow/remote-access.md` § Pair a device.
 
 ### Gateway pairing
-A one-way grant from one *workspace gateway* to another: gateway B lets gateway A open its *workspaces*, for every device paired with A. B mints a *gateway pairing code*, and A enters it. Each side records the pairing in its own file, so auth state stays per gateway (ADR 0590).
+A one-way grant from one *workspace gateway* to another: gateway B lets gateway A open its *workspaces*, for every device paired with A. B mints a *gateway pairing secret*, and A pastes it. Each side records the pairing in its own file, so auth state stays per gateway (ADR 0590).
 
 The grant is one-way: access both ways means pairing twice. **The trust is not.** B's pages open on A's address, so they can do anything A's devices can do on A. Add only a gateway you run.
 
 **Unpair** on B ends it on A's next request. **Remove** on A ends it on A and asks B to forget it too. Gateways pair over `https` only.
-See also: *gateway pairing code*, *remote gateway*, `system-knowhow/remote-access.md` § Pair a gateway.
+See also: *gateway pairing secret*, *remote gateway*, `system-knowhow/remote-access.md` § Pair a gateway.
 
-### Gateway pairing code
-The one-time code that makes a *gateway pairing*. Like a *pairing code*, it works once and expires in five minutes. It never pairs a device, and a device's code never pairs a gateway. Two places mint one: **Settings → Access → Pair a gateway**, and `lucidos pair --gateway`.
-See also: *gateway pairing*, *pairing code*, `system-knowhow/lucidos-cli.md` § `lucidos pair`.
+### Gateway pairing secret
+The one-time secret that makes a *gateway pairing*: `lgp_` and 26 more characters, pasted rather than typed. It works once and expires in five minutes. It is long enough that no flood of guesses can find it, so it is accepted from any address and never rate limited (ADR 0615). It never pairs a device, and a device's *pairing secret* never pairs a gateway. Two places mint one: **Settings → Access → Pair a gateway**, and `lucidos pair --gateway`.
+See also: *gateway pairing*, *pairing secret*, `system-knowhow/lucidos-cli.md` § `lucidos pair`.
 
 ### Remote gateway
 Another *workspace gateway* this one has a *gateway pairing* with, listed under **Settings → Access → Remote gateways**. You give it a short name, such as `cloud`, when you add it.
@@ -1156,6 +1171,9 @@ One stretch of slowness is an *episode*. It opens when a workspace answered slow
 
 Dismissing the bar hides it on that device until the next episode. The gateway measures it once for the whole machine.
 
+### Skipped slot
+A cron slot of a *trigger* that passed with no run, because the computer was asleep or Lucidos was not running. A slot from the past hour still fires once when Lucidos wakes or starts. An older one never runs. Lucidos posts one inbox notice instead, with a push, per trigger per gap. It names how many runs it skipped, and the tap opens the trigger. A gap the trigger ran in after all gets no notice.
+
 ### Source event
 The specific *event* a notification points to, stored as `notifications.event_id`. The *in-app surface* uses it to tell whether the user is looking at that very thing. If the page is on its thread AND it is in viewport, the notification is auto-marked read with no toast and no badge increment. A notification with `tap = { kind: 'navigate', to: { target: 'thread', id: '...', event_id: '...' } }` also lands on it (scroll + pulse).
 
@@ -1211,7 +1229,7 @@ The internal name for a **thread subscription** (see *event subscription*): a *t
 
 The agent says what it waits for (optionally filtered), why, and for how long, then finishes its turn. The thread holds and blocks nothing while it watches. Lucidos re-opens it when a matching *event* arrives, or tells it the wait timed out. The *Lucidos Agent* and a *coding agent* can both use it, list their waits and cancel them (`list_event_waits` / `cancel_event_wait`, or `lucidos event-waits list` / `cancel`).
 
-A watching thread reads as **Waiting**, like one waiting on its *sub-threads*, even after a reload; the *waiting indicator* says what for. A *read request* shows instead when its agent made one. Its *todo list* agrees: unfinished items at park time are marked `waiting`, not `abandoned`.
+A watching thread reads as **Waiting**, like one waiting on its *sub-threads*, even after a reload; the *waiting indicator* says what for. A *read request* shows instead when its agent made one. Its *todo list* agrees: unfinished items at park time are marked `waiting`, not `abandoned`. The same holds for a thread waiting on a *live child* still on its edge; one moved to top level reports to nobody.
 
 Two things separate it from a *trigger*. **Where the answer goes:** a trigger runs in its own thread and reaches you as a *notification*, while an event wait resumes the conversation you are reading. **How long it lasts:** a trigger starts a NEW thread every time, indefinitely. An event wait resolves on the first match; the agent re-arms it per event, up to a cap on re-arms without you.
 
@@ -1248,7 +1266,7 @@ A thread shows in every group it matches, so a failed thread with a ready *chang
 See also: *Folders grouping*, *thread drawer*.
 
 ### In flight
-The *Ongoing grouping* group for work that is not finished and does not need you. It lists every Current and Saved *thread* whose status reads **Running** or **Waiting**: a turn running now, a thread watching for an *event wait* of its own, or a parent waiting on its *sub-threads*. A sub-thread sits under its parent when both are in flight. A thread waiting for your answer or one that failed is in *Blocked* instead. A finished one with a ready *change* is in *Review*. So is one whose agent made a *read request*, which leaves In flight even while it still waits.
+The *Ongoing grouping* group for work that is not finished and does not need you. It lists every Current and Saved *thread* whose status reads **Running** or **Waiting**: a turn running now, a thread watching for an *event wait* of its own, or a parent waiting on its *sub-threads*. A sub-thread sits under its parent when both are in flight. A thread waiting for your answer or one that failed is in *Blocked* instead. A finished one with a ready *change* is in *Review*. One whose agent made a *read request* is in Review too, and stays in In flight while it still waits.
 
 Its tile also works as a filter. Press the selected In flight tile again to list only the running threads, again for only the waiting ones, and once more for all. The filter skips a kind with no threads, and with only one kind there is nothing to filter. The tile marks the count it lists. When the listed kind runs out, or you select another group, the whole group lists again.
 
@@ -1456,14 +1474,16 @@ A per-*thread* list of *todo items* the *Lucidos Agent* works through during a r
 
 **Settling.** When a response terminates (`ResponseGenerated` / `ResponseCanceled` / `ResponseAborted` / `ResponseFailed`), the engine reads the latest `TodoListWritten`. An all-`completed` list is left alone and persists for the thread's lifetime. If any item is open (`pending`, `in_progress` or `waiting`), the engine emits a new `TodoListWritten` settling those items, completed ones untouched. The status it writes depends on the thread:
 
-- **`waiting`** when the thread still holds a live *event wait*: it stopped on purpose and something will re-open it. Waiting rows keep full-strength text, a clock marker and a `waiting` tag.
+- **`waiting`** when the thread still holds a live *event wait*, or a *live child* still owes it a report: it stopped on purpose and something will re-open it or report to it. A `no-wake` child counts too, since it files its report for the next turn. Waiting rows keep full-strength text, a clock marker and a `waiting` tag.
 - **`abandoned`** otherwise. Abandoned rows show a dashed strike-through and an `abandoned` tag.
 
 A wait that resolves without the agent picking the list back up settles those items to `abandoned`. Usually that happens at the next terminator, since a delivery or a timeout re-opens the thread. **Stop waiting** re-opens nothing, so cancelling a thread's last subscription settles the list itself. Without that, an idle thread whose watch the user called off would read `waiting` forever.
 
-The engine leaves the list alone on a cancel while a turn is live or promised (the agent standing its own watch down mid-turn). The agent can still finish the list there, and `abandoned` is final. A later subscription never un-abandons an item. To avoid the settle, the agent finishes the list or drops it with `todo_write` and `[]`.
+Children work the same way. A child's completion wakes the parent, and that turn settles the list. A filed report, a stopped child and a child moved to top level re-open nothing, so the last of them settles the list itself. A child that dies with an error sends no card, so the parent's list reads `waiting` until its next turn.
 
-**The agent gets asked before it walks away.** A turn about to end with open items and nothing to re-open the thread is stopped once, before its answer is sent. The agent then subscribes, finishes the list, or says it is not watching for anything. So an `abandoned` row usually means the agent chose to leave it. This stops a reply that promises to keep watching while nothing is.
+The engine leaves the list alone on a cancel or a child card while a turn is live or promised. An example is the agent standing its own watch down mid-turn. The agent can still finish the list there, and `abandoned` is final. A later subscription never un-abandons an item. To avoid the settle, the agent finishes the list or drops it with `todo_write` and `[]`.
+
+**The agent gets asked before it walks away.** A turn about to end with open items and nothing to re-open the thread is stopped once, before its answer is sent. A *live child* still on the edge counts as something. The agent then subscribes, finishes the list, or says it is not watching for anything. So an `abandoned` row usually means the agent chose to leave it. This stops a reply that promises to keep watching while nothing is.
 
 **A settle is corrected by writing, never inferred.** The panel shows the agent's last list plus the engine's settling. So an item finished in a LATER turn reads `abandoned` until the agent calls `todo_write` again. The engine cannot see from the work that a plan item is done. So the tool tells the agent to re-write a list it picked back up.
 
@@ -1734,29 +1754,24 @@ You see a bar across the app and a line on the webhook's row in **Settings > Web
 See also: *webhook*, *ingress probe*, *trigger*.
 
 ### Widget
-A small interactive answer that lives in a thread: an *app* whose *app manifest* says `"kind": "widget"`, made by `create_app` with `kind: "widget"`. The agent's reply embeds it, so it shows in the thread as an *inline widget*. It has a chip on the thread's *widget shelf* only once pinned. It fits one phone screen with no scroll area inside, and its name says what it does ("Flight picker"). It runs in the same frame as an app and reaches exactly what an app reaches. It is never in the apps list, so the list stays the user's persistent interfaces.
+A small interactive answer that lives in a thread: an *app* whose *app manifest* says `"kind": "widget"`, made by `create_app` with `kind: "widget"`. The agent's reply embeds it, so it shows in the thread as an *inline widget*. It draws into a *widget box* with no scroll area inside, and its name says what it does ("Flight picker"). It runs in the same frame as an app and reaches exactly what an app reaches. It is never in the apps list, so the list stays the user's persistent interfaces.
 
 The thread filter lists each widget a coding-agent thread worked in under its own Widgets heading. A deleted widget stays there, marked deleted, because `AppDeleted` records its kind (ADR 0404).
 
 Its manifest records its one owner: the thread that made it (`origin_thread_id`), or the *plugin* that ships it (`origin_plugin_id`). *Delete (a thread)* removes that thread's own widgets. Uninstall removes a plugin's. "Make app" builds a separate, full-size app from it and leaves the widget as it is. Not an OS home-screen widget, which is a presence surface outside Lucidos.
 A widget can take *widget params*, so one widget shows in many places with different content: a sound player with a different clip each time. A *widget embed* draws it wherever a picture draws.
-See also: *reusable widget*, *built-in widget*, *widget instance*, *inline widget*, `system-knowhow/building-an-app.md` § Widgets, ADRs 0402, 0407, 0415 and 0466.
+See also: *reusable widget*, *built-in widget*, *widget instance*, *inline widget*, `system-knowhow/building-an-app.md` § Widgets, ADRs 0402, 0415, 0466 and 0621.
 
 ### Reusable widget
-A *widget* whose manifest says `"reusable": true`, so any thread may embed or pin it. The apps panel lists them in a Widgets group, and the agent sees them in its prompt. Its origin thread stays recorded: "Stop reusing" clears the flag, and the widget then belongs to that thread again. So it is refused once that thread is deleted, and while a *dashboard* holds the widget. Deleting the origin thread never removes a reusable widget. A *built-in widget* is a reusable widget that ships with Lucidos, and a *plugin widget* one a plugin ships, and neither offers "Stop reusing".
-
-### Widget shelf
-The row of chips in a thread's title row, one per **pinned *widget instance***. A chip shows the instance's label, else the widget's name. Embedding a *widget* adds no chip: the user or the agent pins the ones worth coming back to, such as a picker. A chip never squeezes the title: on a phone the shelf takes its own line under it, and on desktop it sits beside the title when the row has room. A chip tap drops the widget open under the title on every device; it never scrolls to the turn. A right-click, a long press or the ⋯ in the widget's bar opens its menu: Open in Canvas, Make reusable, Make app, Show in thread, and Pin to shelf or Unpin from shelf.
-
-Home draws no shelf and takes no pins. Every thread's menu, Home's included, offers Add to dashboard, or Remove from dashboard once the widget is a tile there. It acts on the *dashboard* of the layout you tap it in. On a widget that belongs to its thread, Add to dashboard makes it reusable first, in the same action. "Add widget" in the thread's ⋯ menu pins a reusable widget to its shelf, and each dashboard has its own Add.
-
-Unpinning takes the chip off the shelf. The *inline widget* and the files stay. The shelf is the pinned part of the *thread widgets*, so it reads the same on every device and after a reload. The agent pins and unpins through the `widgets` tool, and the CLI through `lucidos widgets pin` and `unpin` (ADR 0407).
-
-### Thread widgets
-Every *widget instance* pinned in a thread, or shown there by an old `WidgetShown`: each one's params, label, name, `reusable` flag, pin state and where "Show in thread" lands. The *inline widgets* read it, and the *widget shelf* keeps its pinned ones. It derives from the thread's `WidgetPinned`, `WidgetUnpinned` and old `WidgetShown` events. A *widget embed* records no event, so only its pin adds an entry, naming the turn that draws it. Read it with `widgets(action="thread")`, `lucidos widgets thread` or `GET /api/v1/widgets/thread`.
+A *widget* whose manifest says `"reusable": true`, so any thread may embed it. The apps panel lists them in a Widgets group, and the agent sees them in its prompt. Its origin thread stays recorded: "Stop reusing" clears the flag, and the widget then belongs to that thread again. So it is refused once that thread is deleted, and while a *dashboard* holds the widget. Deleting the origin thread never removes a reusable widget. A *built-in widget* is a reusable widget that ships with Lucidos, and a *plugin widget* one a plugin ships, and neither offers "Stop reusing".
 
 ### Inline widget
-A *widget* drawn in a turn: its bar (icon, name, Open in Canvas and its menu) with the widget under it. A reply draws one from each *widget embed* it holds, and an old `WidgetShown` still draws one at its turn. The frame is as tall as the content the widget reports, so it never scrolls inside the thread's own scroller. Past about one phone screen, it clips with a fade and an Expand button that opens the widget full size in Canvas. A pin from it names its turn, so "Show in thread" lands there. Unpinning leaves it in place (ADRs 0407, 0466).
+A *widget* drawn in a turn, also called its card: a bar over its *widget box*. The bar holds its icon, its name, a size pill, "+ Dashboard" and the ⋯ menu. A small card folds the name and the button into ⋯.
+
+A reply draws one from each *widget embed* it holds, and an old `WidgetShown` still draws one at its turn. It starts at the widget's default size. The user's pill pick sticks to that *widget instance* in the thread, on every device and after a reload (`InlineWidgetSized`). The agent sets one with `widgets(action="size")` only when you name a size (ADRs 0466, 0621).
+
+### Widget box
+The fixed box a *widget* draws into wherever it has a *widget size*: its *inline widget* in a thread and its tile on a *dashboard*. Both draw the same box at the same size, so what the thread shows is what the dashboard shows. The host sets the box, and content never sizes it. The widget fits by showing less, never by shrinking its text, and never scrolls inside. Content past the box is clipped under a fade, and Open in Canvas shows the widget full size. A question option and the Canvas draw a widget with no box (ADR 0621).
 
 ### Widget shape
 A class the app stylesheet serves for a *widget*'s main shape: `.ring` for a gauge, `.bar-run` for a short series, and `.choice-row` for the tap targets of a pick. Each draws from the theme tokens and follows the motion setting. A widget leads with one instead of a table (`system-knowhow/building-an-app.md` § Widgets, `system-knowhow/js-sdk.md` § Widget shapes).
@@ -1768,12 +1783,14 @@ The JSON object a *widget* receives for one place it is shown, read with `lucido
 `![label](app:<id>?params={...})` in markdown, which draws the *widget* live wherever a picture draws: an option's description or preview, a card's `message`, a reply. It is the one way a widget shows in a thread, and its alt text is the label. In a reply it draws an *inline widget*; in an option, the widget alone inside the option's box. An embed records no event. A bad embed in an option refuses the card. A bad one in a reply reads "This widget is not available" and gives the reason (ADRs 0415, 0466).
 
 ### Widget instance
-One *widget* with one set of *widget params*. *Thread widgets* and the *widget shelf* key on it, so two instances of one widget can both be pinned. Its label is not part of the key. The same names and values in a different order are one instance (ADR 0415).
+One *widget* with one set of *widget params*. A card size and a *dashboard* tile key on it, so two instances of one widget can each have their own. Its label is not part of the key. The same names and values in a different order are one instance (ADR 0415).
 
 ### Widget size
-One of three sizes a *widget* takes as a tile on a *dashboard* (an *app shortcut* has its own, `quarter`, which no widget takes): `small` (one cell, square), `medium` (two cells wide, one high) and `large` (two by two). Cells are square and scale with the UI scale. A cell keeps its size at every dashboard width: the dashboard has as many columns as fit, centred, and only one too narrow for two draws them smaller. A widget that declares no sizes takes all three and starts medium. One that declares `"sizes": ["medium", "small"]` in its *app manifest* takes only those, the first as its default.
+One of three sizes a *widget*'s *widget box* takes, in a thread card and a *dashboard* tile alike. An *app shortcut* has its own, `quarter`, which no widget takes. The three are `small` (one cell, square), `medium` (two cells wide, one high) and `large` (two by two).
 
-The tile sets the size and the widget draws for it, with no scroll inside. It reads its size from `data-widget-size` on `<html>` or `lucidos.widget.size()`. Content past the tile is clipped under a fade, and the tile's menu opens the widget full size in Canvas. A size the widget no longer declares falls back to the nearest smaller one it does (ADR 0432).
+Cells are square and scale with the UI scale. A cell keeps its size at every dashboard width: the dashboard has as many columns as fit, centred, and only one too narrow for two draws them smaller. A widget that declares no sizes takes all three and starts medium. One that declares `"sizes": ["medium", "small"]` in its *app manifest* takes only those, the first as its default.
+
+The box sets the size and the widget draws for it, with no scroll inside. It reads its size from `data-widget-size` on `<html>` or `lucidos.widget.size()`. Content past the box is clipped under a fade, and the menu opens the widget full size in Canvas. A size the widget no longer declares falls back to the nearest smaller one it does (ADRs 0432, 0621).
 
 ### Built-in widget
 A *reusable widget* that ships inside Lucidos, under an id starting `lucidos-`, read-only, updated with each release. Two ship: the sound player, `lucidos-sound-player`, and the video player, `lucidos-video-player`. No workspace app can take a `lucidos-` id. "Make app" gives an editable copy (ADR 0415).
@@ -1808,6 +1825,25 @@ starting or stopping go through the picker, linked from the list's last row. On
 first run the picker offers both ways in side by side: name your first workspace
 (suggesting "personal" or "work"), or restore one from a backup. Nothing is
 auto-created.
+
+### Workspace origin
+The provenance recorded when a workspace is registered: `user`, `eval`, `e2e`,
+`demo` or `unknown`. Older registrations are `unknown` and remain protected.
+Only a paired device may lower an existing workspace's protection. A local
+caller may raise it to `user`. A familiar
+name or folder prefix does not establish an origin.
+
+### Ephemeral workspace
+A workspace explicitly registered as disposable by its creating harness. Its
+owner token authorizes cleanup only for that registration while it remains
+eligible for harness cleanup. An expiry date suggests it for review; nothing is
+deleted on a timer. User and unknown workspaces require a paired device.
+
+### Trash
+Recoverable workspace and worktree state retained by cleanup. Review and named
+confirmation precede moving protected workspace data into Trash. Restore checks
+for collisions and restores the saved state without starting an engine. Only a
+paired device can empty Trash, and entries stay until that explicit decision.
 
 ### Workspace address
 The path a *workspace* is served at (`/personal/`), also its folder and database name. It derives from the name at creation (lower-cased, anything not a letter or digit turned into `-`). Then it is **fixed forever**: a rename changes the label, never the address. The picker shows the address only when it would surprise you: after a rename, or when two workspaces share a label.
@@ -1884,6 +1920,9 @@ The button for *Switch to new version* reads **Switch**, on the toast and in the
 **A version not built yet is its own, quieter signal** (dev only). With new engine code in source and nothing built, there is nothing to switch onto. So the brand mark carries a small dot instead of the switch badge, and the toast offers *Rebuild*. It defers on dismiss like the one above, keyed on the checkout's commit, since no on-disk build exists yet. Tapping the dot brings it back. If a rebuild for that commit already produced nothing to switch onto, the button is withheld and the toast names the real fix.
 
 One packaged failure is reported differently: if the swap leaves no runnable app on disk, Lucidos does **not** restart anything. It says so and tells you to reinstall from the `.dmg`, since a retry has nothing left to install over. The background service keeps running the loaded version, so your workspaces stay up until you reboot.
+
+### Build log
+The captured engine build output, separate from chat and runtime logs. **Show build log** fetches the last 64 KiB through the authenticated shell and displays it in the paired window. The `/api/v1/engine/build-log` route is host-only; an app frame cannot request it.
 
 ### Apply-ready
 A pending *change* that *Apply* merges as it stands: its thread has finished, and it needs no *hardening*. It needs none when `/harden` ran on its branch, when it carries only implementation plans, or when it comes from an *app coding-agent thread*. The Changes panel's **Ready** section lists it until it starts landing, and **Apply All** and **Discard All** act on it. The engine decides it and sends it as `apply_ready` on each change, beside `needs_hardening`. A turn end never proposes work that needs hardening. So once its thread rests, only a change from before that rule can be pending and not apply-ready.
@@ -2246,7 +2285,9 @@ It is either a *polled background task* or a watched one. A watched task arms an
 A command the agent backgrounds on its own dies when its turn ends, which is why this exists. Discarding or archiving the thread stops its running tasks.
 
 ### Polled background task
-A *background task* started with `lucidos background-task run --poll`, the usual choice for long work. No *event wait* is armed. The agent stays in its turn and calls `lucidos background-task wait <id>`, which returns within 230 s, until the task finishes. Every return lands inside the prompt cache's 5-minute life, so no wait pays to re-read the whole conversation. A watched task stays for an open-ended wait, such as a run queued behind a held lock.
+A *background task* started with `lucidos background-task run --poll`, the usual choice for long work. The agent stays in its turn and calls `lucidos background-task wait <id>`, which returns within 230 s, until the task finishes. Every return lands inside the prompt cache's 5-minute life, so no wait pays to re-read the whole conversation. A watched task stays for an open-ended wait, such as a run queued behind a held lock.
+
+No *event wait* is armed while the agent's turn runs. If the turn ends cleanly first, Lucidos arms one, and the thread re-opens when the task finishes. A task that already finished while the agent never read its result re-opens the thread at once, a single time. A Stop arms nothing.
 
 ### Cache keep-alive
 Lucidos pinging the model of a waiting thread, only to keep its prompt cache warm. For a Claude Code agent it runs about every 4 minutes on a 5-minute cache and every 55 on a 1-hour one. It covers an agent waiting on a background task, a lock, a change, or a working child thread not spawned `no-wake`. Lucidos resumes that idle agent with a hidden ping. Each ping leaves no trace: the thread keeps showing Waiting, and no parent, wait or trigger hears of it. A message sent meanwhile waits the few seconds until it ends, and Codex agents get none.
@@ -2328,3 +2369,31 @@ Add a term here when a new concept appears in the user-facing surface: UI string
 ## When a term changes
 
 If a term is renamed, retired, or shifts meaning, update this file in the same commit. Per `.claude/rules/system-knowhow.md`, every `system-knowhow/*.md` file using the term is updated alongside. `/harden` treats drift between code/UI and the glossary as a hardening failure.
+
+## Workspace snapshot
+
+An engine-owned local copy of one workspace's database and included files.
+It stays on the same machine, outside the workspace, and contains no secret
+keys. Restore needs the existing key store. See [workspace snapshots](backups/workspace-snapshots.md).
+
+## Snapshot handle
+
+The opaque identifier of a workspace snapshot. It resolves only within its
+workspace; it is not a filesystem path.
+
+## Recovery snapshot
+
+A verified workspace snapshot captured before a snapshot restore changes
+anything. It preserves the state being replaced, including the discarded timeline.
+
+## Snapshot restore
+
+Replacement of the same workspace's database and included files from a workspace
+snapshot, coordinated by the gateway while its engine is stopped. It does not
+undo external side effects or resume archived work automatically.
+
+## Restore journal
+
+The durable record of a snapshot restore's progress, stored outside the
+workspace database and files. It lets the gateway finish recovery before
+starting the engine after an interruption.

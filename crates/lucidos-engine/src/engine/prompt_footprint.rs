@@ -254,13 +254,13 @@ const APP_OPENS: UseSource = UseSource {
     thread_scoped: false,
 };
 
-/// A widget is used where it is pinned, and where an old `WidgetShown` showed
-/// it (ADR 0466). Its embeds in replies count too, but the embed grammar reads
-/// those (`widget_embed_uses`). A reply has no `app_id`, so it adds no use
-/// here, only its age to the record's coverage.
-const WIDGET_PINS: UseSource = UseSource {
+/// A widget was used where an old `WidgetShown` showed it (ADR 0466). Its
+/// embeds in replies count too, but the embed grammar reads those
+/// (`widget_embed_uses`). A reply has no `app_id`, so it adds no use here,
+/// only its age to the record's coverage.
+const WIDGET_SHOWINGS: UseSource = UseSource {
     id: "payload->>'app_id'",
-    filter: "event_type IN ('WidgetShown', 'WidgetPinned', 'ResponseGenerated')",
+    filter: "event_type IN ('WidgetShown', 'ResponseGenerated')",
     thread_scoped: true,
 };
 
@@ -342,9 +342,17 @@ pub async fn app_open_evidence(pool: &PgPool, days: u32) -> Result<UseEvidence, 
 }
 
 /// Reusable widgets by their newest use, in any thread: an embed in a reply,
-/// a pin, or an old `WidgetShown`.
+/// or an old `WidgetShown`. A widget on a dashboard is in use today.
 pub async fn widget_use_evidence(pool: &PgPool, days: u32) -> Result<UseEvidence, BoxError> {
-    let mut evidence = use_evidence(pool, &WIDGET_PINS, days).await?;
+    let mut evidence = use_evidence(pool, &WIDGET_SHOWINGS, days).await?;
+    let dashboards = crate::engine::dashboard::folded_dashboards(pool).await?;
+    for tile in dashboards.phone.iter().chain(&dashboards.desktop) {
+        let today = LastUse {
+            days_ago: 0,
+            in_window: true,
+        };
+        evidence.last_use.insert(tile.app_id.clone(), today);
+    }
     for (app_id, used) in widget_embed_uses(pool, days).await? {
         let newer = evidence
             .last_use
@@ -580,10 +588,23 @@ mod tests {
             &pool,
             "WidgetPinned",
             "x",
-            serde_json::json!({ "app_id": "inbox" }),
+            serde_json::json!({ "app_id": "old-pin" }),
             30,
         )
         .await;
+        let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+        bus.emit(crate::engine::event_bus::BusEvent::System(
+            crate::engine::event_bus::SystemEvent::DashboardTileAdded {
+                dashboard: crate::engine::thread_events::Dashboard::Phone,
+                app_id: "inbox".into(),
+                params: None,
+                label: None,
+                size: None,
+                actor: None,
+            },
+        ))
+        .await
+        .unwrap();
 
         let widgets = widget_use_evidence(&pool, 60).await.unwrap();
         assert!(widgets.last_use["fare-grid"].in_window, "an old showing");
@@ -603,7 +624,8 @@ mod tests {
             !widgets.last_use.contains_key("example"),
             "an embed in code draws nothing, so it is no use"
         );
-        assert!(widgets.last_use["inbox"].in_window, "a pin");
+        assert_eq!(widgets.last_use["inbox"].days_ago, 0, "a dashboard tile");
+        assert!(!widgets.last_use.contains_key("old-pin"), "a pin is no use");
 
         seed(
             &pool,

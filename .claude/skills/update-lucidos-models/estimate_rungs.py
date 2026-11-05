@@ -47,8 +47,10 @@ steps of SCORE_POINTS_PER_STEP, rounded half up, never the score itself.
 Each surface lists its own pairs, ranked on its profile. A pair is on when no
 other pair of that surface beats it on score and cost, where cost is the
 shipped token band plus the price, as the engine computes it. A pair the
-coding index never measured scores its general score there. --print shows
-the estimates instead of writing.
+coding index never measured scores its general score there. Each surface's
+SHIPPED_DEFAULTS pair stays on even when another pair beats it, so a fresh
+workspace's default is a rung of its ladder. --print shows the estimates
+instead of writing.
 """
 
 import csv
@@ -73,6 +75,13 @@ SOURCE = (
 AA_WEIGHT = 0.75
 CODING_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 REFERENCE = ("claude-opus-5-5", "medium")
+# Each surface's default on a fresh workspace. Engine tests fail when one drifts:
+# the_chat_ladder_loads_with_the_account_default_marked and the_shipped_*_default_*.
+SHIPPED_DEFAULTS = {
+    "chat": REFERENCE,
+    "claude_code": REFERENCE,
+    "codex": ("gpt-6.1-sol", "medium"),
+}
 # Models whose coding index rows are ignored: the index measured them at one
 # effort only, so they take general, and max reads as xhigh. docs/temporary-measures.md.
 CODING_UNMEASURED = {"claude-opus-5-5"}
@@ -356,7 +365,8 @@ def surface(found, name):
     rows = [row for (model, effort), row in found.items()
             if effort in MODELS[model][1].get(name, [])]
     return [{"model": r["model"], "effort": r["effort"],
-             "on": not any(beats(other, r, profile) for other in rows)}
+             "on": (r["model"], r["effort"]) == SHIPPED_DEFAULTS[name]
+             or not any(beats(other, r, profile) for other in rows)}
             for r in ranked(rows, profile)]
 
 

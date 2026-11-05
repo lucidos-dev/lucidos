@@ -13,7 +13,7 @@ vi.mock('../panelRefresh', () => ({ runPanelRefresh, showPullTravel }));
 const { handleAppPullMessage } = await import('./app-pull-bridge');
 
 const APP = { name: 'the app frame' };
-const WIDGET = { name: 'a shelf widget' };
+const WIDGET = { name: 'a widget' };
 const message = (data: unknown, source: unknown = APP) => ({ data, source }) as unknown as MessageEvent;
 
 describe('handleAppPullMessage', () => {
@@ -24,7 +24,7 @@ describe('handleAppPullMessage', () => {
     showPullTravel.mockReset();
   });
 
-  it('ignores a pull from a shelf widget, which is not the Canvas app', () => {
+  it('ignores a pull from a widget, which is not the Canvas app', () => {
     handleAppPullMessage(message({ type: APP_REFRESH_MESSAGE_TYPE }, WIDGET));
     handleAppPullMessage(message({ type: APP_PULL_MESSAGE_TYPE, travel: 40 }, WIDGET));
     expect(runPanelRefresh).not.toHaveBeenCalled();

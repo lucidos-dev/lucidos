@@ -9,10 +9,9 @@ import { fileURLToPath } from 'node:url';
 const here: string = dirname(fileURLToPath(import.meta.url));
 const read = (rel: string): string => readFileSync(resolve(here, rel), 'utf-8');
 
-// :root design tokens live in the base partial; the menu itself in the
-// host-chrome partial (it is never served to app iframes).
+// Root tokens live in the base partial; menus use host/iframe shared styles.
 const baseCss: string = read('../../../styles/global/base.css');
-const menuCss: string = read('../../../styles/global/host-components.css');
+const menuCss: string = read('../../../styles/global/shared-components.css');
 const dropdownSource: string = read('../Dropdown.tsx');
 
 const TOKENS: Record<string, number> = {};

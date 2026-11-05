@@ -3,7 +3,8 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { startThisWorkspace } from '../../store/actions/workspace-start';
 import { connectionStatus, visibleWorkspaceName } from '../../store/store';
 import type { ConnectionStatus } from '../../store/types';
-import { WORKSPACE_ID } from '../../utils/basePath';
+import { remoteConnectionFailure } from '../../utils/remoteConnection';
+import { REMOTE_GATEWAY, WORKSPACE_ID } from '../../utils/basePath';
 import { connectionNotice, hasConnectionNotice } from '../../utils/connectionNotice';
 import { viewportIsMobile } from '../../utils/viewport';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
@@ -137,7 +138,8 @@ export function ConnectionBanner({ layout }: { layout: BannerLayout }) {
   useEffect(() => {
     if (status !== 'stopped') setStarting(false);
   }, [status]);
-  const show = shouldRenderConnectionBanner({
+  const remoteFailure = remoteConnectionFailure.value;
+  const show = (REMOTE_GATEWAY !== null && remoteFailure !== null && bannerBelongsToLayout(layout, viewportIsMobile.value)) || shouldRenderConnectionBanner({
     layout,
     mobileViewport: viewportIsMobile.value,
     status,
@@ -148,7 +150,12 @@ export function ConnectionBanner({ layout }: { layout: BannerLayout }) {
 
   if (!show) return null;
 
-  const workspaceId = WORKSPACE_ID;
+  if (REMOTE_GATEWAY && remoteFailure) return <div ref={ref} class="connection-banner" data-layout={layout} role="status">
+    <span>Cannot reach @{REMOTE_GATEWAY}. {remoteFailure.reason}</span>
+    <a href="/~/?pick">Choose a workspace</a>
+  </div>;
+
+  const workspaceId = REMOTE_GATEWAY ? null : WORKSPACE_ID;
   const onStart = workspaceId === null ? undefined : () => {
     if (starting) return;
     setStarting(true);

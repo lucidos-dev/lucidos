@@ -178,6 +178,40 @@ pub(super) async fn restart_intent(
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// GET /api/v1/internal/oauth/callback: the gateway forwarding a provider's
+/// redirect, which it caught on the loopback callback port it owns.
+///
+/// Answers with the browser page, which the gateway passes through. A 404
+/// means no open flow here owns the `state`, so the gateway may try a peer.
+///
+/// Reachable only from this engine's own gateway, by the same test as the
+/// marker writes: a local process on a hop that did not come through the
+/// proxy. A device or an app document always arrives through the proxy.
+pub(super) async fn oauth_callback(
+    headers: HeaderMap,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> impl IntoResponse {
+    if !may_deliver_oauth_callback(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            "the OAuth callback is delivered by the workspace gateway only",
+        )
+            .into_response();
+    }
+    use crate::core::oauth_callback::{deliver_callback, CallbackDelivery};
+    let (status, page) = match deliver_callback(query.as_deref().unwrap_or("")) {
+        CallbackDelivery::Accepted { ok: true, page } => (StatusCode::OK, page),
+        CallbackDelivery::Accepted { ok: false, page } => (StatusCode::BAD_REQUEST, page),
+        CallbackDelivery::Unclaimed { page } => (StatusCode::NOT_FOUND, page),
+    };
+    (status, axum::response::Html(page)).into_response()
+}
+
+fn may_deliver_oauth_callback(headers: &HeaderMap) -> bool {
+    !crate::api::base_path::arrived_through_gateway_proxy(headers)
+        && crate::api::local_auth::is_local_process(headers)
+}
+
 #[derive(Deserialize)]
 pub(super) struct ClientLogRequest {
     pub category: String,
@@ -1365,6 +1399,10 @@ pub(super) fn router() -> Router<AppState> {
         .route("/internal/permission-prompt", post(permission_prompt))
         .route("/internal/ask-user-question", post(ask_user_question))
         .route("/internal/restart-intent", post(restart_intent))
+        .route(
+            lucidos_gateway_constants::OAUTH_DELIVERY_ROUTE,
+            get(oauth_callback),
+        )
         .route("/internal/mark-hardened", post(mark_hardened))
         .route(
             "/internal/coding-agent-diff-refresh",
@@ -1513,6 +1551,21 @@ mod tests {
             lucidos_local_token::HEADER_LOCAL_TOKEN,
             local,
         )])));
+    }
+
+    /// Only the engine's own gateway delivers an OAuth callback. A device or an
+    /// app document arrives through the proxy, which adds its local token too.
+    #[test]
+    fn only_the_gateway_hop_may_deliver_an_oauth_callback() {
+        let local = crate::api::local_auth::publish_test_local_token();
+        let token = (lucidos_local_token::HEADER_LOCAL_TOKEN, local);
+        assert!(may_deliver_oauth_callback(&marker_headers(&[token])));
+        assert!(!may_deliver_oauth_callback(&marker_headers(&[
+            token,
+            ("x-forwarded-prefix", "/dev/"),
+            (crate::api::actor::HEADER_DEVICE_ID, "a-device"),
+        ])));
+        assert!(!may_deliver_oauth_callback(&marker_headers(&[])));
     }
 
     /// Only a thread's own subprocess makes the marker stop anything (ADR

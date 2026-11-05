@@ -18,7 +18,8 @@
  * its list can never disagree. A failed thread with a
  * proposed change surfaces in both Blocked and review. One awaiting an
  * answer is Blocked only, since the open question withholds Apply.
- * In flight is mutually exclusive with both.
+ * In flight never shares a thread with Blocked or a change in Review. A read
+ * request whose work runs on lists in Review and In flight both.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
@@ -540,8 +541,32 @@ describe('ongoingFilterSteps', () => {
     });
 });
 
-describe('In flight never claims a thread Blocked or Review holds', () => {
-    it('keeps Blocked, Review and In flight disjoint', () => {
+describe('an unread thread whose work runs on', () => {
+    const unreadWaiting = () => [
+        makeThread('parent', { readRequested: true, activeChildrenCount: 1 }),
+        makeThread('parked', { readRequested: true, liveEventWaitCount: 1 }),
+        makeThread('child-parked', { readRequested: true, waitingChildrenCount: 1 }),
+    ];
+
+    it('lists in Review and In flight both', () => {
+        const map = asMap(unreadWaiting());
+        expect(ids(reviewThreads(map)).sort()).toEqual(['child-parked', 'parent', 'parked']);
+        expect(rootIds(inFlightThreads(map)).sort()).toEqual(['child-parked', 'parent', 'parked']);
+    });
+
+    it('keeps its read-request dot and counts as waiting in In flight', () => {
+        const rows = inFlightThreads(asMap(unreadWaiting()));
+        expect(rows.map(n => threadVisualStatus(n.thread))).toEqual(['read-request', 'read-request', 'read-request']);
+        expect(ongoingBreakdown('in-flight', rows)).toEqual([{ part: 'running', count: 0 }, { part: 'waiting', count: 3 }]);
+    });
+
+    it('leaves In flight once nothing runs on', () => {
+        expect(threadIsInFlight(makeThread('done', { readRequested: true }))).toBe(false);
+    });
+});
+
+describe('In flight never claims a thread Blocked holds, nor a change Review holds', () => {
+    it('keeps Blocked, Review changes and In flight disjoint', () => {
         const threads = [
             makeThread('running', { status: 'running' }),
             makeThread('running-proposed', { status: 'running', codingAgentChangeState: { kind: 'proposed', requires_restart: false }}),
@@ -667,6 +692,7 @@ describe('a read request', () => {
     // ADR 0424: an agent that asks mid-flight is heard. Only a change needs
     // the wait to end, since that guard protects its Apply.
     it('lists a thread still waiting on an event or sub-threads, but not a change during a wait', () => {
+        // In flight keeps all three, since their work runs on.
         const watching = makeThread('watching', { liveEventWaitCount: 1, readRequested: true });
         const parent = makeThread('parent', { activeChildrenCount: 2, readRequested: true });
         const watchingChange = makeThread('watching-change', {
@@ -675,7 +701,8 @@ describe('a read request', () => {
         expect(threadInReview(watching)).toBe(true);
         expect(threadInReview(parent)).toBe(true);
         expect(threadInReview(watchingChange)).toBe(false);
-        expect(ids(inFlightThreads(asMap([watching, parent, watchingChange])).map(n => n.thread))).toEqual(['watching-change']);
+        expect(ids(inFlightThreads(asMap([watching, parent, watchingChange])).map(n => n.thread)).sort())
+            .toEqual(['parent', 'watching', 'watching-change']);
     });
 
     it('never makes a thread Blocked, or counts toward its badge', () => {

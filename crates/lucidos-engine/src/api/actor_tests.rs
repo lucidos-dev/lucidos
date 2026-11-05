@@ -1371,3 +1371,52 @@ fn only_a_verified_origin_token_is_refused() {
         assert!(refuse_agent_caller(&h, "refused").is_ok(), "{h:?}");
     }
 }
+
+#[tokio::test]
+async fn snapshot_policy_write_requires_registered_owner_device() {
+    let (pool, name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    crate::core::DeviceStore::register(&pool, &bus, "owner-phone", None, None, None)
+        .await
+        .unwrap();
+    let key = crate::core::prefs::SNAPSHOT_RESTORE_BY_AGENTS.key();
+    let local = crate::api::local_auth::publish_test_local_token();
+    install_test_secret();
+    let token = mint_agent_origin_token(Some(Uuid::new_v4()), 0, None).unwrap();
+    for headers in [
+        headers_with(&[]),
+        headers_with(&[(HEADER_DEVICE_ID, "unknown")]),
+        headers_with(&[(lucidos_local_token::HEADER_LOCAL_TOKEN, local)]),
+        headers_with(&[
+            (HEADER_AGENT_ORIGIN_TOKEN, &token),
+            (HEADER_DEVICE_ID, "owner-phone"),
+        ]),
+    ] {
+        let refusal = crate::api::settings::preference_write_actor(&headers, &pool, key, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            refusal.status,
+            axum::http::StatusCode::FORBIDDEN | axum::http::StatusCode::UNAUTHORIZED
+        ));
+        if refusal.status == axum::http::StatusCode::FORBIDDEN {
+            assert_eq!(
+                refusal.message,
+                "snapshot_restore_policy_owner_device_required"
+            );
+        }
+    }
+    let owner = headers_with(&[(HEADER_DEVICE_ID, "owner-phone")]);
+    assert!(matches!(
+        crate::api::settings::preference_write_actor(&owner, &pool, key, None)
+            .await
+            .unwrap(),
+        Some(MessageOrigin::Device { .. })
+    ));
+    assert!(
+        crate::api::settings::preference_write_actor(&headers_with(&[]), &pool, "theme", None)
+            .await
+            .is_ok()
+    );
+    crate::test_support::teardown_test_db(&name).await;
+}

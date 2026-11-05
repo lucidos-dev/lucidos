@@ -451,6 +451,8 @@ pub struct LucidosEngine {
     /// Shared region handle, updated in place when `vertex_region` changes.
     vertex_location: crate::llm::vertex::LocationHandle,
     vertex_token_cache: Option<crate::llm::vertex::TokenCache>,
+    /// Shared with chat and proxy callers, including rotating-token refreshes.
+    pub(crate) claude_gateway_access: crate::llm::claude_gateway::GatewayAccessFactory,
     /// Shared model routing map (provider + declared context window), reloaded
     /// in place by `spawn_models_registry_subscriber` on any `Model*` event.
     /// The engine holds it — not just `RoutingProvider` — because the context
@@ -481,9 +483,9 @@ pub struct LucidosEngine {
     ///
     /// An `Arc` because the Thread Queue holds a clone of it.
     shutting_down: Arc<AtomicBool>,
-    /// Acquired via `scheduler::BackupGuard::try_acquire`. POST /api/v1/backup
-    /// returns 409 when the guard is held; the scheduled cron skips its tick.
-    pub backup_in_progress: AtomicBool,
+    /// Shared by backup, snapshot capture, check and restore. A concurrent
+    /// archive request is refused; the scheduled backup skips its tick.
+    pub archive_job_slot: crate::core::snapshot::ArchiveJobSlot,
     /// Is the workspace database answering, and if not, why? Only the background
     /// probe (`db_health::spawn_db_health_probe`) writes it. `GET /api/v1/health`
     /// reads it per request, so an outage adds no latency to the endpoint the
@@ -523,11 +525,9 @@ pub struct LucidosEngine {
     /// behind HEAD, so an idle workspace never populates it. Dev-only. See
     /// `engine_version::pending_commits`.
     pending_commits_cache: std::sync::Mutex<engine_version::PendingCommitsCache>,
-    /// Throttled cache of the checkout's HEAD sha. Three callers now need it on
-    /// the hot path (the version-status response's pending-version identity, the
-    /// wedged-rebuild verdict, and the self-heal driver's per-HEAD budget), and
-    /// each used to fork its own `git rev-parse`. Same TTL rationale as
-    /// `source_behind_cache`. Dev-only. See `engine_version::head_sha`.
+    /// Throttled HEAD cache shared by version-status and the self-heal budget.
+    /// Same TTL rationale as `source_behind_cache`. Dev-only.
+    /// See `engine_version::head_sha`.
     head_sha_cache: std::sync::Mutex<engine_version::HeadShaCache>,
     /// Self-heal bookkeeping: how many background rebuilds this engine has
     /// auto-triggered for the current HEAD, so a genuinely broken `main` can't
@@ -1212,14 +1212,12 @@ fn provider_config_read(
 /// [`crate::llm::build_active_provider`] and swap the shared provider handle in
 /// place. A first-run user who configures a provider in Settings → Models →
 /// Providers then gets a working chat with NO restart. Removing the last one
-/// swaps back to the unconfigured sentinel, when `LUCIDOS_BOOT_WITHOUT_PROVIDER`
-/// is set. Mirrors `spawn_models_registry_subscriber`.
+/// swaps back to the unconfigured sentinel. Mirrors `spawn_models_registry_subscriber`.
 ///
 /// **Mock isolation:** the caller does not spawn this under `LUCIDOS_MODEL=mock`,
 /// and `ctx.model_is_mock` is `false`, so `build_active_provider` can never
 /// return `MockProvider` here — the mock stays reachable only via the explicit
-/// env opt-in. A `FailFast` rebuild (no provider, gate off) keeps the current
-/// provider rather than panicking the running engine.
+/// env opt-in.
 fn spawn_provider_config_subscriber(
     mut rx: tokio::sync::broadcast::Receiver<event_bus::EmittedEvent>,
     llm_handle: Arc<std::sync::RwLock<Arc<dyn crate::llm::LlmProvider>>>,
@@ -1259,7 +1257,7 @@ pub(crate) fn claude_gateway_access_factory(
 }
 
 /// Rebuild the active LLM provider and search chain, and swap both in place.
-/// `trigger` names what changed, for the log. A failed or `FailFast` rebuild
+/// `trigger` names what changed, for the log. A failed rebuild
 /// keeps the current providers.
 pub(crate) async fn swap_in_rebuilt_providers(
     pool: &sqlx::PgPool,
@@ -1269,7 +1267,7 @@ pub(crate) async fn swap_in_rebuilt_providers(
     trigger: &str,
 ) {
     match crate::llm::build_active_provider(Some(pool), ctx).await {
-        Ok(crate::llm::ProviderBuildOutcome::Install {
+        Ok(crate::llm::ProviderBuildOutcome {
             llm,
             web_search,
             selection,
@@ -1307,12 +1305,6 @@ pub(crate) async fn swap_in_rebuilt_providers(
                     log!("[Providers] web search swap skipped (lock poisoned): {}", e)
                 }
             }
-        }
-        Ok(crate::llm::ProviderBuildOutcome::FailFast) => {
-            log!(
-                "[Providers] {} changed and left no provider configured, with LUCIDOS_BOOT_WITHOUT_PROVIDER off. Keeping the current provider (a restart would fail-fast)",
-                trigger
-            );
         }
         Err(e) => {
             log!(
@@ -1372,6 +1364,7 @@ pub(crate) fn migrate_legacy_auth_modules_dir(workspace_path: &Path) {
 }
 
 mod engine_impl;
+pub(crate) mod restore_boot;
 pub(crate) use engine_impl::mask_stored_events;
 
 /// `processing_thread_ids - all_cc_thread_ids`. Idle coding-agent sessions stay in

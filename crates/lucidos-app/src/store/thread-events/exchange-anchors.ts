@@ -41,8 +41,8 @@ export function exchangeError(exchange: Exchange): ExchangeError | null {
  *  - the failure card, in `ChatExchange`, carries its own `ResponseFailed`
  *    (see `ExchangeError.eventId` above);
  *  - each old `WidgetShown`'s inline widget (`InlineWidget`) carries its own
- *    id, so "Show in thread" lands on it and not on the turn's start. A
- *    reply's inline widget wears nothing: its pin names the turn's starter.
+ *    id, so a deep link lands on it and not on the turn's start. A reply's
+ *    inline widget wears nothing: the turn root already wears the starter.
  *
  *  Every other step is deliberately unstamped, inline steps most of all: the
  *  "Show steps" toggle can hide them, and an id there would resolve only

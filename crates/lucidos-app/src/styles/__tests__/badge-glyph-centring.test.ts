@@ -137,7 +137,26 @@ describe('one rule centres the glyph in every badge that has one', () => {
     expect(icon?.props.get('display')).toBe('flex');
     expect(icon?.props.get('align-items')).toBe('center');
     expect(icon?.props.get('text-box-trim')).toBe('none');
-    expect(icon?.props.get('padding-block')).toBe('0');
+    // All four sides: inline padding is room for a count's digits, and it drew
+    // a one-icon badge as a pill beside the round "!".
+    expect(icon?.props.get('padding')).toBe('0');
+  });
+
+  it('insets the icon by a whole pixel on each side', () => {
+    // Flex centring halves the spare room, and a half pixel snaps either way:
+    // at 100% a 9px icon in the 12px box sat a pixel low. The icon is the box
+    // minus an even, whole-pixel inset, derived from both sizes.
+    const svg = cssRules(badgesCss)
+      .find(r => r.selector === '.badge :is(.brand-badge-spinner, .brand-badge-queued) svg');
+    expect(svg?.atRules, 'it reads --badge-box, which only the trim rule declares')
+      .toBe('@supports (text-box-trim: trim-both)');
+    const size = svg?.props.get('--badge-icon-snapped') ?? '';
+    expect(size).toMatch(/^calc\(var\(--badge-box\)\s+- 2 \* round\(down, /);
+    expect(size).toContain('var(--badge-icon-size)');
+    expect(size).toContain(', 1px))');
+    for (const side of ['width', 'height']) {
+      expect(svg?.props.get(side)).toBe('var(--badge-icon-snapped)');
+    }
   });
 
   it('names every icon the brand badge can draw in that exemption', () => {

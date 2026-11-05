@@ -552,7 +552,7 @@ async function captureAppUIInner(appId: string, requestId: string, saveFormat?: 
   await postAppCapture(requestId, result.screenshot, mismatchNote + result.dom);
 }
 
-/** Find the visible Canvas app iframe, never a shelf widget's. Tolerates
+/** Find the visible Canvas app iframe, never a widget's. Tolerates
  *  transient duplicates during a layout swap by preferring non-zero
  *  dimensions. */
 export function getVisibleAppFrame(): HTMLIFrameElement | null {

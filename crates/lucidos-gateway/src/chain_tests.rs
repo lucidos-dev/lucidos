@@ -98,22 +98,34 @@ fn write_fixture(workspace: &Path) {
 /// The real router, so a request passes the real `auth_api::enforce` and the
 /// real `proxy`. Not the gateway BINARY: that one refuses to boot from a
 /// coding-agent worktree, deliberately and with no opt-out (ADR 0021). A test
-/// process is not the machine-global daemon that guard exists for. It registers
-/// nothing, adopts nothing, spawns no engine, and dies with the test.
+/// process is not the machine-global daemon that guard exists for. Its private
+/// registry adopts only the disposable engine, spawns nothing, and dies with the test.
 async fn serve_gateway(engine: &LiveEngine, slug: &str, token: &str) -> String {
-    let state = GatewayState::for_tests_with(None, token, engine.tls);
-    state.register_for_test(Workspace::gateway_provisioned(
-        slug.to_string(),
-        slug.to_string(),
-        engine.port,
-    ));
-    // The live engine bound its real socket, under `~/.lucidos/run`, which is
-    // not where a test build roots `EngineAddress::for_workspace`.
+    let state = GatewayState::for_tests_with(None, token, engine.tls).with_live_engine_sockets();
+    state.register_for_test(Workspace {
+        id: slug.to_string(),
+        name: slug.to_string(),
+        dir: engine
+            .workspace
+            .to_str()
+            .expect("workspace path")
+            .to_string(),
+        port: engine.port,
+        database_url: None,
+        cleanup: Default::default(),
+        autostart: false,
+    });
+    assert!(
+        state.engine_address(slug).is_none(),
+        "registration alone cannot route"
+    );
+    state.adopt_running_engines_for_test().await;
     let socket = lucidos_engine_socket::path_for(&engine.workspace)
         .expect("the e2e workspace has an engine socket");
-    state.set_route_for_test(
-        slug,
-        crate::engine_hop::EngineAddress::at(socket, engine.port),
+    assert_eq!(
+        state.engine_address(slug),
+        Some(crate::engine_hop::EngineAddress::at(socket, engine.port)),
+        "the real adoption probe must install the registered engine socket",
     );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -182,6 +194,8 @@ async fn an_app_frames_own_files_load_through_a_gateway() {
     let slug = "e2e-test";
     let gateway = serve_gateway(&engine, slug, &token).await;
     let client = client();
+
+    gateway_restore_origin_from_spawned_child(&engine, &gateway, &token).await;
 
     // 1. The frame's own document. This one IS authorized: the host sets the
     //    iframe src from the shell, whose site-for-cookies is the gateway's, so
@@ -289,6 +303,25 @@ async fn an_app_frames_own_files_load_through_a_gateway() {
     let preflight = cross_origin(&client, reqwest::Method::OPTIONS, &fira, "font").await;
     assert!(preflight.status().is_success(), "{}", preflight.status());
     assert_eq!(allow_origin(&preflight), Some("*"), "the preflight's grant");
+
+    for path in [
+        format!("apps/{APP_ID}/index.html"),
+        format!("apps/{APP_ID}/style.css"),
+        format!("apps/{APP_ID}/own.woff2"),
+        format!("apps/{APP_ID}/main.js"),
+        format!("artifacts/{APP_ID}/index.html"),
+        format!("artifacts/{APP_ID}/next/index.html"),
+        format!("artifacts/{APP_ID}/pixel.txt"),
+    ] {
+        let removed = client
+            .delete(format!("{gateway}/{slug}/api/v1/data/{path}"))
+            .header("x-lucidos-device-id", "gateway-origin-chain")
+            .header(crate::auth::HEADER_LOCAL_TOKEN, &token)
+            .send()
+            .await
+            .expect("remove the disposable chain fixture");
+        assert!(removed.status().is_success());
+    }
 }
 
 /// A request shaped the way an opaque-origin frame's is, with no cookie.
@@ -313,4 +346,206 @@ fn allow_origin(res: &reqwest::Response) -> Option<&str> {
     res.headers()
         .get("access-control-allow-origin")
         .and_then(|v| v.to_str().ok())
+}
+
+/// Run the origin probe as an actual engine child. The test only sees its
+/// allowlisted answer, never the inherited process-MAC token being forwarded.
+async fn gateway_restore_origin_from_spawned_child(
+    engine: &LiveEngine,
+    gateway: &str,
+    token: &str,
+) {
+    let base = format!(
+        "{}://127.0.0.1:{}",
+        if engine.tls { "https" } else { "http" },
+        engine.port
+    );
+    let client = client();
+    let device = "gateway-origin-chain";
+    let registered = client
+        .post(format!("{base}/api/v1/devices/register"))
+        .header("content-type", "application/json")
+        .body(serde_json::json!({ "device_id": device, "user_agent": "lucidos-e2e/1" }).to_string())
+        .send()
+        .await
+        .expect("register the disposable device");
+    assert!(registered.status().is_success());
+    let prefs = client
+        .get(format!("{base}/api/v1/preferences"))
+        .header(crate::auth::HEADER_LOCAL_TOKEN, token)
+        .send()
+        .await
+        .expect("read preferences")
+        .text()
+        .await
+        .expect("preferences body");
+    let prefs: serde_json::Value = serde_json::from_str(&prefs).expect("preferences JSON");
+    let key = crate::preference_test_keys::key("CODING_AGENT_CLAUDE_PATH");
+    let old = prefs["preferences"][key].as_str();
+    let fake = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../lucidos-app/e2e/fake-claude-code/claude.mjs")
+        .canonicalize()
+        .expect("fake agent fixture");
+    let changed = client
+        .put(format!("{base}/api/v1/preferences?key={key}"))
+        .header("x-lucidos-device-id", device)
+        .header("content-type", "application/json")
+        .body(serde_json::json!({ "value": fake.to_str().expect("fixture path") }).to_string())
+        .send()
+        .await
+        .expect("configure the disposable agent");
+    assert!(changed.status().is_success());
+
+    // Keep cleanup outside the assertion path, including when the child fails.
+    let result = async {
+        let thread = "bce23d74-18a8-4652-aef0-168258160821";
+        let submitted = client.post(format!("{base}/api/v1/chat/stream"))
+            .header("x-lucidos-device-id", device)
+            .header("content-type", "application/json").body(serde_json::json!({
+                "message": format!("Probe snapshot gateway restore origin: {gateway}."),
+                "thread_id": thread, "new_thread": true, "mode": "human", "use_coding_agent": true,
+                "coding_agent": "claude-code",
+            }).to_string())
+            .send().await.map_err(|_| "submit child")?;
+        if !submitted.status().is_success() { return Err("child submission refused"); }
+        for _ in 0..120 {
+            let snapshot = client.get(format!("{base}/api/v1/threads/{thread}/events"))
+                .header(crate::auth::HEADER_LOCAL_TOKEN, token)
+                .send().await.map_err(|_| "read child events")?
+                .text().await.map_err(|_| "child events body")?;
+            let snapshot: serde_json::Value = serde_json::from_str(&snapshot).map_err(|_| "child events JSON")?;
+            if let Some(events) = snapshot["events"].as_array() {
+                for event in events {
+                    if event["event_type"] == "ResponseGenerated" {
+                        let content = event["payload"]["text"].as_str().ok_or("child answer missing")?;
+                        let proof: serde_json::Value = serde_json::from_str(content).map_err(|_| "child answer JSON")?;
+                        return if proof == serde_json::json!({ "verified": true, "workspace_id": "e2e-test", "source_thread_id": thread }) {
+                            live_snapshot_approval_matrix(&client, &base, gateway, token, device, thread).await
+                        } else { Err("gateway did not verify the engine-spawned child") };
+                    }
+                    if event["event_type"] == "ResponseFailed" { return Err("child failed"); }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        Err("child proof timed out")
+    }.await;
+    let restore = match old {
+        Some(value) => client
+            .put(format!("{base}/api/v1/preferences?key={key}"))
+            .header("content-type", "application/json")
+            .body(serde_json::json!({ "value": value }).to_string()),
+        None => client.delete(format!("{base}/api/v1/preferences?key={key}")),
+    }
+    .header("x-lucidos-device-id", device)
+    .send()
+    .await
+    .expect("restore disposable preference");
+    assert!(restore.status().is_success());
+    assert_eq!(result, Ok(()));
+}
+
+// The first turn has established a real coding-agent session. Continue it so
+// every card and spend belongs to a live turn, with no inserted fixture events.
+async fn live_snapshot_approval_matrix(
+    client: &reqwest::Client,
+    base: &str,
+    gateway: &str,
+    token: &str,
+    device: &str,
+    thread: &str,
+) -> Result<(), &'static str> {
+    let response = client.post(format!("{base}/api/v1/chat/stream"))
+        .header("x-lucidos-device-id", device)
+        .header("content-type", "application/json")
+        .body(serde_json::json!({
+            "message": format!("Probe snapshot gateway restore origin: {gateway}. Spend snapshot approval."),
+            "thread_id": thread, "mode": "human", "use_coding_agent": true,
+            "coding_agent": "claude-code",
+        }).to_string()).send().await.map_err(|_| "submit approval turn")?;
+    if !response.status().is_success() {
+        return Err("approval turn refused");
+    }
+    let mut answered = std::collections::HashSet::new();
+    for _ in 0..120 {
+        let snapshot = client
+            .get(format!("{base}/api/v1/threads/{thread}/events"))
+            .header(crate::auth::HEADER_LOCAL_TOKEN, token)
+            .send()
+            .await
+            .map_err(|_| "read approval events")?
+            .text()
+            .await
+            .map_err(|_| "read approval body")?;
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&snapshot).map_err(|_| "approval events JSON")?;
+        for event in snapshot["events"]
+            .as_array()
+            .ok_or("missing approval events")?
+        {
+            let payload = &event["payload"];
+            if event["event_type"] == "UserQuestionAsked" {
+                let id = payload["tool_use_id"].as_str().ok_or("card id missing")?;
+                if !id.starts_with("restore-approval-") || answered.contains(id) {
+                    continue;
+                }
+                let label = if id.contains("-allow") || id.contains("-lost") {
+                    "Allow once"
+                } else {
+                    "Don't allow"
+                };
+                let option = payload["options"]
+                    .as_array()
+                    .ok_or("card options missing")?
+                    .iter()
+                    .find(|o| o["label"] == label)
+                    .ok_or("engine card missing")?;
+                if payload["owner_approval"]["target_workspace_id"] != "restore-probe-target"
+                    || payload["owner_approval"]["snapshot_handle"]
+                        != "snap_00000000000000000000000000"
+                {
+                    return Err("card dimensions differ");
+                }
+                let answer = client
+                    .post(format!("{base}/api/v1/threads/{thread}/answer-question"))
+                    .header("x-lucidos-device-id", device)
+                    .header("content-type", "application/json")
+                    .body(
+                        serde_json::json!({ "tool_use_id": id,
+                        "answer": { "kind": "Selected", "option_id": option["id"] } })
+                        .to_string(),
+                    )
+                    .send()
+                    .await
+                    .map_err(|_| "answer approval card")?;
+                if !answer.status().is_success() {
+                    return Err("device answer refused");
+                }
+                answered.insert(id.to_owned());
+            }
+            if event["event_type"] == "ResponseGenerated" {
+                let proof: serde_json::Value =
+                    serde_json::from_str(payload["text"].as_str().unwrap_or(""))
+                        .map_err(|_| "approval child JSON")?;
+                if proof["approval_matrix"] == true {
+                    let spent = snapshot["events"]
+                        .as_array()
+                        .ok_or("missing events")?
+                        .iter()
+                        .filter(|e| e["event_type"] == "OwnerApprovalSpent")
+                        .count();
+                    return if answered.len() == 3 && spent == 2 {
+                        Ok(())
+                    } else {
+                        Err("approval event counts differ")
+                    };
+                }
+                if proof["verified"] == false {
+                    return Err("live approval matrix failed");
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    Err("live approval matrix timed out")
 }

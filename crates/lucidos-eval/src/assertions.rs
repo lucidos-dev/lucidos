@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 type Fallible<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// One `ToolCalled` row, flattened to what an assertion asks about.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub sequence: i64,
     pub name: String,
@@ -26,7 +26,7 @@ pub struct ToolCall {
 }
 
 /// One event-store row an assertion reads.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventRow {
     pub sequence: i64,
     pub event_type: String,

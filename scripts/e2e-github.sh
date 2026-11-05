@@ -343,20 +343,13 @@ if [ -n "$attach_run" ] || [ "${#remote_suites[@]}" -gt 0 ]; then
         run_db_id="$(e2e_github_find_run "$branch" "$pushed_commit")" || exit "$E2E_GITHUB_NO_VERDICT_EXIT"
     fi
     echo "$E2E_GITHUB_LINKED_MARK$(e2e_github_run_url "$run_db_id") $branch"
-    # Under pipefail a wait that gave up fails the pipeline, though tail ends 0.
-    # The EXIT trap then cancels the run.
-    run_state="$(e2e_github_wait "$run_db_id" | tail -1)" || exit "$E2E_GITHUB_NO_VERDICT_EXIT"
+    # A wait that gave up exits here, and the EXIT trap then cancels the run.
+    e2e_github_settle_run "$run_db_id" "$out_dir" || exit "$E2E_GITHUB_NO_VERDICT_EXIT"
     run_done=1
-    conclusion="$(e2e_github_conclusion "$run_state")"
-    echo "[e2e-github] run concluded: ${conclusion:-unknown}"
-    if ! e2e_github_download "$run_db_id" "$out_dir"; then
-        echo "ERROR: could not download the run's output." >&2
-        remote_rc="$E2E_GITHUB_NO_VERDICT_EXIT"
-    else
-        e2e_github_report "$out_dir"
-        remote_rc=$?
-        [ "$suite" != main-check ] || e2e_github_record_coverage_map "$PROJECT_DIR" "$out_dir" "$commit" \
-            "$(e2e_github_run_url "$run_db_id")"
+    run_state="$E2E_GITHUB_RUN_STATE"
+    remote_rc="$E2E_GITHUB_SETTLE_RC"
+    if [ -n "$E2E_GITHUB_SETTLE_DOWNLOADED" ] && [ "$suite" = main-check ]; then
+        e2e_github_record_coverage_map "$PROJECT_DIR" "$out_dir" "$commit" "$(e2e_github_run_url "$run_db_id")"
     fi
     e2e_github_record_timings "$out_dir" "$run_db_id" "$suite" "$pushed_at" "$remote_rc" "$run_state"
 fi

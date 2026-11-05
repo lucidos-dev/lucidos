@@ -132,9 +132,10 @@ fn start_response(started: BackgroundTaskStart) -> serde_json::Value {
             "timeout_secs": timeout_secs,
             "message": format!(
                 "Started background task {task_id} in this thread's worktree. It is killed \
-                 if still running after {timeout_secs}s. Nothing re-opens this thread when it \
-                 finishes, so keep your turn: run `lucidos background-task wait {task_id}` \
-                 in the foreground, and re-issue it until it reports finished."
+                 if still running after {timeout_secs}s. Keep your turn: run `lucidos \
+                 background-task wait {task_id}` in the foreground, and re-issue it until it \
+                 reports finished. If your turn ends first, the engine re-opens this thread \
+                 when it finishes."
             ),
         }),
         BackgroundTaskStart::Finished { task_id, output } => serde_json::json!({

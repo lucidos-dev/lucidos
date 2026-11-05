@@ -1,5 +1,4 @@
 import type { ComponentType } from 'preact';
-import { WidgetShelf } from '../widgets/WidgetShelf';
 import { scrolledFromTop } from '../chat/scrollState';
 import { SearchIcon } from '../shared/icons';
 import { SearchField } from '../shared/SearchField';
@@ -247,7 +246,6 @@ export function MobileThreadTitleBar() {
       data-scroller-pinned
     >
       <ThreadTitleMenu thread={eventThread} title={threadTitle} status={threadVisualStatus(eventThread)} />
-      <WidgetShelf threadId={threadId} />
     </div>
   );
 }

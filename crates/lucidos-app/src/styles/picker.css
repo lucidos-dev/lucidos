@@ -1488,6 +1488,8 @@
   font-size: var(--font-size-2xl);
   /* Four and four, as the boxes above group them. */
   letter-spacing: 0.15em;
+  /* A long pairing secret has no space to break at. */
+  overflow-wrap: anywhere;
 }
 
 .pairing-code-actions {

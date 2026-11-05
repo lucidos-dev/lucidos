@@ -7,8 +7,8 @@
 //! contract: either keep working the list until every item is `completed`, or
 //! call `todo_write` with `[]` to drop it. If the agent left open items behind,
 //! the helper emits a fresh `TodoListWritten` with those settled to `Waiting`
-//! (the thread is parked on a live *event wait*) or to `Abandoned` (it walked
-//! away), so the panel says which. All-completed lists are left alone, since
+//! (the thread is parked on a live *event wait* or a live child) or to
+//! `Abandoned` (it walked away), so the panel says which. All-completed lists are left alone, since
 //! finished lists persist by design.
 //!
 //! The helper takes the terminator's sequence number so both of its questions
@@ -29,6 +29,12 @@
 //! closes, and it is the one hole in the "`Waiting` cannot strand" guarantee
 //! the 2026-08-09 split claimed.
 //!
+//! **Child cards are the same shape.** A thread a live child still owes a
+//! report is parked too. `ChildThreadCompleted` wakes the parent, so its turn
+//! settles the list. `ChildReportFiled`, `ChildThreadStopped` and
+//! `ChildThreadDetached` wake nothing, so each one is a trigger here. See
+//! `docs/plans/2026-11-02-a-thread-parked-on-its-children-reads-as-waiting.md`.
+//!
 //! Coding-agent threads never emit `TodoListWritten` (CC has its own
 //! `TodoWrite`), so the helper's `SELECT` short-circuits to `None` for them
 //! and this consumer pays one indexed lookup per CC turn.
@@ -39,12 +45,13 @@ use tokio::sync::broadcast::error::RecvError;
 use super::event_bus::{BusEvent, EmittedEvent, EventBus, LagReplay, ReplayScope};
 use super::thread_events::ThreadEvent;
 use super::thread_lifecycle::ThreadStatus;
-use super::tools::todo::settle_open_todos;
+use super::tools::todo::{settle_open_todos, CHILD_UNPARK_EVENT_TYPES};
 use super::LucidosEngine;
 use uuid::Uuid;
 
-/// Process a single broadcast event: if it's a response-termination or a
-/// canceled subscription on a thread, run the open-todo settle. Exposed so
+/// Process a single broadcast event: if it's a response-termination, a
+/// canceled subscription or a child card that wakes nothing, run the open-todo
+/// settle. Exposed so
 /// tests can drive the dispatch without spawning the background task.
 ///
 /// `holds_background_work` is read by the caller rather than here, which is
@@ -84,49 +91,60 @@ pub async fn handle_event(
         // anchor, so the re-entered turn's terminator settles the list, and handling
         // them here would race it and could write terminal `Abandoned`
         // over a list the agent is picking back up.
+        //
+        // `holds_background_work: false` is not a shortcut, it is the correct
+        // answer on this path. That override covers the arm-after-terminator
+        // race: the chat turn tail arms its background-task wait AFTER the loop
+        // emitted the terminator, so the settle's anti-join cannot see it. A
+        // cancel is later than the arming it resolves, so the anti-join is
+        // authoritative here. And a background task nothing is subscribed to
+        // never re-opens the thread. Reading the registry would strand the list
+        // when the watched task was still running at **Stop waiting**.
         ThreadEvent::EventWaitCanceled { .. } => {
-            settle_after_cancel(bus, pool, *thread_id, seq).await;
+            settle_unless_a_turn_owns_the_list(bus, pool, *thread_id, seq, false).await;
+        }
+        // The child-side mirror of the cancel: a card that resolves a child
+        // and starts no turn. `ChildThreadCompleted` is deliberately absent. It
+        // wakes the parent, and the woken turn's terminator settles the list.
+        //
+        // These keep the registry read. The child path resolved no
+        // background-task wait. So a running task still means a wait the tail
+        // is about to arm, possibly after this card landed.
+        ThreadEvent::ChildReportFiled { .. }
+        | ThreadEvent::ChildThreadStopped { .. }
+        | ThreadEvent::ChildThreadDetached { .. } => {
+            settle_unless_a_turn_owns_the_list(bus, pool, *thread_id, seq, holds_background_work)
+                .await;
         }
         _ => {}
     }
 }
 
-/// Settle the list after a subscription was canceled, unless a turn still owns
-/// it.
-///
-/// `holds_background_work: false` is not a shortcut, it is the correct answer
-/// on this path. That override exists purely to cover the arm-after-terminator
-/// race: the chat turn tail arms its background-task wait AFTER the loop
-/// emitted the terminator, so `thread_held_event_wait`'s anti-join cannot see
-/// it. A cancel is by definition later than the arming it resolves, so the
-/// anti-join is authoritative here. And a background task nothing is
-/// subscribed to will never re-open the thread, so a thread holding one is not
-/// parked. Reading the registry here would strand the list in exactly the
-/// reported case, where the watched task was still running when the user
-/// pressed **Stop waiting**.
-async fn settle_after_cancel(
+/// Settle the list at an unpark no turn follows, unless a turn still owns it.
+async fn settle_unless_a_turn_owns_the_list(
     bus: &EventBus,
     pool: &sqlx::PgPool,
     thread_id: Uuid,
-    cancel_seq: i64,
+    unpark_seq: i64,
+    holds_background_work: bool,
 ) {
     match turn_in_flight(pool, thread_id).await {
         Ok(true) => return,
         Ok(false) => {}
         Err(e) => {
-            // Same rule the settle already applies to its own two queries: a
-            // probe that could not run settles nothing, because `Abandoned` is
+            // Same rule the settle already applies to its own queries: a probe
+            // that could not run settles nothing, because `Abandoned` is
             // terminal and a wrong guess here cannot be walked back.
             crate::log!(
                 @Todo,
-                "Could not resolve the turn state for thread {} after a canceled subscription: {} (leaving the list untouched)",
+                "Could not resolve the turn state for thread {} at an unpark: {} (leaving the list untouched)",
                 thread_id,
                 e
             );
             return;
         }
     }
-    settle_open_todos(bus, pool, thread_id, cancel_seq, false).await;
+    settle_open_todos(bus, pool, thread_id, unpark_seq, holds_background_work).await;
 }
 
 /// Does a turn still own this thread's todo list?
@@ -156,13 +174,15 @@ async fn turn_in_flight(pool: &sqlx::PgPool, thread_id: Uuid) -> Result<bool, sq
     })
 }
 
-/// The event types the settle runs on: every chat terminator, and a canceled
-/// subscription. `handle_event` decides which of them settle.
+/// The event types the settle runs on: every chat terminator, a canceled
+/// subscription, and a child card no turn follows. `handle_event` decides
+/// which of them settle.
 fn settle_event_types() -> Vec<&'static str> {
     ThreadEvent::TERMINATOR_EVENT_TYPES
         .iter()
         .copied()
         .chain(["EventWaitCanceled"])
+        .chain(CHILD_UNPARK_EVENT_TYPES)
         .collect()
 }
 
@@ -228,7 +248,9 @@ where
 mod tests {
     use super::*;
     use crate::core::event_subscription::EventSubscription;
-    use crate::engine::thread_events::{EventMeta, EventWaitCancelCause, TodoStatus};
+    use crate::engine::thread_events::{
+        ChildCompletionStatus, EventMeta, EventWaitCancelCause, TodoStatus, WakeMode,
+    };
     use crate::engine::tools::todo::todo_tool_impl;
     use crate::test_support::{setup_test_db, teardown_test_db};
     use serde_json::json;
@@ -260,6 +282,16 @@ mod tests {
         dispatch_next_terminator_with_background(bus, pool, rx, thread_id, false).await
     }
 
+    fn is_terminator(event: &ThreadEvent) -> bool {
+        matches!(
+            event,
+            ThreadEvent::ResponseGenerated { .. }
+                | ThreadEvent::ResponseCanceled { .. }
+                | ThreadEvent::ResponseAborted { .. }
+                | ThreadEvent::ResponseFailed { .. }
+        )
+    }
+
     async fn dispatch_next_terminator_with_background(
         bus: &EventBus,
         pool: &sqlx::PgPool,
@@ -267,28 +299,28 @@ mod tests {
         thread_id: Uuid,
         holds_background_work: bool,
     ) {
+        let ev = next_matching(rx, thread_id, is_terminator).await;
+        handle_event(bus, pool, &ev, holds_background_work).await;
+    }
+
+    /// The thread's next persisted event that `pick` accepts. Everything before
+    /// it is skipped unhandled.
+    async fn next_matching(
+        rx: &mut Receiver<EmittedEvent>,
+        thread_id: Uuid,
+        pick: impl Fn(&ThreadEvent) -> bool,
+    ) -> EmittedEvent {
         loop {
             let ev = rx.recv().await.expect("broadcast channel should not close");
-            let dispatch = if let BusEvent::Thread {
+            if let BusEvent::Thread {
                 thread_id: tid,
                 event,
                 ..
             } = &ev.typed
             {
-                *tid == thread_id
-                    && matches!(
-                        event,
-                        ThreadEvent::ResponseGenerated { .. }
-                            | ThreadEvent::ResponseCanceled { .. }
-                            | ThreadEvent::ResponseAborted { .. }
-                            | ThreadEvent::ResponseFailed { .. }
-                    )
-            } else {
-                false
-            };
-            if dispatch {
-                handle_event(bus, pool, &ev, holds_background_work).await;
-                return;
+                if *tid == thread_id && pick(event) {
+                    return ev;
+                }
             }
         }
     }
@@ -412,28 +444,19 @@ mod tests {
     /// `holds_background_work: true` is deliberate on every call. It is the
     /// terminator path's input and must never reach the cancel path, so passing
     /// the value that WOULD strand the list is what pins that (see
-    /// `settle_after_cancel`: a background task nothing is subscribed to cannot
-    /// re-open the thread, so it does not park it).
+    /// the cancel arm of `handle_event`: a background task nothing is
+    /// subscribed to cannot re-open the thread, so it does not park it).
     async fn dispatch_next_cancel(
         bus: &EventBus,
         pool: &sqlx::PgPool,
         rx: &mut Receiver<EmittedEvent>,
         thread_id: Uuid,
     ) {
-        loop {
-            let ev = rx.recv().await.expect("broadcast channel should not close");
-            if let BusEvent::Thread {
-                thread_id: tid,
-                event: ThreadEvent::EventWaitCanceled { .. },
-                ..
-            } = &ev.typed
-            {
-                if *tid == thread_id {
-                    handle_event(bus, pool, &ev, true).await;
-                    return;
-                }
-            }
-        }
+        let ev = next_matching(rx, thread_id, |e| {
+            matches!(e, ThreadEvent::EventWaitCanceled { .. })
+        })
+        .await;
+        handle_event(bus, pool, &ev, true).await;
     }
 
     /// Feed every event for a short window through the handler and fail if any
@@ -904,18 +927,10 @@ mod tests {
         // Capture the cancel before the pool goes, so the handler runs against a
         // real event and a dead pool: the shape of a connection lost between the
         // broadcast and this async consumer's first query.
-        let cancel = loop {
-            let ev = rx.recv().await.expect("broadcast channel should not close");
-            if matches!(
-                &ev.typed,
-                BusEvent::Thread {
-                    event: ThreadEvent::EventWaitCanceled { .. },
-                    ..
-                }
-            ) {
-                break ev;
-            }
-        };
+        let cancel = next_matching(&mut rx, thread_id, |e| {
+            matches!(e, ThreadEvent::EventWaitCanceled { .. })
+        })
+        .await;
         pool.close().await;
 
         handle_event(&bus, &pool, &cancel, false).await;
@@ -969,5 +984,402 @@ mod tests {
             reason: String::new(),
         };
         assert!(settle_event_types().contains(&cancel.event_type()));
+    }
+
+    /// Spawn `child` as a direct child of `parent`, the way the spawn path
+    /// does: the child's first `MessageReceived` names the parent, and the
+    /// projection opens its row as running.
+    async fn spawn_child(bus: &EventBus, parent: Uuid, child: Uuid, wake_mode: Option<WakeMode>) {
+        bus.emit(BusEvent::Thread {
+            thread_id: child,
+            event: ThreadEvent::MessageReceived {
+                provider: None,
+                voice_session_id: None,
+                wake_mode,
+                text: "child task".to_string(),
+                user_image_hashes: vec![],
+                device_id: None,
+                image_description: None,
+                mode: crate::engine::thread_events::ActorMode::Human,
+                model: None,
+                reasoning_effort: None,
+                parent_thread_id: Some(parent),
+                spawning_event_id: None,
+                origin: None,
+            },
+            meta: EventMeta::NONE,
+        })
+        .await
+        .expect("emit the child's MessageReceived");
+    }
+
+    /// The child's turn ended. Its card on the parent is emitted separately,
+    /// so each test picks which card it is.
+    async fn finish_child(pool: &sqlx::PgPool, child: Uuid) {
+        seed_thread_status(pool, child, "idle").await;
+    }
+
+    fn child_completed(child_thread_id: Uuid) -> ThreadEvent {
+        ThreadEvent::ChildThreadCompleted {
+            child_thread_id,
+            child_thread_title: None,
+            status: ChildCompletionStatus::Success,
+            summary: "done".to_string(),
+            pending_change_ids: vec![],
+            sub_thread_pending_changes: vec![],
+            integrated_branch: None,
+        }
+    }
+
+    fn child_report_filed(child_thread_id: Uuid) -> ThreadEvent {
+        ThreadEvent::ChildReportFiled {
+            child_thread_id,
+            child_thread_title: None,
+            status: ChildCompletionStatus::Success,
+            summary: "done".to_string(),
+            pending_change_ids: vec![],
+            sub_thread_pending_changes: vec![],
+            integrated_branch: None,
+        }
+    }
+
+    fn child_stopped(child_thread_id: Uuid) -> ThreadEvent {
+        ThreadEvent::ChildThreadStopped {
+            child_thread_id,
+            child_thread_title: None,
+        }
+    }
+
+    fn child_detached(child_thread_id: Uuid) -> ThreadEvent {
+        ThreadEvent::ChildThreadDetached {
+            child_thread_id,
+            child_thread_title: None,
+        }
+    }
+
+    async fn emit_on(bus: &EventBus, thread_id: Uuid, event: ThreadEvent) {
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event,
+            meta: EventMeta::NONE,
+        })
+        .await
+        .expect("emit on the parent");
+    }
+
+    fn is_child_unpark(event: &ThreadEvent) -> bool {
+        matches!(
+            event,
+            ThreadEvent::ChildReportFiled { .. }
+                | ThreadEvent::ChildThreadStopped { .. }
+                | ThreadEvent::ChildThreadDetached { .. }
+        )
+    }
+
+    async fn dispatch_next_child_unpark(
+        bus: &EventBus,
+        pool: &sqlx::PgPool,
+        rx: &mut Receiver<EmittedEvent>,
+        parent: Uuid,
+    ) {
+        let ev = next_matching(rx, parent, is_child_unpark).await;
+        handle_event(bus, pool, &ev, false).await;
+    }
+
+    /// Settle `parent`'s in-progress list at a terminator and return its status.
+    async fn settle_at_terminator(
+        bus: &EventBus,
+        pool: &sqlx::PgPool,
+        rx: &mut Receiver<EmittedEvent>,
+        parent: Uuid,
+    ) -> TodoStatus {
+        emit_response_generated(bus, parent).await;
+        dispatch_next_terminator(bus, pool, rx, parent).await;
+        next_todo_items(rx, parent).await[0].status
+    }
+
+    /// The reported shape: an orchestrator spawned children, armed no wait on
+    /// purpose, and ended its turn. Returns with the list parked.
+    async fn park_on_children(
+        bus: &EventBus,
+        pool: &sqlx::PgPool,
+        rx: &mut Receiver<EmittedEvent>,
+        parent: Uuid,
+        children: &[Uuid],
+    ) {
+        seed_in_progress_list(bus, pool, parent).await;
+        for child in children {
+            spawn_child(bus, parent, *child, None).await;
+        }
+        drain(rx);
+        let status = settle_at_terminator(bus, pool, rx, parent).await;
+        assert_eq!(
+            status,
+            TodoStatus::Waiting,
+            "precondition: a live child parks the list"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_child_at_the_terminator_parks_the_list() {
+        let (bus, mut rx, pool, db) = setup().await;
+        park_on_children(&bus, &pool, &mut rx, Uuid::new_v4(), &[Uuid::new_v4()]).await;
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// A `no-wake` child still files its report for the parent's next turn, so
+    /// the parent is still owed something.
+    #[tokio::test]
+    async fn a_live_no_wake_child_parks_the_list_too() {
+        let (bus, mut rx, pool, db) = setup().await;
+        let parent = Uuid::new_v4();
+
+        seed_in_progress_list(&bus, &pool, parent).await;
+        spawn_child(&bus, parent, Uuid::new_v4(), Some(WakeMode::NoWake)).await;
+        drain(&mut rx);
+
+        let status = settle_at_terminator(&bus, &pool, &mut rx, parent).await;
+        assert_eq!(status, TodoStatus::Waiting);
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// The Thread Queue holds a spawn with no `thread_summaries` row until it
+    /// starts, and that spawn will report to the parent all the same.
+    #[tokio::test]
+    async fn a_queued_spawn_with_no_row_parks_the_list() {
+        let (bus, mut rx, pool, db) = setup().await;
+        let parent = Uuid::new_v4();
+
+        seed_in_progress_list(&bus, &pool, parent).await;
+        sqlx::query(
+            "INSERT INTO thread_queue (id, kind, thread_id, request, status) \
+             VALUES ($1, 'sub-thread', $2, jsonb_build_object('parent_thread_id', $3::text), \
+                     'queued')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .bind(parent.to_string())
+        .execute(&pool)
+        .await
+        .expect("seed a queued spawn");
+        drain(&mut rx);
+
+        let status = settle_at_terminator(&bus, &pool, &mut rx, parent).await;
+        assert_eq!(status, TodoStatus::Waiting);
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// A detached child's queue entry still names the old parent in its
+    /// request, but the child reports to nobody.
+    #[tokio::test]
+    async fn a_queued_child_moved_to_top_level_does_not_park_the_list() {
+        let (bus, mut rx, pool, db) = setup().await;
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+
+        seed_in_progress_list(&bus, &pool, parent).await;
+        spawn_child(&bus, parent, child, None).await;
+        finish_child(&pool, child).await;
+        sqlx::query(
+            "INSERT INTO thread_queue (id, kind, thread_id, request, status) \
+             VALUES ($1, 'sub-thread', $2, jsonb_build_object('parent_thread_id', $3::text), \
+                     'queued')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(child)
+        .bind(parent.to_string())
+        .execute(&pool)
+        .await
+        .expect("seed the child's queue entry");
+        emit_on(&bus, parent, child_detached(child)).await;
+        drain(&mut rx);
+
+        let status = settle_at_terminator(&bus, &pool, &mut rx, parent).await;
+        assert_eq!(status, TodoStatus::Abandoned);
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// A child that reported before the terminator owes the parent nothing, so
+    /// the parent walked away.
+    #[tokio::test]
+    async fn a_child_that_finished_before_the_terminator_does_not_park_the_list() {
+        let (bus, mut rx, pool, db) = setup().await;
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+
+        seed_in_progress_list(&bus, &pool, parent).await;
+        spawn_child(&bus, parent, child, None).await;
+        finish_child(&pool, child).await;
+        emit_on(&bus, parent, child_completed(child)).await;
+        drain(&mut rx);
+
+        let status = settle_at_terminator(&bus, &pool, &mut rx, parent).await;
+        assert_eq!(status, TodoStatus::Abandoned);
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// The consumer is async. A child live at the terminator that reports
+    /// before the consumer runs was still live when the response ended.
+    #[tokio::test]
+    async fn a_child_resolving_after_the_terminator_still_parks_the_list() {
+        let (bus, mut rx, pool, db) = setup().await;
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+
+        seed_in_progress_list(&bus, &pool, parent).await;
+        spawn_child(&bus, parent, child, None).await;
+        drain(&mut rx);
+
+        emit_response_generated(&bus, parent).await;
+        let terminator = next_matching(&mut rx, parent, is_terminator).await;
+        finish_child(&pool, child).await;
+        emit_on(&bus, parent, child_report_filed(child)).await;
+
+        handle_event(&bus, &pool, &terminator, false).await;
+        let settled = next_todo_items(&mut rx, parent).await;
+        assert_eq!(settled[0].status, TodoStatus::Waiting);
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// The last live child resolving with no turn behind it settles the
+    /// parked list, since nothing is owed to the parent any more.
+    async fn assert_the_last_child_unpark_abandons(
+        resolve: impl FnOnce(Uuid) -> ThreadEvent,
+        child_idles: bool,
+    ) {
+        let (bus, mut rx, pool, db) = setup().await;
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+
+        park_on_children(&bus, &pool, &mut rx, parent, &[child]).await;
+        if child_idles {
+            finish_child(&pool, child).await;
+        }
+        emit_on(&bus, parent, resolve(child)).await;
+        dispatch_next_child_unpark(&bus, &pool, &mut rx, parent).await;
+
+        let settled = next_todo_items(&mut rx, parent).await;
+        assert_eq!(settled[0].status, TodoStatus::Abandoned);
+        assert_nothing_settles(&bus, &pool, &mut rx, parent).await;
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn the_last_child_filing_its_report_abandons_the_list() {
+        assert_the_last_child_unpark_abandons(child_report_filed, true).await;
+    }
+
+    #[tokio::test]
+    async fn the_last_child_stopping_abandons_the_list() {
+        assert_the_last_child_unpark_abandons(child_stopped, true).await;
+    }
+
+    /// A detached child keeps running, but its result never reaches the
+    /// former parent.
+    #[tokio::test]
+    async fn the_last_child_detached_abandons_the_list() {
+        assert_the_last_child_unpark_abandons(child_detached, false).await;
+    }
+
+    #[tokio::test]
+    async fn one_of_two_children_filing_changes_nothing_and_the_last_settles_once() {
+        let (bus, mut rx, pool, db) = setup().await;
+        let parent = Uuid::new_v4();
+        let first = Uuid::new_v4();
+        let last = Uuid::new_v4();
+
+        park_on_children(&bus, &pool, &mut rx, parent, &[first, last]).await;
+
+        finish_child(&pool, first).await;
+        emit_on(&bus, parent, child_report_filed(first)).await;
+        dispatch_next_child_unpark(&bus, &pool, &mut rx, parent).await;
+        assert_nothing_settles(&bus, &pool, &mut rx, parent).await;
+
+        finish_child(&pool, last).await;
+        emit_on(&bus, parent, child_report_filed(last)).await;
+        dispatch_next_child_unpark(&bus, &pool, &mut rx, parent).await;
+        let settled = next_todo_items(&mut rx, parent).await;
+        assert_eq!(settled[0].status, TodoStatus::Abandoned);
+        assert_nothing_settles(&bus, &pool, &mut rx, parent).await;
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// A completion wakes the parent, and the woken turn's terminator settles
+    /// the list. Settling here would race that turn.
+    #[tokio::test]
+    async fn a_completed_child_is_left_to_the_turn_it_wakes() {
+        let (bus, mut rx, pool, db) = setup().await;
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+
+        park_on_children(&bus, &pool, &mut rx, parent, &[child]).await;
+        finish_child(&pool, child).await;
+        emit_on(&bus, parent, child_completed(child)).await;
+        assert_nothing_settles(&bus, &pool, &mut rx, parent).await;
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    async fn assert_a_turn_owning_the_list_blocks_a_child_unpark(status: &str) {
+        let (bus, mut rx, pool, db) = setup().await;
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+
+        park_on_children(&bus, &pool, &mut rx, parent, &[child]).await;
+        seed_thread_status(&pool, parent, status).await;
+        finish_child(&pool, child).await;
+        emit_on(&bus, parent, child_report_filed(child)).await;
+        dispatch_next_child_unpark(&bus, &pool, &mut rx, parent).await;
+        assert_nothing_settles(&bus, &pool, &mut rx, parent).await;
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_child_unpark_settles_nothing_while_the_parent_is_running() {
+        assert_a_turn_owning_the_list_blocks_a_child_unpark("running").await;
+    }
+
+    #[tokio::test]
+    async fn a_child_unpark_settles_nothing_while_the_parent_awaits_an_answer() {
+        assert_a_turn_owning_the_list_blocks_a_child_unpark("waiting_for_user_answer").await;
+    }
+
+    #[tokio::test]
+    async fn a_child_unpark_settles_nothing_while_the_parent_is_paused() {
+        assert_a_turn_owning_the_list_blocks_a_child_unpark("paused").await;
+    }
+
+    /// The replay list gates live frames too, so every child unpark must be in
+    /// it, and the completion must not.
+    #[test]
+    fn the_settle_list_names_the_child_unparks_and_not_the_completion() {
+        let child = Uuid::new_v4();
+        let types = settle_event_types();
+        for unpark in [
+            child_report_filed(child),
+            child_stopped(child),
+            child_detached(child),
+        ] {
+            assert!(types.contains(&unpark.event_type()), "{unpark:?}");
+        }
+        assert!(!types.contains(&child_completed(child).event_type()));
     }
 }

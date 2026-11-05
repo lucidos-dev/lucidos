@@ -26,7 +26,7 @@ fn a_model_provider_host_is_recognised_and_a_plain_api_is_not() {
     ] {
         assert!(!is_model_host(url), "{url}");
     }
-    assert!(Upstream::Builtin.is_model_provider());
+    assert!(Upstream::Builtin { name: "openai" }.is_model_provider());
 }
 
 /// The row keeps both: the model the request asked for, and the one the
@@ -87,6 +87,7 @@ fn a_reply_header_names_the_request_id() {
         model: "gpt-6.1".to_string(),
         served_model: None,
         request_id: None,
+        provider: None,
     };
     let mut headers = HeaderMap::new();
     assert_eq!(call().answered_by(&headers).request_id, None);
@@ -188,7 +189,7 @@ fn only_a_model_provider_loses_the_callers_accept_encoding() {
         h
     };
     let mut model = headers();
-    prepare_request(&Upstream::Builtin, &mut model);
+    prepare_request(&Upstream::Builtin { name: "openai" }, &mut model);
     assert!(model.get(ACCEPT_ENCODING).is_none());
     let mut plain = headers();
     prepare_request(
@@ -236,4 +237,18 @@ fn a_trigger_fires_token_names_the_cost_trigger() {
     let owner = cost_owner(&origin_headers(&token));
     assert_eq!(owner.thread, None);
     assert_eq!(owner.trigger.as_deref(), Some("trg-hourly"));
+}
+
+#[test]
+fn gateway_usage_keeps_its_provider_for_managed_telemetry() {
+    let request = body(json!({"model":"claude-haiku-5-5"}));
+    for (reply, streamed) in [
+        (body(json!({"model":"claude-haiku-5-5", "usage":{"input_tokens":7,"output_tokens":9}})), false),
+        (b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n".to_vec(), true),
+    ] {
+        let call = reported(&reply, streamed, &request, "/messages").unwrap()
+            .with_upstream(&Upstream::Builtin { name: "claude-gateway" });
+        assert_eq!(call.provider.as_deref(), Some("claude-gateway"));
+        assert_eq!((call.usage.input_tokens, call.usage.output_tokens), (7,9));
+    }
 }

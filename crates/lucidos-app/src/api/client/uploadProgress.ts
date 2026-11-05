@@ -1,3 +1,5 @@
+import { requestGenerationGuard } from './_core';
+import { restoreAdmissionReady, waitForRestoreAdmission } from '../../utils/restoreAdmission';
 import { deviceIdHeader } from '../../utils/deviceIdHeader';
 import { registrationToAwait } from '../../utils/deviceRegistration';
 
@@ -39,11 +41,15 @@ export async function postWithUploadProgress(
   body: FormData,
   observer: UploadObserver = {},
 ): Promise<Response> {
+  const checkGeneration = requestGenerationGuard(url);
+  if (!restoreAdmissionReady()) await waitForRestoreAdmission();
   const registration = registrationToAwait(url, 'POST');
   if (registration) await registration;
+  if (!restoreAdmissionReady()) await waitForRestoreAdmission();
+  checkGeneration();
   observer.signal?.throwIfAborted();
 
-  return new Promise<Response>((resolve, reject) => {
+  const response = await new Promise<Response>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     let deadline: ReturnType<typeof setTimeout> | undefined;
     let settled = false;
@@ -72,7 +78,7 @@ export async function postWithUploadProgress(
     }
 
     xhr.open('POST', url);
-    for (const [name, value] of Object.entries(deviceIdHeader())) xhr.setRequestHeader(name, value);
+    for (const [name, value] of Object.entries({ ...deviceIdHeader(), ...checkGeneration.headers })) xhr.setRequestHeader(name, value);
     xhr.upload.onprogress = (e) => {
       armStall();
       if (e.lengthComputable) observer.onProgress?.({ sentBytes: e.loaded, totalBytes: e.total });
@@ -92,6 +98,9 @@ export async function postWithUploadProgress(
     armStall();
     xhr.send(body);
   });
+  if (!restoreAdmissionReady()) await waitForRestoreAdmission();
+  checkGeneration();
+  return response;
 }
 
 /** Statuses the `Response` constructor refuses a body for. */

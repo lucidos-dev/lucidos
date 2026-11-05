@@ -28,7 +28,7 @@ describe('a widget in the transcript (ADR 0402)', () => {
     ]);
   });
 
-  it('stays drawn after a pin and an unpin, which add no turn and no row', () => {
+  it('stays drawn after a legacy pin and unpin, which add no turn and no row (I9)', () => {
     const before = rows([MESSAGE, SHOWN]);
     const after = rows([MESSAGE, SHOWN, PINNED, UNPINNED]);
     expect(after.exchanges).toHaveLength(before.exchanges.length);

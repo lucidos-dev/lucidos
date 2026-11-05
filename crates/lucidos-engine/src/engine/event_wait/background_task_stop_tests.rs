@@ -17,17 +17,18 @@ use crate::test_support::{seed_thread_event, setup_test_db, teardown_test_db};
 use serde_json::json;
 use std::path::Path;
 
-/// Everything one test needs, torn down with the database.
-struct Stores {
-    pool: sqlx::PgPool,
+/// Everything one test needs, torn down with the database. Shared with the
+/// arming tests.
+pub(super) struct Stores {
+    pub(super) pool: sqlx::PgPool,
     db_name: String,
-    bus: EventBus,
-    live: LiveWaits,
-    registry: BackgroundBashRegistry,
+    pub(super) bus: EventBus,
+    pub(super) live: LiveWaits,
+    pub(super) registry: BackgroundBashRegistry,
 }
 
 impl Stores {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         let (pool, db_name) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
         Stores {
@@ -39,13 +40,13 @@ impl Stores {
         }
     }
 
-    async fn teardown(self) {
+    pub(super) async fn teardown(self) {
         self.pool.close().await;
         teardown_test_db(&self.db_name).await;
     }
 
     /// A thread the projection knows about, so a wait's events land on a row.
-    async fn thread(&self) -> Uuid {
+    pub(super) async fn thread(&self) -> Uuid {
         let thread_id = Uuid::new_v4();
         seed_thread_event(
             &self.bus,
@@ -117,7 +118,11 @@ impl Stores {
 
     /// The `BackgroundBashCompleted` this task produced, as the dispatcher
     /// would see it. Waits for the reap first.
-    async fn completion(&self, task_id: &str, owner: Uuid) -> (String, serde_json::Value) {
+    pub(super) async fn completion(
+        &self,
+        task_id: &str,
+        owner: Uuid,
+    ) -> (String, serde_json::Value) {
         assert!(
             self.registry
                 .wait_for_finish(task_id, std::time::Duration::from_secs(15))
@@ -141,7 +146,11 @@ impl Stores {
     }
 
     /// Who the completion would wake, by wait id.
-    async fn woken_by(&self, event_type: &str, payload: &serde_json::Value) -> Vec<Uuid> {
+    pub(super) async fn woken_by(
+        &self,
+        event_type: &str,
+        payload: &serde_json::Value,
+    ) -> Vec<Uuid> {
         waits_matching(&self.live.snapshot().await, event_type, payload)
             .into_iter()
             .map(|(wait_id, _)| wait_id)

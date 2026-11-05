@@ -2168,3 +2168,17 @@ fn a_quiet_pick_shows_the_reply_of_each_picked_option_in_option_order() {
     assert_eq!(quiet_reply(&multi(&["opt-0", "opt-3"]), &options), None);
     assert_eq!(quiet_reply(&selected("opt-3"), &options), None);
 }
+
+/// The restore settle closes a card before it marks the thread settled. A
+/// lookup that could not run must stop it, never read as "no card".
+#[tokio::test]
+async fn a_failed_pending_question_lookup_is_an_error_not_no_card() {
+    let (pool, db_name) = setup_test_db().await;
+    pool.close().await;
+    assert!(
+        try_lookup_pending_question_tool_use_id(&pool, Uuid::new_v4())
+            .await
+            .is_err()
+    );
+    teardown_test_db(&db_name).await;
+}

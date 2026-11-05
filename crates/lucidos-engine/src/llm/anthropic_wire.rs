@@ -346,6 +346,45 @@ fn thinking_config(base_model: &str, reasoning_effort: Option<&str>) -> Thinking
     }
 }
 
+/// Safe request template for SDK callers, derived from the same thinking
+/// authority as the provider transport. Contains no credentials or origins.
+pub(crate) fn sdk_request_defaults(
+    model: &str,
+    effort: Option<&str>,
+    vertex: bool,
+) -> serde_json::Value {
+    let (base, is_1m) = parse_context_suffix(model);
+    let (thinking, output_config, max_tokens) = thinking_config(base, effort);
+    let mut body = serde_json::json!({ "max_tokens": max_tokens });
+    let mut headers = serde_json::json!({});
+    let mut betas = Vec::new();
+    if ThinkingDisplay::of(thinking.as_ref()) == ThinkingDisplay::ProgressUpdates {
+        betas.push(ANTHROPIC_BETA_THINKING_DISPLAY_UPDATES);
+    }
+    if let Some(thinking) = thinking {
+        body["thinking"] = serde_json::to_value(thinking).expect("thinking serializes");
+    }
+    if let Some(config) = output_config {
+        body["output_config"] = serde_json::to_value(config).expect("output config serializes");
+    }
+    if vertex {
+        body["anthropic_version"] = serde_json::json!("vertex-2023-10-16");
+        if is_1m {
+            body["anthropic_beta"] = serde_json::json!([ANTHROPIC_BETA_1M_CONTEXT]);
+        }
+    } else {
+        body["model"] = serde_json::json!(base);
+        headers["anthropic-version"] = serde_json::json!("2023-06-01");
+        if is_1m {
+            betas.insert(0, ANTHROPIC_BETA_1M_CONTEXT);
+        }
+    }
+    if !betas.is_empty() {
+        headers["anthropic-beta"] = serde_json::json!(betas.join(","));
+    }
+    serde_json::json!({ "body": body, "headers": headers })
+}
+
 /// Effort `none` asks for no thinking, and each [`ThinkingMode`] needs a
 /// different request to honour it. Omitting `thinking` is not "off" on a model
 /// that thinks by default: it runs adaptive thinking anyway.

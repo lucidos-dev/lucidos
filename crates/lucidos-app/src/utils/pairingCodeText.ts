@@ -1,10 +1,10 @@
 /**
- * Read a pairing code out of text the user handed us.
+ * Read a pairing secret or code out of text the user handed us.
  *
  * Two sources, one rule. The Paste button on the pairing form, and whatever a
  * QR turns out to hold when the camera reads one. Either may carry a pairing
- * URL or the bare digits: the QR encodes the URL, and a person copying a code
- * copies the number.
+ * URL, the bare secret, or the bare digits: the QR encodes the URL, and a
+ * person copying a code copies the number.
  *
  * The URL branch is deliberately not `digitsOnly`. Stripping non-digits out of
  * `https://mac.ts.net/~/?pair=01234567` would leave the port and every digit in
@@ -13,14 +13,14 @@
  * lets the scanner keep looking instead of accepting a phone number.
  */
 
-import { isPairingCode, pairingCodeToAdopt } from './pairingCodeSeed';
+import { isPairingCode, isPairingSecret, pairingCodeToAdopt } from './pairingCodeSeed';
 
 /** Characters people put between digits when they write a code down. Removed
  *  before the grammar is applied, so `4711 8899` pastes as one code. */
 const FORMATTING_RE = /[\s-]/g;
 
 /**
- * The pairing code `text` carries, or `null`.
+ * The pairing secret or code `text` carries, or `null`.
  *
  * Pure, so every rejection is testable without a DOM or a camera.
  */
@@ -34,6 +34,7 @@ export function pairingCodeFromText(text: string): string | null {
       return null;
     }
   }
+  if (isPairingSecret(raw)) return raw;
   const digits = raw.replace(FORMATTING_RE, '');
   return isPairingCode(digits) ? digits : null;
 }

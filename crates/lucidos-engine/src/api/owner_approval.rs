@@ -71,11 +71,44 @@ pub(super) async fn spend_owner_approval(
     verb: ThreadReachVerb,
     target: Option<Uuid>,
 ) -> bool {
-    // No card can propose this verb, so none can be live for it.
-    if !verb.proposable() {
+    spend_bound_approval(
+        bus,
+        caller_thread_id,
+        &OwnerApproval {
+            verb,
+            target_thread_id: target,
+            target_workspace_id: None,
+            snapshot_handle: None,
+        },
+    )
+    .await
+}
+
+/// Match all dimensions of an approval before the single-use event is emitted.
+/// Snapshot authority never comes from the thread-target approval path.
+async fn spend_bound_approval(
+    bus: &EventBus,
+    caller_thread_id: Uuid,
+    approval: &OwnerApproval,
+) -> bool {
+    let snapshot = approval.verb == ThreadReachVerb::RestoreSnapshot;
+    let valid_target = if snapshot {
+        approval.target_thread_id.is_none()
+            && approval
+                .target_workspace_id
+                .as_ref()
+                .is_some_and(|w| !w.is_empty())
+            && approval
+                .snapshot_handle
+                .as_ref()
+                .is_some_and(|h| crate::core::snapshot::handle::Handle::try_from(h.clone()).is_ok())
+    } else {
+        approval.target_workspace_id.is_none() && approval.snapshot_handle.is_none()
+    };
+    if !approval.verb.proposable() || !valid_target {
         return false;
     }
-    let Some(tool_use_id) = live_owner_approval(bus.pool(), caller_thread_id, verb, target).await
+    let Some(tool_use_id) = live_owner_approval(bus.pool(), caller_thread_id, approval).await
     else {
         return false;
     };
@@ -84,8 +117,10 @@ pub(super) async fn spend_owner_approval(
             thread_id: caller_thread_id,
             event: ThreadEvent::OwnerApprovalSpent {
                 tool_use_id: tool_use_id.clone(),
-                verb,
-                target_thread_id: target,
+                verb: approval.verb,
+                target_thread_id: approval.target_thread_id,
+                target_workspace_id: approval.target_workspace_id.clone(),
+                snapshot_handle: approval.snapshot_handle.clone(),
             },
             meta: EventMeta::NONE,
         })
@@ -107,20 +142,45 @@ pub(super) async fn spend_owner_approval(
     }
 }
 
+/// The source engine spends its own thread's card. The target engine cannot
+/// consult its restored log for authority belonging to another workspace.
+pub(super) async fn spend_restore_approval(
+    bus: &EventBus,
+    caller: Uuid,
+    source: &str,
+    target: &str,
+    handle: &crate::core::snapshot::handle::Handle,
+) -> bool {
+    if source == target || !lucidos_gateway_constants::is_valid_workspace_id(target) {
+        return false;
+    }
+    spend_bound_approval(
+        bus,
+        caller,
+        &OwnerApproval {
+            verb: ThreadReachVerb::RestoreSnapshot,
+            target_thread_id: None,
+            target_workspace_id: Some(target.to_owned()),
+            snapshot_handle: Some(handle.as_str().to_owned()),
+        },
+    )
+    .await
+}
+
 /// The newest live approval on `thread_id` for this verb and target, by card
 /// id. Live means Allow once on an engine-worded card for this exact act,
 /// picked by a device, unspent, and raised in the current turn.
 async fn live_owner_approval(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
-    verb: ThreadReachVerb,
-    target: Option<Uuid>,
+    approval: &OwnerApproval,
 ) -> Option<String> {
     // The card must be newer than the current turn start, so its answer is
     // too. The inner `FROM events` is unaliased, so the shared fragment's bare
     // columns bind to it.
     let sql = format!(
-        "SELECT q.payload->>'tool_use_id' \
+        concat!(
+            "SELECT q.payload->>'tool_use_id' \
          FROM events q \
          JOIN events a ON a.aggregate_id = q.aggregate_id \
               AND a.event_type = 'UserQuestionAnswered' \
@@ -134,7 +194,14 @@ async fn live_owner_approval(
                    AND q.payload->'owner_approval'->>'verb' = $2 \
                    AND q.payload->'owner_approval'->>'target_thread_id' \
                        IS NOT DISTINCT FROM $3::text \
+                   AND q.payload->'owner_approval'->>'target_workspace_id' \
+                       IS NOT DISTINCT FROM $5::text \
+                   AND q.payload->'owner_approval'->>'snapshot_handle' \
+                       IS NOT DISTINCT FROM $6::text \
                    AND o->>'label' = $4) \
+           AND q.sequence > ",
+            crate::core::snapshot::boundary::restore_floor_sql!(),
+            " \
            AND q.sequence > COALESCE(( \
                  SELECT MAX(sequence) FROM events WHERE aggregate_id = $1 AND {opens} \
                ), 0) \
@@ -142,14 +209,17 @@ async fn live_owner_approval(
                  SELECT 1 FROM events s WHERE s.aggregate_id = $1 \
                    AND s.event_type = 'OwnerApprovalSpent' \
                    AND s.payload->>'tool_use_id' = q.payload->>'tool_use_id') \
-         ORDER BY a.sequence DESC LIMIT 1",
+         ORDER BY a.sequence DESC LIMIT 1"
+        ),
         opens = crate::api::standing_instruction::opens_current_turn_sql(),
     );
     sqlx::query_scalar::<_, String>(&sql)
         .bind(thread_id.to_string())
-        .bind(verb_wire(verb))
-        .bind(target.map(|t| t.to_string()))
+        .bind(verb_wire(approval.verb))
+        .bind(approval.target_thread_id.map(|t| t.to_string()))
         .bind(ALLOW_ONCE_LABEL)
+        .bind(&approval.target_workspace_id)
+        .bind(&approval.snapshot_handle)
         .fetch_optional(pool)
         .await
         .unwrap_or_else(|e| {
@@ -254,12 +324,15 @@ pub(in crate::api) async fn approval_ask(
                 .to_string(),
         );
     }
-    let row: Option<(serde_json::Value, String)> = sqlx::query_as(
+    let row: Option<(serde_json::Value, String)> = sqlx::query_as(concat!(
         "SELECT payload->'approval', payload->>'question' FROM events \
          WHERE aggregate_id = $1 AND event_type = 'OwnerApprovalRequested' \
            AND payload->>'request_id' = $2 \
-         ORDER BY sequence DESC LIMIT 1",
-    )
+         AND sequence > ",
+        crate::core::snapshot::boundary::restore_floor_sql!(),
+        " \
+         ORDER BY sequence DESC LIMIT 1"
+    ))
     .bind(thread_id.to_string())
     .bind(request_id)
     .fetch_optional(pool)
@@ -285,6 +358,10 @@ pub(in crate::api) struct RequestOwnerApprovalBody {
     verb: ThreadReachVerb,
     #[serde(default)]
     target_thread_id: Option<Uuid>,
+    #[serde(default)]
+    target_workspace_id: Option<String>,
+    #[serde(default)]
+    snapshot_handle: Option<String>,
     reason: String,
 }
 
@@ -292,17 +369,60 @@ pub(in crate::api) struct RequestOwnerApprovalBody {
 /// calling thread, and return the id the agent asks `AskUserQuestion` with.
 ///
 /// Only a coding agent inside its own thread may call it, and the request
-/// lands on the thread its token names. Body: `{verb, target_thread_id,
-/// reason}`.
+/// lands on the thread its token names. Snapshot requests name a workspace and
+/// handle instead of a target thread, and never inherit subtree authority.
 pub(in crate::api) async fn request_owner_approval(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<RequestOwnerApprovalBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let caller = calling_agent_thread(&headers)?;
+    let (approval, question) = if body.verb == ThreadReachVerb::RestoreSnapshot {
+        let source = super::snapshots::restore_workspace_identity()?;
+        checked_snapshot_request(&body, &source)?
+    } else {
+        checked_thread_request(&state.pool, caller, &body).await?
+    };
+
+    let request_id = record_request(&state.engine.event_bus, caller, approval, question).await?;
+    Ok(Json(serde_json::json!({ "request_id": request_id })))
+}
+
+async fn record_request(
+    bus: &EventBus,
+    caller: Uuid,
+    approval: OwnerApproval,
+    question: String,
+) -> Result<String, ApiError> {
+    let request_id = format!("{REQUEST_ID_PREFIX}{}", Uuid::new_v4());
+    bus.emit(BusEvent::Thread {
+        thread_id: caller,
+        event: ThreadEvent::OwnerApprovalRequested {
+            request_id: request_id.clone(),
+            approval,
+            question,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .map_err(|_| ApiError::internal("owner_approval_request_failed"))?;
+    Ok(request_id)
+}
+
+async fn checked_thread_request(
+    pool: &sqlx::PgPool,
+    caller: Uuid,
+    body: &RequestOwnerApprovalBody,
+) -> Result<(OwnerApproval, String), ApiError> {
+    if body.target_workspace_id.is_some() || body.snapshot_handle.is_some() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "snapshot_target_requires_restore_verb",
+        ));
+    }
     let (target, reason) = checked_request(body.verb, body.target_thread_id, &body.reason)?;
-    let target_title = thread_title(&state.pool, target).await?;
-    if authority_held(&state.pool, Some(caller), None, Some(target), body.verb)
+    let target_title = thread_title(pool, target).await?;
+    if authority_held(pool, Some(caller), None, Some(target), body.verb)
         .await
         .map_err(ApiError::from)?
         .is_some()
@@ -317,31 +437,59 @@ pub(in crate::api) async fn request_owner_approval(
         ));
     }
 
-    let request_id = format!("{REQUEST_ID_PREFIX}{}", Uuid::new_v4());
     let question = owner_approval_question(body.verb, &target_title, reason);
-    state
-        .engine
-        .event_bus
-        .emit(BusEvent::Thread {
-            thread_id: caller,
-            event: ThreadEvent::OwnerApprovalRequested {
-                request_id: request_id.clone(),
-                approval: OwnerApproval {
-                    verb: body.verb,
-                    target_thread_id: Some(target),
-                },
-                question,
-            },
-            meta: EventMeta::NONE,
-        })
-        .await
-        .map_err(|e| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Could not record the request: {e}"),
-            )
-        })?;
-    Ok(Json(serde_json::json!({ "request_id": request_id })))
+    Ok((
+        OwnerApproval {
+            verb: body.verb,
+            target_thread_id: Some(target),
+            target_workspace_id: None,
+            snapshot_handle: None,
+        },
+        question,
+    ))
+}
+
+fn checked_snapshot_request(
+    body: &RequestOwnerApprovalBody,
+    source: &str,
+) -> Result<(OwnerApproval, String), ApiError> {
+    let bad = || ApiError::new(StatusCode::BAD_REQUEST, "snapshot_approval_target_invalid");
+    let target = body.target_workspace_id.as_deref().ok_or_else(bad)?;
+    let handle = body.snapshot_handle.as_deref().ok_or_else(bad)?;
+    if body.verb != ThreadReachVerb::RestoreSnapshot
+        || body.target_thread_id.is_some()
+        || !lucidos_gateway_constants::is_valid_workspace_id(target)
+        || crate::core::snapshot::handle::Handle::try_from(handle.to_owned()).is_err()
+    {
+        return Err(bad());
+    }
+    if target == source {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "snapshot_restore_own_workspace_refused",
+        ));
+    }
+    let reason = checked_reason(&body.reason)?;
+    let quoted: String = reason
+        .split(['\n', '\r'])
+        .map(|line| format!("> {line}\n"))
+        .collect();
+    let question = format!(
+        "**Restore snapshot `{handle}` in workspace `{target}`, once?**\n\n\
+         This replaces the workspace database and files with the snapshot. All running threads \
+         stop; archived work does not resume. Current device access and pairing are preserved. \
+         A verified recovery snapshot is saved first. Allow once permits only this snapshot \
+         in this workspace.\n\nThe agent's reason:\n\n{quoted}"
+    );
+    Ok((
+        OwnerApproval {
+            verb: ThreadReachVerb::RestoreSnapshot,
+            target_thread_id: None,
+            target_workspace_id: Some(target.to_owned()),
+            snapshot_handle: Some(handle.to_owned()),
+        },
+        question,
+    ))
 }
 
 /// The calling agent's own thread, as its origin token's MAC proves it. Any
@@ -368,6 +516,11 @@ fn checked_request(
     reason: &str,
 ) -> Result<(Uuid, &str), ApiError> {
     let bad = |msg: String| ApiError::new(StatusCode::BAD_REQUEST, msg);
+    if verb == ThreadReachVerb::RestoreSnapshot {
+        return Err(bad(
+            "Snapshot approvals require an explicit workspace and snapshot target.".into(),
+        ));
+    }
     if !verb.needs_authority() {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -386,6 +539,11 @@ fn checked_request(
             verb.act()
         )));
     };
+    Ok((target, checked_reason(reason)?))
+}
+
+fn checked_reason(reason: &str) -> Result<&str, ApiError> {
+    let bad = |msg| ApiError::new(StatusCode::BAD_REQUEST, msg);
     let reason = reason.trim();
     if reason.is_empty() {
         return Err(bad(
@@ -396,7 +554,7 @@ fn checked_request(
         Some((end, _)) => &reason[..end],
         None => reason,
     };
-    Ok((target, reason))
+    Ok(reason)
 }
 
 /// The target's title, or a 404 naming the id when no such thread exists.
@@ -458,4 +616,4 @@ pub(super) fn router() -> axum::Router<AppState> {
 
 #[cfg(test)]
 #[path = "owner_approval_tests.rs"]
-mod tests;
+pub(crate) mod tests;

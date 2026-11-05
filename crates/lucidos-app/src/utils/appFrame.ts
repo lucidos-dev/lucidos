@@ -44,7 +44,7 @@ export function appIdForFrame(frame: HTMLIFrameElement | null): string | null {
  *  asks for this one. */
 export const CANVAS_APP_FRAME_SELECTOR = '[data-role="app-ui-panel"] iframe[data-role="app-ui-frame"]';
 
-/** True for the Canvas pane's frame, false for a widget's on the shelf. */
+/** True for the Canvas pane's frame, false for a widget's frame. */
 export function isCanvasAppFrame(frame: HTMLIFrameElement | null): boolean {
   return frame?.closest('[data-role="app-ui-panel"]') != null;
 }

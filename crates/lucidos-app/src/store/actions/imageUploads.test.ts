@@ -29,12 +29,16 @@ import {
   _resetImageUploadRunsForTesting,
 } from './imageUploads';
 import { ApiError, uploadThreadBlob, type UploadObserver } from '../../api/client';
-import { awaitThreadStarted, isThreadStartPending } from './compose';
+import { awaitThreadStarted, isThreadStartPending, sendCompose, sendFollowup } from './compose';
+import { retryUnsentMessage, showRestoredUnsentMessage, sendMessage } from './chat';
+import { unsentMessages } from '../unsentMessages';
+import { _resetUnsentMessageRecordsForTesting, liveUnsentMessageRecords } from '../unsentMessageRecords';
 import { _recordServerComposeForTesting as noteServerDraft } from '../composeSync';
 import {
   createMemoryPendingUploadBackend,
   ownedPendingUploadRecords,
   readPendingUploadStore,
+  retainSendingImageHashes,
   _resetPendingUploadRecordsForTesting,
   type PendingUploadBackend,
 } from '../pendingUploadRecords';
@@ -289,6 +293,8 @@ describe('landing on the ImageUploaded event', () => {
     seedThread();
     toasts.value = [];
     _resetPendingUploadRecordsForTesting();
+    _resetUnsentMessageRecordsForTesting();
+    unsentMessages.value = new Map();
     vi.mocked(uploadThreadBlob).mockReset();
     vi.mocked(awaitThreadStarted).mockReset().mockImplementation(async () => {});
     vi.mocked(isThreadStartPending).mockReset().mockReturnValue(false);
@@ -427,10 +433,14 @@ describe('recordStillNeeded', () => {
     expect(recordStillNeeded(record(), false, [], undefined)).toBe(false);
   });
 
-  it('keeps a landed record until the engine holds the hash', () => {
+  it('keeps attached bytes even after the engine holds the hash', () => {
     expect(recordStillNeeded(record('h1'), false, ['h1'], undefined)).toBe(true);
     expect(recordStillNeeded(record('h1'), false, ['h1'], [])).toBe(true);
-    expect(recordStillNeeded(record('h1'), false, ['h1'], ['h1'])).toBe(false);
+    expect(recordStillNeeded(record('h1'), false, ['h1'], ['h1'])).toBe(true);
+  });
+
+  it('keeps bytes referenced by an unresolved send after the composer clears', () => {
+    expect(recordStillNeeded(record('h1'), false, [], ['h1'])).toBe(true);
   });
 
   it('drops a landed record the local draft no longer holds', () => {
@@ -502,7 +512,7 @@ describe('pending upload records', () => {
     expect(await storedIds()).toEqual([]);
   });
 
-  it('a landed image stays on the device until the engine draft holds it', async () => {
+  it('a landed image stays on the device while still attached', async () => {
     // The draft write that would carry the hash has not been answered yet.
     globalThis.fetch = vi.fn(() => new Promise<Response>(() => {})) as unknown as typeof fetch;
     const upload = heldUpload();
@@ -516,7 +526,7 @@ describe('pending upload records', () => {
     expect((await readPendingUploadStore()).uploads[0]).toMatchObject({ localId, landedHash: 'h1' });
 
     noteServerDraft(THREAD, '', ['h1']);
-    expect(await storedIds()).toEqual([]);
+    expect(await storedIds()).toEqual([localId]);
   });
 
   it('a landed image the user removes from the draft is released', async () => {
@@ -527,6 +537,109 @@ describe('pending upload records', () => {
     await run;
     patchDraft(THREAD, { image_hashes: [] });
     expect(await storedIds()).toEqual([]);
+  });
+
+  it('retains bytes across draft clearing and overlapping send leases, releasing only after settlement', async () => {
+    const upload = heldUpload();
+    const run = attach();
+    await uploadStarted();
+    upload.answer('h1');
+    await run;
+    const releaseFirst = retainSendingImageHashes(['h1']);
+    const releaseSecond = retainSendingImageHashes(['h1']);
+    patchDraft(THREAD, { image_hashes: [] });
+    expect(await storedIds()).toHaveLength(1);
+    releaseFirst();
+    releaseFirst();
+    expect(await storedIds()).toHaveLength(1);
+    releaseSecond();
+    expect(await storedIds()).toEqual([]);
+  });
+
+  it('retains content-addressed bytes when refusal moves them into a different draft', async () => {
+    const upload = heldUpload();
+    const run = attach();
+    await uploadStarted();
+    upload.answer('h1');
+    await run;
+    const release = retainSendingImageHashes(['h1']);
+    patchDraft(THREAD, { image_hashes: [] });
+    patchDraft('replacement-draft', { image_hashes: ['h1'] });
+    release();
+    expect(await storedIds()).toHaveLength(1);
+    patchDraft('replacement-draft', { image_hashes: [] });
+    expect(await storedIds()).toEqual([]);
+  });
+
+  it.each(['first-send', 'follow-up', 'retry'] as const)('retains landed bytes through an actual %s POST and refusal rollback', async (kind) => {
+    const upload = heldUpload();
+    const run = attach();
+    await uploadStarted();
+    upload.answer('h1');
+    await run;
+    patchDraft(THREAD, { text: 'keep photo', mode: 'lucidos' });
+    let answer!: (response: Response) => void;
+    const posted = new Promise<Response>((resolve) => { answer = resolve; });
+    globalThis.fetch = vi.fn(async (url) => String(url).includes('/chat') ? posted : new Response(null, { status: 204 })) as typeof fetch;
+    let sending: Promise<unknown>;
+    if (kind === 'retry') {
+      showRestoredUnsentMessage({ eventId: 'retry-image', threadId: THREAD,
+        body: { message: 'keep photo', mode: 'human', image_hashes: ['h1'], event_id: 'retry-image', thread_id: THREAD },
+        phase: 'unsent', failedRetries: 0, ownerId: 'previous-page', sentAt: new Date().toISOString(), settlement: { kind: 'follow-up' } });
+      patchDraft(THREAD, { text: '', image_hashes: [] });
+      sending = retryUnsentMessage('retry-image');
+    } else if (kind === 'first-send') sending = sendCompose(THREAD, { focus: false });
+    else sending = sendFollowup(THREAD, 'keep photo', ['h1'], { focus: false });
+    expect(await storedIds()).toHaveLength(1);
+    answer(new Response(JSON.stringify({ error: 'refused' }), { status: 400, headers: { 'Content-Type': 'application/json' } }));
+    await sending;
+    expect(getDraft(THREAD).image_hashes).toContain('h1');
+    expect(await storedIds()).toHaveLength(1);
+  });
+
+  it('owns the raw request before waiting for thread creation, even when persistence fails', async () => {
+    _resetUnsentMessageRecordsForTesting(null);
+    let started!: () => void;
+    const waiting = new Promise<void>((resolve) => { started = resolve; });
+    const sending = sendMessage('before thread start', ['h1'], { threadId: THREAD, focus: false, threadStarted: () => waiting });
+    expect(liveUnsentMessageRecords()).toEqual([expect.objectContaining({
+      body: expect.objectContaining({ message: 'before thread start', image_hashes: ['h1'] }), phase: 'sending',
+    })]);
+    globalThis.fetch = vi.fn(async () => new Response(JSON.stringify({ event_id: 'accepted' }), { status: 200 })) as typeof fetch;
+    started();
+    await sending;
+    expect(liveUnsentMessageRecords()).toEqual([]);
+  });
+
+  it('keeps bytes after every answer is lost and through a retry until acceptance', async () => {
+    const upload = heldUpload();
+    const run = attach();
+    await uploadStarted();
+    upload.answer('h1');
+    await run;
+    vi.useFakeTimers();
+    try {
+      globalThis.fetch = vi.fn(async (url) => {
+        if (String(url).includes('/chat')) throw transportDrop();
+        return new Response(null, { status: 204 });
+      }) as typeof fetch;
+      const sending = sendFollowup(THREAD, 'lost reply', ['h1'], { focus: false });
+      await vi.runAllTimersAsync();
+      await sending;
+      expect(await storedIds()).toHaveLength(1);
+      const eventId = [...unsentMessages.value.keys()][0];
+      expect(eventId).toBeDefined();
+      let accept!: (response: Response) => void;
+      const posted = new Promise<Response>((resolve) => { accept = resolve; });
+      globalThis.fetch = vi.fn(async () => posted) as typeof fetch;
+      const retry = retryUnsentMessage(eventId);
+      expect(await storedIds()).toHaveLength(1);
+      accept(new Response(JSON.stringify({ event_id: eventId }), { status: 200 }));
+      await retry;
+      expect(await storedIds()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('a discarded draft cancels its uploads and deletes their records', async () => {

@@ -929,6 +929,114 @@ fn authorize_url_and_token_exchange_send_an_identical_redirect_uri() {
 }
 
 // ---------------------------------------------------------------------------
+// Which redirect a browser gets: loopback, web redirect URI, or a refusal
+// ---------------------------------------------------------------------------
+
+const WEB_URI: &str = "https://host.example/~/oauth/callback";
+
+fn gateway_route(local: bool, origin: Option<&str>) -> CallbackRoute {
+    CallbackRoute::Gateway(crate::core::oauth_callback::BrowserContext {
+        prefix: "/dev/".into(),
+        local,
+        origin: origin.map(Into::into),
+    })
+}
+
+fn web_config(listed: &[&str], secret: Option<&str>) -> serde_json::Value {
+    let mut config = config_with(None, secret);
+    config["web_redirect_uris"] = serde_json::json!(listed);
+    config
+}
+
+#[test]
+fn a_local_browser_or_no_gateway_keeps_the_loopback_redirect() {
+    let config = web_config(&[WEB_URI], Some("s"));
+    for route in [
+        CallbackRoute::OwnListener,
+        gateway_route(true, Some("https://host.example")),
+    ] {
+        assert_eq!(
+            redirect_uri_for("acme", &route, &config).unwrap(),
+            default_redirect_uri()
+        );
+    }
+}
+
+#[test]
+fn a_remote_browser_gets_its_listed_web_redirect_uri() {
+    let route = gateway_route(false, Some("https://host.example"));
+    let config = web_config(
+        &[" https://other.example/~/oauth/callback ", WEB_URI],
+        Some("s"),
+    );
+    assert_eq!(redirect_uri_for("acme", &route, &config).unwrap(), WEB_URI);
+}
+
+#[test]
+fn a_remote_browser_never_gets_a_loopback_redirect() {
+    let refusal = |route: CallbackRoute, config: serde_json::Value| {
+        redirect_uri_for("acme", &route, &config)
+            .expect_err("a remote browser cannot follow a loopback redirect")
+            .to_string()
+    };
+    let unlisted = refusal(
+        gateway_route(false, Some("https://host.example")),
+        web_config(&[], Some("s")),
+    );
+    assert!(
+        unlisted.contains(WEB_URI),
+        "names the URI to register: {unlisted}"
+    );
+    assert!(unlisted.contains("Web redirect URIs"), "{unlisted}");
+
+    let plain = refusal(
+        gateway_route(false, Some("http://192.168.1.20:8080")),
+        web_config(&["http://192.168.1.20:8080/~/oauth/callback"], Some("s")),
+    );
+    assert!(plain.contains("https"), "{plain}");
+    for refusal in [&unlisted, &plain] {
+        let toast = format!("OAuth flow failed: {refusal}");
+        // ERROR_MAX_CHARS in the frontend's toastMessage.ts, which Rust cannot import.
+        assert!(toast.len() <= 200, "fits an error toast: {toast}");
+    }
+
+    let no_origin = refusal(
+        gateway_route(false, None),
+        web_config(&[WEB_URI], Some("s")),
+    );
+    assert!(no_origin.contains("computer running"), "{no_origin}");
+
+    let public = refusal(
+        gateway_route(false, Some("https://host.example")),
+        web_config(&[WEB_URI], None),
+    );
+    assert!(public.contains("client secret"), "{public}");
+}
+
+#[test]
+fn a_web_redirect_uri_is_byte_identical_on_both_legs() {
+    let route = gateway_route(false, Some("https://host.example"));
+    let config = web_config(&[WEB_URI], Some("client-secret"));
+    let redirect_uri = redirect_uri_for("acme", &route, &config).unwrap();
+    let auth = ClientAuth::from_secret(config["client_secret"].as_str());
+    let url = build_authorize_url(
+        "https://login.example.com/authorize",
+        "cid-123",
+        &redirect_uri,
+        "openid email",
+        "the-state",
+        &auth,
+        &default_authorize_params(),
+    );
+    let form = exchange_form("the-code", "cid-123", &redirect_uri, &auth);
+    assert_eq!(
+        authorize_param(&url, "redirect_uri").as_deref(),
+        Some(WEB_URI)
+    );
+    assert_eq!(form_value(&form, "redirect_uri"), Some(WEB_URI));
+}
+
+// ---------------------------------------------------------------------------
 // Client authentication — confidential (unchanged) vs public (PKCE)
 // ---------------------------------------------------------------------------
 
@@ -1887,6 +1995,7 @@ async fn a_flow_started_with_a_legacy_prefix_connects_the_canonical_account() {
         "oauth:Dropbox",
         "files.content.read",
         None,
+        CallbackRoute::OwnListener,
         open_auth_url,
     )
     .await
@@ -1902,6 +2011,70 @@ async fn a_flow_started_with_a_legacy_prefix_connects_the_canonical_account() {
         .await
         .unwrap();
     assert_eq!(rows, 1, "no second row under the prefixed spelling");
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// Under a gateway the flow never touches the callback port: it opens a
+/// delivery slot, and the gateway's forward completes it.
+#[tokio::test]
+async fn a_gateway_flow_completes_by_delivery_without_binding_the_port() {
+    use crate::core::oauth_callback::{deliver_callback, BrowserContext, CallbackDelivery};
+    const ACCESS_TOKEN: &str = "delivered-token";
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _callback_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    let token_url = serve_one_token_grant(ACCESS_TOKEN).await;
+    crate::test_support::seed_credential(
+        &pool,
+        "acme",
+        "https://api.example.com",
+        crate::core::AuthType::OauthClient,
+        &serde_json::json!({
+            "client_id": "cid",
+            "client_secret": "secret",
+            "auth_url": "https://oauth.example.com/authorize",
+            "token_url": token_url,
+        })
+        .to_string(),
+    )
+    .await;
+
+    let route = CallbackRoute::Gateway(BrowserContext {
+        prefix: "/dev@cloud/".into(),
+        local: true,
+        origin: None,
+    });
+    let open_auth_url = async |auth_url: &str, request_id: uuid::Uuid| -> Result<(), BoxError> {
+        let state = authorize_param(auth_url, "state").expect("the URL carries a state");
+        assert!(state.starts_with("/dev@cloud/~"), "{state}");
+        assert_eq!(
+            authorize_param(auth_url, "redirect_uri").as_deref(),
+            Some(default_redirect_uri().as_str()),
+            "a local browser keeps the loopback redirect"
+        );
+        let slot = ACTIVE_CALLBACK_FLOW.lock().await;
+        assert!(
+            slot.as_ref()
+                .is_none_or(|flow| flow.request_id != request_id),
+            "a gateway flow never takes the listener slot"
+        );
+        drop(slot);
+        let query = format!("code=granted-code&state={}", urlencoding::encode(&state));
+        assert!(matches!(
+            deliver_callback(&query),
+            CallbackDelivery::Accepted { ok: true, .. }
+        ));
+        Ok(())
+    };
+    run_oauth_flow(&pool, &bus, "acme", "read", None, route, open_auth_url)
+        .await
+        .expect("the delivered flow completes");
+
+    let account = OAuthStore::get_by_provider(&pool, "acme")
+        .await
+        .unwrap()
+        .expect("the account is stored");
+    assert_eq!(account.access_token, ACCESS_TOKEN);
 
     crate::test_support::teardown_test_db(&db_name).await;
 }
@@ -3339,7 +3512,17 @@ async fn connecting_with_a_stored_cleartext_token_url_is_refused_before_the_brow
         opened.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     };
-    let Err(error) = run_oauth_flow(&pool, &bus, "acme", "read", None, open_auth_url).await else {
+    let Err(error) = run_oauth_flow(
+        &pool,
+        &bus,
+        "acme",
+        "read",
+        None,
+        CallbackRoute::OwnListener,
+        open_auth_url,
+    )
+    .await
+    else {
         panic!("a cleartext token_url must refuse the flow");
     };
     let error = error.to_string();

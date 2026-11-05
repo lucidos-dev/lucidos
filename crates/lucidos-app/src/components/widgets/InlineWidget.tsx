@@ -1,20 +1,22 @@
 import type { ComponentChildren } from 'preact';
-import { useEffect, useLayoutEffect, useState } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import { OverflowMenu } from '../shared/OverflowMenu';
 import { useObjectMenu, type ObjectMenu } from '../shared/useObjectMenu';
 import type { ViewportPoint } from '../../hooks/useAnchoredPopover';
-import { OpenInCanvasIcon } from '../shared/icons';
 import { AppIcon } from '../shared/AppIcon';
 import { readAppsById } from '../../store/actions/appsById';
-import { openWidgetInCanvas } from '../../store/actions/widget-actions';
 import { appById } from '../../store/appsById';
-import { threadWidget } from '../../store/widgets';
-import type { App, AppReveal } from '../../store/types';
+import { widgetCardSize } from '../../store/widgetCardSizes';
+import { sizeWidgetCards } from '../../store/actions/widget-actions';
+import type { App, WidgetSize } from '../../store/types';
 import type { WidgetParams } from '../../utils/widgetParams';
 import { widgetRefusal } from '../../utils/widgetEmbed';
+import { widgetBoxCss } from '../../utils/dashboardGeometry';
+import { AddToDashboardButton } from './DashboardItem';
 import type { WidgetMenuTarget } from './WidgetMenu';
 import { WidgetMenuItems } from './widgetMenuChunks';
-import { WidgetFrame, defaultWidgetHeight } from './WidgetFrame';
+import { WidgetBox } from './WidgetBox';
+import { WidgetSizePill } from './WidgetSizePill';
 
 /** What an inline widget draws when its widget cannot: in place, never
  *  refused, since a reply cannot be (ADR 0415). */
@@ -37,34 +39,26 @@ export function UnavailableWidget({ appId, stamp, reason }: { appId?: string; st
   );
 }
 
-/** A widget's bar: its app icon, its name, the word "widget", and its
- *  actions. The icon slot stays empty until the name lands. `opener` lets the
- *  panel around it open the bar's ⋯ menu from a gesture. */
-function WidgetBar({ target, icon, leading, trailing, opener }: {
+/** A widget's bar: its app icon, its name, and its actions, the ⋯ last. A
+ *  `compact` bar, a small card's, folds its name into the icon's tooltip. The
+ *  icon slot stays empty until the name lands. `opener` lets the panel around
+ *  it open the bar's ⋯ menu from a gesture. */
+function WidgetBar({ target, icon, compact = false, leading, trailing, opener }: {
   target: WidgetMenuTarget;
   icon?: string;
+  compact?: boolean;
   leading?: ComponentChildren;
   trailing?: ComponentChildren;
   opener: ObjectMenu['opener'];
 }) {
   return (
     <div class="widget-bar">
-      <span class="widget-bar-icon">
+      <span class="widget-bar-icon" data-tooltip={compact ? target.name || undefined : undefined}>
         {target.name && <AppIcon appId={target.appId} name={target.name} icon={icon} />}
       </span>
-      <span class="widget-bar-name">{target.name}</span>
-      <span class="widget-bar-kind">widget</span>
+      {!compact && <span class="widget-bar-name">{target.name}</span>}
       <span class="widget-bar-actions">
         {leading}
-        <button
-          type="button"
-          class="icon-btn header-icon"
-          aria-label={`Open ${target.name} in Canvas`}
-          data-tooltip="Open in Canvas"
-          onClick={() => void openWidgetInCanvas(target.appId, target.name, target.params)}
-        >
-          <OpenInCanvasIcon />
-        </button>
         <OverflowMenu
           ariaLabel={`${target.name} widget actions`}
           hostOpener={{ ref: opener, trigger: true }}
@@ -77,18 +71,20 @@ function WidgetBar({ target, icon, leading, trailing, opener }: {
   );
 }
 
-/** A widget's panel: its bar over its frame. An inline widget and the dropped
- *  open shelf widget draw it. A right-click or a long press anywhere on it
- *  opens the bar's ⋯ menu, inside the frame included (`frame` gets `onMenu`).
- *  The click a hold pairs is swallowed in capture, so a bar button under the
- *  finger does not also run. `stamp` and `inlineWidget` are an inline
- *  widget's deep-link stamp and app id. */
-export function WidgetPanel({ class: className, stamp, inlineWidget, target, icon, leading, trailing, frame }: {
+/** A widget's panel: its bar over its frame, as an inline widget draws it.
+ *  A right-click or a long press anywhere on it opens the bar's ⋯ menu,
+ *  inside the frame included (`frame` gets `onMenu`). The click a hold pairs
+ *  is swallowed in capture, so a bar button under the finger does not also
+ *  run. `stamp` and `inlineWidget` are an inline
+ *  widget's deep-link stamp and app id, and `style` its box geometry. */
+export function WidgetPanel({ class: className, style, stamp, inlineWidget, target, icon, compact, leading, trailing, frame }: {
   class: string;
+  style?: Record<string, string>;
   stamp?: string;
   inlineWidget?: string;
   target: WidgetMenuTarget;
   icon?: string;
+  compact?: boolean;
   leading?: ComponentChildren;
   trailing?: ComponentChildren;
   frame: (onMenu: (at?: ViewportPoint) => void) => ComponentChildren;
@@ -102,21 +98,30 @@ export function WidgetPanel({ class: className, stamp, inlineWidget, target, ico
     <div
       ref={setPanel}
       class={className}
+      style={style}
       data-event-id={stamp}
       data-inline-widget={inlineWidget}
       {...menu.press}
       onClickCapture={menu.onClick}
     >
-      <WidgetBar target={target} icon={icon} leading={leading} trailing={trailing} opener={menu.opener} />
+      <WidgetBar target={target} icon={icon} compact={compact} leading={leading} trailing={trailing} opener={menu.opener} />
       {frame(onMenu)}
     </div>
   );
 }
 
-/** An *inline widget* (ADR 0466): a widget in a turn, with its bar over its
- *  frame. A reply draws one from its embed, and an old `WidgetShown` still
- *  draws one at its turn. `eventId` is an event of that turn: a pin from here
- *  records it, so "Show in thread" lands back on the turn.
+/** The size a card holds its room at until its widget is read. */
+const UNREAD_BOX_SIZE: WidgetSize = 'medium';
+
+/** An *inline widget* (ADR 0466): a widget in a turn, its bar over its
+ *  *widget box*, the same box its dashboard tile draws (ADR 0432). A reply
+ *  draws one from its embed, and an old `WidgetShown` still draws one at its
+ *  turn. `eventId` is an event of that turn.
+ *
+ *  The card starts at the widget's default size, and its pill picks another
+ *  of the sizes it declares. A pick writes `InlineWidgetSized`, and the card
+ *  draws the newest one the thread holds. It resizes the box and keeps the
+ *  frame.
  *
  *  `stamped` is set for an old `WidgetShown`, which is its own deep-link
  *  target (`stampedEventIds`). A reply's widget names its turn's starter,
@@ -139,91 +144,61 @@ export function InlineWidget({ threadId, appId, params, label, eventId, stamped 
     if (read.status === 'not-loaded') void readAppsById([appId]);
   }, [read.status, appId]);
   const app = read.status === 'loaded' ? read.data : undefined;
+  const sizes = app?.sizes ?? [];
   const reason = read.status === 'failed'
     ? read.error
-    : app === null ? `No widget '${appId}' exists.` : app ? refusal(app) : null;
+    : app === null
+      ? `No widget '${appId}' exists.`
+      : app ? refusal(app) ?? (sizes.length === 0 ? `Widget '${appId}' declares no sizes.` : null) : null;
   if (reason !== null) {
     return <UnavailableWidget appId={appId} stamp={stamp} reason={reason} />;
   }
-  // The thread's widgets carry the pin, and refresh as a widget is renamed or
-  // made reusable. The app read stands in until they name this instance.
-  const shelf = threadWidget(threadId, appId, params);
-  const named = shelf ?? app;
+  const picked = widgetCardSize(threadId, appId, params);
+  const size = picked && sizes.includes(picked) ? picked : sizes[0] ?? UNREAD_BOX_SIZE;
   const target: WidgetMenuTarget = {
     threadId,
     appId,
     params,
     label,
     // Blank until the widget is read: a single value, so no skeleton.
-    name: label ?? shelf?.name ?? app?.name ?? '',
-    reusable: shelf?.reusable ?? app?.reusable ?? false,
-    originPluginId: shelf?.origin_plugin_id ?? app?.origin_plugin_id,
-    builtIn: shelf?.built_in ?? app?.built_in ?? false,
-    pinned: shelf?.pinned ?? false,
-    drawnByEventId: eventId,
+    name: label ?? app?.name ?? '',
+    reusable: app?.reusable ?? false,
+    originPluginId: app?.origin_plugin_id,
+    builtIn: app?.built_in ?? false,
+    size,
   };
+  const pick = (next: WidgetSize) => void sizeWidgetCards({ appId, threadId, params }, target.name, next);
+  const box = widgetBoxCss(size);
+  const compact = size === 'small';
   return (
     <WidgetPanel
       class="widget-panel inline-widget"
+      style={{ '--widget-box-width': box.width, '--widget-box-height': box.height }}
       stamp={stamp}
       inlineWidget={appId}
       target={target}
-      icon={named?.icon}
+      icon={app?.icon}
+      compact={compact}
+      leading={app && (
+        <>
+          <WidgetSizePill name={target.name} sizes={sizes} current={size} onPick={pick} />
+          {!compact && <AddToDashboardButton tile={target} />}
+        </>
+      )}
       frame={(onMenu) => (app ? (
-        <ClippedFrame appId={appId} params={params} name={target.name} reveal={app.reveal} onMenu={onMenu} />
+        <WidgetBox
+          appId={appId}
+          params={params}
+          reveal={app.reveal}
+          place="inline"
+          size={size}
+          transparent={app.transparent}
+          onMenu={onMenu}
+        />
       ) : (
-        // The frame waits on the manifest's `reveal`. Its box holds the room.
-        <div class="inline-widget-clip">
-          <div class="widget-frame widget-frame-inline" style={{ height: `${defaultWidgetHeight('inline')}px` }} />
-        </div>
+        // The frame waits on the manifest's `reveal`. The box holds the room.
+        <div class="widget-box" data-size={size} />
       ))}
     />
-  );
-}
-
-/** The inline frame inside a box about one phone screen tall. The frame keeps
- *  its full height, so it never scrolls inside the transcript. A widget taller
- *  than the box is clipped, and says so with a fade and an Expand button. */
-function ClippedFrame({ appId, params, name, reveal, onMenu }: {
-  appId: string;
-  params?: WidgetParams;
-  name: string;
-  reveal: AppReveal;
-  onMenu: (at?: ViewportPoint) => void;
-}) {
-  const [clip, setClip] = useState<HTMLDivElement | null>(null);
-  const [height, setHeight] = useState(0);
-  const [clipped, setClipped] = useState(false);
-
-  // The frame box holds its height without a transition, so the clip box has
-  // settled by the time this reads it.
-  useLayoutEffect(() => {
-    if (!clip) return;
-    // One pixel of slack absorbs `clientHeight` rounding a fractional report.
-    const measure = () => setClipped(height - clip.clientHeight > 1);
-    measure();
-    // The cap follows the viewport, so a resize can clip or unclip the card.
-    if (typeof ResizeObserver !== 'function') return;
-    const observer = new ResizeObserver(measure);
-    observer.observe(clip);
-    return () => observer.disconnect();
-  }, [clip, height]);
-
-  return (
-    <div ref={setClip} class="inline-widget-clip">
-      <WidgetFrame appId={appId} params={params} reveal={reveal} place="inline" onHeight={setHeight} onMenu={onMenu} />
-      {clipped && (
-        <div class="inline-widget-fade">
-          <button
-            type="button"
-            class="action-btn action-btn-secondary"
-            aria-label={`Expand ${name} in Canvas`}
-            onClick={() => void openWidgetInCanvas(appId, name, params)}
-          >
-            Expand
-          </button>
-        </div>
-      )}
-    </div>
   );
 }

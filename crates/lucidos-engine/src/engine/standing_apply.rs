@@ -457,6 +457,80 @@ async fn take_arm_generation(
     Ok(row.map(hydrate_arm))
 }
 
+/// End archived instructions before subscribers or reconstruction can dispatch.
+/// A durable announcement precedes deletion. The row lock excludes a concurrent
+/// re-arm, and a post-boundary announcement makes a crash retry idempotent.
+pub(crate) async fn settle_restored_standing_applies(
+    pool: &sqlx::PgPool,
+    bus: &EventBus,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(boundary) = crate::core::snapshot::boundary::read(pool).await? else {
+        return Ok(());
+    };
+    let rows: Vec<StandingApplyRow> = sqlx::query_as(&format!(
+        "SELECT {ARM_COLUMNS} FROM standing_applies WHERE created_at <= $1"
+    ))
+    .bind(boundary.restored_at)
+    .fetch_all(pool)
+    .await?;
+    for row in rows {
+        settle_restored_arm(pool, bus, &hydrate_arm(row)).await?;
+    }
+    Ok(())
+}
+
+async fn settle_restored_arm(
+    pool: &sqlx::PgPool,
+    bus: &EventBus,
+    loaded: &LoadedArm,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(boundary) = crate::core::snapshot::boundary::read(pool).await? else {
+        return Ok(false);
+    };
+    if loaded.generation > boundary.restored_at {
+        return Ok(false);
+    }
+    let mut tx = pool.begin().await?;
+    let row: Option<StandingApplyRow> = sqlx::query_as(&format!(
+        "SELECT {ARM_COLUMNS} FROM standing_applies WHERE thread_id = $1 AND created_at = $2 FOR UPDATE"
+    ))
+    .bind(loaded.arm.thread_id)
+    .bind(loaded.generation)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let arm = hydrate_arm(row).arm;
+    let announced: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE sequence > $1 \
+         AND event_type = 'StandingApplyDropped' \
+         AND payload->'data'->>'thread_id' = $2 \
+         AND payload->'data'->>'reason' = 'snapshot-restored')",
+    )
+    .bind(boundary.event_sequence)
+    .bind(arm.thread_id.to_string())
+    .fetch_one(&mut *tx)
+    .await?;
+    if !announced {
+        bus.emit(BusEvent::System(SystemEvent::StandingApplyDropped {
+            thread_id: arm.thread_id,
+            change_id: arm.change_id,
+            batch_id: arm.batch_id,
+            reason: "snapshot-restored".into(),
+            actor: arm.actor,
+        }))
+        .await?;
+    }
+    sqlx::query("DELETE FROM standing_applies WHERE thread_id = $1 AND created_at = $2")
+        .bind(arm.thread_id)
+        .bind(loaded.generation)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 /// Consume the arm a resolution read for firing, and announce that it fired.
 ///
 /// The announcement follows the consume. So a fire that lost the race to a
@@ -467,6 +541,11 @@ async fn take_arm_to_fire(
     loaded: &LoadedArm,
     change_id: Uuid,
 ) -> Result<Option<LoadedArm>, sqlx::Error> {
+    // Restore cannot occur while this engine owns the workspace. Recheck at
+    // the consume boundary too, so no caller can fire an archived instruction.
+    if !crate::core::snapshot::boundary::permits_slot(pool, loaded.generation).await? {
+        return Ok(None);
+    }
     let taken = take_arm_generation(pool, loaded.arm.thread_id, loaded.generation).await?;
     if let Some(fired) = &taken {
         bus.emit_or_log(
@@ -1024,6 +1103,21 @@ impl LucidosEngine {
             return;
         };
 
+        // A restored instruction is settled even if its thread is still
+        // running or parked. Apply authority never survives the restore, and
+        // this check must cover later event-driven resolutions as well as boot.
+        match crate::core::snapshot::boundary::permits_slot(self.pool(), loaded.generation).await {
+            Ok(true) => {}
+            Ok(false) => {
+                self.end_standing_apply(&loaded, "snapshot-restored").await;
+                return;
+            }
+            Err(error) => {
+                log!("[StandingApply] restore boundary unavailable: {}", error);
+                return;
+            }
+        }
+
         let facts = match read_settle_facts(self.pool(), &loaded.arm, &self.agent_sessions).await {
             FactsProbe::Ready(facts) => facts,
             FactsProbe::Unknown => return,
@@ -1044,6 +1138,14 @@ impl LucidosEngine {
     /// when a re-arm won the race: the newer instruction is live and owes no
     /// report.
     async fn end_standing_apply(&self, loaded: &LoadedArm, reason: &str) {
+        if reason == "snapshot-restored" {
+            match settle_restored_arm(self.pool(), &self.event_bus, loaded).await {
+                Ok(true) => self.standing_applies.remove(loaded.arm.thread_id),
+                Ok(false) => {}
+                Err(error) => log!("[StandingApply] restore settlement failed: {}", error),
+            }
+            return;
+        }
         if self.take_standing_apply_generation(loaded).await.is_some() {
             self.report_standing_apply_dropped(&loaded.arm, reason, None)
                 .await;
@@ -2146,6 +2248,89 @@ mod db_tests {
             .expect("take")
             .is_none());
         assert_eq!(fired_events(&pool, thread).await, 0);
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn restored_arm_settlement_is_durable_and_retryable() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread = Uuid::new_v4();
+        seed_thread(&pool, thread, "running").await;
+        insert_arm(&pool, &arm_for(thread, None)).await.unwrap();
+        sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) VALUES ($1, 'snapshot', now(), 0)")
+            .bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+        crate::test_support::refuse_event_type(&pool, "StandingApplyDropped").await;
+        assert!(settle_restored_standing_applies(&pool, &bus).await.is_err());
+        assert!(load_arm(&pool, thread).await.unwrap().is_some());
+        sqlx::query("DROP TRIGGER refuse_event ON events")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Simulate a crash after announcement but before the row delete commits.
+        sqlx::query("CREATE FUNCTION refuse_arm_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'delete refused'; END $$")
+            .execute(&pool).await.unwrap();
+        sqlx::query("CREATE TRIGGER refuse_arm_delete BEFORE DELETE ON standing_applies FOR EACH ROW EXECUTE FUNCTION refuse_arm_delete()")
+            .execute(&pool).await.unwrap();
+        assert!(settle_restored_standing_applies(&pool, &bus).await.is_err());
+        assert!(load_arm(&pool, thread).await.unwrap().is_some());
+        sqlx::query("DROP TRIGGER refuse_arm_delete ON standing_applies")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            settle_restored_standing_applies(&pool, &bus).await.unwrap();
+            assert!(load_arm(&pool, thread).await.unwrap().is_none());
+        }
+        let drops: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE event_type = 'StandingApplyDropped'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(drops, 1);
+        // A new arm on the same thread retains current owner authority.
+        insert_arm(&pool, &arm_for(thread, None)).await.unwrap();
+        settle_restored_standing_applies(&pool, &bus).await.unwrap();
+        assert!(load_arm(&pool, thread).await.unwrap().is_some());
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn restored_standing_arm_cannot_fire_but_a_new_instruction_can() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread = Uuid::new_v4();
+        let change = Uuid::new_v4();
+        seed_thread(&pool, thread, "idle").await;
+        seed_change(&pool, change, thread, ChangeStatus::Pending).await;
+        insert_arm(&pool, &arm_for(thread, Some(change)))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) VALUES ($1, $2, now(), 0)")
+            .bind(Uuid::new_v4()).bind(crate::core::snapshot::handle::Handle::generate().as_str())
+            .execute(&pool).await.unwrap();
+        for _ in 0..2 {
+            let loaded = load_arm(&pool, thread).await.unwrap().unwrap();
+            assert!(take_arm_to_fire(&pool, &bus, &loaded, change)
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(fired_events(&pool, thread).await, 0);
+        }
+        // The restored arm remains available for announced settlement; a fresh
+        // owner instruction replaces it and carries new authority.
+        insert_arm(&pool, &arm_for(thread, Some(change)))
+            .await
+            .unwrap();
+        let loaded = load_arm(&pool, thread).await.unwrap().unwrap();
+        assert!(take_arm_to_fire(&pool, &bus, &loaded, change)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(fired_events(&pool, thread).await, 1);
+        pool.close().await;
         teardown_test_db(&db).await;
     }
 

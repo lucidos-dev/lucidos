@@ -107,6 +107,9 @@ pub enum AbortCause {
     /// itself never got to run its cleanup, so the abort is emitted by the
     /// session entry's drop-guard.
     SessionDropped,
+    /// A snapshot replaced the log. Work visible as in flight in the restored
+    /// log is settled permanently, without replay or automatic resume.
+    SnapshotRestored,
     /// Pre-typed-cause legacy event or unrecognized cause string. Never emit
     /// fresh.
     #[serde(other)]
@@ -116,7 +119,7 @@ pub enum AbortCause {
 impl AbortCause {
     /// True when the abort came from an engine restart (shutdown or recovery
     /// sweep) rather than from the turn itself failing. `SafetyNet`,
-    /// `ProcessKilled`, `StaleSettle`, `SessionDropped` and the legacy
+    /// `ProcessKilled`, `StaleSettle`, `SessionDropped`, `SnapshotRestored` and the legacy
     /// `Unknown` are not.
     ///
     /// **It does not say whether the child comes back.** It has no actor axis,
@@ -180,7 +183,7 @@ impl AbortCause {
     ///   on its way back.
     /// * **Everything else** is a real interruption nobody promised to undo, and
     ///   keeps the red `failed` indicator: `SafetyNet`, `ProcessKilled`,
-    ///   `SessionDropped`, `Unknown`, every `RecoveryAfterRestart` (the crash
+    ///   `SessionDropped`, `SnapshotRestored`, `Unknown`, every `RecoveryAfterRestart` (the crash
     ///   boundary, and the boot floor's withdrawal of a resume promise it could
     ///   not keep), and a system-actor `EngineShutdown`.
     ///
@@ -262,6 +265,9 @@ pub enum EventWaitCancelCause {
     /// subscription has not held a turn since ADR 0049, so it was never part of
     /// what a Stop owns. Do not re-add the emit; see `api::chat::cancel_chat`.
     ThreadCanceled,
+    /// A workspace restore ended a subscription the restored snapshot carried
+    /// in. Restore never replays work from either timeline (ADR 0612).
+    SnapshotRestored,
     /// Legacy or unrecognized cause, so old DB rows replay cleanly. Never emit
     /// fresh.
     #[serde(other)]
@@ -364,4 +370,26 @@ pub enum UnqueueReason {
     BatchFailed,
     /// The lane could not build or publish the change's landing merge.
     LandingFailed,
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn restored_snapshot_never_promises_resume_or_transient_retry() {
+        let cause: AbortCause = serde_json::from_str("\"snapshot_restored\"").unwrap();
+        assert_eq!(cause, AbortCause::SnapshotRestored);
+        assert!(!cause.is_transient());
+        assert!(!cause.promises_auto_resume(None));
+        assert!(
+            !cause.promises_auto_resume(Some(&super::super::MessageOrigin::Device {
+                device_id: "owner-device".into(),
+            }))
+        );
+        assert_eq!(
+            serde_json::to_string(&cause).unwrap(),
+            "\"snapshot_restored\""
+        );
+    }
 }

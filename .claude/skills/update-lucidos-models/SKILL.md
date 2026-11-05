@@ -144,8 +144,10 @@ README names each file's source.
    docs/plans/rung-estimate-inputs` rewrites the file. Add `--print` to read
    the estimates first. Its docstring states the blend and both profiles.
 7. **Run the tests.** `./scripts/test-engine.sh -- -- runtime::intelligence_ladder`
-   checks every pair's fields, that each surface's on pairs form a frontier,
-   and that the file ships integer bands only. Its expected-ladder tests name
+   checks every pair's fields and that each surface's on pairs form a
+   frontier. The script keeps each surface's shipped default on, so the
+   frontier check skips it and a pin test checks it is an on rung. The tests
+   also check that the file ships integer bands only. Its expected-ladder tests name
    the shipped rungs, so a refresh that moves them updates the tests in the
    same change.
 

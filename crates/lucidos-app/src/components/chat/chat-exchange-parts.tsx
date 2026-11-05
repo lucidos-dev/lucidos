@@ -1415,6 +1415,7 @@ const EVENT_WAIT_STOP_NOTE: Record<EventWaitCancelCause, string | null> = {
   // Retired: a thread-level Stop no longer stops a subscription. Only old rows
   // carry it, and they still have to render.
   thread_canceled: 'stopped by Stop',
+  snapshot_restored: 'stopped by a workspace restore',
   unknown: null,
 };
 

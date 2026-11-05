@@ -14,8 +14,9 @@
 //! authorizes nothing the user can see. The cookie has to land in the webview's
 //! own jar, so the page posts the code to `/~/api/v1/auth/pair` itself.
 //!
-//! The token never crosses IPC. Only the code does, and a code is single use
-//! and expires in five minutes.
+//! The token never crosses IPC. Only the pairing secret does, and it is single
+//! use and expires in five minutes. The long secret is handed over rather than
+//! the short code, so the page pairs whatever channel the gateway judges it on.
 
 use serde::Serialize;
 
@@ -52,10 +53,16 @@ pub fn mint_pairing_code() -> Result<MintedCode, String> {
 /// Pure: read the mint response, so the shape is tested without a gateway.
 ///
 /// A body that parses but carries no usable code is a miss. Otherwise the page
-/// would be handed an empty code and post it.
+/// would be handed an empty code and post it. An older gateway sends no
+/// `secret`, so its short code is the fallback.
 fn parse_minted_code(body: &str) -> Option<MintedCode> {
     let json: serde_json::Value = serde_json::from_str(body).ok()?;
-    let code = json.get("code")?.as_str()?.trim().to_string();
+    let code = json
+        .get("secret")
+        .or_else(|| json.get("code"))?
+        .as_str()?
+        .trim()
+        .to_string();
     if code.is_empty() {
         return None;
     }
@@ -83,6 +90,15 @@ mod tests {
                 code: "12345678".into(),
                 expires_in_secs: 300
             })
+        );
+    }
+
+    #[test]
+    fn the_long_secret_is_preferred_over_the_short_code() {
+        let body = r#"{"code":"12345678","secret":"ldp_abcdefghijklmnopqrstuvwxyz","expires_in_secs":300}"#;
+        assert_eq!(
+            parse_minted_code(body).map(|m| m.code).as_deref(),
+            Some("ldp_abcdefghijklmnopqrstuvwxyz")
         );
     }
 

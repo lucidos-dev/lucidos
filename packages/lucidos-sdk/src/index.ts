@@ -12,6 +12,7 @@ import { sse } from './sse';
 import { utils } from './utils';
 import { capture } from './capture';
 import { proxy } from './proxy';
+import { modelRequest } from './modelRequest';
 import { oauth } from './oauth';
 import { request } from './request';
 import { storage } from './storage';
@@ -44,6 +45,7 @@ export const lucidos = {
   sse,
   utils,
   proxy,
+  modelRequest,
   oauth,
   // Per-app, per-device storage. An isolated frame's own `localStorage`
   // throws, so this stands in for it.
@@ -78,3 +80,6 @@ export * from './appStorage';
 // tool). Exposed as runtime values so the host app can cross-check them against
 // its own renderable nav set — see `crates/lucidos-engine/src/llm/tools/misc.rs`.
 export { CODING_AGENT_TARGETS, NAVIGATE_TARGETS, SETTINGS_VIEW_TARGETS } from './generated/navigate-targets';
+
+export type { ModelPickerValue, ModelPickerFilter, ModelPickerOptions, ModelPickerInstance } from './modelPicker';
+export type { ModelMessage, ModelRequestOptions, ModelRequest } from './modelRequest';

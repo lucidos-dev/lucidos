@@ -1518,3 +1518,127 @@ async fn a_red_with_flaky_tests_opens_only_its_fix_thread() {
     assert_eq!(fx.snapshot().state, MainCheckState::Red);
     teardown_test_db(&fx.db).await;
 }
+
+#[tokio::test]
+async fn restored_red_preserves_history_without_reopening_its_fix() {
+    let fx = fixture(&reporting_script("fail", "Failed: engine.")).await;
+    let (mut driver, mut rx) = fx.driver();
+    let (pre, _) = fx.land_commit("a.txt").await;
+    driver.handle(landed(Uuid::new_v4(), &pre)).await;
+    run_to_end(&mut driver, &mut rx).await;
+    assert_eq!(fx.opened.lock().unwrap().len(), 1);
+    sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, 'snapshot', now(), MAX(sequence) FROM events")
+        .bind(Uuid::new_v4()).execute(&fx.pool).await.unwrap();
+    for _ in 0..2 {
+        let (mut restored, _rx) = fx.driver();
+        restored.handle(MainCheckMsg::Restore).await;
+        assert_eq!(fx.snapshot().state, MainCheckState::Red);
+        assert_eq!(
+            fx.opened.lock().unwrap().len(),
+            1,
+            "restored fix authority must not send an old prompt"
+        );
+    }
+    teardown_test_db(&fx.db).await;
+}
+
+#[tokio::test]
+async fn restored_check_settlement_runs_before_driver_construction() {
+    use crate::engine::event_bus::SystemEvent;
+    let fx = fixture(&reporting_script("pass", "Passed.")).await;
+    fx.bus
+        .emit(BusEvent::System(SystemEvent::MainCheckStarted {
+            check_id: Uuid::new_v4(),
+            from_sha: "before".into(),
+            to_sha: "after".into(),
+        }))
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, 'snapshot', now(), MAX(sequence) FROM events")
+        .bind(Uuid::new_v4()).execute(&fx.pool).await.unwrap();
+    crate::test_support::refuse_event_type(&fx.pool, "MainCheckAbandoned").await;
+    assert!(super::settle_restored_checks(&fx.pool, &fx.bus)
+        .await
+        .is_err());
+    sqlx::query("DROP TRIGGER refuse_event ON events")
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        super::settle_restored_checks(&fx.pool, &fx.bus)
+            .await
+            .unwrap();
+    }
+    assert_eq!(fx.count("MainCheckAbandoned").await, 1);
+    let (mut restored, mut rx) = fx.driver();
+    restored.handle(MainCheckMsg::Restore).await;
+    assert!(rx.try_recv().is_err());
+    assert_eq!(fx.count("MainCheckAbandoned").await, 1);
+    teardown_test_db(&fx.db).await;
+}
+
+#[tokio::test]
+async fn restored_linked_check_must_announce_abandonment_before_recovery() {
+    use crate::engine::event_bus::SystemEvent;
+    use crate::test_support::refuse_event_type;
+    let fx = fixture(&reporting_script("pass", "Passed.")).await;
+    let check_id = Uuid::new_v4();
+    for event in [
+        SystemEvent::MainCheckStarted {
+            check_id,
+            from_sha: "before".into(),
+            to_sha: "after".into(),
+        },
+        SystemEvent::MainCheckRunLinked {
+            check_id,
+            run_url: RUN_URL.into(),
+            branch: RUN_BRANCH.into(),
+        },
+    ] {
+        fx.bus.emit(BusEvent::System(event)).await.unwrap();
+    }
+    sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, 'snapshot', now(), MAX(sequence) FROM events")
+        .bind(Uuid::new_v4()).execute(&fx.pool).await.unwrap();
+    refuse_event_type(&fx.pool, "MainCheckAbandoned").await;
+    let (mut restored, mut rx) = fx.driver();
+    restored.handle(MainCheckMsg::Restore).await;
+    assert!(rx.try_recv().is_err());
+    assert_eq!(fx.count("MainCheckAbandoned").await, 0);
+    sqlx::query("DROP TRIGGER refuse_event ON events")
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        restored.handle(MainCheckMsg::Restore).await;
+        assert!(rx.try_recv().is_err());
+        assert_ne!(fx.snapshot().state, MainCheckState::Running);
+    }
+    assert_eq!(fx.count("MainCheckAbandoned").await, 1);
+    assert!(fx.latest("MainCheckAbandoned").await["reason"]
+        .as_str()
+        .unwrap()
+        .contains("snapshot"));
+    teardown_test_db(&fx.db).await;
+}
+
+#[tokio::test]
+async fn restored_flaky_fix_is_not_prompted_but_fresh_flaky_fix_is() {
+    let fx = flaky_fixture().await;
+    let (mut driver, mut rx) = fx.driver();
+    land_and_check(&fx, &mut driver, &mut rx, Uuid::new_v4(), "a.txt").await;
+    sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, 'snapshot', now(), MAX(sequence) FROM events")
+        .bind(Uuid::new_v4()).execute(&fx.pool).await.unwrap();
+    for _ in 0..2 {
+        let (mut restored, _rx) = fx.driver();
+        restored.handle(MainCheckMsg::Restore).await;
+        assert_eq!(fx.opened.lock().unwrap().len(), 1);
+    }
+    // A new check and flaky fix in the current generation still recover.
+    let old_fix = fx.opened.lock().unwrap()[0].thread_id;
+    land_and_check(&fx, &mut driver, &mut rx, old_fix, "b.txt").await;
+    assert_eq!(fx.opened.lock().unwrap().len(), 2);
+    let (mut restored, _rx) = fx.driver();
+    restored.handle(MainCheckMsg::Restore).await;
+    assert_eq!(fx.opened.lock().unwrap().len(), 3);
+    teardown_test_db(&fx.db).await;
+}

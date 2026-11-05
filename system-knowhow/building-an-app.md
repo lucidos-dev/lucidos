@@ -26,9 +26,9 @@ When unsure, ask one question, then act: "Do you want to open this regularly, or
 
 ## Widgets: a small answer inline in the thread
 
-A *widget* is an app that lives in the thread that made it. It is not in the apps list. `create_app` with `kind: "widget"` makes one and records this thread as its origin. Embed it in your reply, `![Name](app:<id>)`, and it shows there as an *inline widget*: a bar with its name and menu, and the widget under it. The frame is as tall as the content, so it never scrolls inside. Past about one phone screen, it clips with a fade and an Expand button that opens the widget full size in Canvas.
+A *widget* is an app that lives in the thread that made it. It is not in the apps list. `create_app` with `kind: "widget"` makes one and records this thread as its origin. Embed it in your reply, `![Name](app:<id>)`, and it shows there as an *inline widget*: a bar over the widget's *widget box*.
 
-A widget has a chip on the thread's *widget shelf*, under the title, only once pinned. Embedding one adds no chip. The *home thread* draws no shelf: a widget the user wants in view goes on one of the two *dashboards*, each with its own tiles. The desktop dashboard stays in view in a rail beside everything, and the phone one is a sheet the user opens over any thread. So a tile may sit beside any screen, at the width of two cells.
+The bar carries the widget's icon and name, a size pill, "+ Dashboard" and the ⋯ menu. The box is exactly the box its dashboard tile draws at that size, so what the thread shows is what a dashboard shows. A widget the user wants in view goes on one of the two *dashboards*, each with its own tiles. The desktop dashboard stays in view in a rail beside everything, and the phone one is a sheet the user opens over any thread.
 
 **When to choose one.**
 - A comparison or a dataset that is easier to scan and click than to read: a fare comparison, a week's trend, a chart with a toggle.
@@ -37,14 +37,12 @@ A widget has a chip on the thread's *widget shelf*, under the title, only once p
 
 The system prompt says whether automatic widgets are on. When they are off, make a widget only when the user asks for one. For a pick, offer one as a question option instead. "Just text" means no widget.
 
-**When to pin one.** Pin with `widgets(action="pin")` only when the user will come back to the widget in this thread, such as a picker. A one-off answer stays unpinned, so a thread of ten one-offs keeps an empty shelf.
-
 **Build it exactly like an app.** The same scaffold, theme rules and SDK apply. Data still comes through `lucidos.*`, and a widget keeps it current the same way: one `render()`, called on each stream open and each matching file event (see *Live data* below). Five differences:
 
-- **Small: one phone screen, no scroll area inside.** Put the answer on the top screen, because a taller inline widget clips. One focused view, at most two actions, no tabs, no navigation, no settings screen. If it needs more, build an app.
+- **Small: a fixed box, no scroll area inside.** Put the answer where the smallest declared size shows it. One focused view, at most two actions, no tabs, no navigation, no settings screen. If it needs more, build an app.
 - **Hold a phone height budget.** By default show about 5 list rows and one control row. Put the sort and the filter in that one row, and never stack two toolbars. Put the rest of the rows behind a "Show more" button.
 - **Named by what it does**, in two or three words: "Flight picker", "Fare grid", "Run chart". The inline widget's bar shows the name, so the trip, dates and other specifics go inside the widget and in its description.
-- **Height follows the content.** The host sizes the frame to `document.body`. Never give the body `height: 100vh` or a full-height flex layout, or the frame cannot shrink. Load the SDK, which reports the height. See `system-knowhow/js-sdk.md` § Sizing a widget to its content.
+- **It draws into a widget box.** Follow the box contract below, in a thread and on a dashboard alike. See `system-knowhow/js-sdk.md` § Sizing a widget.
 - **Its manifest says so.** `create_app` writes `"kind": "widget"` and `"origin_thread_id"`. Keep both, and `"reusable"`, `"params"`, `"sizes"` and `"transparent"`, when you rewrite `manifest.json`. A widget a plugin ships names `"origin_plugin_id"` instead and is always reusable: see `system-knowhow/plugins.md` § Shipping widgets.
 
 **How a widget looks.** A widget is one strong shape on calm ground. The inline widget around it already draws a frame and the name, so the widget draws neither.
@@ -79,7 +77,7 @@ const { clip } = lucidos.params();   // {} when the widget was given none
 
 The host carries them in the frame URL, so they are visible there. Never put a credential in a param. Params over 2 KB are refused: put large data in a file and pass its path.
 
-**Sizes: how big its dashboard tile may be.** A widget on a *dashboard* is a tile at one of three *widget sizes*: `small` (one square cell), `medium` (two cells wide, one high) or `large` (two by two). A widget that declares none takes all three and starts medium, so draw for each. Declare `sizes` only to drop one the widget cannot draw well, default first, with `create_app`'s `sizes` or in the manifest. Only a widget takes sizes, and each name may appear once.
+**Sizes: how big its box may be.** A widget's card and its dashboard tile take one of three *widget sizes*: `small` (one square cell), `medium` (two cells wide, one high) or `large` (two by two). A widget that declares none takes all three and starts medium, so draw for each. Declare `sizes` only to drop one the widget cannot draw well, default first, with `create_app`'s `sizes` or in the manifest. Only a widget takes sizes, and each name may appear once.
 
 ```json
 { "name": "Clock", "kind": "widget", "sizes": ["small", "medium"], "transparent": true }
@@ -87,13 +85,17 @@ The host carries them in the frame URL, so they are visible there. Never put a c
 
 **Transparent: a widget with its own shape.** A tile draws a rounded surface behind the widget. Set `"transparent": true` for a widget that draws its own shape, such as a round clock: its tile and page are then see-through. Give the shape a fill of its own.
 
-**The size contract on a dashboard.** Five rules:
+**The widget box.** Seven rules, one contract for a thread card and a dashboard tile:
 
-1. The tile sets the box, and the frame fills it exactly. A content-size report never sizes a tile.
-2. Draw for the size you are told, under `html[data-widget-size="small"]` and its siblings or with `lucidos.widget.size()`. Never scroll inside a tile.
-3. Content past the tile is clipped under a fade. The tile's menu offers Open in Canvas, which opens the widget full size.
-4. A dashboard may ask for a size the widget no longer declares, as after an update. The tile then shows the nearest smaller declared size, else the nearest larger.
-5. Sizes are names, never pixels. A cell is one size in rem at every dashboard width, and a narrower dashboard shows fewer columns.
+1. **A widget draws into a widget box.** The box is fixed at its size. The host sets it, and content never sizes it.
+2. **The same box everywhere a size applies:** the thread card, under its bar, and a dashboard tile. What the thread shows is what a dashboard shows.
+3. **Read the size, never measure the page for it.** Style under `html[data-widget-size="small"]` and its siblings, or read `lucidos.widget.size()` and listen on `lucidos.widget.onSize()`. The document's viewport is the box, so `100%`, `100vh` and container units all mean the box.
+4. **Fit by dropping content, never by shrinking it.** Type stays on the theme tokens, in rem, so the UI scale reaches it. A smaller size shows less: the one value at small, the pick and its alternatives at medium, the full answer at large.
+5. **Never scroll inside the box.** Content past it is clipped under a fade, and ⋯ › Open in Canvas shows the widget full size.
+6. **Declare only the sizes you draw well.** A size the widget no longer declares, as after an update, falls back. The card or tile shows the nearest smaller declared size, else the nearest larger.
+7. **Two places have no size.** In Canvas the widget is a full page. In a question option it is as tall as its content, under the option's label. There `lucidos.widget.size()` returns `null`.
+
+Sizes are names, never pixels. A cell is one size in rem, and a narrow phone column draws the cells smaller, as a narrow dashboard does.
 
 **A tap leads into the work.** A tile is a way in: tapping a row opens its thread or app with `lucidos.ui.navigate` (`system-knowhow/js-sdk.md` § lucidos.ui). Keep a tile live from data the workspace holds: a trigger fetches, writes to `data/` and emits an event, and the widget re-reads on that event. A tile that polls on a timer keeps a renderer busy for nothing, so stop timers when `lucidos.widget.onVisibility` says it is hidden.
 
@@ -101,29 +103,26 @@ The host carries them in the frame URL, so they are visible there. Never put a c
 
 - **In an option**, the engine lifts the embed into the option, and the card draws the widget under the option's label. One embed per option. A broken embed, an unknown or non-widget id, another thread's widget that is not reusable, or params the manifest does not take refuse the card. Fix the embed and ask again.
 - **In a reply**, a bad embed cannot be refused, so it reads "This widget is not available" in place. Under that it gives the reason an option would get, such as `Widget 'habit-tracker' takes no param 'date'.` Pass only the params the widget's manifest declares. While the reply streams it shows its label; the widget mounts once the text is final.
-- **An embed records no showing.** A pin from its inline widget adds the instance to the *thread widgets*, and names the turn, so "Show in thread" lands there.
+- **A card starts at the widget's default size.** The user's pill pick sticks to that instance in the thread, on every device and after a reload.
 
 **Built-in widgets ship with Lucidos.** A *built-in widget* is a reusable widget under an id starting `lucidos-`, such as `lucidos-sound-player` or `lucidos-video-player` (each takes param `clip`: a workspace path or an https URL). It is read-only: no tool, route or CLI command can change, delete or stop reusing it, and `create_app` refuses a new `lucidos-` id. Read its files at `apps/<id>/` to build your own from it. Prefer a built-in over building the same thing again.
 
 **Only one sound plays at a time.** A clip that starts in one app or widget pauses the others. So a voice sample per option never talks over another (`system-knowhow/js-sdk.md` § One sound at a time).
 
-**What the user can do with it**, from the ⋯ menu on the inline widget or the chip. Each action is also yours:
+**What the user can do with it**, from the inline widget's bar and its ⋯ menu. Each action is also yours:
 
 | Menu action | Tool |
 |---|---|
-| Open in Canvas, full size (Expand does the same) | `navigate_ui` to the widget's id |
+| Open in Canvas, full size | `navigate_ui` to the widget's id |
 | Make reusable, offering it to every thread | `widgets(action="make_reusable")` |
 | Show a widget in this thread | Embed it in your reply: `![Name](app:<id>)` |
-| Pin to shelf, for a widget the user will come back to in this thread. Not in the home thread, which has no shelf | `widgets(action="pin")` |
-| Add to dashboard, from any thread: a tile on the phone or desktop dashboard. A widget that belongs to its thread is made reusable first | `widgets(action="add_to_dashboard")`, with `dashboard` when the user names one |
+| Pick a card's size with the pill. Only a size the user named in this turn | `widgets(action="size")` |
+| Add to dashboard ("+ Dashboard" or the ⋯ item), from any thread: a tile at the card's size on the phone or desktop dashboard. A widget that belongs to its thread is made reusable first | `widgets(action="add_to_dashboard")`, with `dashboard` when the user names one, and `size` when the user named one |
 | Remove from dashboard: that dashboard only | `widgets(action="remove_from_dashboard")` |
 | Arrange a dashboard: order and size. Only when the user asks in this turn | `widgets(action="arrange")`, after `widgets(action="dashboard")` |
-| Unpin from shelf (the inline widget stays) | `widgets(action="unpin")` |
 | Make app | Build a new app with `create_app`, reading the widget's files. The widget stays as it is. |
 
-An embed, a pin and an unpin take params and a label too: one set of params is one *widget instance*, with its own inline widget and chip. `![Marin](app:lucidos-sound-player?params={"clip":"artifacts/voices/marin.mp3"})` shows that player with that clip.
-
-`widgets(action="thread")` lists the *thread widgets*: every instance pinned in a thread, or shown there by an old `WidgetShown`, and which are pinned.
+An embed, a card size and a dashboard add take params too: one set of params is one *widget instance*, with its own card and card size. `![Marin](app:lucidos-sound-player?params={"clip":"artifacts/voices/marin.mp3"})` shows that player with that clip.
 
 The four dashboard actions take an optional `dashboard`, `phone` or `desktop`. Leave it out and they use the *last used device*'s dashboard. A turn with no device, such as a trigger run, must name one.
 
@@ -245,7 +244,7 @@ Don't design on paper. Scaffold the smallest thing that shows the idea (`create_
 
 ## App icon
 
-Every app and every widget gets an icon. Lucidos draws it on the apps panel, the menu drawer, Search Everywhere, the history menu and the coding-agent App row. A widget's shelf chip and inline widget draw it too. Widgets need one most: the shelf shows them side by side.
+Every app and every widget gets an icon. Lucidos draws it on the apps panel, the menu drawer, Search Everywhere, the history menu and the coding-agent App row. A widget's card bar draws it too. Widgets need one most: a dashboard's Add lists them side by side.
 
 - **Pass `icon_svg` to `create_app`.** It saves the SVG as `assets/icon.svg` and sets the manifest's `"icon": "assets/icon.svg"`.
 - **The name is words only.** Never put an emoji or other pictograph in an app or widget name. Lucidos draws the icon beside the name, so a leading emoji shows two icons side by side. Draw the motif in the SVG icon instead.
@@ -344,6 +343,13 @@ A "no" on any line means the app is not finished:
 - **Inline `<script>` for small apps.** Split into `app.js` only when the script grows past ~100 lines or you want to share it with another script.
 - **Inline `<style>` likewise.** External CSS is for shared design across apps.
 - **Use the SDK for everything stateful.** `lucidos.data.read` / `lucidos.data.write` are the right primitives, and `lucidos.storage` holds per-device state. Inside the host shell, a direct `fetch` to `/api/v1/*` has no network at all. An app frame's origin is opaque, so the engine is cross-origin to it and CORS refuses the answer. `localStorage` and `new EventSource` fail the same way, and the SDK carries all three over a bridge to the host. Where no SDK method covers the endpoint, see `system-knowhow/js-sdk.md` § `lucidos.apiUrl` for what a frame can and cannot reach.
+- **Model selection:** use `lucidos.ui.ModelPicker.create` for the host's stepped
+  model, reasoning effort and provider picker. Set `filter: { callableOnly: true }`
+  for app model calls, await `ready`, and persist the returned value in app data.
+  Use `lucidos.modelRequest(value, { messages })` to build the provider's request,
+  then send it through `lucidos.proxy(req.proxy).fetch(req.path, ...)`. Replies
+  retain their provider protocol. Call `refresh()` to reload registry/setup
+  changes and `destroy()` when removing the field. See `js-sdk.md` for the contract.
 - **External APIs: call `lucidos.proxy(name).fetch(path, init)`. Always.** Configure the backend in `data/config/apis.json`; the engine forwards server-side and injects the configured auth header. Never paste credentials into iframe code.
 
   **Model providers are built in**: `lucidos.proxy('openai' | 'vertex' | 'openrouter' | 'xai' | 'anthropic' | 'local' | 'typesafe').fetch(...)` needs no `apis.json` entry. The engine reuses its own provider credential from Settings → Models, and an `apis.json` entry of the same name overrides it. See `system-knowhow/js-sdk.md` § `lucidos.proxy` → "Built-in model-provider proxies". Two wrong shapes look right:

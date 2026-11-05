@@ -10,7 +10,7 @@ vi.mock('../../utils/appFrame', () => ({ appFrameFor, isCanvasAppFrame }));
 const { parseAppScrollMessage, parseAppTouchMessage } = await import('./app-scroll-bridge');
 
 const APP = { name: 'the app frame' };
-const WIDGET = { name: 'a shelf widget' };
+const WIDGET = { name: 'a widget' };
 const STRANGER = { name: 'an embed inside the app' };
 const message = (data: unknown, source: unknown = APP) => ({ data, source }) as unknown as MessageEvent;
 const report = { type: APP_SCROLL_MESSAGE_TYPE, delta: 30, top: 400, max: 2000 };

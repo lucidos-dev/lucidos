@@ -1,70 +1,32 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { ThreadWidget } from '../../api/client/widgets';
 
-const fetchThreadWidgets = vi.fn();
+const listReusableWidgetsApi = vi.fn();
 vi.mock('../../api/client/widgets', () => ({
-  fetchThreadWidgets: (...args: unknown[]) => fetchThreadWidgets(...args),
-  getAppApi: vi.fn(),
-  listReusableWidgetsApi: vi.fn(),
-  makeWidgetReusableApi: vi.fn(),
-  pinWidgetApi: vi.fn(),
-  stopReusingWidgetApi: vi.fn(),
-  unpinWidgetApi: vi.fn(),
+  listReusableWidgetsApi: (...args: unknown[]) => listReusableWidgetsApi(...args),
 }));
 
-const { threadWidgets, threadWidgetsFor } = await import('../widgets');
-const { forgetThreadWidgets, refreshThreadWidgetsNaming, rereadThreadWidgets } = await import('./widgets');
-
-function widget(appId: string): ThreadWidget {
-  return { app_id: appId, name: appId, reusable: false, reveal: 'on-load', sizes: ['medium'], pinned: false, shown_event_id: `e-${appId}` };
-}
-
-/** A fetch the test settles by hand, in any order. */
-function deferred() {
-  let resolve!: (v: ThreadWidget[]) => void;
-  const promise = new Promise<ThreadWidget[]>((r) => { resolve = r; });
-  return { promise, resolve };
-}
+const { reusableWidgets } = await import('../widgets');
+const { refreshReusableWidgets } = await import('./widgets');
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
-describe('the thread widgets store (ADRs 0402, 0407)', () => {
+describe('the reusable widgets list (ADR 0402)', () => {
   beforeEach(() => {
-    fetchThreadWidgets.mockReset();
-    threadWidgets.value = new Map();
+    listReusableWidgetsApi.mockReset();
+    listReusableWidgetsApi.mockResolvedValue([]);
   });
 
-  it('applies only the newest read, so a late older answer cannot put back a removed chip', async () => {
-    const older = deferred();
-    const newer = deferred();
-    fetchThreadWidgets.mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise);
-
-    rereadThreadWidgets('t1');
-    rereadThreadWidgets('t1');
-    newer.resolve([widget('currency')]);
+  it('re-reads on an app change once this device has read it', async () => {
+    reusableWidgets.value = { status: 'loaded', data: [] };
+    refreshReusableWidgets();
     await flush();
-    older.resolve([widget('fare-grid'), widget('currency')]);
-    await flush();
-
-    const widgets = threadWidgetsFor('t1');
-    expect(widgets.status === 'loaded' && widgets.data.map((w) => w.app_id)).toEqual(['currency']);
+    expect(listReusableWidgetsApi).toHaveBeenCalledTimes(1);
   });
 
-  it('re-reads only the threads whose widgets include a changed app', async () => {
-    threadWidgets.value = new Map([
-      ['names-it', { status: 'loaded', data: [widget('fare-grid')] }],
-      ['does-not', { status: 'loaded', data: [widget('currency')] }],
-    ]);
-    fetchThreadWidgets.mockResolvedValue([]);
-    refreshThreadWidgetsNaming('fare-grid');
+  it('reads nothing for a list this device never opened', async () => {
+    reusableWidgets.value = { status: 'not-loaded' };
+    refreshReusableWidgets();
     await flush();
-    expect(fetchThreadWidgets).toHaveBeenCalledTimes(1);
-    expect(fetchThreadWidgets).toHaveBeenCalledWith('names-it');
-  });
-
-  it('forgets a deleted thread\'s widgets', () => {
-    threadWidgets.value = new Map([['gone', { status: 'loaded', data: [widget('fare-grid')] }]]);
-    forgetThreadWidgets(['gone']);
-    expect(threadWidgetsFor('gone').status).toBe('not-loaded');
+    expect(listReusableWidgetsApi).not.toHaveBeenCalled();
   });
 });

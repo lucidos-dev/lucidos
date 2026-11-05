@@ -17,6 +17,11 @@ fn api_dir() -> PathBuf {
 /// The third column is prose for a reader: nothing keys on it.
 const MOUNTED_ELSEWHERE: &[(&str, &str, &str)] = &[
     (
+        "restore_generation.rs",
+        "durable_boundary_fences_before_handler_without_waiting_for_hello",
+        "an inline test's own router",
+    ),
+    (
         "apps.rs",
         "ui_router",
         "nested at /app, outside /api/v1, so the hatch cannot address it",
@@ -27,6 +32,11 @@ const MOUNTED_ELSEWHERE: &[(&str, &str, &str)] = &[
         "an inline test's own router",
     ),
     ("fonts.rs", "answer", "an inline test's own router"),
+    (
+        "snapshots_restore.rs",
+        "delivery_is_refused_unless_the_post_left_unanswered",
+        "an inline test's own router",
+    ),
     (
         "local_auth.rs",
         "an_open_door_streams_a_body_instead_of_collecting_it",
@@ -52,7 +62,12 @@ const MOUNTED_ELSEWHERE: &[(&str, &str, &str)] = &[
 /// around the question. It lives beside the scan because the scan is its only
 /// reader: the running gate matches on the route axum reports, which is the
 /// built string.
-const COMPUTED_ROUTE_REACH: &[(&str, &str, Reach)] = &[];
+const COMPUTED_ROUTE_REACH: &[(&str, &str, Reach)] = &[
+    // The OAuth callback delivery, shared with the gateway as a constant. Only
+    // the gateway calls it, so like the rest of the `/internal/` tree no app
+    // frame may.
+    ("internal.rs", "router", Reach::Agent),
+];
 
 /// Every route the `/api/v1` router serves, with the methods each answers.
 ///
@@ -235,6 +250,7 @@ fn the_deliberate_omissions_stay_denied() {
         ("/changes/apply-all", "POST"),
         ("/claude-code/control", "POST"),
         ("/engine/rebuild", "POST"),
+        ("/engine/build-log", "GET"),
         ("/restart", "POST"),
         ("/plugins/install-request", "POST"),
         ("/plugins/uninstall-request", "POST"),

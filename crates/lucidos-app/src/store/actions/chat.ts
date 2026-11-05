@@ -15,6 +15,7 @@ import {
   effectiveThreadStatus,
 } from '../store';
 import type { ChatContext } from './chatContext';
+import { retainSendingImageHashes } from '../pendingUploadRecords';
 import type { ChatRequestBody } from '../../api/types';
 import { submitChat, cancelChat, stopClaudeCode, removeQueuedMessage as removeQueuedMessageRequest, ApiError, type CodingAgentModelValue, type CodingAgentReasoningEffort } from '../../api/client';
 import { sendFailureOf, withQuietRetries, type SendFailure } from './sendRetry';
@@ -372,6 +373,7 @@ export async function sendMessage(
   // thread's order is the order the user pressed send. Released however the
   // send ends, a throw before its POST included.
   const sendSlot = enterSendChain(threadId);
+  const releaseImages = retainSendingImageHashes(imageHashes);
   try {
     return await buildAndPostSend({ message, imageHashes, options, eventId, threadId, isNewThread, shouldFocus, sendSlot });
   } catch (error) {
@@ -382,6 +384,7 @@ export async function sendMessage(
     throw error;
   } finally {
     sendSlot.release();
+    releaseImages();
   }
 }
 
@@ -430,10 +433,6 @@ async function buildAndPostSend({ message, imageHashes, options, eventId, thread
   const answersQuestion = addPendingMessage(threadId, message, eventId, imageHashes);
   // A typed answer replaces a pick to the same card that was not sent.
   if (answersQuestion) unsentPicks.clear(answersQuestion);
-  // After the row, never before: a send in flight must have one. The Stop
-  // bridge (`shouldClearSubmitting`) and the composer's action row read it.
-  if (options?.threadStarted) await options.threadStarted();
-
   const body: ChatRequestBody = {
     message,
     mode: 'human',
@@ -463,7 +462,7 @@ async function buildAndPostSend({ message, imageHashes, options, eventId, thread
   // exactly on the raw-new path; compose first-sends and follow-ups both pass
   // an explicit `threadId` for a thread that is already in the map, and a
   // compose thread's row exists server-side because `threadStarted` was
-  // awaited above.
+  // awaited before the chat POST below.
   if (!threadBeforeSend) body.new_thread = true;
 
   // `sendCompose` (compose.ts) flips composing→active before delegating here,
@@ -520,6 +519,13 @@ async function buildAndPostSend({ message, imageHashes, options, eventId, thread
     if (provider) body.provider = provider;
   }
 
+  const settlement: SendSettlement = options?.settlement ?? { kind: body.new_thread ? 'raw-new' : 'follow-up' };
+  const sentAt = new Date().toISOString();
+  // Own the exact user content before the first await, including a pending
+  // thread start or webview extraction. Those waits can span a restore.
+  persistSendingMessage({ eventId, threadId, body, settlement, sentAt, answersQuestion });
+  if (options?.threadStarted) await options.threadStarted();
+
   // CC ignores url_context; only send for non-CC threads. Content extraction is
   // tauri-only (browser can't read cross-origin iframes); fall back to URL+title.
   if (panelUrl.value && !body.use_coding_agent) {
@@ -538,10 +544,9 @@ async function buildAndPostSend({ message, imageHashes, options, eventId, thread
       content: extractedContent,
     };
   }
-  const settlement: SendSettlement = options?.settlement ?? { kind: body.new_thread ? 'raw-new' : 'follow-up' };
   // Kept on the device before the POST goes out, so a reload while it is in
   // flight, or waiting its turn, still finds the message.
-  persistSendingMessage({ eventId, threadId, body, settlement, sentAt: new Date().toISOString(), answersQuestion });
+  persistSendingMessage({ eventId, threadId, body, settlement, sentAt, answersQuestion });
   return postSend({ threadId, eventId, body, sendSlot, failedRetries: 0, settlement });
 }
 
@@ -727,32 +732,41 @@ export function showRestoredUnsentMessage(record: UnsentMessageRecord): void {
  *  question card goes back to sending on that card. Resolves null when there
  *  is nothing to retry, e.g. a second press. */
 export async function retryUnsentMessage(eventId: string): Promise<SendOutcome | null> {
-  const unsent = takeUnsentMessage(eventId);
-  if (!unsent) return null;
-  const { threadId } = unsent;
-  const thread = threadMap.value.get(threadId);
+  const original = unsentMessages.peek().get(eventId);
+  if (!original) return null;
+  const thread = threadMap.value.get(original.threadId);
   if (!thread) return null;
-  const sendSlot = enterSendChain(threadId);
-  // A fresh place at the tail: the engine already admitted what was sent since.
-  const body = { ...unsent.body, ...sendSlot.position };
-  let outcome: SendOutcome;
+  const releaseImages = retainSendingImageHashes(original.body.image_hashes);
   try {
-    retireUnsentExchange(thread, eventId);
-    addPendingMessage(threadId, body.message, eventId, body.image_hashes);
-    outcome = await postSend({
-      threadId,
-      eventId,
-      body,
-      sendSlot,
-      failedRetries: unsent.failedRetries + 1,
-      settlement: unsent.settlement,
-    });
+    const unsent = takeUnsentMessage(eventId);
+    if (!unsent) return null;
+    const { threadId } = unsent;
+    const sendSlot = enterSendChain(threadId);
+    // A fresh place at the tail: the engine already admitted what was sent since.
+    const body = { ...unsent.body, ...sendSlot.position };
+    persistSendingMessage({ eventId, threadId, body, settlement: original.settlement,
+      sentAt: new Date().toISOString(), answersQuestion: original.answersQuestion });
+    let outcome: SendOutcome;
+    try {
+      retireUnsentExchange(thread, eventId);
+      addPendingMessage(threadId, body.message, eventId, body.image_hashes);
+      outcome = await postSend({
+        threadId,
+        eventId,
+        body,
+        sendSlot,
+        failedRetries: unsent.failedRetries + 1,
+        settlement: unsent.settlement,
+      });
+    } finally {
+      sendSlot.release();
+    }
+    if (outcome === 'sent') settleAcceptedSend(threadId, unsent.settlement);
+    if (outcome === 'dropped') restoreRefusedSend(threadId, body, unsent.settlement);
+    return outcome;
   } finally {
-    sendSlot.release();
+    releaseImages();
   }
-  if (outcome === 'sent') settleAcceptedSend(threadId, unsent.settlement);
-  if (outcome === 'dropped') restoreRefusedSend(threadId, body, unsent.settlement);
-  return outcome;
 }
 
 /** Drop an unsent message the user no longer wants sent: its card and its

@@ -358,9 +358,16 @@ fn the_effort_vocabulary_is_both_menus_effort_rows() {
     }
 }
 
-#[test]
-fn each_surface_s_pairs_that_are_on_form_a_frontier() {
+#[tokio::test]
+async fn each_surface_s_pairs_that_are_on_form_a_frontier_apart_from_its_shipped_default() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let routes = seeded_routes(&pool).await;
     for (surface, pairs) in surfaces() {
+        let default = load(&pool, &routes, surface_named(surface))
+            .await
+            .default_intelligence_rung
+            .expect("every surface ships a default rung");
+        let is_default = |p: &SurfacePair| p.model == default.model && p.effort == default.effort;
         let cost =
             |p: &SurfacePair| estimate_of(&p.model, &p.effort).map(list_cost_on_estimate_day);
         let on: Vec<&SurfacePair> = pairs.iter().filter(|p| p.on).collect();
@@ -370,7 +377,13 @@ fn each_surface_s_pairs_that_are_on_form_a_frontier() {
             surface == "chat"
                 || estimate_of(&p.model, &p.effort).is_some_and(|e| !e.coding_estimated)
         };
-        let ranked_on: Vec<&SurfacePair> = on.iter().copied().filter(measured_on_profile).collect();
+        // The shipped default stays on even when a cheaper pair beats it.
+        let ranked_on: Vec<&SurfacePair> = on
+            .iter()
+            .copied()
+            .filter(measured_on_profile)
+            .filter(|p| !is_default(p))
+            .collect();
         for pair in ranked_on.windows(2) {
             assert!(
                 cost(pair[0]) <= cost(pair[1]),
@@ -391,6 +404,7 @@ fn each_surface_s_pairs_that_are_on_form_a_frontier() {
             );
         }
     }
+    crate::test_support::teardown_test_db(&db_name).await;
 }
 
 #[test]
@@ -1075,6 +1089,27 @@ fn codex_with_no_offered_default_picks_nothing() {
 }
 
 #[tokio::test]
+async fn the_shipped_claude_code_default_is_an_intelligence_rung_on_the_shipped_claude_code_ladder()
+{
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let routes = seeded_routes(&pool).await;
+    assert_eq!(
+        default_implementer(&pool, CodingAgent::ClaudeCode).await,
+        Some(opus_medium())
+    );
+    let ladder = load(&pool, &routes, LadderSurface::ClaudeCode).await;
+    assert!(
+        ladder.intelligence_rungs.iter().any(|r| r.on
+            && r.is_default
+            && r.intelligence.is_some()
+            && r.model == "claude-opus-5-5"
+            && r.effort == "medium"),
+        "the default reads as an on rung of the ladder, with a band"
+    );
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
 async fn the_shipped_codex_default_is_an_intelligence_rung_on_the_shipped_codex_ladder() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
     let routes = seeded_routes(&pool).await;
@@ -1392,10 +1427,11 @@ async fn the_chat_ladder_loads_with_the_account_default_marked() {
         .clone()
         .expect("the shipped chat model has a default effort");
     assert_eq!(default.model, prefs::CHAT_MODEL.read(&pool).await);
-    assert!(ladder
-        .intelligence_rungs
-        .iter()
-        .any(|r| r.is_default && r.model == default.model && r.effort == default.effort));
+    assert!(ladder.intelligence_rungs.iter().any(|r| r.is_default
+        && r.on
+        && r.intelligence.is_some()
+        && r.model == default.model
+        && r.effort == default.effort));
     assert!(!ladder.pairs().is_empty());
     crate::test_support::teardown_test_db(&db_name).await;
 }

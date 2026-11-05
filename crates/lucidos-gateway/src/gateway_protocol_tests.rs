@@ -1,4 +1,5 @@
 use super::*;
+use crate::pairing;
 use axum::body::Body;
 use axum::http::Request as HttpRequest;
 use serde_json::{json, Value};
@@ -19,7 +20,22 @@ async fn call(
     headers: &[(&str, &str)],
     body: Option<Value>,
 ) -> (StatusCode, Value) {
+    call_from(state, None, method, path, headers, body).await
+}
+
+/// [`call`], as if the acceptor had stamped `peer` on the request.
+async fn call_from(
+    state: &GatewayState,
+    peer: Option<pairing::Peer>,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<Value>,
+) -> (StatusCode, Value) {
     let mut builder = HttpRequest::builder().method(method).uri(path);
+    if let Some(peer) = peer {
+        builder = builder.extension(peer);
+    }
     for (name, value) in headers {
         builder = builder.header(*name, *value);
     }
@@ -56,7 +72,7 @@ fn pairing_path() -> String {
 
 /// Mint a gateway code on `state` and redeem it as a remote gateway would.
 async fn pair_a_gateway(state: &GatewayState) -> PairAnswer {
-    let code = state.paired_gateways().mint_code(None).unwrap();
+    let code = state.paired_gateways().mint_secret(None).unwrap();
     let (status, body) = call(
         state,
         "POST",
@@ -111,7 +127,7 @@ async fn the_label_on_the_code_wins_over_the_one_the_gateway_offers() {
     let (state, _dir) = gateway();
     let code = state
         .paired_gateways()
-        .mint_code(Some("cloud box".to_string()))
+        .mint_secret(Some("cloud box".to_string()))
         .unwrap();
     let (status, _) = call(
         &state,
@@ -128,7 +144,7 @@ async fn the_label_on_the_code_wins_over_the_one_the_gateway_offers() {
 #[tokio::test]
 async fn a_device_code_never_pairs_a_gateway() {
     let (state, _dir) = gateway();
-    let device_code = state.mint_pairing_code(None).unwrap();
+    let device_code = state.mint_pairing(None).unwrap().secret;
     let (status, _) = call(
         &state,
         "POST",
@@ -155,7 +171,7 @@ async fn a_device_code_never_pairs_a_gateway() {
 #[tokio::test]
 async fn a_gateway_code_never_pairs_a_device() {
     let (state, _dir) = gateway();
-    let gateway_code = state.paired_gateways().mint_code(None).unwrap();
+    let gateway_code = state.paired_gateways().mint_secret(None).unwrap();
     let (status, _) = call(
         &state,
         "POST",
@@ -181,7 +197,7 @@ async fn a_gateway_code_never_pairs_a_device() {
 #[tokio::test]
 async fn a_gateway_code_works_once() {
     let (state, _dir) = gateway();
-    let code = state.paired_gateways().mint_code(None).unwrap();
+    let code = state.paired_gateways().mint_secret(None).unwrap();
     let path = pair_path();
     let pair = || call(&state, "POST", &path, &[], Some(json!({ "code": code })));
     assert_eq!(pair().await.0, StatusCode::OK);
@@ -193,7 +209,11 @@ async fn a_gateway_code_works_once() {
 async fn gateway_calls_refuse_anything_but_a_current_gateway_credential() {
     let (state, _dir) = gateway();
     pair_a_gateway(&state).await;
-    let device = match state.redeem_pairing_code(&state.mint_pairing_code(None).unwrap(), None) {
+    let device = match state.redeem_pairing(
+        &state.mint_pairing(None).unwrap().secret,
+        crate::pairing::PairingChannel::Public,
+        None,
+    ) {
         Ok(crate::server::PairingOutcome::Paired(credential)) => credential,
         _ => panic!("the device did not pair"),
     };
@@ -306,7 +326,11 @@ async fn minting_a_gateway_code_needs_a_paired_caller() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(auth::valid_pairing_code(body["code"].as_str().unwrap()).is_some());
+    assert!(crate::pairing::valid_pairing_secret(
+        body["code"].as_str().unwrap(),
+        crate::pairing::PairingKind::Gateway
+    )
+    .is_some());
 }
 
 #[tokio::test]
@@ -339,10 +363,408 @@ fn a_failed_save_records_no_pairing() {
     use crate::remote_gateways::tests::ReadOnlyDir;
     let dir = tempfile::tempdir().unwrap();
     let store = PairedGatewayStore::load(paired_gateways_path(dir.path())).unwrap();
-    let code = store.mint_code(None).unwrap();
+    let code = store.mint_secret(None).unwrap();
     {
         let _locked = ReadOnlyDir::new(dir.path());
         assert!(store.redeem(&code, Some("A")).is_err());
     }
     assert!(store.list().is_empty());
+}
+
+// ── Pairing secrets and channels ────────────────────────────────────────────
+
+const DEVICE_PAIR: &str = "/~/api/v1/auth/pair";
+
+fn peer_at(remote: &str, public_listener: bool) -> Option<pairing::Peer> {
+    Some(pairing::Peer {
+        remote: remote.parse().unwrap(),
+        local: "127.0.0.1:5252".parse().unwrap(),
+        public_listener,
+    })
+}
+
+fn lan_peer(last: u8) -> Option<pairing::Peer> {
+    Some(pairing::Peer {
+        remote: format!("192.168.1.{last}:40000").parse().unwrap(),
+        local: "192.168.1.5:5252".parse().unwrap(),
+        public_listener: false,
+    })
+}
+
+async fn mint_device(state: &GatewayState) -> (String, String) {
+    let (status, body) = call(state, "POST", "/~/api/v1/auth/pairing-code", &[LOCAL], None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    (
+        body["code"].as_str().unwrap().to_string(),
+        body["secret"].as_str().unwrap().to_string(),
+    )
+}
+
+fn wrong_short(code: &str) -> &'static str {
+    if code == "00000000" {
+        "00000001"
+    } else {
+        "00000000"
+    }
+}
+
+/// Invariant: a request from 127.0.0.1 carrying a tunnel header is refused a
+/// typed code, and so is any request on the public listener.
+#[tokio::test]
+async fn a_typed_code_through_a_tunnel_is_refused_and_spends_nothing() {
+    let (state, _dir) = gateway();
+    let (code, secret) = mint_device(&state).await;
+    let loopback = peer_at("127.0.0.1:50000", false);
+    for header in ["cf-connecting-ip", "x-forwarded-for", "forwarded", "cf-ray"] {
+        let (status, body) = call_from(
+            &state,
+            loopback,
+            "POST",
+            DEVICE_PAIR,
+            &[("host", "127.0.0.1:5252"), (header, "203.0.113.9")],
+            Some(json!({ "code": code })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{header}");
+        assert_eq!(
+            body["error"],
+            json!(crate::auth_api::PUBLIC_SHORT_CODE_REFUSAL)
+        );
+    }
+    let (status, _) = call_from(
+        &state,
+        peer_at("127.0.0.1:50000", true),
+        "POST",
+        DEVICE_PAIR,
+        &[("host", "127.0.0.1:5282")],
+        Some(json!({ "code": code })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "the public listener");
+    assert!(state.paired_devices().devices.is_empty());
+
+    let (status, _) = call_from(
+        &state,
+        loopback,
+        "POST",
+        DEVICE_PAIR,
+        &[
+            ("host", "lucidos.example.com"),
+            ("cf-connecting-ip", "203.0.113.9"),
+        ],
+        Some(json!({ "code": secret })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the long secret pairs through a tunnel"
+    );
+}
+
+/// Invariant: a raw forward to the main port, which a caller can give any
+/// `Host`, is refused a typed code. This machine pairs by the secret instead.
+#[tokio::test]
+async fn a_typed_code_pairs_on_the_lan_and_never_from_loopback() {
+    let (state, _dir) = gateway();
+    let (code, _) = mint_device(&state).await;
+    let (status, body) = call_from(
+        &state,
+        lan_peer(20),
+        "POST",
+        DEVICE_PAIR,
+        &[("host", "192.168.1.5:5252")],
+        Some(json!({ "code": code })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (code, secret) = mint_device(&state).await;
+    let loopback = peer_at("127.0.0.1:50000", false);
+    let (status, body) = call_from(
+        &state,
+        loopback,
+        "POST",
+        DEVICE_PAIR,
+        &[("host", "localhost:5252")],
+        Some(json!({ "code": code })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"],
+        json!(crate::auth_api::PUBLIC_SHORT_CODE_REFUSAL)
+    );
+    let (status, body) = call_from(
+        &state,
+        loopback,
+        "POST",
+        DEVICE_PAIR,
+        &[("host", "localhost:5252")],
+        Some(json!({ "code": secret })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Invariant: a junk flood from X cannot block a correct typed code from Y.
+#[tokio::test]
+async fn one_lan_device_flooding_costs_another_nothing() {
+    let (state, _dir) = gateway();
+    let (code, _) = mint_device(&state).await;
+    let mut throttled = false;
+    for _ in 0..200 {
+        let (status, _) = call_from(
+            &state,
+            lan_peer(66),
+            "POST",
+            DEVICE_PAIR,
+            &[],
+            Some(json!({ "code": wrong_short(&code) })),
+        )
+        .await;
+        throttled |= status == StatusCode::TOO_MANY_REQUESTS;
+    }
+    assert!(throttled, "the flooding device met its own cap");
+    let (status, body) = call_from(
+        &state,
+        lan_peer(7),
+        "POST",
+        DEVICE_PAIR,
+        &[],
+        Some(json!({ "code": code })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Invariant: a flood of wrong secrets from many sources cannot stop a correct
+/// long secret, for device and gateway pairing alike. The full 100,000-guess
+/// run is `pairing::tests`; this drives the routes the process serves.
+#[tokio::test]
+async fn a_flood_through_the_routes_never_refuses_a_correct_secret() {
+    let (state, _dir) = gateway();
+    let (code, device_secret) = mint_device(&state).await;
+    let gateway_secret = state.paired_gateways().mint_secret(None).unwrap();
+    for n in 0..1_000u32 {
+        let remote = format!("10.0.{}.{}:4000", n / 250, n % 250);
+        let peer = Some(pairing::Peer {
+            remote: remote.parse().unwrap(),
+            local: "10.0.9.9:5252".parse().unwrap(),
+            public_listener: n % 2 == 0,
+        });
+        let guess = if n % 2 == 0 {
+            json!({ "code": wrong_short(&code) })
+        } else {
+            json!({ "code": format!("ldp_{:026}", n).replace('0', "a").replace('1', "b") })
+        };
+        let (status, _) = call_from(&state, peer, "POST", DEVICE_PAIR, &[], Some(guess)).await;
+        assert_ne!(status, StatusCode::OK);
+        let gateway_guess = json!({ "code": format!("lgp_{:026}", n).replace('0', "a") });
+        let (status, _) =
+            call_from(&state, peer, "POST", &pair_path(), &[], Some(gateway_guess)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "never a 429 on the gateway route"
+        );
+    }
+    let (status, _) = call(
+        &state,
+        "POST",
+        DEVICE_PAIR,
+        &[],
+        Some(json!({ "code": device_secret })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the device secret paired");
+    let (status, _) = call(
+        &state,
+        "POST",
+        &pair_path(),
+        &[],
+        Some(json!({ "code": gateway_secret })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the gateway secret paired");
+}
+
+/// Invariant: with nothing pending, a flood counts nothing.
+#[tokio::test]
+async fn a_flood_before_any_code_is_minted_costs_the_first_code_nothing() {
+    let (state, _dir) = gateway();
+    for _ in 0..100 {
+        let (status, _) = call_from(
+            &state,
+            lan_peer(9),
+            "POST",
+            DEVICE_PAIR,
+            &[],
+            Some(json!({ "code": "00000000" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    let (code, _) = mint_device(&state).await;
+    let (status, body) = call_from(
+        &state,
+        lan_peer(9),
+        "POST",
+        DEVICE_PAIR,
+        &[],
+        Some(json!({ "code": code })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn the_qr_carries_the_long_secret_never_the_short_code() {
+    let (state, _dir) = gateway();
+    let (status, body) = call(
+        &state,
+        "POST",
+        "/~/api/v1/auth/pairing-code?origin=https://mac.example.ts.net",
+        &[LOCAL],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let url = body["pair_url"].as_str().unwrap();
+    assert!(url.ends_with(body["secret"].as_str().unwrap()), "{url}");
+    assert!(!url.contains(body["code"].as_str().unwrap()), "{url}");
+}
+
+#[test]
+fn rotation_survives_reload_and_first_new_use_revokes_overlap() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = paired_gateways_path(dir.path());
+    let store = PairedGatewayStore::load(path.clone()).unwrap();
+    let code = store.mint_secret(None).unwrap();
+    let GatewayRedemption::Paired { credential, .. } = store.redeem(&code, None).unwrap() else {
+        panic!()
+    };
+    let headers = |value: &str| {
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_GATEWAY_CREDENTIAL, value.parse().unwrap());
+        headers
+    };
+    let candidate = auth::mint_credential().unwrap();
+    store.rotate(&headers(&credential), &candidate).unwrap();
+    // Lost responses can repeat the same intent without creating another key.
+    store.rotate(&headers(&credential), &candidate).unwrap();
+    let store = PairedGatewayStore::load(path.clone()).unwrap();
+    assert!(store.authorize(&headers(&credential)).unwrap().is_some());
+    assert!(store.authorize(&headers(&candidate)).unwrap().is_some());
+    let store = PairedGatewayStore::load(path).unwrap();
+    assert!(store.authorize(&headers(&credential)).unwrap().is_none());
+    assert!(store.authorize(&headers(&candidate)).unwrap().is_some());
+    assert!(store.list()[0].last_used_at.is_some());
+}
+
+#[test]
+fn rotation_expiry_revocation_and_persistence_failure_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = paired_gateways_path(dir.path());
+    let store = PairedGatewayStore::load(path.clone()).unwrap();
+    let code = store.mint_secret(None).unwrap();
+    let GatewayRedemption::Paired {
+        credential,
+        pairing_id,
+    } = store.redeem(&code, None).unwrap()
+    else {
+        panic!()
+    };
+    let headers = |value: &str| {
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_GATEWAY_CREDENTIAL, value.parse().unwrap());
+        headers
+    };
+    let candidate = auth::mint_credential().unwrap();
+    assert!(!store.rotate(&headers("wrong"), &candidate).unwrap());
+    assert!(store.rotate(&headers(&credential), "short").is_err());
+    assert!(store.rotate(&headers(&credential), &candidate).unwrap());
+    assert!(store
+        .rotate(&headers(&credential), &auth::mint_credential().unwrap())
+        .is_err());
+    store
+        .write(|data| {
+            data.gateways[0]
+                .previous_credential
+                .as_mut()
+                .unwrap()
+                .expires_at = 0
+        })
+        .unwrap();
+    assert!(store.authorize(&headers(&credential)).unwrap().is_none());
+    // Old overlap expiry cannot strand A: its durable candidate still works.
+    assert!(store.authorize(&headers(&candidate)).unwrap().is_some());
+    store
+        .write(|data| data.gateways[0].last_used_at = None)
+        .unwrap();
+    let before = store.list();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(store
+        .rotate(&headers(&candidate), &auth::mint_credential().unwrap())
+        .is_err());
+    assert!(store.authorize(&headers(&candidate)).is_err());
+    assert_eq!(store.list(), before);
+    std::fs::remove_dir(&path).unwrap();
+    assert!(store.unpair(&pairing_id).unwrap());
+    assert!(!store
+        .rotate(&headers(&candidate), &auth::mint_credential().unwrap())
+        .unwrap());
+}
+
+#[tokio::test]
+async fn rotation_route_authenticates_without_consuming_the_overlap() {
+    let (state, _dir) = gateway();
+    let code = state.paired_gateways().mint_secret(None).unwrap();
+    let GatewayRedemption::Paired { credential, .. } =
+        state.paired_gateways().redeem(&code, None).unwrap()
+    else {
+        panic!()
+    };
+    let candidate = auth::mint_credential().unwrap();
+    let path = format!("{GATEWAY_API_PREFIX}{ROTATE_PATH}");
+    for _ in 0..2 {
+        let (status, _) = call(
+            &state,
+            "POST",
+            &path,
+            &[(HEADER_GATEWAY_CREDENTIAL, &credential)],
+            Some(json!({"candidate":candidate})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    let (status, _) = call(
+        &state,
+        "POST",
+        &path,
+        &[],
+        Some(json!({"candidate":candidate})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn recent_gateway_use_does_not_rewrite_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = paired_gateways_path(dir.path());
+    let store = PairedGatewayStore::load(path.clone()).unwrap();
+    let code = store.mint_secret(None).unwrap();
+    let GatewayRedemption::Paired { credential, .. } = store.redeem(&code, None).unwrap() else {
+        panic!()
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(HEADER_GATEWAY_CREDENTIAL, credential.parse().unwrap());
+    assert!(store.authorize(&headers).unwrap().is_some());
+    let before = store.list();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(store.authorize(&headers).unwrap().is_some());
+    assert_eq!(store.list(), before);
 }

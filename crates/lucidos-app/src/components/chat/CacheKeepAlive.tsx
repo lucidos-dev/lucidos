@@ -379,6 +379,46 @@ function rereadSentence(status: RunStatus): string | null {
   return `Rereading ${rereadWhat(tokens)} costs ${usd(status.reread_usd)}.`;
 }
 
+/** The pings an open run needs to keep the cache warm up to its expected wake:
+ *  one per interval since the run began. `null` without a wake or interval. */
+function pingsBeforeWake(status: Status<'warming'>): number | null {
+  if (!status.expected_wake || status.beat_every_secs === undefined) return null;
+  const secs = (Date.parse(status.expected_wake.at) - Date.parse(status.since)) / 1000;
+  return Math.max(0, Math.floor(secs / status.beat_every_secs));
+}
+
+/** What an open run with no odds should cost against rereading, scored like
+ *  the math's rows: a wake before the first ping reads a warm cache anyway,
+ *  and a wake past the budget pays every ping and the reread. */
+function warmingComparison(status: Status<'warming'>, pingUsd: number, rereadUsd: number): string {
+  const wakePings = pingsBeforeWake(status);
+  const budget = status.budget_beats;
+  if (wakePings === null) {
+    return `The whole plan of ${pings(budget)} costs at most ${usd(budget * pingUsd)}, against ${usd(rereadUsd)} to reread.`;
+  }
+  if (wakePings === 0) return 'The expected wake comes before the first ping, so the cache is still warm without one.';
+  if (wakePings > budget) {
+    return `The plan stops after ${pings(budget)}, before the expected wake, so the reply rereads anyway: keeping it warm costs about ${usd(budget * pingUsd)} more.`;
+  }
+  const keepWarm = wakePings * pingUsd;
+  const saving = Math.round((rereadUsd - keepWarm) * 100) / 100;
+  const verdict = saving >= 0 ? `saves about ${usd(saving)}` : `costs about ${usd(-saving)} more`;
+  return `Keeping it warm to the expected wake takes ${pings(wakePings)}, about ${usd(keepWarm)}, against ${usd(rereadUsd)} to reread. That ${verdict}.`;
+}
+
+/** The explainer's prices for a run with no odds to build the math from: what
+ *  one ping costs, then the reread, compared where the run is open. */
+function priceSentences(status: RunStatus): string[] {
+  const reread = rereadSentence(status);
+  const tokens = status.context_tokens ?? 0;
+  if (status.ping_usd === undefined) return reread ? [reread] : [];
+  const ping = `A ping reads ${rereadWhat(tokens)} for ${usd(status.ping_usd)}.`;
+  if (status.state === 'warming' && status.reread_usd !== undefined) {
+    return [ping, warmingComparison(status, status.ping_usd, status.reread_usd)];
+  }
+  return reread ? [ping, reread] : [ping];
+}
+
 /** Whether `status` is a run the thread still keeps warm, so its card may carry
  *  the meter and the switch. A card of a closed run, or one read while the
  *  thread runs, is not open. A parked thread is not running: its beats run
@@ -694,18 +734,18 @@ function cacheIntro(status: CacheKeepAliveStatus): string {
   return `The model holds this thread's context in its prompt cache for a while. ${keeps} instead of paying to reread it.`;
 }
 
-/** The run's sentence and the meter, then the math or the reread price. Or
- *  the reason nothing keeps the cache warm. */
+/** The run's sentence and the meter, then the math or the prices. Or the
+ *  reason nothing keeps the cache warm. */
 function KeepAliveRunFacts({ status }: { status: CacheKeepAliveStatus }) {
   if (status.state === 'not_kept') return <p>{`Nothing keeps it warm while you are away. ${notKeptReason(status)}`}</p>;
   const math = keepAliveMath(status);
-  const reread = math ? null : rereadSentence(status);
+  const prices = math ? [] : priceSentences(status);
   return (
     <>
       <p>{explainerSentence(status)}</p>
       {status.state === 'warming' ? <KeepAliveMeter status={status} /> : null}
       {math ? <KeepAliveMathFold math={math} /> : null}
-      {reread ? <p>{reread}</p> : null}
+      {prices.length > 0 ? <p>{prices.join(' ')}</p> : null}
       {status.state === 'turned_off' ? <p>{TURNS_BACK_ON}</p> : null}
     </>
   );

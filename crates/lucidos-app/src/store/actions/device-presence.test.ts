@@ -76,6 +76,10 @@ Object.defineProperty(document, 'visibilityState', {
 const fetchMock = vi.fn().mockResolvedValue({ ok: true });
 (globalThis as { fetch: typeof fetch }).fetch = fetchMock as unknown as typeof fetch;
 
+const { observeSourceGeneration } = await import('../../utils/restoreSourceGeneration');
+const { trackDeviceRegistration } = await import('../../utils/deviceRegistration');
+const { installRestoreAdmission } = await import('../../utils/restoreAdmission');
+
 const { startDevicePresenceTracking, stopDevicePresenceTracking } = await import('./device-presence');
 
 interface DevicePresenceBody {
@@ -93,6 +97,8 @@ function lastFetchBody(): DevicePresenceBody | null {
 
 describe('device presence tracking', () => {
   beforeEach(() => {
+    observeSourceGeneration(null);
+    installRestoreAdmission({ ready: () => true, wait: async () => {} });
     fetchMock.mockClear();
     documentListeners.clear();
     windowListeners.clear();
@@ -102,6 +108,49 @@ describe('device presence tracking', () => {
 
   afterEach(() => {
     stopDevicePresenceTracking();
+  });
+
+  it('stamps the original generation and keeps unload delivery on the guarded transport', () => {
+    startDevicePresenceTracking();
+    expect(fetchMock.mock.calls[0][1].headers['x-lucidos-restore-generation']).toBe('none');
+    fetchMock.mockClear();
+    fire(windowListeners, 'beforeunload');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({ keepalive: true,
+      headers: { 'x-lucidos-restore-generation': 'none' } });
+    expect(lastFetchBody()).toMatchObject({ visible: false });
+  });
+
+  it('does not dispatch old presence when registration finishes after a restore', async () => {
+    let release!: () => void;
+    const registration = trackDeviceRegistration(new Promise<void>((resolve) => { release = resolve; }));
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      startDevicePresenceTracking();
+      expect(fetchMock).not.toHaveBeenCalled();
+      observeSourceGeneration('11111111-1111-4111-8111-111111111111');
+      release();
+      await registration;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally { warning.mockRestore(); }
+  });
+
+  it('does not dispatch old presence when restore admission releases after a restore', async () => {
+    let release!: () => void;
+    let ready = false;
+    const waiting = new Promise<void>((resolve) => { release = resolve; });
+    installRestoreAdmission({ ready: () => ready, wait: () => waiting });
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      startDevicePresenceTracking();
+      expect(fetchMock).not.toHaveBeenCalled();
+      observeSourceGeneration('11111111-1111-4111-8111-111111111111');
+      ready = true;
+      release();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally { warning.mockRestore(); }
   });
 
   it('emits visible=true immediately on start when the page is visible+focused', () => {

@@ -6,7 +6,10 @@
  *
  *  Plan: `docs/plans/2026-10-02-pending-uploads-survive-a-reload.md`. */
 
+import { isHistoricalRestoreSource } from '../../utils/restoreSourceGeneration';
 import { effect } from '@preact/signals';
+import { waitForRestoreAdmission, restoreSourcePreserved, queuedRestoreSourceId } from '../../utils/restoreAdmission';
+import { readUnsentMessageStore } from '../unsentMessageRecords';
 
 import { queueUploadSend, queuedUploadSends } from '../../components/chat/prompt-input-helpers';
 import { composeDrafts, getDraft } from '../composeDrafts';
@@ -116,9 +119,17 @@ export function restorePendingUploads(now: number = Date.now()): Promise<Restore
 }
 
 async function restorePass(now: number): Promise<RestoreOutcome> {
+  await waitForRestoreAdmission();
   const outcome: RestoreOutcome = { restored: 0, gone: 0, expired: 0, unsentQueuedUploadSends: 0, unresolved: 0 };
-  const { uploads, queuedUploadSendRecords } = await readPendingUploadStore();
+  // Resolve send ownership before any age/gone cleanup. Unsent restoration
+  // runs independently and may not have populated its live map yet. A read
+  // failure must leave all bytes intact rather than treating it as no sends.
+  const [stored, sends] = await Promise.all([readPendingUploadStore(), readUnsentMessageStore()]);
+  await waitForRestoreAdmission();
+  const uploads = stored.uploads.filter((r) => !isHistoricalRestoreSource(r) && !restoreSourcePreserved('upload', r.localId));
+  const queuedUploadSendRecords = stored.queuedUploadSendRecords.filter((r) => !isHistoricalRestoreSource(r) && !restoreSourcePreserved('queued', queuedRestoreSourceId(r)));
   const liveOwners = await liveOwnerIds();
+  await waitForRestoreAdmission();
   const ownedElsewhere = (ownerId: string) => ownedByAnotherLiveTab(ownerId, liveOwners);
   notePendingUploadsOwnedElsewhere(uploads.filter((r) => ownedElsewhere(r.ownerId)));
 
@@ -128,16 +139,19 @@ async function restorePass(now: number): Promise<RestoreOutcome> {
   const verdicts = new Map<string, Promise<DraftVerdict>>();
 
   for (const record of uploads) {
+    if (isHistoricalRestoreSource(record)) continue;
     if (record.ownerId === pageOwnerId || ownedElsewhere(record.ownerId) || alreadyOwned.has(record.localId)) continue;
-    if (now - record.createdAt > PENDING_UPLOAD_MAX_AGE_MS) {
-      forgetPendingUploadRecord(record.localId);
-      outcome.expired += 1;
-      continue;
-    }
+    // Leave these bytes under their existing owner: adopting as a pending
+    // upload would re-send them, and adopting as a draft would let draft
+    // cleanup delete them before the unsent card is reconstructed. Once the
+    // original send settles, a later pass can apply ordinary cleanup.
+    if (record.landedHash !== undefined && sends.some((send) => send.body.image_hashes?.includes(record.landedHash!))) continue;
     let verdict: DraftVerdict;
     try {
       if (!verdicts.has(record.threadId)) verdicts.set(record.threadId, draftVerdict(record.threadId));
       verdict = await verdicts.get(record.threadId)!;
+      await waitForRestoreAdmission();
+      if (isHistoricalRestoreSource(record)) continue;
     } catch (err) {
       outcome.unresolved += 1;
       outcome.unresolvedReason ??= errorDetail(err);
@@ -152,7 +166,13 @@ async function restorePass(now: number): Promise<RestoreOutcome> {
     }
     // It landed, and the draft the engine served already holds it.
     if (record.landedHash !== undefined && getDraft(record.threadId).image_hashes.includes(record.landedHash)) {
+      adoptPendingUploadRecord(record, true);
+      restoredIds.add(record.localId);
+      continue;
+    }
+    if (now - record.createdAt > PENDING_UPLOAD_MAX_AGE_MS) {
       forgetPendingUploadRecord(record.localId);
+      outcome.expired += 1;
       continue;
     }
     resume(record);
@@ -161,6 +181,7 @@ async function restorePass(now: number): Promise<RestoreOutcome> {
   }
 
   for (const queued of queuedUploadSendRecords) {
+    if (isHistoricalRestoreSource(queued)) continue;
     // This page's own record mirrors its live queue, and another tab's is theirs.
     if (queued.ownerId === pageOwnerId || ownedElsewhere(queued.ownerId)) continue;
     if (unresolvedThreads.has(queued.threadId)) continue;
@@ -172,7 +193,7 @@ async function restorePass(now: number): Promise<RestoreOutcome> {
       queueUploadSend(queued.threadId, queued.intent);
       continue;
     }
-    forgetQueuedUploadSend(queued.threadId);
+    forgetQueuedUploadSend(queued.threadId, queued);
     // An empty list means its images had all landed: it was already sent.
     if (queued.localIds.length > 0) outcome.unsentQueuedUploadSends += 1;
   }

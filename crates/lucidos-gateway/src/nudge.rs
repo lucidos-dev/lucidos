@@ -19,9 +19,8 @@ use axum::http::{Request, StatusCode};
 use axum::Json;
 use serde_json::{json, Value};
 
-use crate::auth;
 use crate::engine_hop::{self, Credential, EngineAddress};
-use crate::gateway_protocol::{GATEWAY_API_PREFIX, HEADER_GATEWAY_CREDENTIAL};
+use crate::gateway_protocol::GATEWAY_API_PREFIX;
 use crate::remote_gateways::RemoteGateway;
 use crate::server::GatewayState;
 
@@ -74,7 +73,7 @@ pub async fn gateway_pairings(State(state): State<GatewayState>) -> Json<Value> 
 pub async fn nudge_remote_gateways(
     state: &GatewayState,
 ) -> Vec<(String, Result<NudgeAnswer, String>)> {
-    let Some(client) = state.relay_client().client() else {
+    let Some(client) = state.peer_connection().client() else {
         crate::log!("[Gateway] no relay client, so no remote gateway was nudged");
         return Vec::new();
     };
@@ -99,16 +98,17 @@ pub async fn nudge_remote_gateways(
     futures::future::join_all(nudges).await
 }
 
-async fn nudge(client: &reqwest::Client, gateway: &RemoteGateway) -> Result<NudgeAnswer, String> {
-    let mut request = client
-        .post(format!(
-            "{}{GATEWAY_API_PREFIX}{NUDGE_PATH}",
-            gateway.address
-        ))
+async fn nudge(
+    client: &crate::peer_connection::PeerConnection,
+    gateway: &RemoteGateway,
+) -> Result<NudgeAnswer, String> {
+    let request = client
+        .request(
+            gateway,
+            reqwest::Method::POST,
+            &format!("{GATEWAY_API_PREFIX}{NUDGE_PATH}"),
+        )?
         .timeout(NUDGE_TIMEOUT);
-    if let Some(credential) = auth::sensitive_credential(&gateway.credential) {
-        request = request.header(HEADER_GATEWAY_CREDENTIAL, credential);
-    }
     let response = request
         .send()
         .await

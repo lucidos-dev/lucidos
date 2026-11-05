@@ -35,7 +35,7 @@ the e2e workspace at the engine's port, or it clears both
 
 - `auto`, the default, uses a gateway already running. On a dev machine that is
   the dev gateway, which lists `e2e-test` once a launch has registered it.
-- `own`, which GitHub browser shards set, starts a session-scoped gateway. It
+- `own`, which GitHub API and browser shards set, starts a session-scoped gateway. It
   has its own data dir inside the e2e workspace, its own loopback port, and no
   hook socket. Its registry lists the workspace at the engine's port with
   autostart off. It adopts the engine the harness starts and stops with the

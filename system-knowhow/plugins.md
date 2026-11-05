@@ -192,10 +192,11 @@ A plugin may ship *reusable widgets* (ADR 0414). Such a widget's plugin owns it,
 ```
 
 - **`"reusable": true`** and **`"origin_plugin_id"` equal to the plugin's `id`**, with **no `origin_thread_id`**. Any other widget folder fails validation: the scan names the folder in the catalog's errors, and install refuses with `apps/<id>/ is not a widget a plugin can ship`.
-- **Any thread may embed or pin it, and either dashboard may hold it**, and the agent sees it with the other reusable widgets.
+- **Any thread may embed it, and either dashboard may hold it**, and the agent sees it with the other reusable widgets.
 - **It offers no "Stop reusing"**, and `widgets(action="stop_reusing")` refuses it. Uninstall removes it with the rest of the plugin, and an update replaces it. Deleting a thread never touches it.
 - **Make one from a thread's widget** by copying its folder into the plugin's `apps/` and rewriting the manifest as above: drop `origin_thread_id`, add `origin_plugin_id`, set `reusable`.
-- **Narrow its dashboard tile sizes** with `"sizes"`, default first, only if it cannot draw all three (none declared means all three, starting medium). Set `"transparent": true` for one that draws its own shape (`system-knowhow/building-an-app.md` § Widgets). A bad `sizes` fails validation like a bad origin. The user adds it from a *dashboard*'s own Add, and it runs no code until the plugin is installed: Add lists only installed widgets.
+- **Draw it per size.** A plugin widget draws into a *widget box* in a thread card and a dashboard tile alike. One written for content height clips in both. Follow "The widget box" in `system-knowhow/building-an-app.md` § Widgets.
+- **Narrow its sizes** with `"sizes"`, default first, only if it cannot draw all three (none declared means all three, starting medium). Set `"transparent": true` for one that draws its own shape (`system-knowhow/building-an-app.md` § Widgets). A bad `sizes` fails validation like a bad origin. The user adds it from a *dashboard*'s own Add, and it runs no code until the plugin is installed: Add lists only installed widgets.
 - **A plugin widget brings work in.** It reads the user's own data through `lucidos.*`, and a tap leads into a thread or an app with `lucidos.ui.navigate`. It never frames another product's interface so the user works there instead: that would be a room, not a ramp (`docs/philosophy.md`).
 
 ## Install confirmation panel
@@ -783,6 +784,9 @@ A match is exact. `x.md` does not match `x-v2.md`, a one-word knowhow id is not 
 - the receipt, under **Triggers to check**;
 - one notification per confirm, with no web push. Its tap opens the trigger, or the trigger list when there are several. The title reads `<Plugin> update removed know-how a trigger uses`, or `Removing <Plugin> removed know-how a trigger uses`;
 - each later fire of the trigger, as a `[REMOVED KNOW-HOW]` block (see `system-knowhow/triggers.md` § "Know-how a plugin removed").
+
+These warnings navigate to triggers; they do not offer a snapshot restore action.
+Undo restore belongs to the snapshot completion notification and requires its own owner confirmation.
 
 The confirm matches against the paths it actually deleted, with the same function the staging used. So a trigger made between staging and confirm still appears in the event.
 

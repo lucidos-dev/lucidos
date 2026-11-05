@@ -165,6 +165,10 @@ fn the_ordinary_ceiling_still_applies() {
 
 // ── the reason the user reads ────────────────────────────────────────
 
+fn label(t: &RunningTaskHandle) -> String {
+    task_label(t.description.as_deref(), &t.command)
+}
+
 fn named(description: Option<&str>, command: &str) -> RunningTaskHandle {
     RunningTaskHandle {
         description: description.map(String::from),
@@ -178,7 +182,10 @@ fn named(description: Option<&str>, command: &str) -> RunningTaskHandle {
 #[test]
 fn one_described_task_is_named_in_the_agents_words() {
     let t = named(Some("the five-project e2e sweep"), "./scripts/sweep.sh");
-    assert_eq!(armed_reason(&[&t]), "the five-project e2e sweep to finish");
+    assert_eq!(
+        armed_reason(&[label(&t)]),
+        "the five-project e2e sweep to finish"
+    );
 }
 
 /// No description still names the work, by its command. A generic sentence
@@ -187,7 +194,7 @@ fn one_described_task_is_named_in_the_agents_words() {
 fn an_undescribed_task_is_named_by_its_command() {
     let t = named(None, "cargo test --lib");
     assert_eq!(
-        armed_reason(&[&t]),
+        armed_reason(&[label(&t)]),
         "the background command \"cargo test --lib\" to finish"
     );
 }
@@ -199,7 +206,7 @@ fn several_tasks_are_all_named_and_the_first_to_finish_is_what_counts() {
     let a = named(Some("the build"), "make");
     let b = named(None, "npm test");
     assert_eq!(
-        armed_reason(&[&a, &b]),
+        armed_reason(&[label(&a), label(&b)]),
         "the first of 2 background jobs to finish: the build; \
          the background command \"npm test\""
     );
@@ -212,9 +219,9 @@ fn tasks_past_the_cap_are_counted() {
     let tasks: Vec<RunningTaskHandle> = (0..5)
         .map(|i| named(Some(&format!("job {i}")), "x"))
         .collect();
-    let refs: Vec<&RunningTaskHandle> = tasks.iter().collect();
+    let labels: Vec<String> = tasks.iter().map(label).collect();
     assert_eq!(
-        armed_reason(&refs),
+        armed_reason(&labels),
         "the first of 5 background jobs to finish: job 0; job 1; job 2; 2 more"
     );
 }
@@ -225,7 +232,7 @@ fn tasks_past_the_cap_are_counted() {
 fn a_long_multi_line_command_becomes_one_bounded_line() {
     let command = format!("set -e\ncd /tmp\n{}", "echo lots; ".repeat(50));
     let t = named(None, &command);
-    let reason = armed_reason(&[&t]);
+    let reason = armed_reason(&[label(&t)]);
 
     assert!(!reason.contains('\n'), "{reason}");
     assert!(reason.contains("\"set -e cd /tmp echo lots;"), "{reason}");
@@ -276,8 +283,8 @@ fn task(id: &str) -> RunningTaskHandle {
 #[test]
 fn an_unwatched_task_is_armed() {
     let running = [task("build")];
-    match plan_wait(&running, &[], Some(0), owner()) {
-        ArmingPlan::Arm(tasks) => assert_eq!(tasks.len(), 1),
+    match plan_wait(&running, &[], &[], Some(0), owner(), OwnerTurn::Ended) {
+        ArmingPlan::Arm(Uncovered { running: tasks, .. }) => assert_eq!(tasks.len(), 1),
         other => panic!("expected Arm, got {other:?}"),
     }
 }
@@ -292,7 +299,7 @@ fn a_task_the_model_is_already_watching_is_not_armed_again() {
         Some(json!({"task_id": "build"})),
     )])];
     assert_eq!(
-        plan_wait(&running, &live, Some(0), owner()),
+        plan_wait(&running, &[], &live, Some(0), owner(), OwnerTurn::Ended),
         ArmingPlan::NothingUncovered
     );
 }
@@ -306,8 +313,8 @@ fn only_the_uncovered_tasks_are_armed() {
         "BackgroundBashCompleted",
         Some(json!({"task_id": "watched"})),
     )])];
-    match plan_wait(&running, &live, Some(0), owner()) {
-        ArmingPlan::Arm(tasks) => {
+    match plan_wait(&running, &[], &live, Some(0), owner(), OwnerTurn::Ended) {
+        ArmingPlan::Arm(Uncovered { running: tasks, .. }) => {
             assert_eq!(tasks.len(), 1);
             assert_eq!(tasks[0].task_id, "unwatched");
         }
@@ -320,8 +327,8 @@ fn only_the_uncovered_tasks_are_armed() {
 #[test]
 fn several_uncovered_tasks_go_into_one_wait() {
     let running = [task("a"), task("b"), task("c")];
-    match plan_wait(&running, &[], Some(0), owner()) {
-        ArmingPlan::Arm(tasks) => assert_eq!(tasks.len(), 3),
+    match plan_wait(&running, &[], &[], Some(0), owner(), OwnerTurn::Ended) {
+        ArmingPlan::Arm(Uncovered { running: tasks, .. }) => assert_eq!(tasks.len(), 3),
         other => panic!("expected Arm, got {other:?}"),
     }
 }
@@ -335,7 +342,7 @@ fn the_live_wait_cap_refuses_and_says_why() {
     let live: Vec<super::super::LiveWait> = (0..MAX_LIVE_WAITS_PER_THREAD)
         .map(|_| wait_over(vec![sub("ChangeProposed", None)]))
         .collect();
-    match plan_wait(&running, &live, Some(0), owner()) {
+    match plan_wait(&running, &[], &live, Some(0), owner(), OwnerTurn::Ended) {
         ArmingPlan::Refused(why) => assert!(why.contains("live subscriptions"), "{why}"),
         other => panic!("expected Refused, got {other:?}"),
     }
@@ -352,8 +359,10 @@ fn the_recent_subscription_cap_refuses_at_the_same_limit_the_model_gets() {
         plan_wait(
             &running,
             &[],
+            &[],
             Some(super::super::MAX_RECENT_SUBSCRIPTIONS),
-            owner()
+            owner(),
+            OwnerTurn::Ended,
         ),
         ArmingPlan::Refused(_)
     ));
@@ -361,8 +370,10 @@ fn the_recent_subscription_cap_refuses_at_the_same_limit_the_model_gets() {
         plan_wait(
             &running,
             &[],
+            &[],
             Some(super::super::MAX_RECENT_SUBSCRIPTIONS - 1),
-            owner()
+            owner(),
+            OwnerTurn::Ended,
         ),
         ArmingPlan::Arm(_)
     ));
@@ -374,7 +385,7 @@ fn the_recent_subscription_cap_refuses_at_the_same_limit_the_model_gets() {
 #[test]
 fn an_unreadable_subscription_count_refuses_rather_than_assuming_zero() {
     let running = [task("build")];
-    match plan_wait(&running, &[], None, owner()) {
+    match plan_wait(&running, &[], &[], None, owner(), OwnerTurn::Ended) {
         ArmingPlan::Refused(why) => assert!(why.contains("could not be read"), "{why}"),
         other => panic!("an unknown count must refuse, got {other:?}"),
     }
@@ -388,8 +399,8 @@ fn a_task_being_stopped_is_never_armed_for() {
     let mut stopping = task("lint");
     stopping.stop_requested = true;
     let running = [stopping, task("e2e")];
-    match plan_wait(&running, &[], Some(0), owner()) {
-        ArmingPlan::Arm(tasks) => {
+    match plan_wait(&running, &[], &[], Some(0), owner(), OwnerTurn::Ended) {
+        ArmingPlan::Arm(Uncovered { running: tasks, .. }) => {
             assert_eq!(
                 tasks.iter().map(|h| h.task_id.as_str()).collect::<Vec<_>>(),
                 ["e2e"]
@@ -398,20 +409,20 @@ fn a_task_being_stopped_is_never_armed_for() {
         other => panic!("expected Arm, got {other:?}"),
     }
     assert_eq!(
-        plan_wait(&running[..1], &[], Some(0), owner()),
+        plan_wait(&running[..1], &[], &[], Some(0), owner(), OwnerTurn::Ended),
         ArmingPlan::NothingUncovered
     );
 }
 
-/// The agent reads a polled task's result itself. A later watched `run` arms
-/// for its own task only, so the polled one never re-opens the thread.
+/// Mid-turn, the agent reads a polled task's result itself. A later watched
+/// `run` arms for its own task only, so the polled one is not delivered twice.
 #[test]
-fn a_polled_task_is_never_armed_for() {
+fn a_polled_task_is_not_armed_for_while_its_owners_turn_runs() {
     let mut polled = task("suite");
     polled.polled = true;
     let running = [polled, task("e2e")];
-    match plan_wait(&running, &[], Some(0), owner()) {
-        ArmingPlan::Arm(tasks) => {
+    match plan_wait(&running, &[], &[], Some(0), owner(), OwnerTurn::Running) {
+        ArmingPlan::Arm(Uncovered { running: tasks, .. }) => {
             assert_eq!(
                 tasks.iter().map(|h| h.task_id.as_str()).collect::<Vec<_>>(),
                 ["e2e"]
@@ -420,9 +431,122 @@ fn a_polled_task_is_never_armed_for() {
         other => panic!("expected Arm, got {other:?}"),
     }
     assert_eq!(
-        plan_wait(&running[..1], &[], Some(0), owner()),
+        plan_wait(
+            &running[..1],
+            &[],
+            &[],
+            Some(0),
+            owner(),
+            OwnerTurn::Running
+        ),
         ArmingPlan::NothingUncovered
     );
+}
+
+/// THE regression. A Codex `/harden` started its gates as polled tasks, and
+/// the turn ended before they finished. Nobody polls an idle agent, so the
+/// turn end covers the polled task like any other.
+#[test]
+fn a_polled_task_is_armed_for_once_its_owners_turn_ends() {
+    let mut polled = task("harden gates");
+    polled.polled = true;
+    let running = [polled, task("e2e")];
+    match plan_wait(&running, &[], &[], Some(0), owner(), OwnerTurn::Ended) {
+        ArmingPlan::Arm(Uncovered { running: tasks, .. }) => {
+            assert_eq!(
+                tasks.iter().map(|h| h.task_id.as_str()).collect::<Vec<_>>(),
+                ["harden gates", "e2e"]
+            )
+        }
+        other => panic!("expected Arm, got {other:?}"),
+    }
+}
+
+/// A polled task the agent itself stopped is no more news at a turn end than
+/// a watched one (ADR 0369).
+#[test]
+fn a_polled_task_being_stopped_is_not_armed_for_at_turn_end() {
+    let mut stopping = task("suite");
+    stopping.polled = true;
+    stopping.stop_requested = true;
+    assert_eq!(
+        plan_wait(&[stopping], &[], &[], Some(0), owner(), OwnerTurn::Ended),
+        ArmingPlan::NothingUncovered
+    );
+}
+
+fn unread_result(id: &str) -> UnreadResult {
+    UnreadResult {
+        task_id: id.to_string(),
+        description: Some("the harden gates".to_string()),
+        command: "make lint".to_string(),
+    }
+}
+
+/// The gap the Codex review found: the gates finished mid-turn and the agent
+/// never read them. A clean turn end delivers the result, with nothing
+/// running at all.
+#[test]
+fn an_unread_result_is_armed_for_once_its_owners_turn_ends() {
+    let unread = [unread_result("gates")];
+    match plan_wait(&[], &unread, &[], Some(0), owner(), OwnerTurn::Ended) {
+        ArmingPlan::Arm(uncovered) => {
+            assert!(uncovered.running.is_empty());
+            assert_eq!(uncovered.task_ids(), ["gates"]);
+            assert_eq!(
+                armed_reason(&uncovered.labels()),
+                "the harden gates to finish"
+            );
+        }
+        other => panic!("expected Arm, got {other:?}"),
+    }
+}
+
+/// Mid-turn, the owner still reads the result itself.
+#[test]
+fn an_unread_result_is_not_armed_for_while_its_owners_turn_runs() {
+    let unread = [unread_result("gates")];
+    assert_eq!(
+        plan_wait(&[], &unread, &[], Some(0), owner(), OwnerTurn::Running),
+        ArmingPlan::NothingUncovered
+    );
+}
+
+/// A live engine wait over the result is about to deliver it. A model's wait
+/// may have armed above the completion, so it covers nothing unread.
+#[test]
+fn only_a_live_engine_wait_covers_an_unread_result() {
+    let unread = [unread_result("gates")];
+    let engine = [wait_armed_by(
+        &engine_tool_use_id(),
+        vec![completed("gates")],
+    )];
+    assert_eq!(
+        plan_wait(&[], &unread, &engine, Some(0), owner(), OwnerTurn::Ended),
+        ArmingPlan::NothingUncovered
+    );
+    let model = [wait_armed_by("toolu_x", vec![completed("gates")])];
+    assert!(matches!(
+        plan_wait(&[], &unread, &model, Some(0), owner(), OwnerTurn::Ended),
+        ArmingPlan::Arm(_)
+    ));
+}
+
+/// The caps bound a delivery of unread results like any other arming.
+#[test]
+fn an_unread_result_is_refused_at_the_recent_subscription_cap() {
+    let unread = [unread_result("gates")];
+    assert!(matches!(
+        plan_wait(
+            &[],
+            &unread,
+            &[],
+            Some(super::super::MAX_RECENT_SUBSCRIPTIONS),
+            owner(),
+            OwnerTurn::Ended,
+        ),
+        ArmingPlan::Refused(_)
+    ));
 }
 
 // ── standing a wait down when its thread stops a task ───────────────

@@ -89,7 +89,7 @@ async fn an_upgrade_without_a_ticket_is_refused() {
     let client = user_client().await;
     assert_eq!(
         dial(&client, home_thread().await, None).await,
-        StatusCode::FORBIDDEN,
+        StatusCode::CONFLICT,
         "the owner's device header alone must not open a call"
     );
 }
@@ -148,7 +148,7 @@ async fn a_ticket_spent_on_another_thread_cannot_then_open_home() {
     );
     assert_eq!(
         replay,
-        StatusCode::FORBIDDEN,
-        "the wrong-thread try spent the ticket"
+        StatusCode::CONFLICT,
+        "the wrong-thread try spent the ticket, so it no longer proves the live generation"
     );
 }

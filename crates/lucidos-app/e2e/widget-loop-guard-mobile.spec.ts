@@ -13,11 +13,14 @@ import { ensureHomeThread, psql } from './db-helpers';
  *   frame, because the SDK writes only when the host's value changes.
  * - A widget whose content grows with its frame stops growing, because the
  *   widget height guard locks the frame.
+ *
+ * Both draw the widget in a question option: the one place whose frame follows
+ * its content, and so the one the height guard covers (ADR 0621).
  * - A launch that finds the restore guard's marker starts on Home and offers
  *   the thread back.
  */
 
-const DEFAULT_WIDGET_HEIGHT_PX = 240;
+const OPTION_WIDGET_HEIGHT_PX = 48;
 const MESSAGE_TEXT = 'compare the fares';
 
 let written: string[] = [];
@@ -42,7 +45,8 @@ async function writeWidget(page: Page, appId: string, threadId: string, html: st
   }));
 }
 
-/** A thread with one human message, showing `appId` inline when given. */
+/** A thread with one human message, asking a question whose first option draws
+ *  `appId` when given. */
 function seedThread(threadId: string, appId?: string): void {
   seededThreads.push(threadId);
   const now = new Date().toISOString();
@@ -53,7 +57,11 @@ function seedThread(threadId: string, appId?: string): void {
       + `VALUES ('${randomUUID()}', 'MessageReceived', '{"text":"${MESSAGE_TEXT}","mode":"human","channel":"chat"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
     ...(appId ? [
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) `
-        + `VALUES ('${randomUUID()}', 'WidgetShown', '{"app_id":"${appId}"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+        + `VALUES ('${randomUUID()}', 'UserQuestionAsked', '${JSON.stringify({
+          tool_use_id: `tu-${threadId.slice(0, 8)}`,
+          question: 'Which fare?',
+          options: [{ id: 'a', label: 'This one', widget: { app_id: appId } }, { id: 'b', label: 'Neither' }],
+        })}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
     ] : []),
   ].join(';\n'));
 }
@@ -88,7 +96,9 @@ const SELF_PINNING_WIDGET = widgetHtml(
  *  the frame by 16 px. */
 const VIEWPORT_TALL_WIDGET = widgetHtml('<style>body { height: 100vh; }</style>', '<p>Cost</p>');
 
-const frameHeight = (page: Page) => page.locator('.chat-exchange .widget-frame:visible').first().evaluate(
+const optionFrame = (page: Page) => page.locator('.widget-frame-option:visible').first();
+
+const frameHeight = (page: Page) => optionFrame(page).evaluate(
   (el) => parseFloat((el as HTMLElement).style.height),
 );
 
@@ -119,10 +129,10 @@ test.describe('A widget cannot lock a phone out of the app', () => {
     seedThread(threadId, appId);
     await openThread(page, threadId);
 
-    await expect(page.locator('.chat-exchange .widget-frame:visible').first()).toBeVisible({ timeout: 15_000 });
+    await expect(optionFrame(page)).toBeVisible({ timeout: 15_000 });
     // A loop starves the frame's animation frames, so it never reports and
     // keeps the default height.
-    await expect.poll(() => frameHeight(page), { timeout: 15_000 }).not.toBe(DEFAULT_WIDGET_HEIGHT_PX);
+    await expect.poll(() => frameHeight(page), { timeout: 15_000 }).not.toBe(OPTION_WIDGET_HEIGHT_PX);
     const height = await frameHeight(page);
     expect(height).toBeGreaterThan(400);
     expect(height).toBeLessThan(500);
@@ -146,7 +156,7 @@ test.describe('A widget cannot lock a phone out of the app', () => {
       await page.waitForTimeout(1_500);
       return (await frameHeight(page)) - before;
     }, { timeout: 20_000 }).toBe(0);
-    expect(await frameHeight(page)).toBeLessThanOrEqual(DEFAULT_WIDGET_HEIGHT_PX + 16 * 12);
+    expect(await frameHeight(page)).toBeLessThanOrEqual(OPTION_WIDGET_HEIGHT_PX + 16 * 12);
   });
 
   test('a launch after a crash on a thread starts on Home and offers it back', async ({ page }) => {

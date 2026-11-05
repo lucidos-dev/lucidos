@@ -8,12 +8,14 @@
  * front, that a paired gateway is trusted like this one.
  */
 
+import { headersFromDraft, type HeaderDraft } from './RemoteHeadersEditor';
 import { addRemoteGateway, type RemoteGateway } from '../../api/client/control';
 
 export interface RemoteGatewayDraft {
   address: string;
   code: string;
   name: string;
+  headers?: HeaderDraft[];
 }
 
 export const EMPTY_REMOTE_GATEWAY_DRAFT: RemoteGatewayDraft = { address: '', code: '', name: '' };
@@ -51,5 +53,6 @@ export function submitRemoteGateway(draft: RemoteGatewayDraft): Promise<RemoteGa
     address: draft.address.trim(),
     code: draft.code.trim(),
     name: draft.name.trim(),
+    headers: headersFromDraft(draft.headers ?? []),
   });
 }

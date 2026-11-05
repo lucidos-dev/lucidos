@@ -54,9 +54,8 @@ pub use provider::{
     TokenCallback, ToolCall,
 };
 pub use provider_build::{
-    boot_without_provider_enabled, build_active_provider, ProviderBuildContext,
-    ProviderBuildOutcome, NO_PROVIDER_AT_BOOT, PROVIDER_CREDENTIAL_SERVICES,
-    PROVIDER_PREFERENCE_KEYS,
+    build_active_provider, ProviderBuildContext, ProviderBuildOutcome,
+    PROVIDER_CREDENTIAL_SERVICES, PROVIDER_PREFERENCE_KEYS,
 };
 pub use provider_selection::{select_provider, ProviderSelection, ProviderSelectionInputs};
 // `clamp_effort` is deliberately NOT re-exported: it is the wire-side rule and

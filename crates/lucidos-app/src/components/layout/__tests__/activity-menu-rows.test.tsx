@@ -15,7 +15,6 @@ import {
   applyAllCanceling,
   applyAllInProgress,
   engineBuilding,
-  engineRebuildWedged,
   engineVersionPending,
   IDLE_MAIN_CHECK,
   mainCheck,
@@ -168,8 +167,9 @@ describe('activityMenuGroup', () => {
   it('says what follows a build whose commits git could not count', () => {
     const el = draw(props({ rows: [buildRow], open: new Set(['engine-build']), commits: null }));
     expect(el.querySelector('[data-role="activity-changes"]')).toBeNull();
-    expect(el.querySelector('[data-role="activity-body"]')?.textContent)
+    expect(el.querySelector('.brand-menu-activity-note')?.textContent)
       .toBe('You can switch to it once the build finishes.');
+    expect(el.querySelector('.brand-menu-activity-actions')?.textContent).toContain('Show build log');
   });
 
   it('shows a download\'s progress and its memory caveat', () => {
@@ -380,8 +380,8 @@ describe('activityMenuGroup', () => {
   });
 
   it('keeps a row for pending code, which is how its toast is found again', () => {
-    const el = draw(props({ pending: 'wedged' }));
-    expect(el.textContent).toContain('New code pending, no rebuild can deliver it');
+    const el = draw(props({ pending: 'pending' }));
+    expect(el.textContent).toContain('New code pending');
   });
 });
 
@@ -398,7 +398,6 @@ describe('ActivityMenuGroup', () => {
   afterEach(() => {
     if (host) { render(null, host); host.remove(); host = null; }
     engineVersionPending.value = false;
-    engineRebuildWedged.value = false;
     engineBuilding.value = false;
     applyAllInProgress.value = false;
     applyAllCanceling.value = false;

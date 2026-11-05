@@ -28,6 +28,56 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 pub use lucidos_gateway_constants::SIGIL;
 
+/// Legacy entries stay protected until a user classifies them.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspaceOrigin {
+    User,
+    Demo,
+    Eval,
+    E2e,
+    #[default]
+    Unknown,
+}
+
+/// Cleanup authority is persisted with the entry, never inferred from its name.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkspaceCleanup {
+    #[serde(default)]
+    pub origin: WorkspaceOrigin,
+    #[serde(default)]
+    pub ephemeral: bool,
+    #[serde(default)]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub owner_token_digest: Option<String>,
+    #[serde(default)]
+    pub last_opened_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Optional registration changes. Omitting them preserves an existing entry.
+#[derive(Deserialize, Default)]
+pub struct CleanupRegistration {
+    pub origin: Option<WorkspaceOrigin>,
+    pub ephemeral: Option<bool>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl WorkspaceCleanup {
+    pub fn permits_owner(&self, token: &str) -> bool {
+        self.ephemeral
+            && matches!(
+                self.origin,
+                WorkspaceOrigin::Eval | WorkspaceOrigin::E2e | WorkspaceOrigin::Demo
+            )
+            && !token.is_empty()
+            && self
+                .owner_token_digest
+                .as_ref()
+                .is_some_and(|digest| crate::auth::ct_eq(digest, &crate::auth::digest(token)))
+    }
+}
+
 /// One registered workspace.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Workspace {
@@ -68,6 +118,8 @@ pub struct Workspace {
     /// [`Registry::migrate_to_current`] then lifts it to the current default.
     #[serde(default)]
     pub autostart: bool,
+    #[serde(flatten)]
+    pub cleanup: WorkspaceCleanup,
 }
 
 impl Workspace {
@@ -96,6 +148,10 @@ impl Workspace {
             name,
             port,
             database_url: None,
+            cleanup: WorkspaceCleanup {
+                origin: WorkspaceOrigin::User,
+                ..Default::default()
+            },
             autostart: true,
         }
     }
@@ -376,18 +432,41 @@ pub fn parse_workspace_name_from_archive(filename: &str) -> Option<String> {
 /// The slug pipeline already produces this; the check guards control-API inputs
 /// that bypass slugify.
 pub fn is_valid_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        && !id.starts_with('-')
-        && !id.ends_with('-')
+    lucidos_gateway_constants::is_valid_workspace_id(id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_legacy_entries_are_protected_and_owner_tokens_are_revocable() {
+        let legacy: Workspace = serde_json::from_value(serde_json::json!({
+            "id": "legacy", "name": "Legacy", "dir": "workspaces/legacy", "port": 1234
+        }))
+        .unwrap();
+        assert_eq!(legacy.cleanup.origin, WorkspaceOrigin::Unknown);
+        assert!(!legacy.cleanup.permits_owner("owner"));
+        let mut cleanup = WorkspaceCleanup {
+            origin: WorkspaceOrigin::Eval,
+            ephemeral: true,
+            owner_token_digest: Some(crate::auth::digest("owner")),
+            ..Default::default()
+        };
+        assert!(cleanup.permits_owner("owner"));
+        assert!(!cleanup.permits_owner("other"));
+        assert!(!cleanup.permits_owner(""));
+        cleanup.origin = WorkspaceOrigin::User;
+        assert!(!cleanup.permits_owner("owner"));
+        cleanup.origin = WorkspaceOrigin::Unknown;
+        assert!(!cleanup.permits_owner("owner"));
+        cleanup.origin = WorkspaceOrigin::Eval;
+        cleanup.ephemeral = false;
+        assert!(!cleanup.permits_owner("owner"));
+        let roundtrip: Workspace =
+            serde_json::from_str(&serde_json::to_string(&legacy).unwrap()).unwrap();
+        assert_eq!(legacy, roundtrip);
+    }
 
     #[test]
     fn slugify_handles_spaces_emoji_and_punctuation() {
@@ -473,6 +552,7 @@ mod tests {
             dir: "/Users/me/workspaces/dev".into(),
             port: 5000,
             database_url: None,
+            cleanup: Default::default(),
             autostart: false,
         };
         assert_eq!(
@@ -485,6 +565,7 @@ mod tests {
             dir: "workspaces/default".into(),
             port: 5001,
             database_url: None,
+            cleanup: Default::default(),
             autostart: false,
         };
         assert_eq!(
@@ -547,6 +628,7 @@ mod tests {
             dir: "workspaces/default".into(),
             port: 51811,
             database_url: None,
+            cleanup: Default::default(),
             autostart: false,
         })
         .unwrap();
@@ -556,6 +638,7 @@ mod tests {
             dir: "workspaces/myws".into(),
             port: 51812,
             database_url: Some("postgres://lucidos:lucidos@127.0.0.1:5599/lucidos".into()),
+            cleanup: Default::default(),
             autostart: true,
         })
         .unwrap();
@@ -579,6 +662,7 @@ mod tests {
             dir: "x".into(),
             port: 1,
             database_url: None,
+            cleanup: Default::default(),
             autostart: false,
         };
         reg.add(ws.clone()).unwrap();
@@ -694,6 +778,7 @@ mod tests {
                 dir: format!("workspaces/{id}"),
                 port: 5000,
                 database_url: None,
+                cleanup: Default::default(),
                 autostart: false,
             })
             .unwrap();

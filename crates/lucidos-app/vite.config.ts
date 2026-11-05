@@ -364,6 +364,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': resolve(__dirname, 'src'),
+      '@lucidos/restore-generation': resolve(__dirname, '../../packages/lucidos-sdk/src/_restoreGeneration.ts'),
       '@lucidos/sdk': resolve(__dirname, '../../packages/lucidos-sdk/src/index.ts'),
       // The appearance boot contract, reached WITHOUT the SDK barrel above.
       // The barrel pulls the whole SDK in at module load. The host store
@@ -379,6 +380,7 @@ export default defineConfig({
       // popover. Both are reached WITHOUT the barrel, for the same reason.
       // Mirrored in tsconfig.json `paths` so tsc resolves them too.
       '@lucidos/geometry': resolve(__dirname, '../../packages/lucidos-sdk/src/geometry.ts'),
+      '@lucidos/motion': resolve(__dirname, 'src/utils/motion.ts'),
       '@lucidos/tooltip': resolve(__dirname, '../../packages/lucidos-sdk/src/tooltip.ts'),
       // The event-stream transport, shared so the shell and an app iframe
       // attach to one connection through the same code. Reached WITHOUT the

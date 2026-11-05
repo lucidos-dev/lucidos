@@ -2,7 +2,7 @@
 /**
  * A built-in widget is read-only (ADR 0415), so its menu offers no reuse
  * change. Every other item stays. Add to dashboard is offered in every thread
- * (ADR 0496).
+ * (ADR 0496). The retired pin items are gone from every thread (I8).
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { render } from 'preact';
@@ -37,7 +37,7 @@ afterEach(() => {
 /** Both dashboards loaded, each holding these widgets, so no read starts. */
 function holding(apps: string[]): void {
   const tiles: DashboardTile[] = apps.map((app_id) => (
-    { kind: 'widget', app_id, name: app_id, reusable: true, reveal: 'on-load', sizes: ['medium'], pinned: true, size: 'medium' }
+    { kind: 'widget', app_id, name: app_id, reusable: true, reveal: 'on-load', sizes: ['medium'], size: 'medium' }
   ));
   dashboards.value = new Map([
     ['phone', { status: 'loaded', data: { dashboard: 'phone', tiles } }],
@@ -55,7 +55,7 @@ function labels(target: Partial<WidgetMenuTarget>): string[] {
   document.body.appendChild(host);
   const ctx = { run: (fn: () => void) => () => fn(), anchor: null };
   render(widgetMenuItems(ctx, {
-    threadId: 't-1', appId: 'w', name: 'W', reusable: true, builtIn: false, pinned: false, ...target,
+    threadId: 't-1', appId: 'w', name: 'W', reusable: true, builtIn: false, ...target,
   }), host);
   return [...host.querySelectorAll('.widget-menu-label > span:first-child')].map((el) => el.textContent ?? '');
 }
@@ -69,24 +69,24 @@ describe('widgetMenuItems', () => {
     const items = labels({ builtIn: true });
     expect(items).not.toContain('Stop reusing');
     expect(items).not.toContain('Make reusable');
-    expect(items).toEqual(expect.arrayContaining(['Open in Canvas', 'Make app', 'Pin to shelf']));
+    expect(items).toEqual(expect.arrayContaining(['Open in Canvas', 'Make app', 'Add to dashboard']));
   });
 
-  /** Home takes no pins (ADR 0496), so it offers Add to dashboard alone. */
-  it('offers no shelf pin in Home, only Add to dashboard', () => {
+  it('offers no pin and no Show in thread, in Home or any other thread', () => {
     threadMap.value = new Map([['home', makeThreadState('home', { meta: { title: 'Home', home: true } })]]);
     holding([]);
-    const items = labels({ threadId: 'home' });
-    expect(items).toContain('Add to dashboard');
-    expect(items).not.toContain('Pin to shelf');
-    expect(items).not.toContain('Unpin from shelf');
+    for (const threadId of ['home', 't-1']) {
+      const items = labels({ threadId });
+      expect(items).toContain('Add to dashboard');
+      expect(items.filter((l) => /pin|shelf|show in thread/i.test(l))).toEqual([]);
+    }
   });
 
   /** Invariant: Add to dashboard targets the dashboard this layout shows, and
    *  turns into Remove once that dashboard holds the instance. */
-  it('offers Add to dashboard beside Pin to shelf, until the dashboard holds the instance', () => {
+  it('offers Add to dashboard until the dashboard holds the instance', () => {
     holding([]);
-    expect(labels({})).toEqual(expect.arrayContaining(['Pin to shelf', 'Add to dashboard']));
+    expect(labels({})).toContain('Add to dashboard');
     holding(['w']);
     expect(labels({})).toContain('Remove from dashboard');
     expect(labels({})).not.toContain('Add to dashboard');

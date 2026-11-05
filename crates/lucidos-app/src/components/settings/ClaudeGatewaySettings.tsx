@@ -49,7 +49,8 @@ export function ClaudeGatewaySettings() {
           <p>
             Lucidos signs in as itself, apart from Claude Code. The gateway decides
             which models your account may use, and a model it does not list is not
-            served here.
+            served here. Apps and scripts use the same sign-in through the
+            {' '}<code>claude-gateway</code> proxy with <code>POST /messages</code>.
           </p>
           <p>
             Also reachable as <code>lucidos claude-gateway sign-in</code>. No launch

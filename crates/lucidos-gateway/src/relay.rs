@@ -9,8 +9,6 @@
 //!
 //! Both halves live here: [`relay`] is A's, [`receive`] is B's.
 
-use std::time::Duration;
-
 use axum::body::Body;
 use axum::extract::{OriginalUri, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -35,6 +33,15 @@ pub const HEADER_RELAY_CLAIM: &str = "x-lucidos-relay-claim";
 /// The header carrying the claim's HMAC, in lowercase hex.
 pub const HEADER_RELAY_SIGNATURE: &str = "x-lucidos-relay-signature";
 
+/// Present when A's browser runs on A's machine. Its value is the HMAC of the
+/// claim plus [`LOCAL_BROWSER_BINDING`], so it holds for that claim only. A
+/// gateway that predates it ignores it, which is why it is not a claim field.
+pub const HEADER_RELAY_LOCAL_BROWSER: &str = "x-lucidos-relay-local-browser";
+
+/// Appended to the claim before signing the local-browser stamp, so the stamp's
+/// MAC can never equal the claim's own.
+const LOCAL_BROWSER_BINDING: &str = "|local-browser";
+
 /// The first field of every claim. A new claim shape gets a new version.
 const CLAIM_VERSION: &str = "v1";
 
@@ -43,10 +50,6 @@ const CLAIM_SEPARATOR: char = '|';
 
 /// How far a claim's issue time may sit from B's clock, either way.
 const CLAIM_MAX_SKEW_SECS: u64 = 300;
-
-/// How long A waits to connect to B. No total timeout: an SSE stream is open
-/// for as long as the page is.
-const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Split a route segment `<slug>@<name>` into its halves.
 ///
@@ -139,6 +142,20 @@ pub fn sign(credential: &str, claim: &str) -> String {
         .collect()
 }
 
+/// The [`HEADER_RELAY_LOCAL_BROWSER`] value for `claim`.
+pub fn sign_local_browser(credential: &str, claim: &str) -> String {
+    sign(credential, &format!("{claim}{LOCAL_BROWSER_BINDING}"))
+}
+
+/// Does this verified request carry A's stamp that its browser is local to A?
+fn stamped_local_browser(headers: &HeaderMap, credential: &str) -> bool {
+    let read = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    match (read(HEADER_RELAY_CLAIM), read(HEADER_RELAY_LOCAL_BROWSER)) {
+        (Some(claim), Some(stamp)) => auth::ct_eq(&sign_local_browser(credential, claim), stamp),
+        _ => false,
+    }
+}
+
 /// Why B refused a relayed request. Each is a 401: A holds a credential, so
 /// the reason is for its log, not for a person.
 #[derive(Debug, PartialEq, Eq)]
@@ -220,45 +237,6 @@ pub fn namespaced_device_id(pairing_id: &str, device_id: &str) -> String {
     format!("{pairing_id}:{device_id}")
 }
 
-/// A's client for relayed requests: `https` only, certificates checked, no
-/// redirects, no decompression, and no total timeout. A call that a person
-/// waits on sets its own timeout per request.
-pub struct RelayClient {
-    http: std::sync::RwLock<reqwest::Client>,
-}
-
-impl RelayClient {
-    pub fn new() -> Result<Self, String> {
-        Ok(Self {
-            http: std::sync::RwLock::new(build_client(None)?),
-        })
-    }
-
-    /// Also trust `pem`, for a test's self-signed B.
-    #[cfg(test)]
-    pub fn trust_for_test(&self, pem: &[u8]) {
-        let root = reqwest::Certificate::from_pem(pem).unwrap();
-        *self.http.write().unwrap() = build_client(Some(root)).unwrap();
-    }
-
-    pub(crate) fn client(&self) -> Option<reqwest::Client> {
-        self.http.read().ok().map(|c| c.clone())
-    }
-}
-
-fn build_client(extra_root: Option<reqwest::Certificate>) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder()
-        .https_only(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(RELAY_CONNECT_TIMEOUT);
-    if let Some(root) = extra_root {
-        builder = builder.add_root_certificate(root);
-    }
-    builder
-        .build()
-        .map_err(|e| format!("could not start the relay client: {e}"))
-}
-
 /// A's half: relay `req`, addressed to `/<slug>@<name>/…`, to remote gateway
 /// `name`.
 ///
@@ -312,7 +290,7 @@ pub async fn relay(state: &GatewayState, slug: &str, name: &str, req: Request) -
         )
             .into_response();
     }
-    let Some(client) = state.relay_client().client() else {
+    let Some(client) = state.peer_connection().client() else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             "the relay client is unavailable",
@@ -327,11 +305,12 @@ pub async fn relay(state: &GatewayState, slug: &str, name: &str, req: Request) -
     }
     .encode();
     let signature = sign(&remote.credential, &claim);
+    let local_browser = parts
+        .extensions
+        .get::<crate::oauth_callback::LocalBrowser>()
+        .map(|_| sign_local_browser(&remote.credential, &claim));
 
-    let url = format!(
-        "{}{GATEWAY_API_PREFIX}{RELAY_PATH}/{slug}{rest}",
-        remote.address
-    );
+    let path = format!("{GATEWAY_API_PREFIX}{RELAY_PATH}/{slug}{rest}");
     let origin_vouched = crate::proxy::vouches_for_origin(&parts.headers);
     let mut headers = HeaderMap::new();
     for (header_name, value) in &parts.headers {
@@ -342,8 +321,7 @@ pub async fn relay(state: &GatewayState, slug: &str, name: &str, req: Request) -
             headers.append(header_name.clone(), value.clone());
         }
     }
-    let (Some(credential), Ok(claim), Ok(signature)) = (
-        auth::sensitive_credential(&remote.credential),
+    let (Ok(claim), Ok(signature)) = (
         HeaderValue::from_str(&claim),
         HeaderValue::from_str(&signature),
     ) else {
@@ -353,11 +331,19 @@ pub async fn relay(state: &GatewayState, slug: &str, name: &str, req: Request) -
         )
             .into_response();
     };
-    headers.insert(HEADER_GATEWAY_CREDENTIAL, credential);
+    for name in remote.headers.names() {
+        headers.remove(name.as_str());
+    }
     headers.insert(HEADER_RELAY_CLAIM, claim);
     headers.insert(HEADER_RELAY_SIGNATURE, signature);
+    if let Some(stamp) = local_browser.and_then(|s| HeaderValue::from_str(&s).ok()) {
+        headers.insert(HEADER_RELAY_LOCAL_BROWSER, stamp);
+    }
 
-    let mut upstream = client.request(parts.method, url).headers(headers);
+    let mut upstream = match client.request(&remote, parts.method, &path) {
+        Ok(request) => request.headers(headers),
+        Err(reason) => return (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response(),
+    };
     // A body streams through, never buffered. A request that declares none
     // sends none, so a GET does not go out chunked.
     if let Some(length) = declared_body_length(&parts.headers) {
@@ -381,7 +367,11 @@ pub async fn relay(state: &GatewayState, slug: &str, name: &str, req: Request) -
             }
             return (
                 StatusCode::BAD_GATEWAY,
-                format!("the remote gateway '{name}' could not be reached"),
+                axum::Json(serde_json::json!({
+                    "remote_gateway": name,
+                    "reason_kind": crate::remote_workspaces::transport_reason(&e),
+                    "reason": format!("The remote gateway '{name}' could not be reached"),
+                })),
             )
                 .into_response();
         }
@@ -486,17 +476,33 @@ pub async fn receive(
             return refuse(refusal.message());
         }
     };
+    if claim.device.is_none() && crate::oauth_callback::is_relayed_callback(req.method(), &rest) {
+        return crate::oauth_callback::deliver_relayed(
+            &state,
+            slug,
+            &claim.prefix,
+            original.query(),
+        )
+        .await;
+    }
 
     let local_path = match original.query() {
         Some(query) => format!("/{slug}{rest}?{query}"),
         None => format!("/{slug}{rest}"),
     };
+    let local_browser = stamped_local_browser(req.headers(), credential);
     let (mut parts, body) = req.into_parts();
     let Ok(uri) = local_path.parse() else {
         return (StatusCode::BAD_REQUEST, "malformed relayed path").into_response();
     };
     parts.uri = uri;
     parts.extensions.remove::<AuthenticatedDevice>();
+    parts
+        .extensions
+        .remove::<crate::oauth_callback::LocalBrowser>();
+    if local_browser {
+        parts.extensions.insert(crate::oauth_callback::LocalBrowser);
+    }
     let device = claim.device.map(|d| AuthenticatedDevice {
         id: namespaced_device_id(&gateway.pairing_id, &d.id),
         label: d.label,
@@ -506,8 +512,9 @@ pub async fn receive(
         parts.extensions.insert(device);
     }
     let local = Request::from_parts(parts, body);
-    // A claim with no device reaches only what B admits without one. B, not
-    // A, verifies a frame capability: B's engine minted it.
+    // A claim with no device reaches only what B admits without one: the OAuth
+    // callback above, public app assets, and a frame capability. B, not A,
+    // verifies a frame capability: B's engine minted it.
     if !has_device
         && !crate::auth_api::is_public_app_asset(local.uri().path())
         && !crate::auth_api::frame_capability_admits(&state, &local)

@@ -38,6 +38,36 @@ describe('oauthClientSubmitError', () => {
     expect(oauthClientSubmitError(fields(COMPLETE), false)).toBeNull();
   });
 
+  it('accepts a web redirect URI on a client with a secret', () => {
+    const web = fields({
+      ...COMPLETE,
+      clientSecret: 's3cret',
+      webRedirectUris: 'https://host.example/~/oauth/callback',
+    });
+    expect(oauthClientSubmitError(web, false)).toBeNull();
+    expect(oauthClientSubmitError(web, true)).toBeNull();
+  });
+
+  it('refuses a web redirect URI without a secret, on create and on edit', () => {
+    const web = fields({ ...COMPLETE, webRedirectUris: 'https://host.example/~/oauth/callback' });
+    for (const editing of [false, true]) {
+      expect(oauthClientSubmitError(web, editing)).toMatch(/client secret/);
+    }
+  });
+
+  it('refuses a web redirect URI a provider could never return to', () => {
+    for (const bad of [
+      'http://host.example/~/oauth/callback',
+      'https://host.example/oauth/callback',
+      'https://host.example/~/oauth/callback/',
+      'https://host.example/~/oauth/callback?x=1',
+      'not a url',
+    ]) {
+      const web = fields({ ...COMPLETE, clientSecret: 's', webRedirectUris: bad });
+      expect(oauthClientSubmitError(web, false), bad).toMatch(/is not a web redirect URI/);
+    }
+  });
+
   it('accepts a blank client secret, which selects a public client', () => {
     // Not an omission: a blank secret is how Lucidos is expressed as a public
     // client authenticating with PKCE, the right shape for a desktop app.

@@ -163,6 +163,74 @@ pub enum SystemEvent {
         #[serde(default)]
         main_check: crate::engine::MainCheckSnapshot,
     },
+    /// Transient capture/check activity. Subscribe to the terminal snapshot events.
+    SnapshotProgress {
+        workspace_id: String,
+        handle: crate::core::snapshot::handle::Handle,
+        job_id: uuid::Uuid,
+        action: crate::core::snapshot::jobs::Action,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// Target-authorized restore, persisted before the gateway stops the engine.
+    SnapshotRestoreRequested {
+        workspace_id: String,
+        handle: crate::core::snapshot::handle::Handle,
+        restore_id: uuid::Uuid,
+        actor: MessageOrigin,
+    },
+    /// Verified restored log after no-replay settlement. Completion notification
+    /// and external journal completion must follow before dispatch is admitted.
+    WorkspaceRestored {
+        workspace_id: String,
+        handle: crate::core::snapshot::handle::Handle,
+        recovery: crate::core::snapshot::handle::Handle,
+        restore_id: uuid::Uuid,
+        retained_worktrees: Vec<String>,
+        actor: MessageOrigin,
+    },
+    /// A verified local capture was published. Persisted; no paths or key material.
+    SnapshotCreated {
+        workspace_id: String,
+        handle: crate::core::snapshot::handle::Handle,
+        job_id: uuid::Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A capture failed or was interrupted. Persisted; reason is a fixed safe code.
+    SnapshotCaptureFailed {
+        workspace_id: String,
+        handle: crate::core::snapshot::handle::Handle,
+        job_id: uuid::Uuid,
+        reason: crate::core::snapshot::jobs::Failure,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A full snapshot check finished. Persisted, including failed checks.
+    SnapshotChecked {
+        workspace_id: String,
+        handle: crate::core::snapshot::handle::Handle,
+        job_id: uuid::Uuid,
+        passed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A snapshot's manual retention protection changed. Persisted for all clients.
+    SnapshotKeepChanged {
+        workspace_id: String,
+        handle: crate::core::snapshot::handle::Handle,
+        keep: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A snapshot was deleted manually or by retention. Persisted after each deletion.
+    SnapshotDeleted {
+        workspace_id: String,
+        handle: crate::core::snapshot::handle::Handle,
+        reason: crate::core::snapshot::events::DeletionReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     BackupProgress {
         phase: String,
         progress: usize,
@@ -395,8 +463,8 @@ pub enum SystemEvent {
         #[serde(skip_serializing)]
         actor: Option<MessageOrigin>,
     },
-    /// A widget instance was added to one dashboard, at the widget's default
-    /// size (ADR 0496). Persisted: the dashboards fold these on read.
+    /// A widget instance was added to one dashboard (ADR 0496). Persisted: the
+    /// dashboards fold these on read.
     DashboardTileAdded {
         dashboard: Dashboard,
         app_id: String,
@@ -405,6 +473,10 @@ pub enum SystemEvent {
         /// The tile's label. Absent means the widget's name.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
+        /// The tile's size, as picked on the card it came from. Absent means
+        /// the widget's default size.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<crate::core::apps::WidgetSize>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
@@ -641,6 +713,17 @@ pub enum SystemEvent {
         trigger_id: String,
         trigger_name: String,
         result_summary: String,
+    },
+    /// Cron slots of one trigger passed with no run, past the catch-up grace.
+    /// One per trigger per gap, with a matching inbox notice. PERSISTED, so a
+    /// trigger can react to it, and its `last_slot` keeps the next boot from
+    /// reporting the same gap. Engine-driven, so it carries no actor.
+    TriggerSlotsSkipped {
+        trigger_id: String,
+        trigger_name: String,
+        first_slot: chrono::DateTime<chrono::Utc>,
+        last_slot: chrono::DateTime<chrono::Utc>,
+        count: u32,
     },
     ChangeDiscarded {
         change_id: String,
@@ -1828,6 +1911,7 @@ impl SystemEvent {
         "TriggerGroupReordered",
         "TriggerGroupDeleted",
         "TriggerCompleted",
+        "TriggerSlotsSkipped",
         "LanguageSet",
         "TimezoneSet",
         "ChangeDiscarded",
@@ -1910,6 +1994,13 @@ impl SystemEvent {
         "ThreadQueueDropped",
         "ThreadQueueCompleted",
         "CapacityPolicyChanged",
+        "SnapshotRestoreRequested",
+        "WorkspaceRestored",
+        "SnapshotCreated",
+        "SnapshotCaptureFailed",
+        "SnapshotChecked",
+        "SnapshotKeepChanged",
+        "SnapshotDeleted",
         "BackupCompleted",
         "BackupFailed",
         "BackupKeyRevealed",
@@ -1967,6 +2058,14 @@ impl SystemEvent {
             Self::TreeBackfillCapRaised { .. } => "TreeBackfillCapRaised",
             Self::TreeBackfillEnded { .. } => "TreeBackfillEnded",
             Self::ChangesUpdated { .. } => "ChangesUpdated",
+            Self::SnapshotProgress { .. } => "SnapshotProgress",
+            Self::SnapshotRestoreRequested { .. } => "SnapshotRestoreRequested",
+            Self::WorkspaceRestored { .. } => "WorkspaceRestored",
+            Self::SnapshotCreated { .. } => "SnapshotCreated",
+            Self::SnapshotCaptureFailed { .. } => "SnapshotCaptureFailed",
+            Self::SnapshotChecked { .. } => "SnapshotChecked",
+            Self::SnapshotKeepChanged { .. } => "SnapshotKeepChanged",
+            Self::SnapshotDeleted { .. } => "SnapshotDeleted",
             Self::BackupProgress { .. } => "BackupProgress",
             Self::BackupCompleted { .. } => "BackupCompleted",
             Self::BackupFailed { .. } => "BackupFailed",
@@ -2013,6 +2112,7 @@ impl SystemEvent {
             Self::TimezoneSet { .. } => "TimezoneSet",
             Self::RepositoryImported { .. } => "RepositoryImported",
             Self::TriggerCompleted { .. } => "TriggerCompleted",
+            Self::TriggerSlotsSkipped { .. } => "TriggerSlotsSkipped",
             Self::ChangeDiscarded { .. } => "ChangeDiscarded",
             Self::DeviceVisible { .. } => "DeviceVisible",
             Self::DeviceHidden { .. } => "DeviceHidden",
@@ -2149,6 +2249,14 @@ impl SystemEvent {
         "TreeBackfillCapRaised",
         "TreeBackfillEnded",
         "ChangesUpdated",
+        "SnapshotProgress",
+        "SnapshotRestoreRequested",
+        "WorkspaceRestored",
+        "SnapshotCreated",
+        "SnapshotCaptureFailed",
+        "SnapshotChecked",
+        "SnapshotKeepChanged",
+        "SnapshotDeleted",
         "BackupProgress",
         "BackupCompleted",
         "BackupFailed",
@@ -2195,6 +2303,7 @@ impl SystemEvent {
         "TimezoneSet",
         "RepositoryImported",
         "TriggerCompleted",
+        "TriggerSlotsSkipped",
         "ChangeDiscarded",
         "DeviceVisible",
         "DeviceHidden",
@@ -2307,6 +2416,14 @@ impl SystemEvent {
             | Self::TimezoneSet { .. } => "preference",
             Self::ReleaseNoticeResolved { .. } => "release_notice",
             Self::ChangesUpdated { .. } | Self::ChangeDiscarded { .. } => "change",
+            Self::SnapshotProgress { .. }
+            | Self::SnapshotRestoreRequested { .. }
+            | Self::WorkspaceRestored { .. }
+            | Self::SnapshotCreated { .. }
+            | Self::SnapshotCaptureFailed { .. }
+            | Self::SnapshotChecked { .. }
+            | Self::SnapshotKeepChanged { .. }
+            | Self::SnapshotDeleted { .. } => "snapshot",
             Self::MemoryRebuildProgress { .. }
             | Self::EmbeddingModelStatusChanged { .. }
             | Self::BackupProgress { .. }
@@ -2334,7 +2451,8 @@ impl SystemEvent {
             | Self::TriggerEnabled { .. }
             | Self::TriggerDisabled { .. }
             | Self::TriggerExecuted { .. }
-            | Self::TriggerCompleted { .. } => "trigger",
+            | Self::TriggerCompleted { .. }
+            | Self::TriggerSlotsSkipped { .. } => "trigger",
             Self::TriggerGroupCreated { .. }
             | Self::TriggerGroupRenamed { .. }
             | Self::TriggerGroupReordered { .. }
@@ -2463,6 +2581,15 @@ impl SystemEvent {
 
     pub fn aggregate_id(&self) -> String {
         match self {
+            Self::SnapshotProgress { handle, .. }
+            | Self::SnapshotRestoreRequested { handle, .. }
+            | Self::WorkspaceRestored { handle, .. }
+            | Self::SnapshotCreated { handle, .. }
+            | Self::SnapshotCaptureFailed { handle, .. }
+            | Self::SnapshotChecked { handle, .. }
+            | Self::SnapshotKeepChanged { handle, .. }
+            | Self::SnapshotDeleted { handle, .. } => handle.as_str().to_owned(),
+
             Self::NotificationCreated { id, .. } | Self::NotificationRead { id, .. } => id.clone(),
             Self::ArtifactImported { artifact_path, .. }
             | Self::ArtifactCreated { artifact_path, .. }
@@ -2475,7 +2602,8 @@ impl SystemEvent {
             | Self::TriggerEnabled { trigger_id, .. }
             | Self::TriggerDisabled { trigger_id, .. }
             | Self::TriggerExecuted { trigger_id, .. } => trigger_id.clone(),
-            Self::TriggerCompleted { trigger_id, .. } => trigger_id.clone(),
+            Self::TriggerCompleted { trigger_id, .. }
+            | Self::TriggerSlotsSkipped { trigger_id, .. } => trigger_id.clone(),
             Self::TriggerGroupCreated { group_id, .. }
             | Self::TriggerGroupRenamed { group_id, .. }
             | Self::TriggerGroupReordered { group_id, .. }

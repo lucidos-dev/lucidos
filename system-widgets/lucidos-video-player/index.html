@@ -23,6 +23,25 @@
       border: 1px solid var(--border-color);
       border-radius: var(--radius-surface);
     }
+    /* In a widget box, a thread card or a dashboard tile, the box is the
+       surface: the picture fills what the bar leaves and keeps its shape
+       inside it. */
+    html[data-widget-size], html[data-widget-size] body { height: 100%; }
+    html[data-widget-size] .player {
+      display: flex;
+      flex-direction: column;
+      width: 100%;
+      height: 100%;
+      border: none;
+      border-radius: 0;
+      background: none;
+    }
+    html[data-widget-size] .stage {
+      flex: 1;
+      min-height: 0;
+      aspect-ratio: auto;
+      max-height: none;
+    }
     /* An explicit width, or a capped height shrinks the box to the clip. */
     .stage {
       position: relative;

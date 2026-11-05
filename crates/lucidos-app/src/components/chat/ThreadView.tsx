@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { WidgetShelf } from '../widgets/WidgetShelf';
+import { useWidgetCell } from '../widgets/useWidgetCell';
 import { focusedThreadId, threadMap, stepsExpanded, detailsExpanded, collapsedExchanges, activeStreamingBuffer, threadsLoaded, awaitedThreadId, promptAnimating, revealOnFocus, connectionStatus, scaledDurationMs, effectiveThreadStatus, isMidTurn } from '../../store/store';
 import { getThreadEventsBump } from '../../store/threadActivity';
 import { unfocusThread } from '../../store/actions/threads';
@@ -848,6 +848,10 @@ export function ThreadView() {
     // Every effect below that positions the reader reaches for it, the first
     // being the deep link's own history fetch.
     const areaRef = useRef<HTMLDivElement>(null);
+    // The pane's width sets its cards' widget cell. The phone dashboard fills
+    // this pane and sets its own the same way, so a card and a tile match.
+    const [paneWrap, setPaneWrap] = useState<HTMLDivElement | null>(null);
+    useWidgetCell(paneWrap);
     // This mount's identity, as the holder of a visit (`lastSeededVisit`).
     const visitOwner = useRef({}).current;
 
@@ -1987,7 +1991,7 @@ export function ThreadView() {
             {/* Keyed to match the no-thread tree above, so the cold-open switch
                 between them reuses these nodes rather than rebuilding them. See
                 the comment on that return for what the rebuild costs. */}
-            <div class="thread-content-wrap has-scroll-indicator" key="wrap">
+            <div ref={setPaneWrap} class="thread-content-wrap has-scroll-indicator" key="wrap">
                 {/* tabindex makes the transcript a keyboard-focusable scroll
                     region: once focused (via Tab or the ⌘↑/⌘↓ turn shortcuts) the
                     native Arrow/PageUp/PageDown/Home/End/Space keys scroll it. */}
@@ -2108,7 +2112,6 @@ export function DesktopThreadTitleBar({ threadId }: { threadId: string }) {
         <div class={`thread-view-header${scrolledFromTop.value ? ' scrolled' : ''}`}>
             <ThreadTitleMenu thread={thread} title={title} status={threadVisualStatus(thread)} />
             <ThreadTitlePin thread={thread} />
-            <WidgetShelf threadId={threadId} />
         </div>
     );
 }

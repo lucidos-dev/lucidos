@@ -16,7 +16,7 @@ use super::*;
 /// space can fall from the soft threshold to zero in minutes.
 const DISK_MONITOR_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How far above [`FREE_DISK_SOFT_BYTES`] free disk must recover before the
+/// How far above the soft threshold free disk must recover before the
 /// alert re-arms. Without the band, a 60 s tick alerts each time free space
 /// jitters across the threshold.
 const REARM_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -81,8 +81,8 @@ pub struct DiskMonitor {
     pub(super) bus: Arc<EventBus>,
     pub(super) workspace_root: PathBuf,
     pub(super) free_disk: FreeDiskProbe,
-    pub(super) free_soft_bytes: u64,
-    pub(super) free_hard_bytes: u64,
+    pub(super) soft_cap_bytes: u64,
+    pub(super) hard_cap_bytes: u64,
     pub(super) rearm_margin_bytes: u64,
     pub(super) large_footprint_bytes: u64,
     pub(super) emit_timeout: Duration,
@@ -104,8 +104,8 @@ impl DiskMonitor {
             bus,
             free_disk: os_free_disk_probe(workspace_root.clone()),
             workspace_root,
-            free_soft_bytes: FREE_DISK_SOFT_BYTES,
-            free_hard_bytes: FREE_DISK_HARD_BYTES,
+            soft_cap_bytes: FREE_DISK_SOFT_BYTES,
+            hard_cap_bytes: FREE_DISK_HARD_BYTES,
             rearm_margin_bytes: REARM_MARGIN_BYTES,
             large_footprint_bytes: LARGE_FOOTPRINT_BYTES,
             emit_timeout: ALERT_EMIT_TIMEOUT,
@@ -130,9 +130,9 @@ impl DiskMonitor {
     /// [`ALERT_EMIT_TIMEOUT`].
     async fn run_loop(mut self) {
         log!(
-            "[DiskMonitor] starting (interval={:?}, free_soft={} bytes, rearm_margin={} bytes)",
+            "[DiskMonitor] starting (interval={:?}, soft_cap={} bytes, rearm_margin={} bytes)",
             DISK_MONITOR_INTERVAL,
-            self.free_soft_bytes,
+            self.soft_cap_bytes,
             self.rearm_margin_bytes,
         );
         loop {
@@ -145,18 +145,20 @@ impl DiskMonitor {
     /// below the soft threshold sends one alert. A failed probe changes
     /// nothing, so a transient failure neither wakes, sends nor re-arms.
     pub(super) async fn check_once(&mut self) {
-        let Some(free) = (self.free_disk)() else {
+        let Some(reading) = (self.free_disk)() else {
             return;
         };
-        self.wake_cleanup_on_worsening(free);
+        self.wake_cleanup_on_worsening(reading);
         match self.alert {
             AlertState::Sent => {
-                if free >= self.rearm_level() {
+                if reading.free_bytes >= self.rearm_level(reading) {
                     self.alert = AlertState::Armed;
                 }
                 return;
             }
-            AlertState::Armed if free >= self.free_soft_bytes => return,
+            AlertState::Armed if reading.free_bytes >= self.thresholds(reading).soft_bytes => {
+                return
+            }
             AlertState::Armed => {}
         }
 
@@ -166,31 +168,41 @@ impl DiskMonitor {
         let Some(fresh) = (self.free_disk)() else {
             return;
         };
-        if fresh >= self.free_soft_bytes {
+        if fresh.free_bytes >= self.thresholds(fresh).soft_bytes {
             log!(
                 "[DiskMonitor] free disk recovered to {:.1} GB before the alert went out, not sending it",
-                fresh as f64 / BYTES_PER_GB,
+                fresh.free_bytes as f64 / BYTES_PER_GB,
             );
             return;
         }
-        if self.emit_disk_low_alert(fresh, lucidos_bytes).await {
+        if self
+            .emit_disk_low_alert(fresh.free_bytes, lucidos_bytes)
+            .await
+        {
             self.alert = AlertState::Sent;
         }
     }
 
     /// Once per worsening, never per tick: a wake per tick would run a full
     /// cleanup cycle every minute through a long low-disk episode.
-    fn wake_cleanup_on_worsening(&mut self, free: u64) {
+    fn wake_cleanup_on_worsening(&mut self, reading: DiskReading) {
         let level =
-            DiskPressure::classify(Some(free), self.free_soft_bytes, self.free_hard_bytes).level();
+            DiskPressure::classify(Some(reading), self.soft_cap_bytes, self.hard_cap_bytes).level();
         if level > self.level {
             self.cleanup_wake.notify_one();
         }
         self.level = level;
     }
 
-    fn rearm_level(&self) -> u64 {
-        self.free_soft_bytes.saturating_add(self.rearm_margin_bytes)
+    /// The pressure levels of the volume `reading` came from.
+    fn thresholds(&self, reading: DiskReading) -> DiskThresholds {
+        DiskThresholds::for_reading(Some(reading), self.soft_cap_bytes, self.hard_cap_bytes)
+    }
+
+    fn rearm_level(&self, reading: DiskReading) -> u64 {
+        self.thresholds(reading)
+            .soft_bytes
+            .saturating_add(self.rearm_margin_bytes)
     }
 
     /// Bytes held by `thread-<8hex>` worktrees, measured from disk alone.

@@ -6,6 +6,7 @@
 //! trigger run. ADR 0362 asks what the Tree memory module costs in model
 //! calls, compactor calls included, and this is that number for every arm.
 
+use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 
 use crate::config::ModelPrice;
@@ -17,7 +18,7 @@ type Fallible<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 pub const TURN_PURPOSE: &str = "turn";
 
 /// One purpose and model's calls over a whole arm.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PurposeCalls {
     /// The engine's `ContextPurpose`, snake_case on the wire.
     pub purpose: String,
@@ -32,7 +33,7 @@ pub struct PurposeCalls {
 /// A node whose source already fit is stored verbatim with no call. So the
 /// written count is a floor on compactor calls. The captured calls are the
 /// exact figure wherever a thread anchored them.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeNodes {
     pub written: i64,
     pub free: i64,

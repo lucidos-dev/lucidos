@@ -332,6 +332,21 @@ impl LucidosEngine {
                 .into());
             }
         };
+        // A callback can already be queued in memory when a durable restore
+        // floor is learned. Check its own persisted row again at dispatch.
+        if let Some(boundary) = crate::core::snapshot::boundary::read(self.pool()).await? {
+            if row
+                .sequence
+                .is_none_or(|seq| seq <= boundary.event_sequence)
+            {
+                return Ok(());
+            }
+        }
+        if !crate::engine::agent_recovery::thread_turn_after_restore(self.pool(), child_thread_id)
+            .await?
+        {
+            return Ok(());
+        }
         // **The parent may have been waiting for this itself.** A thread can
         // `await_event` on `ChildThreadCompleted`, and the card the fan-in just
         // emitted is a bus event like any other, so the event-wait dispatcher

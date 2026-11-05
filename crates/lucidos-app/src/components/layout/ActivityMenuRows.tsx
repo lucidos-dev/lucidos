@@ -1,3 +1,4 @@
+import { showEngineBuildLog } from '../../store/actions/engine-update';
 /**
  * The *activity group*: the Lucidos menu's rows for work in flight, one per
  * job. A tap unfolds the job's detail under its row, the way the Workspaces
@@ -13,7 +14,7 @@
 
 import { Fragment, type VNode } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
-import { engineBuildDetail, engineRebuildWedged, engineVersionPending } from '../../store/store';
+import { engineBuildDetail, engineVersionPending } from '../../store/store';
 import { liveActivityRows, type ActivityBody, type ActivityRow, type ApplyThread } from '../../store/actions/activityRows';
 import { activityAction, buildTimerIsLive } from '../../store/actions/backgroundActivity';
 import { openApplyPhase } from '../../store/actions/applyProgress';
@@ -48,9 +49,8 @@ import { progressFillWidth } from '../shared/progressBar';
 /** How often an open menu re-reads the clock while a job counts its time. */
 const TICK_MS = 1000;
 
-/** New code in source with no version built behind it, and whether a rebuild
- *  could still deliver it. Not in flight, so it has no spinner. */
-export type PendingCode = 'none' | 'pending' | 'wedged';
+/** New source waiting for a build. Not in flight, so it has no spinner. */
+export type PendingCode = 'none' | 'pending';
 
 export interface ActivityGroupProps {
   rows: ActivityRow[];
@@ -73,10 +73,9 @@ export interface ActivityGroupProps {
   onOpenPending: () => void;
 }
 
-/** What the pending row says. It states what exists, never what to press:
- *  the toast behind the tap decides whether a Rebuild is on offer. */
-export function pendingLabel(pending: Exclude<PendingCode, 'none'>): string {
-  return pending === 'wedged' ? 'New code pending, no rebuild can deliver it' : 'New code pending';
+/** The pending row reopens the toast offering Rebuild. */
+export function pendingLabel(): string {
+  return 'New code pending';
 }
 
 function progressBar(progress: number | StepProgress): VNode {
@@ -124,7 +123,9 @@ function note(text: string): VNode {
 
 function backgroundBody(activity: BackgroundActivity, commits: PendingCommits | null): VNode {
   const primary = activityAction(activity.action);
-  const secondary = activityAction(activity.secondaryAction);
+  const secondary = activity.kind === 'engine-build'
+    ? { label: 'Show build log', onClick: showEngineBuildLog }
+    : activityAction(activity.secondaryAction);
   // A build names what it brings when git can count it, and otherwise says
   // what follows it.
   const counted = activity.kind === 'engine-build' ? commitsBody(commits) : null;
@@ -384,12 +385,12 @@ export function activityMenuGroup(props: ActivityGroupProps) {
           <button
             key="pending-code"
             type="button"
-            class={`brand-menu-item brand-menu-activity-row${pending === 'wedged' ? ' is-wedged' : ''}`}
+            class="brand-menu-item brand-menu-activity-row"
             role="menuitem"
             onClick={onOpenPending}
           >
             <span class="brand-menu-activity-mark" aria-hidden="true"><span class="brand-menu-activity-dot" /></span>
-            <span class="brand-menu-activity-label">{pendingLabel(pending)}</span>
+            <span class="brand-menu-activity-label">{pendingLabel()}</span>
             <ChevronRightIcon size="1rem" />
           </button>
         )}
@@ -417,7 +418,7 @@ export function ActivityMenuGroup({ onClose }: { onClose: () => void }) {
 
   const pending: PendingCode = !engineVersionPending.value
     ? 'none'
-    : engineRebuildWedged.value ? 'wedged' : 'pending';
+    : 'pending';
   // A fix thread or lane thread may be archived, so the page never loaded it.
   const openThread = (threadId: string) => {
     onClose();

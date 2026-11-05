@@ -156,8 +156,12 @@ async fn admit(
     // The ticket names the caller. The mint ran the origin check a handshake
     // cannot, because a browser sends no `Referer` on one. Spent here whatever
     // happens next, so a refused upgrade cannot be retried on the same ticket.
+    let generation = crate::core::snapshot::boundary::read(pool)
+        .await
+        .map_err(ApiError::db)?
+        .map(|boundary| boundary.restore_id);
     let device_id = super::voice_ticket::ticket_in(uri)
-        .and_then(|ticket| tickets.redeem(&ticket, thread_id))
+        .and_then(|ticket| tickets.redeem(&ticket, thread_id, generation))
         .ok_or_else(|| ApiError::new(StatusCode::FORBIDDEN, NO_LIVE_TICKET))?;
 
     // Through the gateway the header is the device it authenticated. A ticket

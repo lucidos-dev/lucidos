@@ -668,7 +668,7 @@ async fn uncommitted_paths(worktree_path: &Path) -> Result<Vec<String>, String> 
 /// `-z` keeps a path with a space or a non-ASCII byte unquoted.
 async fn conflicted_paths(worktree_path: &Path) -> Result<Vec<String>, String> {
     let unmerged = git_paths(
-        &["diff", "--name-only", "--diff-filter=U", "-z"],
+        &[&super::UNMERGED_PATHS_ARGS[..], &["-z"]].concat(),
         worktree_path,
     )
     .await?;

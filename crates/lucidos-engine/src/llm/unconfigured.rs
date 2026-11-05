@@ -16,13 +16,9 @@ pub const NO_PROVIDER_MESSAGE: &str =
 /// Sentinel LLM provider for the "booted before any provider is configured"
 /// state.
 ///
-/// A packaged desktop build sets `LUCIDOS_BOOT_WITHOUT_PROVIDER=1` so the engine
-/// still boots on first run — before the user has entered any provider
-/// credential — instead of crashing the `.app` on launch. When no real provider
-/// (Vertex / OpenAI / Anthropic / OpenRouter / xAI / local) is configured, this
-/// provider is installed instead of the deterministic `MockProvider`: it lets
-/// the engine boot but returns a clear, actionable error on every chat attempt,
-/// so a shipped release never serves mock output to a real user.
+/// Every launch mode boots before the user has entered any provider credential.
+/// This provider keeps Settings reachable and returns an actionable chat error.
+/// It never serves deterministic mock output to a real user.
 ///
 /// It reports `is_configured() == false`, which `/health` exposes as
 /// `llm_configured: false` so the frontend shows first-run provider onboarding.

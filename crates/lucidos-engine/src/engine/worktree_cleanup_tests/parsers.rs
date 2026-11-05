@@ -334,25 +334,107 @@ async fn last_activity_is_the_newest_timestamp_not_the_last_insert() {
 }
 
 #[test]
-fn available_disk_bytes_returns_some_for_existing_path() {
-    use super::available_disk_bytes;
+fn disk_reading_returns_free_and_total_for_an_existing_path() {
+    use super::disk_reading;
     let tmp = tempfile::tempdir().unwrap();
-    let bytes = available_disk_bytes(tmp.path());
+    let reading = disk_reading(tmp.path()).expect("should read an existing tempdir");
     assert!(
-        bytes.is_some(),
-        "should return Some for an existing tempdir"
-    );
-    assert!(
-        bytes.unwrap() > 0,
+        reading.free_bytes > 0,
         "free space must be > 0 on a healthy host"
+    );
+    assert!(reading.total_bytes >= reading.free_bytes);
+}
+
+#[test]
+fn disk_reading_returns_none_for_missing_path() {
+    use super::disk_reading;
+    let bogus = Path::new("/this/path/does/not/exist/lucidos-test");
+    assert!(disk_reading(bogus).is_none());
+}
+
+#[test]
+fn thresholds_are_the_caps_on_a_big_volume_and_shares_on_a_small_one() {
+    use super::{DiskThresholds, FREE_DISK_HARD_BYTES, FREE_DISK_SOFT_BYTES};
+    let on = |total| DiskThresholds::for_volume(total, FREE_DISK_SOFT_BYTES, FREE_DISK_HARD_BYTES);
+    let caps = DiskThresholds {
+        soft_bytes: 20 * GB,
+        hard_bytes: 5 * GB,
+    };
+    assert_eq!(on(80 * GB), caps, "80 GiB is where both caps start to bind");
+    assert_eq!(on(1024 * GB), caps);
+    assert_eq!(on(u64::MAX), caps);
+    assert_eq!(
+        on(50 * GB),
+        DiskThresholds {
+            soft_bytes: 50 * GB / 4,
+            hard_bytes: 5 * GB,
+        }
+    );
+    let small = on(20 * GB);
+    assert_eq!(small.soft_bytes, 5 * GB);
+    assert_eq!(small.hard_bytes, 2 * GB);
+    assert_eq!(
+        on(0),
+        DiskThresholds {
+            soft_bytes: 0,
+            hard_bytes: 0
+        }
     );
 }
 
 #[test]
-fn available_disk_bytes_returns_none_for_missing_path() {
-    use super::available_disk_bytes;
-    let bogus = Path::new("/this/path/does/not/exist/lucidos-test");
-    assert!(available_disk_bytes(bogus).is_none());
+fn no_reading_gets_the_caps() {
+    use super::{DiskReading, DiskThresholds, FREE_DISK_HARD_BYTES, FREE_DISK_SOFT_BYTES};
+    let of =
+        |reading| DiskThresholds::for_reading(reading, FREE_DISK_SOFT_BYTES, FREE_DISK_HARD_BYTES);
+    let on = |total| DiskThresholds::for_volume(total, FREE_DISK_SOFT_BYTES, FREE_DISK_HARD_BYTES);
+    assert_eq!(of(None), on(u64::MAX));
+    let small = DiskReading {
+        free_bytes: 3 * GB,
+        total_bytes: 20 * GB,
+    };
+    assert_eq!(of(Some(small)), on(20 * GB));
+}
+
+#[test]
+fn zfs_ancestors_run_from_the_pool_root_to_the_dataset() {
+    use super::zfs::dataset_and_ancestors;
+    let all: Vec<_> = dataset_and_ancestors("rpool/USERDATA/home").collect();
+    assert_eq!(all, ["rpool", "rpool/USERDATA", "rpool/USERDATA/home"]);
+    let root: Vec<_> = dataset_and_ancestors("tank").collect();
+    assert_eq!(root, ["tank"]);
+}
+
+#[test]
+fn zfs_size_is_the_pool_bounded_by_every_quota_that_applies() {
+    use super::zfs::size_from_listing;
+    let no_quota = "tank\t0\t0\t5000\t15000\ntank/ws\t0\t0\t3000\t15000\n";
+    assert_eq!(size_from_listing("tank/ws", no_quota), Some(20_000));
+    let own = "tank\t0\t0\t5000\t15000\ntank/ws\t9000\t8000\t3000\t5000\n";
+    assert_eq!(size_from_listing("tank/ws", own), Some(8000));
+    let ancestor =
+        "tank\t0\t0\t5000\t15000\ntank/a\t7000\t0\t4000\t3000\ntank/a/ws\t0\t0\t3000\t3000\n";
+    assert_eq!(size_from_listing("tank/a/ws", ancestor), Some(7000));
+    let ancestor_refquota =
+        "tank\t0\t0\t5000\t15000\ntank/a\t0\t1000\t4000\t3000\ntank/a/ws\t0\t0\t3000\t3000\n";
+    assert_eq!(
+        size_from_listing("tank/a/ws", ancestor_refquota),
+        Some(20_000),
+        "an ancestor's refquota limits only its own data"
+    );
+    assert_eq!(
+        size_from_listing("tank", "tank\t0\t0\t5000\t15000\n"),
+        Some(20_000)
+    );
+    assert_eq!(
+        size_from_listing("tank/ws", "tank/ws\t0\t0\t3000\t15000\n"),
+        None
+    );
+    assert_eq!(size_from_listing("tank", "tank\t-\t0\t5000\t15000\n"), None);
+    assert_eq!(
+        size_from_listing("tank", &format!("tank\t0\t0\t{}\t1\n", u64::MAX)),
+        None
+    );
 }
 
 /// An empty session map with nothing registered anywhere.
@@ -432,7 +514,9 @@ async fn a_running_background_task_makes_its_thread_active() {
 fn the_tier_1_idle_window_shrinks_with_each_pressure_level() {
     use super::{DiskPressure, TIER_1_IDLE};
     let forced = Duration::from_secs(60 * 60);
-    let window = |free| DiskPressure::classify(Some(free), 20 * GB, 5 * GB).tier1_idle(forced);
+    let window = |free| {
+        DiskPressure::classify(Some(on_a_huge_volume(free)), 20 * GB, 5 * GB).tier1_idle(forced)
+    };
     assert_eq!(window(50 * GB), TIER_1_IDLE, "comfortable");
     assert_eq!(window(10 * GB), forced, "soft");
     assert_eq!(window(GB), Duration::ZERO, "hard");
@@ -459,8 +543,8 @@ async fn hard_threshold_emits_auto_cleanup_when_bytes_freed() {
     insert_old_event(&pool, thread_id, 90 * 60).await; // 90 min — forced Tier 1 will fire
 
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    worker.free_hard_bytes = u64::MAX;
-    worker.free_soft_bytes = u64::MAX;
+    worker.hard_cap_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
 
     let rx = bus.subscribe();
     worker.run_once().await;
@@ -493,8 +577,8 @@ async fn hard_threshold_no_auto_cleanup_when_nothing_freed() {
 
     let (_tmp, root) = fresh_workspace().await;
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    worker.free_hard_bytes = u64::MAX;
-    worker.free_soft_bytes = u64::MAX;
+    worker.hard_cap_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
 
     let rx = bus.subscribe();
     worker.run_once().await;
@@ -581,7 +665,7 @@ async fn tier_0_removes_clean_worktree_with_no_commits_after_grace() {
     // Reclaim is disk-gated now (a non-archived worktree is kept while disk is
     // comfortable) — drive Tier 0 via soft pressure.
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    worker.free_soft_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
@@ -616,7 +700,7 @@ async fn tier_0_skips_branch_with_commits_ahead_of_main() {
     // Under soft pressure so the commits-ahead skip — not ample disk — is the
     // operative reason Tier 0 doesn't fire.
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    worker.free_soft_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
@@ -652,7 +736,7 @@ async fn tier_0_respects_one_hour_grace_window() {
     // Under soft pressure so the 1 h grace — not ample disk — is the operative
     // reason Tier 0 doesn't fire yet.
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    worker.free_soft_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
@@ -691,8 +775,8 @@ async fn tier_0_fires_within_grace_under_disk_pressure() {
     // Force real disk pressure: the volume sits below BOTH thresholds (in
     // production hard < soft, so under_hard implies under_soft). Soft opens the
     // reclaim gate; hard drops the Tier 0 grace to zero so it fires immediately.
-    worker.free_soft_bytes = u64::MAX;
-    worker.free_hard_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
+    worker.hard_cap_bytes = u64::MAX;
 
     let rx = bus.subscribe();
     worker.run_once().await;
@@ -748,7 +832,7 @@ async fn tier_0_skips_thread_with_pending_change() {
     // Under soft pressure so the pending-change skip — not ample disk — is the
     // operative reason Tier 0 doesn't fire.
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    worker.free_soft_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
@@ -804,7 +888,7 @@ async fn tier_0_skips_thread_with_live_agent_session() {
         root.clone(),
         active_threads(&[thread_id]),
     );
-    worker.free_soft_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;

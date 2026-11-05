@@ -1716,8 +1716,8 @@ const ENV_VARS_DOMAIN: Domain = Domain {
 };
 
 // ---------------------------------------------------------------------------
-// widgets: a thread's widgets, its shelf, reusable widgets and the two
-// dashboards (ADRs 0402, 0407, 0415, 0496). Pin, unpin and the dashboard edits
+// widgets: reusable widgets, a thread's widget card sizes and the two
+// dashboards (ADRs 0402, 0415, 0496). A card size and the dashboard edits
 // name a widget instance: the widget and its params.
 // Every widget action the UI offers has an action here, for the agent and the
 // CLI. Open in Canvas is navigate_ui to the widget's id. `thread_id` is
@@ -1749,46 +1749,21 @@ const WIDGET_PARAMS_ARG: Arg = Arg {
     loc: ArgIn::Body,
     description: "Widget params, a JSON object. One set is one instance.",
 };
-const WIDGET_LABEL_ARG: Arg = Arg {
-    name: "label",
+const WIDGET_SIZE_ARG: Arg = Arg {
+    name: "size",
     ty: ArgType::Str,
-    enum_values: &[],
-    required: false,
+    enum_values: &["small", "medium", "large"],
+    required: true,
     loc: ArgIn::Body,
-    description: "Chip label. Default: the widget's name.",
+    description: "One the widget declares. Only a size the user named this turn.",
 };
-/// What pin and unpin name: one widget instance in one thread.
-const WIDGET_INSTANCE_ARGS: &[Arg] = &[
+/// What a card size names: one widget instance in one thread, and its size.
+const WIDGET_CARD_SIZE_ARGS: &[Arg] = &[
     WIDGET_APP_ID_ARG,
     WIDGET_THREAD_BODY_ARG,
     WIDGET_PARAMS_ARG,
-    WIDGET_LABEL_ARG,
+    WIDGET_SIZE_ARG,
 ];
-const WIDGET_SHOWN_EVENT_ARG: Arg = Arg {
-    name: "shown_event_id",
-    ty: ArgType::Str,
-    enum_values: &[],
-    required: false,
-    loc: ArgIn::Body,
-    description: "Reply turn's event id, for Show in thread.",
-};
-/// A pin names its instance, and may name the reply that draws it.
-const WIDGET_PIN_ARGS: &[Arg] = &[
-    WIDGET_APP_ID_ARG,
-    WIDGET_THREAD_BODY_ARG,
-    WIDGET_PARAMS_ARG,
-    WIDGET_LABEL_ARG,
-    WIDGET_SHOWN_EVENT_ARG,
-];
-const WIDGET_THREAD_QUERY_ARG: Arg = Arg {
-    name: "thread_id",
-    ty: ArgType::Str,
-    enum_values: &[],
-    required: false,
-    loc: ArgIn::Query,
-    description: "Thread uuid. Default: yours.",
-};
-
 pub const DASHBOARD_QUERY_ARG: Arg = Arg {
     name: "dashboard",
     ty: ArgType::Str,
@@ -1802,8 +1777,12 @@ const DASHBOARD_BODY_ARG: Arg = Arg {
     ..DASHBOARD_QUERY_ARG
 };
 const DASHBOARD_LABEL_ARG: Arg = Arg {
+    name: "label",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Body,
     description: "Tile label. Default: the name.",
-    ..WIDGET_LABEL_ARG
 };
 /// A tile is a widget, or an app shown as an app shortcut.
 const DASHBOARD_APP_ID_ARG: Arg = Arg {
@@ -1816,6 +1795,11 @@ const DASHBOARD_ADD_ARGS: &[Arg] = &[
     DASHBOARD_BODY_ARG,
     WIDGET_PARAMS_ARG,
     DASHBOARD_LABEL_ARG,
+    Arg {
+        required: false,
+        description: "A widget's tile size. Default: its default size.",
+        ..WIDGET_SIZE_ARG
+    },
 ];
 const DASHBOARD_REMOVE_ARGS: &[Arg] =
     &[DASHBOARD_APP_ID_ARG, DASHBOARD_BODY_ARG, WIDGET_PARAMS_ARG];
@@ -1866,28 +1850,12 @@ const WIDGETS_OPS: &[Operation] = &[
         "list",
     ),
     widget_op(
-        "thread",
-        "Every widget in a thread.",
-        Method::Get,
-        "/widgets/thread",
-        &[WIDGET_THREAD_QUERY_ARG],
-        "thread",
-    ),
-    widget_op(
-        "pin",
-        "Add its chip to the shelf.",
+        "size",
+        "Resize its cards in a thread.",
         Method::Post,
-        "/widgets/pin",
-        WIDGET_PIN_ARGS,
-        "pin",
-    ),
-    widget_op(
-        "unpin",
-        "Remove its chip. The card stays.",
-        Method::Post,
-        "/widgets/unpin",
-        WIDGET_INSTANCE_ARGS,
-        "unpin",
+        "/widgets/size",
+        WIDGET_CARD_SIZE_ARGS,
+        "size",
     ),
     widget_op(
         "make_reusable",
@@ -1946,7 +1914,7 @@ const WIDGETS_DOMAIN: Domain = Domain {
     name: "widgets",
     tool_name: "widgets",
     tool_summary:
-        "A thread's widgets, shelf, reusable widgets and dashboards. Make one with create_app kind='widget'.",
+        "Reusable widgets, a thread's widget card sizes and the dashboards. Make one with create_app kind='widget'.",
     llm: true,
     cli: true,
     sdk: false,

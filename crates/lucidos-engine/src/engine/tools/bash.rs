@@ -729,6 +729,9 @@ impl LucidosEngine {
         };
 
         if let Some(snap) = snapshot {
+            if snap.finished {
+                self.bash_background.mark_result_read(thread_id, task_id);
+            }
             // Same `as_reported` rule as the persisted row, so a task the
             // teardown killed does not read as `signal: 9` here and as no
             // status there. The two are one tool call to the LLM.
@@ -753,7 +756,15 @@ impl LucidosEngine {
             .to_string());
         }
 
-        match persisted_drain(&self.pool, thread_id, task_id, call_started).await? {
+        match persisted_drain(
+            &self.pool,
+            &self.bash_background,
+            thread_id,
+            task_id,
+            call_started,
+        )
+        .await?
+        {
             Some(result) => Ok(result),
             // No registry entry and no completion row. Before calling the id
             // unknown, ask whether this thread ever spawned it: a task with no
@@ -817,8 +828,10 @@ impl LucidosEngine {
 ///
 /// The streams are masked again on the way out. A row written before the
 /// write-time mask holds them raw, and nothing rewrites the events table.
+/// The reader has now read the result, so no wait delivers it (ADR 0619).
 async fn persisted_drain(
     pool: &sqlx::PgPool,
+    registry: &super::bash_background::BackgroundBashRegistry,
     thread_id: uuid::Uuid,
     task_id: &str,
     call_started: std::time::Instant,
@@ -866,28 +879,28 @@ async fn persisted_drain(
             .and_then(|v| v.as_i64())
             .map(|s| s as i32),
     );
-    Ok(Some(
-        serde_json::json!({
-            "stdout": stream("stdout"),
-            "stderr": stream("stderr"),
-            "exit_code": outcome.exit_code(),
-            "signal": outcome.signal(),
-            "status": outcome.describe(),
-            "finished": true,
-            "timed_out": payload.get("timed_out").cloned().unwrap_or(serde_json::Value::Bool(false)),
-            "killed": payload.get("killed").cloned().unwrap_or(serde_json::Value::Bool(false)),
-            // True only on a row the recovery sweep wrote: the engine
-            // that owned the task stopped, so no status was ever
-            // reaped and `elapsed_secs` spans the downtime too.
-            "abandoned": payload.get("abandoned").cloned().unwrap_or(serde_json::Value::Bool(false)),
-            // The in-memory branch's two time fields, so the LLM need not
-            // guess how long the task ran. `waited_secs` is measured: a drain
-            // can block and only then find the retention window closed.
-            "elapsed_secs": persisted_elapsed_secs(&payload),
-            "waited_secs": call_started.elapsed().as_secs(),
-        })
-        .to_string(),
-    ))
+    let result = serde_json::json!({
+        "stdout": stream("stdout"),
+        "stderr": stream("stderr"),
+        "exit_code": outcome.exit_code(),
+        "signal": outcome.signal(),
+        "status": outcome.describe(),
+        "finished": true,
+        "timed_out": payload.get("timed_out").cloned().unwrap_or(serde_json::Value::Bool(false)),
+        "killed": payload.get("killed").cloned().unwrap_or(serde_json::Value::Bool(false)),
+        // True only on a row the recovery sweep wrote: the engine
+        // that owned the task stopped, so no status was ever
+        // reaped and `elapsed_secs` spans the downtime too.
+        "abandoned": payload.get("abandoned").cloned().unwrap_or(serde_json::Value::Bool(false)),
+        // The in-memory branch's two time fields, so the LLM need not
+        // guess how long the task ran. `waited_secs` is measured: a drain
+        // can block and only then find the retention window closed.
+        "elapsed_secs": persisted_elapsed_secs(&payload),
+        "waited_secs": call_started.elapsed().as_secs(),
+    })
+    .to_string();
+    registry.mark_result_read(thread_id, task_id);
+    Ok(Some(result))
 }
 
 /// Task runtime in seconds from a persisted `BackgroundBashCompleted`
@@ -1006,10 +1019,16 @@ mod tests {
         .await
         .expect("insert a pre-fix completion row");
 
-        let out = persisted_drain(&pool, thread_id, "task-old", std::time::Instant::now())
-            .await
-            .expect("the drain reads the store")
-            .expect("the row is found");
+        let out = persisted_drain(
+            &pool,
+            &super::super::bash_background::BackgroundBashRegistry::new(),
+            thread_id,
+            "task-old",
+            std::time::Instant::now(),
+        )
+        .await
+        .expect("the drain reads the store")
+        .expect("the row is found");
 
         assert!(!out.contains(secret), "credential replayed: {out}");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("json result");
@@ -1019,6 +1038,62 @@ mod tests {
             .unwrap()
             .starts_with("warning: echoed"));
         assert_eq!(parsed["exit_code"], 0);
+
+        pool.close().await;
+        crate::test_support::teardown_test_db(&db).await;
+    }
+
+    /// ADR 0619: a result read off its persisted row is read, so no clean
+    /// turn end delivers it again.
+    #[tokio::test]
+    async fn a_persisted_read_marks_the_result_read() {
+        let (pool, db) = crate::test_support::setup_test_db().await;
+        let registry = super::super::bash_background::BackgroundBashRegistry::new();
+        let thread_id = uuid::Uuid::new_v4();
+        let spec = TaskSpec {
+            timeout_secs: 60,
+            description: None,
+            delivery: CompletionDelivery::Poll,
+            inherited: crate::core::InheritedSecrets::Keep,
+        };
+        let (task_id, _rx) = registry
+            .spawn_task(
+                "true",
+                std::path::Path::new("/tmp"),
+                &[],
+                Some(thread_id),
+                spec,
+            )
+            .await
+            .expect("spawn");
+        assert!(
+            registry
+                .wait_for_finish(&task_id, Duration::from_secs(10))
+                .await
+        );
+        assert_eq!(registry.unread_results_for_thread(thread_id).len(), 1);
+        sqlx::query(
+            "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
+             VALUES ($1, 'thread', $2, 'BackgroundBashCompleted', $3, NOW(), $2::uuid)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(thread_id.to_string())
+        .bind(serde_json::json!({ "task_id": task_id, "command": "true", "exit_code": 0 }))
+        .execute(&pool)
+        .await
+        .expect("insert the completion row");
+
+        persisted_drain(
+            &pool,
+            &registry,
+            thread_id,
+            &task_id,
+            std::time::Instant::now(),
+        )
+        .await
+        .expect("the drain reads the store")
+        .expect("the row is found");
+        assert!(registry.unread_results_for_thread(thread_id).is_empty());
 
         pool.close().await;
         crate::test_support::teardown_test_db(&db).await;

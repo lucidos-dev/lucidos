@@ -20,6 +20,7 @@
 //! The gateway deliberately does not link sqlx (ADR 0014 §1). All database
 //! management is done with PostgreSQL command-line tools and readiness probes.
 
+use crate::cleanup_process::CleanupCommand;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,6 +35,9 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 // carries a copy of each `pub(crate)` value below. `value_pins_tests` pins them.
 pub(crate) const PG_USER: &str = "lucidos";
 const PG_ADMIN_DATABASE: &str = "postgres";
+// Server-side bounds also stop SQL inside Docker if its CLI disconnects.
+const PG_BULK_OPTIONS: &str = "-c statement_timeout=0 -c lock_timeout=10000";
+const PG_QUERY_OPTIONS: &str = "-c statement_timeout=60000 -c lock_timeout=10000";
 pub(crate) const PG_IMAGE: &str = "pgvector/pgvector:pg18";
 pub(crate) const SHARED_DOCKER_CONTAINER: &str = "lucidos-pg-shared";
 pub(crate) const SHARED_DOCKER_VOLUME: &str = "lucidos-pg-data-shared";
@@ -278,17 +282,26 @@ pub async fn ensure(
 /// for unhealthy stacks that failed after database creation but before a
 /// [`PgHandle`] was stored. It never creates a missing Docker cluster; if the
 /// shared Docker container is absent there is nothing to drop. Embedded clusters
-/// are started only when their data directory already exists.
+/// must already be running; teardown never starts or provisions them.
 pub async fn teardown_workspace(
     backend: &PgBackend,
     ws_id: &str,
     app_data: &Path,
 ) -> Result<(), BoxError> {
-    let database = database_name(ws_id)?;
+    teardown_named_database(backend, &database_name(ws_id)?, app_data).await
+}
+
+/// Delete exactly an observed cleanup database, without deriving a workspace id.
+pub async fn teardown_named_database(
+    backend: &PgBackend,
+    database: &str,
+    app_data: &Path,
+) -> Result<(), BoxError> {
+    validate_cleanup_database(database)?;
     match backend {
-        PgBackend::Docker => teardown_docker_workspace(&database).await,
+        PgBackend::Docker => teardown_docker_workspace(database).await,
         PgBackend::Embedded { bin, lib } => {
-            teardown_embedded_workspace(bin, lib, app_data, &database).await
+            teardown_embedded_workspace(bin, lib, app_data, database).await
         }
     }
 }
@@ -297,13 +310,500 @@ pub async fn teardown_workspace(
 /// (`[a-z0-9-]`); Postgres accepts hyphens in database names when quoted, and
 /// URLs accept them in the path.
 pub fn database_name(ws_id: &str) -> Result<String, BoxError> {
-    if !crate::registry::is_valid_id(ws_id) {
-        return Err(format!("invalid workspace id for database name: '{ws_id}'").into());
-    }
-    Ok(format!("{DATABASE_PREFIX}{ws_id}"))
+    lucidos_gateway_constants::workspace_database_name(ws_id)
 }
 
-const DATABASE_PREFIX: &str = "lucidos_";
+/// Cleanup names come from the cluster inventory, including legacy names that
+/// are not registry slugs. Preserve them exactly and quote at the SQL boundary.
+/// PostgreSQL truncates identifiers beyond 63 bytes, so reject those outright.
+pub(crate) fn validate_cleanup_database(database: &str) -> Result<(), BoxError> {
+    if !database.starts_with("lucidos_")
+        || database.len() <= "lucidos_".len()
+        || database.len() > 63
+        || database.contains('\0')
+    {
+        return Err("invalid cleanup database name".into());
+    }
+    Ok(())
+}
+
+/// Write a custom-format recovery dump without provisioning or changing a cluster.
+pub fn cleanup_dump(
+    backend: &PgBackend,
+    app_data: &Path,
+    id: &str,
+    path: &Path,
+) -> Result<(), BoxError> {
+    cleanup_dump_named(backend, app_data, &database_name(id)?, path)
+}
+
+pub fn cleanup_dump_named(
+    backend: &PgBackend,
+    app_data: &Path,
+    database: &str,
+    path: &Path,
+) -> Result<(), BoxError> {
+    validate_cleanup_database(database)?;
+    let mut command = match backend {
+        PgBackend::Docker => {
+            let mut command = Command::new("docker");
+            command.args([
+                "exec",
+                "-e",
+                &format!("PGOPTIONS={PG_BULK_OPTIONS}"),
+                &docker_container_name(),
+                "pg_dump",
+                "-U",
+                PG_USER,
+            ]);
+            command
+        }
+        PgBackend::Embedded { bin, lib } => {
+            let mut command = Command::new(bin.join("pg_dump"));
+            with_pg_libpath(&mut command, lib);
+            command.env("PGOPTIONS", PG_BULK_OPTIONS);
+            command
+                .arg("-h")
+                .arg(embedded_socket_dir(&embedded_data_dir(app_data))?);
+            command.args(["-p", &EMBEDDED_PORT.to_string(), "-U", PG_USER]);
+            command
+        }
+    };
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    command.args(["-Fc", "-d", database]);
+    let output = command.cleanup_output_to(file.try_clone()?)?;
+    if !output.status.success() || file.metadata()?.len() == 0 {
+        return Err(format!(
+            "Recovery dump failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    file.sync_all()?;
+    Ok(())
+}
+
+fn cleanup_query(backend: &PgBackend, app_data: &Path, sql: &str) -> Result<String, BoxError> {
+    match backend {
+        PgBackend::Docker => psql_query_docker(&docker_container_name(), PG_ADMIN_DATABASE, sql),
+        PgBackend::Embedded { bin, lib } => {
+            let socket = embedded_socket_dir(&embedded_data_dir(app_data))?;
+            psql_query_embedded(bin, lib, &socket, PG_ADMIN_DATABASE, sql)
+        }
+    }
+}
+
+/// A successful catalog observation only. Errors never prove that DROP finished.
+pub(crate) fn cleanup_database_exists(
+    backend: &PgBackend,
+    app_data: &Path,
+    database: &str,
+) -> Result<bool, BoxError> {
+    cleanup_database_exists_with(database, |sql| cleanup_query(backend, app_data, sql))
+}
+
+fn cleanup_database_exists_with(
+    database: &str,
+    query: impl FnOnce(&str) -> Result<String, BoxError>,
+) -> Result<bool, BoxError> {
+    validate_cleanup_database(database)?;
+    let result = query(&format!(
+        "SELECT count(*) FROM pg_database WHERE datname={}",
+        sql_string_literal(database)
+    ))?;
+    match result.trim() {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err("invalid database existence observation".into()),
+    }
+}
+
+#[cfg(test)]
+mod cleanup_existence_tests {
+    use super::*;
+
+    #[test]
+    fn only_successful_exact_catalog_answers_prove_absence() {
+        for answer in ["0", " 0\n"] {
+            assert!(!cleanup_database_exists_with("lucidos_odd'name", |sql| {
+                assert_eq!(
+                    sql,
+                    "SELECT count(*) FROM pg_database WHERE datname='lucidos_odd''name'"
+                );
+                Ok(answer.into())
+            })
+            .unwrap());
+        }
+        assert!(cleanup_database_exists_with("lucidos_scratch", |_| Ok("1".into())).unwrap());
+        for answer in ["", "2", "unknown"] {
+            assert!(
+                cleanup_database_exists_with("lucidos_scratch", |_| Ok(answer.into())).is_err()
+            );
+        }
+        assert!(cleanup_database_exists_with("lucidos_scratch", |_| Err(
+            "catalog unavailable".into()
+        ))
+        .is_err());
+        assert!(cleanup_database_exists_with("postgres", |_| panic!(
+            "invalid target must not query"
+        ))
+        .is_err());
+    }
+}
+
+pub fn cleanup_mark_original(
+    backend: &PgBackend,
+    app_data: &Path,
+    id: &str,
+    operation: &str,
+) -> Result<(), BoxError> {
+    cleanup_mark_named_original(backend, app_data, &database_name(id)?, operation)
+}
+
+pub fn cleanup_mark_named_original(
+    backend: &PgBackend,
+    app_data: &Path,
+    database: &str,
+    operation: &str,
+) -> Result<(), BoxError> {
+    cleanup_mark_original_with(database, operation, |sql| {
+        cleanup_query(backend, app_data, sql)
+    })
+}
+
+fn cleanup_mark_original_with(
+    database: &str,
+    operation: &str,
+    mut query: impl FnMut(&str) -> Result<String, BoxError>,
+) -> Result<(), BoxError> {
+    validate_cleanup_database(database)?;
+    validate_cleanup_operation(operation)?;
+    if query(&format!(
+        "SELECT 1 FROM pg_database WHERE datname={}",
+        sql_string_literal(database)
+    ))?
+    .trim()
+        != "1"
+    {
+        return Ok(());
+    }
+    query(&format!(
+        "COMMENT ON DATABASE {} IS {}",
+        quote_ident(database),
+        sql_string_literal(&format!("lucidos-trash:{operation}:deleting"))
+    ))?;
+    Ok(())
+}
+
+fn validate_cleanup_operation(operation: &str) -> Result<(), BoxError> {
+    if operation.len() != 32 || !operation.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("invalid Trash operation".into());
+    }
+    Ok(())
+}
+
+/// A present original is reusable only with this journal's deletion marker.
+/// Absence means the drop committed and the dump must be restored instead.
+fn cleanup_original_with(
+    target: &str,
+    operation: Option<&str>,
+    mut query: impl FnMut(&str) -> Result<String, BoxError>,
+) -> Result<bool, BoxError> {
+    let Some(operation) = operation else {
+        return Ok(false);
+    };
+    validate_cleanup_operation(operation)?;
+    if query(&format!(
+        "SELECT 1 FROM pg_database WHERE datname={}",
+        sql_string_literal(target)
+    ))?
+    .trim()
+        != "1"
+    {
+        return Ok(false);
+    }
+    let marker = query(&format!(
+        "SELECT COALESCE(shobj_description(oid, 'pg_database'), '') FROM pg_database WHERE datname={}",
+        sql_string_literal(target)
+    ))?;
+    Ok(marker.trim() == format!("lucidos-trash:{operation}:deleting"))
+}
+
+/// Restore a Trash dump into an operation-specific staging database. A durable
+/// database comment distinguishes a completed rename from an unrelated target
+/// after a gateway crash. Never uses --clean or drops the destination database.
+pub fn cleanup_restore(
+    backend: &PgBackend,
+    app_data: &Path,
+    id: &str,
+    operation: &str,
+    dump: &Path,
+    deletion_operation: Option<&str>,
+) -> Result<(), BoxError> {
+    cleanup_restore_named(
+        backend,
+        app_data,
+        &database_name(id)?,
+        operation,
+        dump,
+        deletion_operation,
+    )
+}
+
+pub fn cleanup_restore_named(
+    backend: &PgBackend,
+    app_data: &Path,
+    target: &str,
+    operation: &str,
+    dump: &Path,
+    deletion_operation: Option<&str>,
+) -> Result<(), BoxError> {
+    validate_cleanup_database(target)?;
+    if cleanup_original_with(target, deletion_operation, |sql| {
+        cleanup_query(backend, app_data, sql)
+    })? {
+        return Ok(());
+    }
+    cleanup_restore_with(
+        target,
+        operation,
+        |sql| cleanup_query(backend, app_data, sql),
+        |database| {
+            let mut command = match backend {
+                PgBackend::Docker => {
+                    let mut command = Command::new("docker");
+                    command.args([
+                        "exec",
+                        "-i",
+                        "-e",
+                        &format!("PGOPTIONS={PG_BULK_OPTIONS}"),
+                        &docker_container_name(),
+                        "pg_restore",
+                        "-U",
+                        PG_USER,
+                    ]);
+                    command
+                }
+                PgBackend::Embedded { bin, lib } => {
+                    let mut command = Command::new(bin.join("pg_restore"));
+                    with_pg_libpath(&mut command, lib);
+                    command.env("PGOPTIONS", PG_BULK_OPTIONS);
+                    command
+                        .arg("-h")
+                        .arg(embedded_socket_dir(&embedded_data_dir(app_data))?);
+                    command.args(["-p", &EMBEDDED_PORT.to_string(), "-U", PG_USER]);
+                    command
+                }
+            };
+            command.args([
+                "--no-owner",
+                "--no-privileges",
+                "--exit-on-error",
+                "-d",
+                database,
+            ]);
+            command.stdin(std::fs::File::open(dump)?);
+            run_cleanup_bulk_command(command, "restore Trash recovery dump")
+        },
+    )
+}
+
+/// Explicit recovery abandons an unmarked staging name; never mutates that database.
+/// A published target or an owned staging database must use ordinary restore.
+pub(crate) fn cleanup_rotate_restore(
+    backend: &PgBackend,
+    home: &Path,
+    target: &str,
+    operation: &str,
+    replacement: &str,
+) -> Result<(), BoxError> {
+    cleanup_rotate_restore_with(target, operation, replacement, |sql| {
+        cleanup_query(backend, home, sql)
+    })
+}
+
+fn cleanup_rotate_restore_with(
+    target: &str,
+    operation: &str,
+    replacement: &str,
+    mut query: impl FnMut(&str) -> Result<String, BoxError>,
+) -> Result<(), BoxError> {
+    for identity in [operation, replacement] {
+        if identity.len() != 32 || !identity.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("invalid Trash restore operation".into());
+        }
+    }
+    if operation == replacement {
+        return Err("restore identity did not change".into());
+    }
+    if cleanup_database_exists_with(target, &mut query)? {
+        return Err("restore target is occupied; retry ordinary restore".into());
+    }
+    let staging = format!("lucidos_restore_{operation}");
+    if !cleanup_database_exists_with(&staging, &mut query)? {
+        return Err("restore staging is absent; retry ordinary restore".into());
+    }
+    // JSON distinguishes an actually empty comment from a malformed query reply.
+    let marker = query(&format!("SELECT to_json(COALESCE(shobj_description(oid, 'pg_database'), '')) FROM pg_database WHERE datname={}", sql_string_literal(&staging)))?;
+    if !serde_json::from_str::<String>(marker.trim())?.is_empty() {
+        return Err("restore staging has an ownership marker; keep its recovery identity".into());
+    }
+    if cleanup_database_exists_with(&format!("lucidos_restore_{replacement}"), &mut query)? {
+        return Err("replacement restore staging is occupied".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod restore_rotation_tests {
+    use super::*;
+    #[test]
+    fn rotation_only_observes_absent_target_and_unmarked_staging() {
+        for answers in [
+            vec!["0", "1", "\"\"", "0"],
+            vec!["1"],
+            vec!["0", "0"],
+            vec!["0", "1", "\"lucidos-trash:owned:ready\""],
+            vec!["0", "1", "\"\"", "1"],
+            vec![""],
+            vec!["0", "1", ""],
+        ] {
+            let expected = answers == vec!["0", "1", "\"\"", "0"];
+            let mut answers = answers.into_iter();
+            let result = cleanup_rotate_restore_with(
+                "lucidos_scratch",
+                &"a".repeat(32),
+                &"b".repeat(32),
+                |sql| {
+                    assert!(sql.starts_with("SELECT "));
+                    Ok(answers.next().unwrap().into())
+                },
+            );
+            assert_eq!(result.is_ok(), expected);
+        }
+        assert!(cleanup_rotate_restore_with(
+            "lucidos_scratch",
+            &"a".repeat(32),
+            &"b".repeat(32),
+            |_| Err("offline".into())
+        )
+        .is_err());
+    }
+}
+
+fn cleanup_restore_with(
+    target: &str,
+    operation: &str,
+    mut query: impl FnMut(&str) -> Result<String, BoxError>,
+    restore: impl FnOnce(&str) -> Result<(), BoxError>,
+) -> Result<(), BoxError> {
+    validate_cleanup_database(target)?;
+    // The journal allocates and persists this random operation identity before
+    // calling us. Restrict it to an identifier-sized, unambiguous alphabet.
+    if operation.len() != 32 || !operation.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("invalid Trash restore operation".into());
+    }
+    let staging = format!("lucidos_restore_{operation}");
+    let preparing = format!("lucidos-trash:{operation}:preparing");
+    let ready = format!("lucidos-trash:{operation}:ready");
+    let inspect = |name: &str| {
+        format!(
+        "SELECT COALESCE(shobj_description(oid, 'pg_database'), '') FROM pg_database WHERE datname={}",
+        sql_string_literal(name)
+    )
+    };
+    // Return existence separately: a database with an empty comment is occupied.
+    let exists = |name: &str| {
+        format!(
+            "SELECT 1 FROM pg_database WHERE datname={}",
+            sql_string_literal(name)
+        )
+    };
+    if query(&exists(target))?.trim() == "1" {
+        if query(&inspect(target))?.trim() == ready {
+            return Ok(());
+        }
+        return Err("restore destination database is occupied".into());
+    }
+    let staged = query(&exists(&staging))?.trim() == "1";
+    let mut staged_ready = false;
+    if staged {
+        let marker = query(&inspect(&staging))?;
+        if marker.trim() == ready {
+            staged_ready = true;
+        } else if marker.trim() == preparing {
+            // A failed pg_restore may have committed a prefix. Only our marked
+            // staging database can be discarded and rebuilt on retry.
+            query(&format!("DROP DATABASE {}", quote_ident(&staging)))?;
+        } else {
+            return Err("restore staging database is occupied".into());
+        }
+    }
+    if !staged_ready {
+        query(&format!(
+            "CREATE DATABASE {} OWNER {PG_USER}",
+            quote_ident(&staging)
+        ))?;
+        query(&format!(
+            "COMMENT ON DATABASE {} IS {}",
+            quote_ident(&staging),
+            sql_string_literal(&preparing)
+        ))?;
+        restore(&staging)?;
+        query(&format!(
+            "COMMENT ON DATABASE {} IS {}",
+            quote_ident(&staging),
+            sql_string_literal(&ready)
+        ))?;
+    }
+    // ALTER DATABASE refuses a destination created since our observation. Its
+    // database comment moves with it, making a lost response safe to retry.
+    query(&format!(
+        "ALTER DATABASE {} RENAME TO {}",
+        quote_ident(&staging),
+        quote_ident(target)
+    ))?;
+    Ok(())
+}
+
+/// Observation only: never creates a cluster, database, or workspace.
+pub fn cleanup_observations(
+    backend: &PgBackend,
+    app_data: &Path,
+) -> Result<Vec<crate::cleanup::DatabaseObservation>, BoxError> {
+    cleanup_observations_with(|database: &str, sql: &str| match backend {
+        PgBackend::Docker => psql_query_docker(&docker_container_name(), database, sql),
+        PgBackend::Embedded { bin, lib } => {
+            let socket = embedded_socket_dir(&embedded_data_dir(app_data))?;
+            psql_query_embedded(bin, lib, &socket, database, sql)
+        }
+    })
+}
+
+fn cleanup_observations_with(
+    mut query: impl FnMut(&str, &str) -> Result<String, BoxError>,
+) -> Result<Vec<crate::cleanup::DatabaseObservation>, BoxError> {
+    let json = query(PG_ADMIN_DATABASE, "SELECT coalesce(json_agg(json_build_object('name',datname,'bytes',pg_database_size(oid),'last_event',null,'warning',null)), '[]'::json) FROM pg_database WHERE left(datname,8) = 'lucidos_'")?;
+    let mut observations: Vec<crate::cleanup::DatabaseObservation> = serde_json::from_str(&json)?;
+    for observation in &mut observations {
+        match query(
+            &observation.name,
+            "SELECT to_json(max(created)) FROM events",
+        ) {
+            Ok(value) => match serde_json::from_str(&value) {
+                Ok(last_event) => observation.last_event = last_event,
+                Err(e) => observation.warning = Some(format!("Activity unreadable: {e}")),
+            },
+            Err(e) => observation.warning = Some(format!("Activity unavailable: {e}")),
+        }
+    }
+    Ok(observations)
+}
+
+use lucidos_gateway_constants::WORKSPACE_DATABASE_PREFIX as DATABASE_PREFIX;
 
 /// The longest id a NEW workspace may take. Past it, Postgres cuts the database
 /// name: two long ids sharing a prefix then share one database, and an id past
@@ -394,12 +894,10 @@ const DOCKER_CLI_MISSING: &str =
 
 /// Ask the Docker CLI whether the daemon answers.
 ///
-/// The probe exists because `docker inspect` exits **1 for both** "no such
-/// container" and "the daemon is unreachable", so [`docker_container_state`]
-/// read a daemon that had not started as `ContainerState::Absent` and went on to
-/// `docker run`. That is how the 2026-08-03 login race surfaced as `docker run
-/// failed: failed to connect to the docker API at unix:///…`. Running this first
-/// makes `Absent` mean what it says.
+/// Provisioning checks the daemon first so an unavailable daemon gets the
+/// boot-splash retry verdict rather than an inventory or launch error. Container
+/// inventory also refuses failed observations independently, since teardown
+/// calls it without this provisioning probe.
 ///
 /// `docker version --format {{.Server.Version}}` is the probe because its
 /// **exit status** answers the question: the server half of `docker version` can
@@ -555,6 +1053,7 @@ fn docker_database_url(port: u16, database: &str, password: &str) -> String {
     format!("postgres://{PG_USER}:{password}@127.0.0.1:{port}/{database}")
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum ContainerState {
     Running,
     Stopped,
@@ -563,24 +1062,60 @@ enum ContainerState {
 
 fn docker_container_state(container: &str) -> Result<ContainerState, BoxError> {
     let out = Command::new("docker")
-        .args(["inspect", "-f", "{{.State.Running}}", container])
-        .output()?;
+        .args([
+            "container",
+            "ls",
+            "--all",
+            "--format",
+            "{{.Names}}\t{{.State}}",
+            "--filter",
+            &format!("name={container}"),
+        ])
+        .cleanup_output()?;
+    classify_container_state(container, out)
+}
+
+fn classify_container_state(
+    container: &str,
+    out: std::process::Output,
+) -> Result<ContainerState, BoxError> {
     if !out.status.success() {
-        return Ok(ContainerState::Absent);
+        return Err(format!(
+            "could not observe Docker containers: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+        .into());
     }
-    let running = String::from_utf8_lossy(&out.stdout).trim() == "true";
-    Ok(if running {
-        ContainerState::Running
-    } else {
-        ContainerState::Stopped
-    })
+    // A successful inventory, rather than an inspect error, establishes absence.
+    // Docker's name filter is a substring match, so compare exact names here.
+    let text = std::str::from_utf8(&out.stdout)?;
+    let mut result = ContainerState::Absent;
+    let mut found = false;
+    for line in text.lines() {
+        let (name, state) = line
+            .split_once('\t')
+            .ok_or("invalid Docker container observation")?;
+        if name != container {
+            continue;
+        }
+        if found {
+            return Err("duplicate Docker container observation".into());
+        }
+        found = true;
+        result = match state {
+            "running" => ContainerState::Running,
+            "created" | "exited" => ContainerState::Stopped,
+            _ => return Err(format!("Docker container is unavailable: {state}").into()),
+        };
+    }
+    Ok(result)
 }
 
 /// Read the loopback host port Docker published for the container's 5432.
 fn docker_published_port(container: &str) -> Result<u16, BoxError> {
     let out = Command::new("docker")
         .args(["port", container, "5432/tcp"])
-        .output()?;
+        .cleanup_output()?;
     if !out.status.success() {
         return Err(format!(
             "docker port {container} failed: {}",
@@ -611,9 +1146,23 @@ fn run_docker(args: &[&str]) -> Result<(), BoxError> {
 fn psql_query_docker(container: &str, db: &str, sql: &str) -> Result<String, BoxError> {
     let out = Command::new("docker")
         .args([
-            "exec", container, "psql", "-U", PG_USER, "-d", db, "-tAX", "-c", sql,
+            "exec",
+            "-e",
+            &format!("PGOPTIONS={PG_QUERY_OPTIONS}"),
+            container,
+            "psql",
+            "-X",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-U",
+            PG_USER,
+            "-d",
+            db,
+            "-tAX",
+            "-c",
+            sql,
         ])
-        .output()?;
+        .cleanup_output()?;
     if !out.status.success() {
         return Err(format!(
             "docker exec psql failed: {}",
@@ -719,15 +1268,23 @@ async fn teardown_embedded_workspace(
     app_data: &Path,
     database: &str,
 ) -> Result<(), BoxError> {
+    teardown_embedded_workspace_with(bin, lib, app_data, database, embedded_socket_dir)
+}
+
+fn teardown_embedded_workspace_with(
+    bin: &Path,
+    lib: &Path,
+    app_data: &Path,
+    database: &str,
+    socket: impl FnOnce(&Path) -> Result<PathBuf, ProvisionError>,
+) -> Result<(), BoxError> {
     let data = embedded_data_dir(app_data);
-    if !data.join("PG_VERSION").exists() {
-        return Ok(());
-    }
-    // Delete is best-effort and has no supervisor to retry it, so the
-    // provisioning verdict is not useful here: flatten back to a plain error.
-    let socket_dir = embedded_socket_dir(&data).map_err(|e| -> BoxError { Box::new(e) })?;
-    ensure_embedded_cluster(bin, lib, &data, &socket_dir)
-        .map_err(|e| -> BoxError { Box::new(e) })?;
+    // Cleanup must observe the existing cluster, never provision or repair it.
+    // A missing version file does not establish database absence. In particular,
+    // lifecycle repair could move a foreign-major cluster aside and delete from
+    // its empty replacement while the original database still exists.
+    // An unavailable cluster leaves the recovery journal for a later retry.
+    let socket_dir = socket(&data).map_err(|e| -> BoxError { Box::new(e) })?;
     drop_database_embedded(bin, lib, &socket_dir, database)
 }
 
@@ -1096,7 +1653,7 @@ fn foreign_aside_dir_name(base: &str, major: u16, ts: &str) -> String {
 /// data dir or the single PID recorded in its `postmaster.pid`. Best-effort:
 /// graceful (`-m fast`) → immediate (`-m immediate`) → kill the recorded PID →
 /// remove the stale lock file. Every fallback is logged; never a broad kill.
-fn stop_cluster_robustly(bin: &Path, lib: &Path, data: &Path) {
+pub(crate) fn stop_cluster_robustly(bin: &Path, lib: &Path, data: &Path) {
     // An unclean stop (a crash, a power loss) leaves `postmaster.pid` behind,
     // and after a reboot its pid may belong to an unrelated app. `pg_ctl` and
     // the fallback below would both signal it, so drop the lock instead.
@@ -1249,8 +1806,12 @@ fn psql_query_embedded(
 ) -> Result<String, BoxError> {
     let mut cmd = Command::new(bin.join("psql"));
     with_pg_libpath(&mut cmd, lib);
+    cmd.env("PGOPTIONS", PG_QUERY_OPTIONS);
     cmd.arg("-h").arg(socket_dir);
     cmd.args([
+        "-X",
+        "-v",
+        "ON_ERROR_STOP=1",
         "-p",
         &EMBEDDED_PORT.to_string(),
         "-U",
@@ -1261,7 +1822,7 @@ fn psql_query_embedded(
         "-c",
         sql,
     ]);
-    let out = cmd.output()?;
+    let out = cmd.cleanup_output()?;
     if !out.status.success() {
         return Err(format!(
             "psql failed: {}",
@@ -1411,7 +1972,14 @@ where
 }
 
 fn run_command(mut cmd: Command, label: &str) -> Result<(), BoxError> {
-    let out = cmd.output()?;
+    check_command_output(cmd.output()?, label)
+}
+
+fn run_cleanup_bulk_command(mut cmd: Command, label: &str) -> Result<(), BoxError> {
+    check_command_output(cmd.cleanup_bulk_output()?, label)
+}
+
+fn check_command_output(out: std::process::Output, label: &str) -> Result<(), BoxError> {
     if !out.status.success() {
         return Err(format!(
             "{label} failed with {}: {}",
@@ -1499,6 +2067,354 @@ async fn tcp_connect(host: &str, port: u16) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cleanup_inventory_uses_configured_docker_cluster() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::env::var_os("CLEANUP_CONTAINER_TEST_CHILD").is_some() {
+            let rows =
+                super::cleanup_observations(&super::PgBackend::Docker, std::path::Path::new("."))
+                    .unwrap();
+            assert!(rows.is_empty());
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let docker = temp.path().join("docker");
+        let log = temp.path().join("arguments");
+        std::fs::write(
+            &docker,
+            "#!/bin/sh\nprintf '%s\n' \"$@\" > \"$CLEANUP_CONTAINER_TEST_LOG\"\nprintf '[]'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "postgres::tests::cleanup_inventory_uses_configured_docker_cluster",
+            ])
+            .env("CLEANUP_CONTAINER_TEST_CHILD", "1")
+            .env("CLEANUP_CONTAINER_TEST_LOG", &log)
+            .env("PATH", temp.path())
+            .env("LUCIDOS_GATEWAY_PG_CONTAINER", "configured-cleanup-cluster")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let arguments = std::fs::read_to_string(log).unwrap();
+        assert!(arguments
+            .lines()
+            .any(|arg| arg == "configured-cleanup-cluster"));
+        assert!(!arguments
+            .lines()
+            .any(|arg| arg == super::SHARED_DOCKER_CONTAINER));
+    }
+
+    #[test]
+    fn named_cleanup_accepts_exact_observed_names_without_slug_conversion() {
+        for name in [
+            "lucidos_sample",
+            "lucidos_old_workspace",
+            "lucidos_Mixed.Name",
+        ] {
+            assert!(super::validate_cleanup_database(name).is_ok(), "{name}");
+        }
+        for name in ["postgres", "template0", "lucidos_", "lucidos_bad\0name"] {
+            assert!(super::validate_cleanup_database(name).is_err(), "{name:?}");
+        }
+        assert!(super::validate_cleanup_database(&format!("lucidos_{}", "x".repeat(56))).is_err());
+    }
+
+    #[test]
+    fn named_cleanup_rejects_invalid_targets_before_querying() {
+        let operation = "0123456789abcdef0123456789abcdef";
+        assert!(
+            super::cleanup_mark_original_with("postgres", operation, |_| {
+                panic!("invalid database must never reach SQL")
+            })
+            .is_err()
+        );
+        assert!(super::cleanup_restore_with(
+            "template1",
+            operation,
+            |_| { panic!("invalid database must never reach SQL") },
+            |_| panic!("invalid database must never restore")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn embedded_teardown_does_not_repair_or_start_foreign_major_cluster() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("pgdata");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(data.join("PG_VERSION"), "1\n").unwrap();
+        let psql = root.path().join("psql");
+        // Only the SQL client exists. Any lifecycle probe, init or start fails.
+        std::fs::write(&psql, "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$0.calls\"\n").unwrap();
+        std::fs::set_permissions(&psql, std::fs::Permissions::from_mode(0o700)).unwrap();
+        super::teardown_embedded_workspace_with(
+            root.path(),
+            root.path(),
+            root.path(),
+            "lucidos_sample",
+            |_| Ok(root.path().join("socket")),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(data.join("PG_VERSION")).unwrap(),
+            "1\n"
+        );
+        let calls = std::fs::read_to_string(root.path().join("psql.calls")).unwrap();
+        assert!(calls.contains("DROP DATABASE IF EXISTS \"lucidos_sample\""));
+        assert!(calls.contains("DROP ROLE IF EXISTS"));
+    }
+
+    #[test]
+    fn embedded_teardown_missing_cluster_is_not_successful_database_deletion() {
+        let root = tempfile::tempdir().unwrap();
+        let error = super::teardown_embedded_workspace_with(
+            root.path(),
+            root.path(),
+            root.path(),
+            "lucidos_sample",
+            |_| Ok(root.path().join("socket")),
+        )
+        .expect_err("an unavailable cluster cannot establish database absence");
+        assert!(!error.to_string().is_empty());
+        assert!(!root.path().join("pgdata").exists());
+    }
+
+    #[test]
+    fn trash_mark_original_handles_missing_database_without_creating_one() {
+        let mut statements = Vec::new();
+        super::cleanup_mark_original_with(
+            "lucidos_sample",
+            "0123456789abcdef0123456789abcdef",
+            |sql| {
+                statements.push(sql.to_owned());
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+        assert_eq!(statements.len(), 1);
+        assert!(statements[0].starts_with("SELECT 1"));
+    }
+
+    #[test]
+    fn trash_mark_original_requires_observation_and_valid_operation() {
+        let mut statements = Vec::new();
+        super::cleanup_mark_original_with(
+            "lucidos_sample",
+            "0123456789abcdef0123456789abcdef",
+            |sql| {
+                statements.push(sql.to_owned());
+                Ok("1".into())
+            },
+        )
+        .unwrap();
+        assert_eq!(statements.len(), 2);
+        assert!(statements[0].starts_with("SELECT 1"));
+        assert!(statements[1].starts_with("COMMENT ON DATABASE"));
+        assert!(
+            super::cleanup_mark_original_with("lucidos_sample", "invalid", |_| panic!(
+                "invalid operation must not query"
+            ))
+            .is_err()
+        );
+        assert!(super::cleanup_mark_original_with(
+            "lucidos_sample",
+            "0123456789abcdef0123456789abcdef",
+            |_| Err("unavailable".into())
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn trash_moved_reuses_only_operation_marked_original() {
+        let token = "0123456789abcdef0123456789abcdef";
+        for (marker, expected) in [
+            (format!("lucidos-trash:{token}:deleting"), true),
+            ("unrelated".into(), false),
+            (String::new(), false),
+        ] {
+            let result = super::cleanup_original_with("lucidos_sample", Some(token), |sql| {
+                assert!(sql.starts_with("SELECT"));
+                Ok(if sql.starts_with("SELECT 1") {
+                    "1".into()
+                } else {
+                    marker.clone()
+                })
+            });
+            assert_eq!(result.is_ok_and(|v| v), expected);
+        }
+        assert!(!super::cleanup_original_with(
+            "lucidos_sample",
+            Some(token),
+            |_| Ok(String::new())
+        )
+        .unwrap());
+        assert!(
+            !super::cleanup_original_with("lucidos_sample", None, |_| panic!(
+                "no marker must not authorize reuse"
+            ))
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn trash_restore_refuses_occupied_target_without_mutation() {
+        let mut sql = Vec::new();
+        let result = super::cleanup_restore_with(
+            "lucidos_sample",
+            "0123456789abcdef0123456789abcdef",
+            |query| {
+                sql.push(query.to_owned());
+                Ok(if query.starts_with("SELECT 1") {
+                    "1"
+                } else {
+                    "unrelated"
+                }
+                .into())
+            },
+            |_| panic!("must not restore over an existing database"),
+        );
+        assert!(result.is_err());
+        assert!(sql.iter().all(|q| q.starts_with("SELECT")));
+    }
+
+    #[test]
+    fn trash_restore_recognizes_crash_after_publish() {
+        let operation = "0123456789abcdef0123456789abcdef";
+        super::cleanup_restore_with(
+            "lucidos_sample",
+            operation,
+            |query| {
+                assert!(query.starts_with("SELECT"));
+                Ok(if query.starts_with("SELECT 1") {
+                    "1".into()
+                } else {
+                    format!("lucidos-trash:{operation}:ready")
+                })
+            },
+            |_| panic!("published restore must not run twice"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn trash_restore_failure_never_publishes_or_drops_original() {
+        let mut sql = Vec::new();
+        let result = super::cleanup_restore_with(
+            "lucidos_sample",
+            "0123456789abcdef0123456789abcdef",
+            |query| {
+                sql.push(query.to_owned());
+                Ok(String::new())
+            },
+            |database| {
+                assert!(database.starts_with("lucidos_restore_"));
+                Err("injected restore failure".into())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!sql
+            .iter()
+            .any(|q| q.starts_with("ALTER") || q.starts_with("DROP")));
+        assert!(!sql.iter().any(|q| q.contains(":ready")));
+    }
+
+    #[test]
+    fn trash_restore_retry_rebuilds_only_its_marked_staging_database() {
+        use std::cell::RefCell;
+        let calls = RefCell::new(Vec::new());
+        let operation = "0123456789abcdef0123456789abcdef";
+        let mut responses = [
+            String::new(),
+            "1".into(),
+            format!("lucidos-trash:{operation}:preparing"),
+        ]
+        .into_iter();
+        super::cleanup_restore_with(
+            "lucidos_sample",
+            operation,
+            |sql| {
+                calls.borrow_mut().push(sql.to_owned());
+                Ok(responses.next().unwrap_or_default())
+            },
+            |_| {
+                calls.borrow_mut().push("RESTORE".into());
+                Ok(())
+            },
+        )
+        .unwrap();
+        let calls = calls.into_inner();
+        assert!(calls[3].starts_with("DROP DATABASE \"lucidos_restore_"));
+        assert!(calls[4].starts_with("CREATE DATABASE"));
+        assert!(calls[5].contains(":preparing"));
+        assert_eq!(calls[6], "RESTORE");
+        assert!(calls[7].contains(":ready"));
+        assert!(calls[8].starts_with("ALTER DATABASE"));
+        assert!(calls[8].ends_with("RENAME TO \"lucidos_sample\""));
+    }
+
+    #[test]
+    fn trash_restore_ready_staging_is_published_without_reloading_dump() {
+        let operation = "0123456789abcdef0123456789abcdef";
+        let mut responses = [
+            String::new(),
+            "1".into(),
+            format!("lucidos-trash:{operation}:ready"),
+        ]
+        .into_iter();
+        let mut calls = Vec::new();
+        super::cleanup_restore_with(
+            "lucidos_sample",
+            operation,
+            |sql| {
+                calls.push(sql.to_owned());
+                Ok(responses.next().unwrap_or_default())
+            },
+            |_| panic!("already restored into staging"),
+        )
+        .unwrap();
+        assert_eq!(calls.len(), 4);
+        assert!(calls[3].starts_with("ALTER DATABASE"));
+    }
+
+    #[test]
+    fn trash_restore_unmarked_staging_is_never_dropped() {
+        let mut responses = ["", "1", ""].into_iter();
+        let mut calls = Vec::new();
+        assert!(super::cleanup_restore_with(
+            "lucidos_sample",
+            "0123456789abcdef0123456789abcdef",
+            |sql| {
+                calls.push(sql.to_owned());
+                Ok(responses.next().unwrap_or_default().into())
+            },
+            |_| panic!("unmarked staging is not ours")
+        )
+        .is_err());
+        assert!(calls.iter().all(|sql| sql.starts_with("SELECT")));
+    }
+
+    #[test]
+    fn cleanup_observation_queries_are_read_only_and_preserve_unknown_activity() {
+        let observations = super::cleanup_observations_with(|database, sql| {
+            assert!(sql.starts_with("SELECT "));
+            if database == "postgres" {
+                Ok(
+                    r#"[{"name":"lucidos_sample","bytes":4096,"last_event":null,"warning":null}]"#
+                        .into(),
+                )
+            } else {
+                Err("activity unavailable".into())
+            }
+        })
+        .unwrap();
+        assert_eq!(observations[0].bytes, 4096);
+        assert!(observations[0].last_event.is_none());
+        assert!(observations[0].warning.is_some());
+    }
     use super::*;
 
     /// Build a fake relocatable-PG tree (bin/postgres, lib/, share/) under a temp
@@ -1562,6 +2478,32 @@ mod tests {
             stdout: Vec::new(),
             stderr: stderr.as_bytes().to_vec(),
         })
+    }
+
+    #[test]
+    fn container_observation_never_turns_failure_into_absence() {
+        assert!(classify_container_state("sample", probe_exit(1, "unreachable").unwrap()).is_err());
+        let classify = |stdout: &str| {
+            let mut output = probe_exit(0, "").unwrap();
+            output.stdout = stdout.as_bytes().to_vec();
+            classify_container_state("sample", output)
+        };
+        assert_eq!(classify("").unwrap(), ContainerState::Absent);
+        assert_eq!(
+            classify("peer\trunning\nsample\trunning\n").unwrap(),
+            ContainerState::Running
+        );
+        assert_eq!(
+            classify("sample\texited\n").unwrap(),
+            ContainerState::Stopped
+        );
+        assert_eq!(
+            classify("sample-other\trunning\n").unwrap(),
+            ContainerState::Absent
+        );
+        assert!(classify("sample\tunexpected\n").is_err());
+        assert!(classify("malformed").is_err());
+        assert!(classify("sample\trunning\nsample\texited\n").is_err());
     }
 
     #[test]

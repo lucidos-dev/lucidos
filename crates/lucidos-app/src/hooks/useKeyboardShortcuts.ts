@@ -298,7 +298,7 @@ export function classifyChord(chord: ChordLike, inContent = false): ShortcutId |
 
 /** Run a chord forwarded from an app iframe against the host registry. The
  *  forward itself is proof the frame's pane is the focused pane: the Canvas
- *  pane for an app, the thread pane for a widget on the shelf (`pane`). The frame
+ *  pane for an app, the thread pane for a widget in a thread (`pane`). The frame
  *  just received the keydown — but pointer events inside the iframe
  *  never reach the host's `focusPane('content')` handler, so `focusedPane` is
  *  stale. Reconcile it BEFORE dispatching, or the three-state pane toggles read

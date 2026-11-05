@@ -427,6 +427,25 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return build_runtime()?.block_on(run_restore_archive());
     }
 
+    // Offline snapshot installation never constructs an Engine or dispatches work.
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("snapshot-restore" | "snapshot-recover")
+    ) {
+        let args =
+            lucidos_engine::core::snapshot::offline::Arguments::parse(std::env::args().skip(2))?;
+        if std::env::args().nth(1).as_deref() == Some("snapshot-recover") {
+            return build_runtime()?.block_on(lucidos_engine::core::snapshot::offline::recover(
+                args,
+                lucidos_engine::core::database_url(),
+            ));
+        }
+        return build_runtime()?.block_on(lucidos_engine::core::snapshot::offline::run(
+            args,
+            lucidos_engine::core::database_url(),
+        ));
+    }
+
     // The two ways out of a boot the secret store refused (ADR 0509).
     if std::env::args().nth(1).as_deref() == Some("secrets") {
         return build_runtime()?.block_on(run_secrets());
@@ -715,6 +734,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         });
 
+    lucidos_engine::core::snapshot::boot_guard::ensure_boot_entry(
+        &lucidos_engine::core::database_url(),
+    )?;
     lucidos_home::ensure_storage_root(&workspace_path)?;
     log!("[Startup] Using workspace: {}", workspace_path.display());
     // Before the wait for a predecessor, which still holds its own consumer
@@ -725,6 +747,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Held as a `run()` local for this engine's whole life. Nothing stateful
     // may run before it: see `own_workspace`.
     let _owner_lock = own_workspace(&workspace_path).await?;
+    let boot_database_url = lucidos_engine::core::database_url();
+    let restore_boot =
+        if lucidos_engine::core::snapshot::boot_guard::ensure_normal_boot(&boot_database_url)
+            .is_ok()
+        {
+            None
+        } else {
+            // Resolve registry authority before opening even a restricted pool.
+            // The capability borrows workspace ownership and retains the archive
+            // lock through verification, generation installation and settlement.
+            let guard = lucidos_engine::core::snapshot::first_boot::RestoreBoot::acquire(
+                &_owner_lock,
+                &workspace_path,
+                &boot_database_url,
+            )?;
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(2)
+                .connect(&boot_database_url)
+                .await?;
+            let verified = guard.verify(pool.clone()).await?;
+            pool.close().await;
+            Some(verified)
+        };
     // Eager, so the CLI is fixed before the first spawn and a publish minutes
     // later cannot give subprocesses a newer CLI than this engine.
     lucidos_engine::runtime::lucidos_cli::pin_cli_for_workspace(&workspace_path, launched_as);
@@ -857,7 +902,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // key loads, since a stored provider key is sealed (ADR 0509). The runtime
     // credential subscriber rebuilds from the same inputs.
     let model_is_mock = model == lucidos_engine::llm::MOCK_MODEL;
-    let boot_without_provider = lucidos_engine::llm::boot_without_provider_enabled();
 
     if !model_is_mock {
         if project_id.is_empty() {
@@ -888,7 +932,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         model_registry,
         // The engine seeds it from the events once its migrations have run.
         not_served: Default::default(),
-        boot_without_provider,
         // No event bus yet, so no gateway access. The engine rebuilds
         // with one once it has a bus.
         claude_gateway_access: None,
@@ -899,7 +942,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // plenty of transient reasons the supervisor's retry recovers from. Only a
     // CLASSIFIED-terminal failure reports, from the site that can classify it:
     // see `boot_failure::terminal_migration_message`.
-    let engine = LucidosEngine::new(workspace_path.clone(), &database_url, provider_ctx).await?;
+    let engine = match restore_boot {
+        Some(guard) => {
+            LucidosEngine::new_with_restore(
+                workspace_path.clone(),
+                &database_url,
+                provider_ctx,
+                guard,
+            )
+            .await?
+        }
+        None => LucidosEngine::new(workspace_path.clone(), &database_url, provider_ctx).await?,
+    };
     log!("[Startup] PostgreSQL connected");
     boot_stages.lap("engine setup");
 

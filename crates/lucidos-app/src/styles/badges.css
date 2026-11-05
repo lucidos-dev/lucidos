@@ -175,13 +175,27 @@
        badge holds a spinning glyph instead of the "!", and while it waits, a
        still hourglass. A line box trimmed to a cap band neither has would park
        the icon off centre. So would the padding that lifts a baseline. It
-       keeps the flex centring. */
+       keeps the flex centring.
+       No inline padding either: that is room for a count's digits, and it
+       stretched a one-icon badge into a pill beside the round "!". */
     .badge:has(.brand-badge-spinner, .brand-badge-queued) {
         display: flex;
         align-items: center;
         justify-content: center;
         text-box-trim: none;
-        padding-block: 0;
+        padding: 0;
+    }
+
+    /* Flex centring halves the room around the icon, and Chrome and WebKit
+       snap a half pixel either way. At 100% a 9px icon in the 12px box sat a
+       pixel low. So the inset is a whole pixel each side, rounded down to
+       favour the larger icon. It inherits the badge's font, so `--badge-box`
+       resolves to the same box here. */
+    .badge :is(.brand-badge-spinner, .brand-badge-queued) svg {
+        --badge-icon-snapped: calc(var(--badge-box)
+            - 2 * round(down, (var(--badge-box) - var(--badge-icon-size)) / 2, 1px));
+        width: var(--badge-icon-snapped);
+        height: var(--badge-icon-snapped);
     }
 }
 

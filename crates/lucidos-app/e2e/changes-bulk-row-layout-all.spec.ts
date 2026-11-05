@@ -14,6 +14,9 @@
 import { test, expect, type Locator, type Page } from './fixtures';
 import { assertHealthy, gotoWithRetry, hideDashboardRail } from './helpers';
 
+// The service worker forwards API GETs itself, outside page.route's mock.
+test.use({ serviceWorkers: 'block' });
+
 function change(id: string, over: Record<string, unknown> = {}) {
   return {
     id,
@@ -63,8 +66,11 @@ const CHANGES_STATE = {
 const ARMED_STATE = { ...CHANGES_STATE, standing_apply_thread_ids: ['thread-settling'] };
 
 async function openChanges(page: Page, state: typeof CHANGES_STATE): Promise<Locator[]> {
-  await page.route('**/api/v1/changes*', (route) =>
-    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(state) }));
+  let reads = 0;
+  await page.route('**/api/v1/changes*', (route) => {
+    reads++;
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(state) });
+  });
   await page.addInitScript(() => {
     localStorage.setItem('lucidos-active-menu-item', 'changes');
     localStorage.setItem('lucidos-mobile-view', 'content');
@@ -76,6 +82,7 @@ async function openChanges(page: Page, state: typeof CHANGES_STATE): Promise<Loc
   // The boot splash is an opaque overlay that clears once layout settles. A
   // box measured or shot under it can still move, or shows only the splash.
   await expect(page.locator('.boot-splash')).toHaveCount(0, { timeout: 30_000 });
+  await expect.poll(() => reads).toBeGreaterThan(0);
   // Count after the splash: rows can leave `:visible` while layout settles, and
   // a snapshot taken before then comes back short. The returned locators stay
   // lazy, so each assertion re-resolves them.

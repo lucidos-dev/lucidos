@@ -594,6 +594,22 @@ async fn a_trigger_listing_a_server_has_its_tools_from_the_first_round() {
     let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect");
     let (id, _dir) = register_stub(&pool).await;
+    // Approve this disposable stub's launch through the owner's normal API.
+    // Other tests may enable the workspace command guard. Stop it again so
+    // the trigger still has to start its listed server during turn setup.
+    for action in ["start", "stop"] {
+        let response = client
+            .post(format!("{}/api/v1/mcp/servers/{id}/{action}", base_url()))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "stub {action}: {}",
+            response.status()
+        );
+    }
     let name = unique_marker("e2e-trigger-mcp-fire");
     let created: serde_json::Value = client
         .post(format!("{}/api/v1/triggers", base_url()))

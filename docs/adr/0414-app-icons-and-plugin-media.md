@@ -1,6 +1,6 @@
 # 0414: Apps and widgets show an image icon named by the app manifest, with a monogram tile when missing; plugins ship media kept per install, and reusable widgets; no plugin code runs before install
 
-- **Status**: Accepted
+- **Status**: Accepted. Amended by [ADR 0621](0621-widgets-one-box-no-pin.md): the shelf chips are gone
 - **Date**: 2026-10-10
 
 ## Context

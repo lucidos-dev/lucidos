@@ -1,6 +1,6 @@
 # 0405: A widget opens from the shelf; the transcript holds a one-line widget row, never a frame
 
-- **Status**: Accepted. Placement amended by 0407: inline widget cards that never scroll, and an opt-in shelf
+- **Status**: Accepted. Placement amended by 0407: inline widget cards that never scroll, and an opt-in shelf. What remained superseded by [ADR 0621](0621-widgets-one-box-no-pin.md)
 - **Date**: 2026-10-09
 
 ## Context

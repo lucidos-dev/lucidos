@@ -32,6 +32,7 @@ pub mod mcp_servers;
 pub mod migration_marker;
 pub mod models;
 pub mod oauth;
+pub mod oauth_callback;
 pub mod oauth_registry;
 pub mod pinned_apps;
 pub mod plugin_catalog_cache;
@@ -48,6 +49,7 @@ pub mod secret_store;
 pub mod shell;
 pub mod shipped_dir;
 pub mod slug;
+pub mod snapshot;
 pub mod store;
 pub mod subprocess_secrets;
 pub mod system_knowhow;
@@ -1988,9 +1990,7 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
         "widgets" => {
             let widget = args["app_id"].as_str().unwrap_or("widget");
             match args["action"].as_str() {
-                Some("thread") => "Reading this thread's widgets...".to_string(),
-                Some("pin") => format!("Pinning widget '{}' to the shelf...", widget),
-                Some("unpin") => format!("Unpinning widget '{}' from the shelf...", widget),
+                Some("size") => format!("Resizing widget '{}'...", widget),
                 Some("make_reusable") => format!("Making widget '{}' reusable...", widget),
                 Some("stop_reusing") => format!("Stopping reuse of widget '{}'...", widget),
                 Some("dashboard") => "Reading the dashboard...".to_string(),

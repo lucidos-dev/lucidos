@@ -1460,3 +1460,102 @@ fn recovery_redecides_the_work_past_a_queued_change() {
         "the re-decide sits outside the queue gate"
     );
 }
+
+#[tokio::test]
+async fn restored_lane_never_reclaims_archived_worktrees_or_queues() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    let change = Uuid::new_v4();
+    start_cc_session(&bus, thread, "work", None).await;
+    propose(&bus, thread, change, "work").await;
+    emit(&bus, thread, queued_event(change, "snap1")).await;
+    let batch = Uuid::new_v4();
+    emit_system(
+        &bus,
+        started(
+            batch,
+            Uuid::new_v4(),
+            vec![LaneMember {
+                change_id: change,
+                snapshot_sha: "snap1".into(),
+            }],
+        ),
+    )
+    .await;
+    sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, 'snapshot', now(), MAX(sequence) FROM events")
+        .bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    let restore =
+        super::recovery::LaneRestore::of(&load_lane_records(&pool).await.unwrap(), |_| true);
+    assert!(
+        restore.opened_here.is_empty(),
+        "restored history cannot authorize deleting worktrees"
+    );
+    assert_eq!(restore.lane.place(change), Place::Absent);
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn restored_lane_settlement_is_durable_retryable_and_preserves_fresh_apply() {
+    use super::driver::settle_restored_lane;
+    use crate::test_support::refuse_event_type;
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    let change = Uuid::new_v4();
+    start_cc_session(&bus, thread, "work", None).await;
+    propose(&bus, thread, change, "work").await;
+    emit(&bus, thread, queued_event(change, "old")).await;
+    let batch = Uuid::new_v4();
+    emit_system(
+        &bus,
+        started(
+            batch,
+            Uuid::new_v4(),
+            vec![LaneMember {
+                change_id: change,
+                snapshot_sha: "old".into(),
+            }],
+        ),
+    )
+    .await;
+    sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, 'snapshot', now(), MAX(sequence) FROM events")
+        .bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    refuse_event_type(&pool, "ChangeUnqueued").await;
+    for _ in 0..2 {
+        assert!(settle_restored_lane(&pool, &bus).await.is_err());
+        assert_eq!(queued_changes(&pool, thread).await.unwrap().len(), 1);
+    }
+    // Failure after the batch announcement must not duplicate it on retry.
+    sqlx::query("DROP TRIGGER refuse_event ON events")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        settle_restored_lane(&pool, &bus).await.unwrap();
+        assert!(queued_changes(&pool, thread).await.unwrap().is_empty());
+    }
+    let counts: (i64, i64) = sqlx::query_as("SELECT count(*) FILTER (WHERE event_type = 'LaneBatchFailed'), count(*) FILTER (WHERE event_type = 'ChangeUnqueued') FROM events")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(counts, (1, 1));
+    emit(&bus, thread, queued_event(change, "fresh")).await;
+    settle_restored_lane(&pool, &bus).await.unwrap();
+    let records = load_lane_records(&pool).await.unwrap();
+    let restore = super::recovery::LaneRestore::of(&records, |_| true);
+    assert!(restore.opened_here.is_empty());
+    assert_ne!(restore.lane.place(change), Place::Absent);
+    assert_eq!(
+        queued_snapshot(&pool, thread, change)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("fresh")
+    );
+    sqlx::query("ALTER TABLE snapshot_restore_boundary RENAME TO unavailable_restore_boundary")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(load_lane_records(&pool).await.is_err());
+    assert!(settle_restored_lane(&pool, &bus).await.is_err());
+    teardown_test_db(&db).await;
+}

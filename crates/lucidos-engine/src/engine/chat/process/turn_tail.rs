@@ -8,7 +8,7 @@
 //! same current value.
 //!
 //! - **The engine build state**, a function of live build state, rebuilt
-//!   every turn. Its four states are 327 to 374 characters, and the 7-day
+//!   every turn. Its three states are 327 to 374 characters, and the 7-day
 //!   data has two threads on one build disagreeing by exactly 44 of them.
 //! - **The client URL**, read from `frontend_origin`, a runtime value set
 //!   from the last observed request origin.
@@ -55,11 +55,6 @@ pub(super) const ENGINE_BUILD_POINTER: &str = "\n\nENGINE BUILD:\n\
 
 /// The volatile half: what the running engine is right now.
 ///
-/// The four states are not the same claim, so none of them may collapse into
-/// another. Source-ahead is split from wedged because the advice inverts:
-/// source-ahead resolves by waiting, while a wedged rebuild resolves only by
-/// relaunching, and the agent must not send the user round that loop.
-///
 /// Deliberately no build id in the text. The user cannot look one up on any
 /// screen, so it would only invite the agent to quote a hex string at them.
 /// See `.claude/rules/glossary.md` and the prompt's own NAMES NOT IDS rule.
@@ -67,9 +62,6 @@ pub(super) fn engine_build_block(status: &VersionStatus) -> String {
     let state = if status.update_available {
         "A NEWER ENGINE IS BUILT AND THE USER HAS NOT SWITCHED ONTO IT YET, so an applied \
          restart-requiring change is NOT live."
-    } else if status.rebuild_wedged {
-        "NO REBUILD CAN DELIVER THE RESTART-REQUIRING CHANGE ON MAIN: one already succeeded and \
-         produced nothing switchable. Do not offer Switch or Rebuild; relaunch instead."
     } else if status.source_behind_head {
         "A RESTART-REQUIRING CHANGE IS ON MAIN WITH NO BUILD BEHIND IT YET (rebuilding, or \
          it failed), so there is nothing to switch onto: do not tell them to."
@@ -105,14 +97,10 @@ pub(crate) struct TurnTail<'a> {
     pub current_time: &'a str,
 }
 
-/// The three flags [`engine_build_block`] branches on, with the rest of
+/// The two flags [`engine_build_block`] branches on, with the rest of
 /// `VersionStatus` inert. Shared with the system prompt footprint, which
-/// bills the widest of the four states.
-pub(super) fn version_status(
-    update_available: bool,
-    source_behind_head: bool,
-    rebuild_wedged: bool,
-) -> VersionStatus {
+/// bills the widest of the three states.
+pub(super) fn version_status(update_available: bool, source_behind_head: bool) -> VersionStatus {
     VersionStatus {
         build_id: "test".to_string(),
         update_available,
@@ -121,7 +109,6 @@ pub(super) fn version_status(
         build_state: "idle",
         source_behind_head,
         head_commit: None,
-        rebuild_wedged,
         build_failure: None,
         shared_build_in_progress: false,
         build_elapsed_ms: None,
@@ -131,13 +118,8 @@ pub(super) fn version_status(
     }
 }
 
-/// The four states, as the flag triples that select them.
-pub(super) const BUILD_STATES: [(bool, bool, bool); 4] = [
-    (false, false, false),
-    (true, false, false),
-    (false, true, false),
-    (false, true, true),
-];
+/// The three states, as the flag pairs that select them.
+pub(super) const BUILD_STATES: [(bool, bool); 3] = [(false, false), (true, false), (false, true)];
 
 #[cfg(test)]
 mod tests {
@@ -149,7 +131,7 @@ mod tests {
     /// moment it is guessing.
     #[test]
     fn a_current_engine_says_so_affirmatively() {
-        let block = engine_build_block(&version_status(false, false, false));
+        let block = engine_build_block(&version_status(false, false));
 
         assert!(
             block.contains("RUNNING ENGINE IS CURRENT"),
@@ -165,7 +147,7 @@ mod tests {
     /// restarted" is true, and it is the only case that may say so.
     #[test]
     fn a_built_but_unswitched_engine_says_the_change_is_not_live() {
-        let block = engine_build_block(&version_status(true, false, false));
+        let block = engine_build_block(&version_status(true, false));
 
         assert!(
             block.contains("HAS NOT SWITCHED ONTO IT YET"),
@@ -182,7 +164,7 @@ mod tests {
     /// sends them to a button that would do nothing.
     #[test]
     fn source_ahead_of_a_built_binary_does_not_tell_the_user_to_switch() {
-        let block = engine_build_block(&version_status(false, true, false));
+        let block = engine_build_block(&version_status(false, true));
 
         assert!(
             block.contains("NO BUILD BEHIND IT YET"),
@@ -194,37 +176,13 @@ mod tests {
         );
     }
 
-    /// A wedged rebuild is source-ahead with the advice inverted. Waiting for
-    /// a build and pressing Rebuild are both dead ends. The block must say so,
-    /// rather than reuse the "rebuilding, or it failed" wording that invites
-    /// both.
-    #[test]
-    fn a_wedged_rebuild_does_not_send_the_user_round_the_loop() {
-        let block = engine_build_block(&version_status(false, true, true));
-
-        assert!(
-            block.contains("NO REBUILD CAN DELIVER"),
-            "must state that rebuilding is futile:\n{block}"
-        );
-        assert!(
-            !block.contains("NO BUILD BEHIND IT YET"),
-            "must not fall through to the retryable source-ahead wording:\n{block}"
-        );
-        assert!(
-            block.contains("relaunch instead"),
-            "must name the one thing that does resolve it:\n{block}"
-        );
-    }
-
-    /// The four cases must be genuinely different text. Collapsing any two
+    /// The three cases must be genuinely different text. Collapsing any two
     /// would restore the guess this block exists to remove.
     #[test]
-    fn the_four_build_states_are_distinct() {
+    fn the_three_build_states_are_distinct() {
         let blocks: Vec<String> = BUILD_STATES
             .into_iter()
-            .map(|(update, behind, wedged)| {
-                engine_build_block(&version_status(update, behind, wedged))
-            })
+            .map(|(update, behind)| engine_build_block(&version_status(update, behind)))
             .collect();
 
         for (i, a) in blocks.iter().enumerate() {
@@ -265,7 +223,7 @@ mod tests {
     /// putting it here only invites the agent to quote a hex string at them.
     #[test]
     fn the_block_carries_no_build_id() {
-        let mut status = version_status(true, false, false);
+        let mut status = version_status(true, false);
         status.build_id = "deadbeef1".to_string();
         status.disk_build_id = Some("cafebabe2".to_string());
 
@@ -319,7 +277,7 @@ mod tests {
     /// each ends inside one concatenated user message.
     #[test]
     fn both_tail_blocks_are_delimited() {
-        let build = engine_build_block(&version_status(false, false, false));
+        let build = engine_build_block(&version_status(false, false));
         assert!(build.starts_with("[ENGINE BUILD]"), "{build}");
         assert!(build.ends_with("[END ENGINE BUILD]"), "{build}");
 

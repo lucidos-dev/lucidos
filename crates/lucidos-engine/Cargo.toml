@@ -20,6 +20,7 @@ real-embedder-tests = []
 e2e-test-hooks = []
 
 [dependencies]
+lucidos-secret-store = { path = "../lucidos-secret-store" }
 async-trait = "0.1"
 bytes = "1"
 tokio = { version = "1", features = ["full"] }
@@ -35,6 +36,7 @@ libc = "0.2"
 lucidos-tailscale = { path = "../lucidos-tailscale" }
 lucidos-build-slot = { path = "../lucidos-build-slot" }
 lucidos-home = { path = "../lucidos-home" }
+lucidos-installs = { path = "../lucidos-installs" }
 lucidos-local-token = { path = "../lucidos-local-token" }
 lucidos-owner-lock = { path = "../lucidos-owner-lock" }
 # The engine socket the gateway reaches this engine on (ADR 0445).
@@ -135,11 +137,6 @@ pulldown-cmark = { version = "0.13", default-features = false }
 # carries a codegen derive.
 syn = { version = "2", features = ["full", "parsing", "extra-traits"] }
 proc-macro2 = "1"
-
-# The macOS Keychain, through the library rather than the `security` command,
-# holds the workspace key on the packaged app (ADR 0509).
-[target.'cfg(target_os = "macos")'.dependencies]
-security-framework = "3"
 
 [dev-dependencies]
 # Enables `#[tokio::test(start_paused = true)]` for time-mocked tests.

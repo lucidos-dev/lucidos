@@ -4,6 +4,82 @@ use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent};
 use crate::test_support::{setup_test_db, teardown_test_db};
 
+#[tokio::test]
+async fn restored_worktree_recovery_requires_a_new_request_not_an_automatic_resume() {
+    use crate::engine::agent_recovery::restored_recovery_branches;
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    crate::test_support::start_cc_session(&bus, thread, "claude-code/archived", None).await;
+    let sibling = Uuid::new_v4();
+    crate::test_support::start_cc_session(&bus, sibling, "claude-code/archived", None).await;
+    assert!(restored_recovery_branches(&pool).await.unwrap().is_none());
+    sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, 'snapshot', now(), MAX(sequence) FROM events")
+        .bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    for _ in 0..2 {
+        bus.emit(BusEvent::Thread {
+            thread_id: thread,
+            event: ThreadEvent::ContinuationStarted {
+                branch: "claude-code/archived".into(),
+                origin: None,
+                reason: Some(crate::engine::agent_recovery::AUTO_RESUME_AFTER_SWITCH_REASON.into()),
+                resumed_abort_id: None,
+            },
+            meta: EventMeta::NONE,
+        })
+        .await
+        .unwrap();
+        assert!(restored_recovery_branches(&pool)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            crate::engine::agent_recovery::branch_turn_in_flight(&pool, "claude-code/archived")
+                .await
+                .unwrap(),
+            Some(false)
+        );
+    }
+    bus.emit(BusEvent::Thread {
+        thread_id: thread,
+        event: ThreadEvent::CodingAgentUserMessageSent {
+            text: "continue my work".into(),
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            restored_recovery_branches(&pool)
+                .await
+                .unwrap()
+                .unwrap()
+                .get("claude-code/archived"),
+            Some(&thread)
+        );
+        assert_eq!(
+            crate::engine::agent_recovery::branch_turn_in_flight(&pool, "claude-code/archived")
+                .await
+                .unwrap(),
+            Some(true)
+        );
+    }
+    sqlx::query("ALTER TABLE snapshot_restore_boundary RENAME TO hidden_restore_boundary")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(restored_recovery_branches(&pool).await.is_err());
+    sqlx::query("ALTER TABLE hidden_restore_boundary RENAME TO snapshot_restore_boundary")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// I4 at boot: a pending change marked incomplete came from an unfinished turn
 /// before ADR 0400. The first boot withdraws it and announces the work as
 /// withheld, so no pending row carries unfinished work. A clean pending row

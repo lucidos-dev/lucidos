@@ -11,6 +11,8 @@
   waits in-turn by default, as a polled task whose every `wait` returns inside
   the prompt cache's life. An event wait that ends the turn stays for an
   open-ended wait.
+- **Amended by**: [0619](0619-idle-owner-covers-its-polled-tasks.md). At a clean
+  turn end the engine's event wait also covers the owner's polled tasks.
 
 ## Context
 

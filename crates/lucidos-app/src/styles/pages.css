@@ -363,6 +363,14 @@
     color: var(--text-primary);
 }
 
+/* The one-click add of this page's own web redirect URI, packed right under
+   the field it fills. */
+.credential-web-redirect-add {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: var(--space-xs);
+}
+
 /* ===== Plugin install panel ===== */
 
 /* Shared by the install and uninstall panels and both receipts. One column,

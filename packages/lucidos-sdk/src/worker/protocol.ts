@@ -32,7 +32,7 @@ export type FromPort =
       streamUrl: string;
       pongUrl: string;
     }
-  | { t: 'pong'; notificationId: string; answer: PongAnswer }
+  | { t: 'pong'; notificationId: string; answer: PongAnswer; sourceGeneration: string | null }
   /** The page came back and wants a silent upstream restarted. Always
    *  answered with `checked`. */
   | { t: 'check' }

@@ -1,5 +1,5 @@
-//! `/api/v1/widgets`: a thread's widgets, its shelf, reusable widgets and the
-//! two dashboards (ADRs 0402, 0407, 0496).
+//! `/api/v1/widgets`: reusable widgets, a thread's widget card sizes and the
+//! two dashboards (ADRs 0402, 0496).
 //!
 //! The UI's widget menu and the `lucidos widgets` CLI both land here. The
 //! agent's grouped `widgets` tool runs the same checks in-process.
@@ -7,25 +7,17 @@
 use super::error::ApiError;
 use super::*;
 
+use crate::core::apps::WidgetSize;
 use crate::core::App;
 use crate::engine::dashboard::{self, DashboardChange, DashboardView};
 use crate::engine::thread_events::{ArrangedTile, Dashboard};
-use crate::engine::widgets::{
-    self, ThreadWidget, WidgetChange, WidgetCheckFailed, WidgetInstance, WidgetInstanceArgs,
-};
+use crate::engine::widgets::{self, WidgetCheckFailed, WidgetInstance, WidgetInstanceArgs};
 
+/// A card size body: the thread, the widget instance and its size.
 #[derive(Debug, Deserialize)]
-pub(super) struct ThreadWidgetsQuery {
+pub(super) struct CardSizeBody {
     thread_id: Option<String>,
-}
-
-/// A show, pin or unpin body: the thread, and the widget instance.
-#[derive(Debug, Deserialize)]
-pub(super) struct WidgetChangeBody {
-    thread_id: Option<String>,
-    /// A pin's reply event, where "Show in thread" lands. Unpin ignores it.
-    #[serde(default)]
-    shown_event_id: Option<uuid::Uuid>,
+    size: WidgetSize,
     #[serde(flatten)]
     instance: WidgetInstanceArgs,
 }
@@ -57,61 +49,35 @@ async fn list_reusable_widgets(State(state): State<AppState>) -> Result<Json<Vec
         .map_err(|e| ApiError::internal(e.to_string()))
 }
 
-/// GET /api/v1/widgets/thread?thread_id= - A thread's widgets, pinned or not.
-async fn thread_widgets(
+/// POST /api/v1/widgets/size - The size of a widget instance's cards in a
+/// thread. Writes one event, no file.
+async fn size_cards(
     State(state): State<AppState>,
-    Query(query): Query<ThreadWidgetsQuery>,
-) -> Result<Json<Vec<ThreadWidget>>, ApiError> {
-    let thread_id = required_thread(query.thread_id.as_deref())?;
-    widgets::thread_widgets(&state.pool, &state.app_manager, thread_id)
-        .await
-        .map(Json)
-        .map_err(|e| ApiError::internal(e.to_string()))
-}
-
-async fn change_shelf(
-    state: &AppState,
-    headers: &HeaderMap,
-    change: WidgetChange,
-    body: WidgetChangeBody,
+    headers: HeaderMap,
+    Json(body): Json<CardSizeBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = super::actor::user_actor(headers, None);
+    let actor = super::actor::user_actor(&headers, None);
     let thread_id = required_thread(body.thread_id.as_deref())?;
     let instance = WidgetInstance::try_from(body.instance).map_err(ApiError::bad_request)?;
-    widgets::check_widget_change(
+    widgets::check_card_size(
         &state.pool,
         &state.app_manager,
-        change,
         &instance,
+        body.size,
         thread_id,
     )
     .await
     .map_err(refusal)?;
-    widgets::emit_widget_change(&state.engine.event_bus, change, instance, thread_id, actor)
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    widgets::emit_card_size(
+        &state.engine.event_bus,
+        instance,
+        body.size,
+        thread_id,
+        actor,
+    )
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(serde_json::json!({ "ok": true })))
-}
-
-/// POST /api/v1/widgets/pin - "Pin to shelf". Writes one event, no file.
-async fn pin_widget(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<WidgetChangeBody>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let change = WidgetChange::Pin {
-        shown_event_id: body.shown_event_id,
-    };
-    change_shelf(&state, &headers, change, body).await
-}
-
-/// POST /api/v1/widgets/unpin - "Unpin from shelf". Writes one event, no file.
-async fn unpin_widget(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<WidgetChangeBody>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    change_shelf(&state, &headers, WidgetChange::Unpin, body).await
 }
 
 async fn set_reusable(
@@ -155,10 +121,13 @@ pub(super) struct DashboardQuery {
     dashboard: Option<String>,
 }
 
-/// An add or remove body: the dashboard, and the widget instance.
+/// An add or remove body: the dashboard, and the widget instance. Only an
+/// add reads `size`.
 #[derive(Debug, Deserialize)]
 pub(super) struct DashboardChangeBody {
     dashboard: Option<String>,
+    #[serde(default)]
+    size: Option<WidgetSize>,
     #[serde(flatten)]
     instance: WidgetInstanceArgs,
 }
@@ -244,7 +213,8 @@ async fn add_to_dashboard(
     headers: HeaderMap,
     Json(body): Json<DashboardChangeBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    change_dashboard(&state, &headers, DashboardChange::Add, body).await
+    let change = DashboardChange::Add { size: body.size };
+    change_dashboard(&state, &headers, change, body).await
 }
 
 /// POST /api/v1/widgets/dashboard-remove - "Remove from dashboard".
@@ -278,9 +248,7 @@ async fn arrange_dashboard(
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/widgets", get(list_reusable_widgets))
-        .route("/widgets/thread", get(thread_widgets))
-        .route("/widgets/pin", post(pin_widget))
-        .route("/widgets/unpin", post(unpin_widget))
+        .route("/widgets/size", post(size_cards))
         .route("/widgets/make-reusable", post(make_reusable))
         .route("/widgets/stop-reusing", post(stop_reusing))
         .route("/widgets/dashboard-add", post(add_to_dashboard))

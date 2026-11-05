@@ -58,6 +58,7 @@ async fn trigger_started_does_not_resurrect_discarded_thread() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ThreadStarted {
+            recovered_compose: None,
             mode: "lucidos".into(),
             actor: None,
         },
@@ -120,6 +121,7 @@ async fn thread_discarded_sets_archive_state_to_archived() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ThreadStarted {
+            recovered_compose: None,
             mode: "claude_code".into(),
             actor: None,
         },
@@ -197,6 +199,7 @@ async fn thread_started_with_claude_code_mode_sets_source_to_claude_code() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ThreadStarted {
+            recovered_compose: None,
             mode: "claude_code".into(),
             actor: None,
         },
@@ -230,6 +233,7 @@ async fn thread_started_with_lucidos_mode_sets_source_to_chat() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ThreadStarted {
+            recovered_compose: None,
             mode: "lucidos".into(),
             actor: None,
         },
@@ -268,6 +272,7 @@ async fn message_received_overrides_stale_compose_source_on_composing_to_active(
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ThreadStarted {
+            recovered_compose: None,
             mode: "claude_code".into(),
             actor: None,
         },
@@ -1837,6 +1842,7 @@ async fn thread_discarded_clears_compose_selection() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ThreadStarted {
+            recovered_compose: None,
             mode: "lucidos".into(),
             actor: None,
         },
@@ -1885,6 +1891,7 @@ async fn seed_thread_awaiting_answer(bus: &EventBus, pool: &PgPool, draft: &str)
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ThreadStarted {
+            recovered_compose: None,
             mode: "lucidos".into(),
             actor: None,
         },
@@ -2050,6 +2057,7 @@ async fn a_chat_continue_leaves_the_compose_epoch_alone() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ThreadStarted {
+            recovered_compose: None,
             mode: "lucidos".into(),
             actor: None,
         },
@@ -2088,6 +2096,81 @@ async fn a_chat_continue_leaves_the_compose_epoch_alone() {
     assert_eq!(row.0, "half a follow-up", "a Continue consumes no draft");
     assert_eq!(row.1, 0, "and therefore moves no epoch");
 
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Recovery inserts the complete initial composer in the event transaction.
+/// A lost-response retry must preserve edits even after a mode/state change.
+#[tokio::test]
+async fn restored_draft_is_atomic_and_retry_preserves_newer_edits() {
+    use crate::engine::thread_events::RecoveredCompose;
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    let generation = Uuid::new_v4();
+    sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) VALUES ($1, 'test', now(), 0)")
+        .bind(generation).execute(&pool).await.unwrap();
+    let thread_id = Uuid::new_v4();
+    let event = || BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ThreadStarted {
+            mode: "lucidos".into(),
+            actor: None,
+            recovered_compose: Some(RecoveredCompose {
+                generation,
+                text: "preserved".into(),
+                image_hashes: vec![],
+                selection: Some(serde_json::json!({"model": "example-model"})),
+            }),
+        },
+        meta: EventMeta::NONE,
+    };
+    bus.emit(event()).await.unwrap();
+    let initial: (String, serde_json::Value) = sqlx::query_as(
+        "SELECT compose_text, compose_selection FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        initial,
+        (
+            "preserved".into(),
+            serde_json::json!({"model": "example-model"})
+        )
+    );
+    sqlx::query("UPDATE thread_summaries SET compose_text = 'newer', compose_mode = 'claude_code', state = 'active' WHERE thread_id = $1")
+        .bind(thread_id).execute(&pool).await.unwrap();
+    assert!(bus.emit(event()).await.unwrap().is_none());
+    let after: (String, String, String) = sqlx::query_as(
+        "SELECT compose_text, compose_mode, state FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        after,
+        ("newer".into(), "claude_code".into(), "active".into())
+    );
+    sqlx::query("UPDATE snapshot_restore_boundary SET restore_id = $1")
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        bus.emit(event()).await.is_err(),
+        "old-generation retries must be refused"
+    );
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM events WHERE aggregate_id = $1 AND event_type = 'ThreadStarted'",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1, "duplicate and refused events must not persist");
     pool.close().await;
     teardown_test_db(&db_name).await;
 }

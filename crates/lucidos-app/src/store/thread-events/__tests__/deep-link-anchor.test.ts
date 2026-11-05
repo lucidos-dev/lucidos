@@ -60,7 +60,7 @@ describe('deepLinkAnchorForEvent', () => {
     expect(deepLinkAnchorForEvent(exchanges, 'tool-1')).toBe('start-2');
   });
 
-  /** "Show in thread" lands on an old showing's inline widget, not on the
+  /** A deep link lands on an old showing's inline widget, not on the
    *  message before it, so the widget's stamp must be declared. */
   it('returns the event itself for a WidgetShown, which stamps its own inline widget', () => {
     const exchanges = [exchange('start-1', [['ToolCalled', 'tool-1'], ['WidgetShown', 'widget-1']])];

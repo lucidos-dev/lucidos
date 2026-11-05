@@ -5,7 +5,8 @@
 //! `RAW_BODY_THRESHOLD_BYTES` switches the body view: requests ≤1MB get the
 //! full bytes (`BodyView::Raw`), larger ones get a SHA-256 + length
 //! (`BodyView::HashOnly`) so signers don't have to buffer megabytes for a
-//! signature they only compute over the digest.
+//! signature they only compute over the digest. Engine policy layers may opt
+//! into raw bytes for inspecting JSON at either size.
 
 use crate::api::proxy_auth_layer::{AuthLayer, BodyView, RetryHint};
 use axum::http::{HeaderName, Method, StatusCode};
@@ -51,7 +52,8 @@ pub fn body_hash(body: &Bytes) -> [u8; 32] {
 /// get `BodyView::Raw(&body)`; larger ones get `BodyView::HashOnly` with a
 /// precomputed SHA-256 + length, so layers can sign over the digest without
 /// buffering the full body into their own view. The hash buffer is owned
-/// here so its borrow lives for the whole pipeline run.
+/// here so its borrow lives for the whole pipeline run. Engine policy layers
+/// opting into raw bytes receive them at either size.
 pub async fn run_pipeline(
     layers: &[Arc<dyn AuthLayer>],
     method: &Method,
@@ -82,7 +84,11 @@ pub async fn run_pipeline(
             method,
             url,
             headers,
-            body: body_view,
+            body: if layer.requires_raw_body() {
+                BodyView::Raw(body)
+            } else {
+                body_view
+            },
             prior_layer_outputs: &prior,
         };
         let mutation = layer.apply(&input).await?;

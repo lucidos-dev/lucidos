@@ -1,10 +1,12 @@
 /**
- * Adopt a pairing code handed over in the URL, so a scanned QR does not make
+ * Adopt a pairing secret handed over in the URL, so a scanned QR does not make
  * anyone type eight digits.
  *
- * Settings -> Access mints a code and renders a QR for
- * `<reachable-origin>/~/?pair=<code>`. The phone's camera opens that, the
- * picker loads, and `PairingGate` finds the code already in the box.
+ * Settings -> Access mints a pairing and renders a QR for
+ * `<reachable-origin>/~/?pair=<secret>`. The phone's camera opens that, the
+ * picker loads, and `PairingGate` redeems the secret. The link carries the
+ * long secret rather than the short code, because the gateway accepts a typed
+ * code only on a local channel. An older gateway's link carries the code.
  *
  * **Stripping the parameter matters for more than tidiness.** A pairing code
  * works once and expires in five minutes, so a URL still carrying it is a URL
@@ -18,7 +20,12 @@
  * `PairingGate` calls it for the value. Whichever runs first does the work.
  */
 
-import { PAIR_PARAM, PAIRING_CODE_DIGITS } from '../generated/gateway-constants';
+import {
+  DEVICE_PAIRING_SECRET_PREFIX,
+  PAIR_PARAM,
+  PAIRING_CODE_DIGITS,
+  PAIRING_SECRET_CHARS,
+} from '../generated/gateway-constants';
 
 /** URL parameter carrying the pairing code. The gateway writes it. */
 export { PAIR_PARAM };
@@ -32,14 +39,23 @@ export { PAIRING_CODE_DIGITS };
  *  since the only thing a malformed code can do is fail. */
 const CODE_RE = new RegExp(`^\\d{${PAIRING_CODE_DIGITS}}$`);
 
+/** Exactly what the gateway mints as a device pairing secret. */
+const SECRET_RE = new RegExp(`^${DEVICE_PAIRING_SECRET_PREFIX}[a-z2-7]{${PAIRING_SECRET_CHARS}}$`);
+
 /** Is this exactly a minted code? The one grammar, so a code arriving from the
  *  URL, a paste or a camera is judged by the same rule. */
 export function isPairingCode(value: string): boolean {
   return CODE_RE.test(value);
 }
 
+/** Is this exactly a minted device pairing secret? */
+export function isPairingSecret(value: string): boolean {
+  return SECRET_RE.test(value);
+}
+
 /**
- * The code to adopt from a query string, or `null` for "there is none".
+ * The secret or code to adopt from a query string, or `null` for "there is
+ * none".
  * Pure, so every rejection is testable without a DOM.
  */
 export function pairingCodeToAdopt(search: string): string | null {
@@ -49,8 +65,8 @@ export function pairingCodeToAdopt(search: string): string | null {
   } catch {
     return null;
   }
-  const code = raw?.trim() ?? '';
-  return isPairingCode(code) ? code : null;
+  const token = raw?.trim() ?? '';
+  return isPairingSecret(token) || isPairingCode(token) ? token : null;
 }
 
 /** The result of the one read, or `undefined` before it happened. */

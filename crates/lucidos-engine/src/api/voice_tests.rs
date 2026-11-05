@@ -524,3 +524,27 @@ async fn the_upgrade_re_checks_what_the_mint_checked() {
 
     teardown_test_db(&db_name).await;
 }
+
+#[tokio::test]
+async fn restore_refuses_old_voice_ticket_and_accepts_a_new_one() {
+    let (pool, db) = setup_test_db().await;
+    voice_set(&pool, true).await;
+    let line = Line::new();
+    let home = the_home_thread(&pool).await;
+    let old = line.owner_mints(&pool, home).await.unwrap();
+    let generation = Uuid::new_v4();
+    sqlx::query("INSERT INTO snapshot_restore_boundary (singleton, restore_id, snapshot, restored_at, event_sequence) VALUES (TRUE, $1, 'fixture', NOW(), 0)")
+        .bind(generation).execute(&pool).await.unwrap();
+    assert!(line
+        .dial(&pool, &device_headers(OWNERS_PHONE), home, Some(&old))
+        .await
+        .is_err());
+    let current = line.owner_mints(&pool, home).await.unwrap();
+    let admitted = line
+        .dial(&pool, &device_headers(OWNERS_PHONE), home, Some(&current))
+        .await
+        .unwrap();
+    drop(admitted);
+    pool.close().await;
+    teardown_test_db(&db).await;
+}

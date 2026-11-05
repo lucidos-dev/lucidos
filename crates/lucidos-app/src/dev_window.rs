@@ -295,9 +295,13 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let url: tauri::Url = format!("http://127.0.0.1:{port}/dev/").parse().unwrap();
         assert!(wait_until_listening(&url, Duration::from_secs(1)));
-        drop(listener);
+        // Binding port zero allocates another port, so zero cannot host a listener.
+        let silent_url: tauri::Url = "http://127.0.0.1:0/dev/".parse().unwrap();
         let started = Instant::now();
-        assert!(!wait_until_listening(&url, Duration::from_millis(400)));
+        assert!(!wait_until_listening(
+            &silent_url,
+            Duration::from_millis(400)
+        ));
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

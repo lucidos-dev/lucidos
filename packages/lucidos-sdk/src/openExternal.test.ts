@@ -10,6 +10,8 @@
  * Everything else routes to the host.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+// Keep link tests independent of the picker's host-side Vitest aliases.
+vi.mock('./modelPicker', () => ({ ModelPicker: {} }));
 
 /** Stands in for `requestVoid`, so it takes the path and the decoded body. */
 const navigate = vi.hoisted(

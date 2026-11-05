@@ -26,7 +26,7 @@ mod recovery;
 mod snapshot;
 mod state;
 
-pub(crate) use driver::{LaneMsg, Submission};
+pub(crate) use driver::{settle_restored_lane, LaneMsg, Submission};
 #[cfg(test)]
 pub(crate) use landing::{publish_clean_pass, LandingInput};
 pub(crate) use lane_thread::{

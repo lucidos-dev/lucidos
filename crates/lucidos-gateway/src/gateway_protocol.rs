@@ -1,14 +1,14 @@
 //! The gateway-to-gateway protocol, from the side that grants: gateway B.
 //!
-//! B mints a *gateway pairing code*, gateway A redeems it, and A then holds a
+//! B mints a *gateway pairing secret*, gateway A redeems it, and A then holds a
 //! gateway credential for B. ADR 0590 records why this is a grant of its own
 //! rather than one more device. A's half lives in [`crate::remote_gateways`].
 //!
-//! # Two code kinds, never crossing
+//! # Two pairing kinds, never crossing
 //!
-//! Gateway codes live in [`PairedGatewayStore`], apart from the device codes in
-//! `GatewayInner::pending_pairings`. A device code never pairs a gateway, and a
-//! gateway code never pairs a device.
+//! Gateway pairings live in [`PairedGatewayStore`], apart from the device
+//! pairings in `GatewayInner::pending_pairings`. A device secret never pairs a
+//! gateway, and a gateway secret never pairs a device.
 //!
 //! # The path and the version only add
 //!
@@ -30,12 +30,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, ct_eq};
 use crate::error::ApiError;
+use crate::pairing::{self, PairingChannel, PairingKind, PendingPairings, Redemption};
 use crate::server::GatewayState;
 use crate::stack::Health;
 
 /// The protocol version B names in its public health. Bumped only when a call
 /// is ADDED; nothing under [`GATEWAY_API_PREFIX`] is ever removed or changed.
-pub const GATEWAY_PROTOCOL: u32 = 1;
+pub const GATEWAY_PROTOCOL: u32 = 2;
+
+pub const ROTATE_PATH: &str = "/rotate";
 
 /// Where every gateway-to-gateway call lives.
 pub const GATEWAY_API_PREFIX: &str = "/~/api/gateway/v1";
@@ -47,7 +50,7 @@ pub const GATEWAY_API_ROOT: &str = "/~/api/gateway";
 /// The header that carries A's gateway credential.
 pub const HEADER_GATEWAY_CREDENTIAL: &str = "x-lucidos-gateway-credential";
 
-/// Redeem a gateway pairing code, relative to [`GATEWAY_API_PREFIX`].
+/// Redeem a gateway pairing secret, relative to [`GATEWAY_API_PREFIX`].
 pub const PAIR_PATH: &str = "/pair";
 
 /// Read or end the caller's own pairing, relative to [`GATEWAY_API_PREFIX`].
@@ -73,6 +76,16 @@ pub struct PairedGateway {
     pub label: String,
     pub credential_digest: String,
     pub paired_at: String,
+    #[serde(default)]
+    pub last_used_at: Option<String>,
+    #[serde(default)]
+    pub previous_credential: Option<PreviousCredential>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreviousCredential {
+    pub digest: String,
+    pub expires_at: i64,
 }
 
 /// B's paired-gateway file, `<data dir>/paired-gateways.json`.
@@ -87,7 +100,7 @@ pub fn paired_gateways_path(app_data: &Path) -> PathBuf {
     app_data.join("paired-gateways.json")
 }
 
-/// The gateway A became by redeeming a code, stamped on the request by
+/// The gateway A became by redeeming a secret, stamped on the request by
 /// [`require_gateway`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedGateway {
@@ -103,10 +116,9 @@ pub enum GatewayRedemption {
         credential: String,
     },
     Rejected,
-    Throttled,
 }
 
-/// B's paired gateways and its outstanding gateway codes.
+/// B's paired gateways and its outstanding gateway pairings.
 ///
 /// The same locking shape as the device store in `server.rs`. The data lock is
 /// held only to read or mutate, and `writing` orders the file writes. Every
@@ -116,8 +128,8 @@ pub struct PairedGatewayStore {
     path: PathBuf,
     gateways: Mutex<PairedGateways>,
     writing: Mutex<()>,
-    /// Never persisted, like device codes: a code lives five minutes.
-    codes: Mutex<auth::PendingPairings>,
+    /// Never persisted, like device pairings: a pairing lives five minutes.
+    pending: Mutex<PendingPairings>,
 }
 
 impl PairedGatewayStore {
@@ -127,38 +139,43 @@ impl PairedGatewayStore {
             path,
             gateways: Mutex::new(gateways),
             writing: Mutex::new(()),
-            codes: Mutex::new(auth::PendingPairings::default()),
+            pending: Mutex::new(PendingPairings::new(PairingKind::Gateway)),
         })
     }
 
-    /// Mint a gateway pairing code, carrying the label B's user suggested.
-    pub fn mint_code(&self, label: Option<String>) -> Result<String, String> {
-        self.codes
+    /// Mint a gateway pairing secret, carrying the label B's user suggested.
+    pub fn mint_secret(&self, label: Option<String>) -> Result<String, String> {
+        self.pending
             .lock()
             .map_err(|_| "gateway pairing state is unavailable".to_string())?
             .mint(label)
-            .map_err(|e| format!("could not mint a gateway pairing code: {e}"))
+            .map(|minted| minted.secret)
+            .map_err(|e| format!("could not mint a gateway pairing secret: {e}"))
     }
 
-    /// Redeem `code` and record a paired gateway.
+    /// Redeem `secret` and record a paired gateway.
     ///
-    /// The label B's user gave the code wins here, unlike a device. B's user
+    /// Never throttled: the secret is long enough that no flood can guess it,
+    /// so no flood can spend a budget that stands before the right one.
+    ///
+    /// The label B's user gave the secret wins here, unlike a device. B's user
     /// is naming a machine they chose to trust, and A only offers its own
     /// hostname.
     pub fn redeem(
         &self,
-        code: &str,
+        secret: &str,
         offered_label: Option<&str>,
     ) -> Result<GatewayRedemption, String> {
         let minted_label = {
-            let mut codes = self
-                .codes
+            let mut pending = self
+                .pending
                 .lock()
                 .map_err(|_| "gateway pairing state is unavailable".to_string())?;
-            match codes.redeem(code) {
-                auth::Redemption::Redeemed(label) => label,
-                auth::Redemption::Rejected => return Ok(GatewayRedemption::Rejected),
-                auth::Redemption::Throttled => return Ok(GatewayRedemption::Throttled),
+            match pending.redeem(secret, PairingChannel::Public) {
+                Redemption::Redeemed(label) => label,
+                Redemption::Rejected | Redemption::LocalOnly | Redemption::Throttled => {
+                    return Ok(GatewayRedemption::Rejected)
+                }
             }
         };
         let label = minted_label
@@ -178,6 +195,8 @@ impl PairedGatewayStore {
             label,
             credential_digest: auth::digest(&credential),
             paired_at: chrono::Utc::now().to_rfc3339(),
+            last_used_at: None,
+            previous_credential: None,
         };
         crate::log!("[Gateway] paired with a remote gateway: {}", gateway.label);
         self.write(|store| store.gateways.push(gateway))?;
@@ -192,22 +211,96 @@ impl PairedGatewayStore {
     /// Only the dedicated header counts. A cookie is never read here, so a
     /// browser's jar cannot stand in for a gateway. A poisoned lock fails
     /// closed.
-    pub fn authorize(&self, headers: &HeaderMap) -> Option<AuthenticatedGateway> {
-        let presented = headers
-            .get(HEADER_GATEWAY_CREDENTIAL)
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())?;
-        let digest = auth::digest(presented);
-        let store = self.gateways.lock().ok()?;
-        store
-            .gateways
-            .iter()
-            .find(|g| ct_eq(&g.credential_digest, &digest))
-            .map(|g| AuthenticatedGateway {
-                pairing_id: g.id.clone(),
-                label: g.label.clone(),
+    pub fn authorize(&self, headers: &HeaderMap) -> Result<Option<AuthenticatedGateway>, String> {
+        let Some(digest) = presented_digest(headers) else {
+            return Ok(None);
+        };
+        self.with_authenticated(&digest, |gateway, current| {
+            // First successful use of the new key durably ends the overlap.
+            if current {
+                gateway.previous_credential = None;
+            }
+            let now = chrono::Utc::now();
+            let due = gateway
+                .last_used_at
+                .as_deref()
+                .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                .is_none_or(|at| now.signed_duration_since(at).num_seconds() >= 60);
+            if due {
+                gateway.last_used_at = Some(now.to_rfc3339());
+            }
+            Ok(AuthenticatedGateway {
+                pairing_id: gateway.id.clone(),
+                label: gateway.label.clone(),
             })
+        })
+    }
+
+    /// Install A's durably sealed candidate. Repeating an intent is idempotent.
+    /// A chooses the key before contacting B so a lost response is recoverable.
+    pub fn rotate(&self, headers: &HeaderMap, candidate: &str) -> Result<bool, String> {
+        if candidate.len() != 64
+            || !candidate
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(
+                "a rotation candidate must be 32 random bytes encoded as lowercase hex".into(),
+            );
+        }
+        let Some(digest) = presented_digest(headers) else {
+            return Ok(false);
+        };
+        let replacement = auth::digest(candidate);
+        self.with_authenticated(&digest, |gateway, current| {
+            if ct_eq(&gateway.credential_digest, &replacement) {
+                return Ok(());
+            }
+            // An old overlap key cannot race the current key into a third key.
+            if !current {
+                return Err("a previous credential cannot start another rotation".into());
+            }
+            gateway.previous_credential = Some(PreviousCredential {
+                digest: gateway.credential_digest.clone(),
+                expires_at: chrono::Utc::now().timestamp() + 600,
+            });
+            gateway.credential_digest = replacement;
+            Ok(())
+        })
+        .map(|result| result.is_some())
+    }
+
+    fn with_authenticated<T>(
+        &self,
+        digest: &str,
+        mutate: impl FnOnce(&mut PairedGateway, bool) -> Result<T, String>,
+    ) -> Result<Option<T>, String> {
+        let _writing = self
+            .writing
+            .lock()
+            .map_err(|_| "paired gateway store is unavailable")?;
+        let mut store = self
+            .gateways
+            .lock()
+            .map_err(|_| "paired gateway store is unavailable")?;
+        let mut next = store.clone();
+        let now = chrono::Utc::now().timestamp();
+        let Some(gateway) = next.gateways.iter_mut().find(|g| {
+            ct_eq(&g.credential_digest, digest)
+                || g.previous_credential
+                    .as_ref()
+                    .is_some_and(|old| old.expires_at > now && ct_eq(&old.digest, digest))
+        }) else {
+            return Ok(None);
+        };
+        let current = ct_eq(&gateway.credential_digest, digest);
+        let result = mutate(gateway, current)?;
+        if next != *store {
+            auth::save_store(&next, &self.path)
+                .map_err(|e| format!("could not save the paired gateway store: {e}"))?;
+            *store = next;
+        }
+        Ok(Some(result))
     }
 
     pub fn list(&self) -> Vec<PairedGateway> {
@@ -271,10 +364,12 @@ pub fn router(state: GatewayState) -> Router<GatewayState> {
             any(crate::relay::receive),
         )
         .route_layer(middleware::from_fn_with_state(state, require_gateway))
-        // The one call A makes before it holds a credential. The code is the
-        // only thing standing here, so it is single use, expires, and wrong
-        // guesses are throttled, exactly as for a device.
-        .route(PAIR_PATH, post(pair));
+        // Pair is the call A makes before it holds a credential. The long secret
+        // is the only thing standing here: single use, expiring, and too long
+        // for any flood to guess, so nothing here is throttled.
+        .route(PAIR_PATH, post(pair))
+        // Authenticate atomically with rotation, without consuming overlap first.
+        .route(ROTATE_PATH, post(rotate));
     let version = GATEWAY_API_PREFIX
         .strip_prefix(GATEWAY_API_ROOT)
         .expect("the versioned prefix sits under the root");
@@ -292,30 +387,62 @@ async fn require_gateway(
     next: Next,
 ) -> Response {
     match state.paired_gateways().authorize(req.headers()) {
-        Some(gateway) => {
+        Ok(Some(gateway)) => {
             req.extensions_mut().insert(gateway);
             next.run(req).await
         }
-        None => ApiError::unauthorized("this gateway is not paired here").into_response(),
+        Ok(None) => ApiError::unauthorized("this gateway is not paired here").into_response(),
+        Err(error) => ApiError::internal(error).into_response(),
+    }
+}
+
+fn presented_digest(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(HEADER_GATEWAY_CREDENTIAL)?
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(auth::digest)
+}
+
+#[derive(Deserialize)]
+struct RotateRequest {
+    candidate: String,
+}
+
+async fn rotate(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<RotateRequest>,
+) -> Result<StatusCode, ApiError> {
+    match state
+        .paired_gateways()
+        .rotate(&headers, &body.candidate)
+        .map_err(ApiError::internal)?
+    {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(ApiError::unauthorized("this gateway is not paired here")),
     }
 }
 
 #[derive(Deserialize)]
 struct PairRequest {
+    /// The gateway pairing secret. Named `code` on the wire, which only adds.
     code: String,
-    /// What A calls itself. B's user may already have named the code.
+    /// What A calls itself. B's user may already have named the secret.
     #[serde(default)]
     label: Option<String>,
 }
 
-/// What A learns by redeeming a code.
+/// What A learns by redeeming a secret.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairAnswer {
     pub pairing_id: String,
     pub credential: String,
     pub gateway_protocol: u32,
     /// B's ADR 0550 external address, when it is `https`. Told only to a
-    /// gateway holding a code, never in public health.
+    /// gateway holding a secret, never in public health.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_address: Option<String>,
 }
@@ -335,13 +462,7 @@ async fn pair(
         } => (pairing_id, credential),
         GatewayRedemption::Rejected => {
             return Err(ApiError::bad_request(
-                "that gateway pairing code is not valid or has expired",
-            ))
-        }
-        GatewayRedemption::Throttled => {
-            return Err(ApiError::too_many_requests(
-                "too many gateway pairing attempts just now, so this one was not checked. \
-                 Wait a minute and try again.",
+                "that gateway pairing secret is not valid or has expired",
             ))
         }
     };
@@ -432,6 +553,7 @@ struct GatewayCodeQuery {
 
 #[derive(Serialize)]
 struct GatewayCodeBody {
+    /// The gateway pairing secret. Named `code` on the wire, which only adds.
     code: String,
     expires_in_secs: u64,
 }
@@ -446,13 +568,13 @@ async fn gateway_pairing_code(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let code = state
+    let secret = state
         .paired_gateways()
-        .mint_code(label)
+        .mint_secret(label)
         .map_err(ApiError::internal)?;
     Ok(Json(GatewayCodeBody {
-        code,
-        expires_in_secs: auth::pairing_code_ttl_secs(),
+        code: secret,
+        expires_in_secs: pairing::pairing_ttl_secs(),
     }))
 }
 
@@ -461,6 +583,7 @@ struct GatewayRow {
     id: String,
     label: String,
     paired_at: String,
+    last_used_at: Option<String>,
 }
 
 async fn list_gateways(State(state): State<GatewayState>) -> Json<Vec<GatewayRow>> {
@@ -473,6 +596,7 @@ async fn list_gateways(State(state): State<GatewayState>) -> Json<Vec<GatewayRow
                 id: g.id,
                 label: g.label,
                 paired_at: g.paired_at,
+                last_used_at: g.last_used_at,
             })
             .collect(),
     )

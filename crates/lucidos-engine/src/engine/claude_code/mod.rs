@@ -365,22 +365,10 @@ pub(crate) fn cc_allowed_tools(dir: &Path) -> String {
         .join(",")
 }
 
-/// True for a `Bash(...)` line Claude Code must not match itself, since it
-/// prefix-matches with no further check. Two kinds:
-///
-/// - the first word runs its arguments as a command (`Bash(bash:*)`,
-///   `Bash(/bin/bash:*)`, `Bash(sudo rm:*)`), so it would cover anything;
-/// - the first word is a path (`Bash(./scripts/x.sh:*)`). Only the engine's
-///   gate checks that the script is trusted (ADR 0571).
+/// All user Bash grants are matched by the engine after the unconditional
+/// floor. Native matching would bypass that floor, even for a bare Bash grant.
 fn only_the_engine_may_match(pattern: &str) -> bool {
-    pattern
-        .strip_prefix("Bash(")
-        .and_then(|rest| rest.strip_suffix(')'))
-        .and_then(|rule| rule.split_whitespace().next())
-        .map(|word| word.strip_suffix(":*").unwrap_or(word))
-        .is_some_and(|word| {
-            word.contains('/') || crate::engine::command_guard::grants_nothing_by_name(word)
-        })
+    pattern == "Bash" || pattern.starts_with("Bash(")
 }
 
 /// Write the instructional header into a not-yet-existing allowlist file.

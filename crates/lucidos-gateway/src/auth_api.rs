@@ -371,7 +371,7 @@ pub async fn enforce(State(state): State<GatewayState>, mut req: Request, next: 
         // affordance. In place rather than redirected: see `serve_pairing_shell`.
         // Hand the screen the code the caller arrived with: a `pair` query does
         // reach a gated path, and `serve_pairing_shell` says how.
-        let pair_code = pairing_qr::pairing_code_in_query(req.uri().query());
+        let pair_code = pairing_qr::pairing_token_in_query(req.uri().query());
         return crate::server::serve_pairing_shell(&state, pair_code);
     }
     if is_nested_frame(req.headers()) {
@@ -504,13 +504,15 @@ struct PairingCodeQuery {
     origin: Option<String>,
 }
 
-/// The minted code, plus the QR when the caller asked for one.
+/// The minted pairing, plus the QR when the caller asked for one.
 ///
-/// With no `origin` sent, both extra fields are omitted rather than null. A
-/// client that never heard of them sees exactly the body it always did.
+/// `code` is the 8-digit short code, which pairs only on a local channel.
+/// `secret` is the long secret, which pairs on any channel; the QR and link
+/// carry it. With no `origin` sent, the QR fields are omitted rather than null.
 #[derive(Serialize)]
 struct PairingCodeBody {
     code: String,
+    secret: String,
     expires_in_secs: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pair_url: Option<String>,
@@ -547,22 +549,34 @@ async fn pairing_code(
         })?),
         None => None,
     };
-    let code = state.mint_pairing_code(label).map_err(ApiError::internal)?;
-    let pair_url = origin.map(|o| pairing_qr::pair_url(o, &code));
+    let minted = state.mint_pairing(label).map_err(ApiError::internal)?;
+    let code = minted
+        .code
+        .ok_or_else(|| ApiError::internal("a device pairing minted no short code"))?;
+    let pair_url = origin.map(|o| pairing_qr::pair_url(o, &minted.secret));
     // A `None` here means the URL fits in no QR at all, which the length cap in
     // `valid_origin` already rules out. The code is still good, so the response
     // carries it and the page falls back to showing the digits.
     let qr_svg = pair_url.as_deref().and_then(pairing_qr::qr_svg);
     Ok(Json(PairingCodeBody {
-        expires_in_secs: auth::pairing_code_ttl_secs(),
+        expires_in_secs: crate::pairing::pairing_ttl_secs(),
         code,
+        secret: minted.secret,
         pair_url,
         qr_svg,
     }))
 }
 
+/// Why a typed code from a public address was refused, and the way that works.
+/// It names no cause: a tunnel, a proxy and an unproved network all land here.
+pub(crate) const PUBLIC_SHORT_CODE_REFUSAL: &str =
+    "a typed code works only from another device on this machine's local network or tailnet, \
+     and Lucidos could not prove this request came from one. Scan the QR code, open the pairing \
+     link or paste the pairing secret instead.";
+
 #[derive(Deserialize)]
 struct PairRequest {
+    /// The long secret or the short code. Named `code` on the wire.
     code: String,
     /// What to call this device in the paired list. Optional, because a phone
     /// typing a code should not also be made to name itself.
@@ -570,38 +584,45 @@ struct PairRequest {
     label: Option<String>,
 }
 
-/// Redeem a pairing code and become a paired device.
+/// Redeem a pairing secret or short code and become a paired device.
 ///
 /// Public by necessity: the caller has no credential yet, which is the point.
-/// The code is the only thing standing here, so it is single use, it expires,
-/// and wrong guesses are rate limited. On a wide bind this route is reachable
-/// from the LAN. Unthrottled, it would be eight digits against a caller that
-/// guesses as fast as the socket accepts.
+/// The long secret is never throttled, because no flood can guess it. The
+/// short code is accepted only on a proved-local channel (`crate::pairing`),
+/// behind a per-source budget.
 async fn pair(
     State(state): State<GatewayState>,
     connection: tls::Connection,
+    peer: Option<axum::Extension<crate::pairing::Peer>>,
     headers: HeaderMap,
     Json(body): Json<PairRequest>,
 ) -> Result<Response, ApiError> {
-    let credential =
-        match state
-            .redeem_pairing_code(&body.code, body.label.as_deref())
-            .map_err(ApiError::internal)?
-        {
-            crate::server::PairingOutcome::Paired(credential) => credential,
-            crate::server::PairingOutcome::Rejected => {
-                return Err(ApiError::bad_request(
-                    "that pairing code is not valid or has expired",
-                ))
-            }
-            // Said plainly, because the person on the other end may be the user
-            // watching a real code go unanswered. A 400 here would send them
-            // hunting a typo that is not there.
-            crate::server::PairingOutcome::Throttled => return Err(ApiError::too_many_requests(
-                "too many pairing attempts just now, so this one was not checked. Wait a minute \
-                 and try again.",
-            )),
-        };
+    let channel = crate::pairing::classify(peer.map(|p| p.0), &headers, |local| {
+        state.certs().is_tailnet_address(local)
+    });
+    let credential = match state
+        .redeem_pairing(&body.code, channel, body.label.as_deref())
+        .map_err(ApiError::internal)?
+    {
+        crate::server::PairingOutcome::Paired(credential) => credential,
+        crate::server::PairingOutcome::Rejected => {
+            return Err(ApiError::bad_request(
+                "that pairing code is not valid or has expired",
+            ))
+        }
+        crate::server::PairingOutcome::LocalOnly => {
+            return Err(ApiError::bad_request(PUBLIC_SHORT_CODE_REFUSAL))
+        }
+        // Said plainly, because the person on the other end may be the user
+        // watching a real code go unanswered. A 400 here would send them
+        // hunting a typo that is not there.
+        crate::server::PairingOutcome::Throttled => {
+            return Err(ApiError::too_many_requests(
+                "too many wrong pairing codes from this device just now, so this one was not \
+                 checked. Wait a minute and try again, or scan the QR code instead.",
+            ))
+        }
+    };
     let secure = auth::request_is_secure(&headers, connection.is_tls());
     Ok((
         StatusCode::OK,
@@ -694,17 +715,21 @@ mod tests {
     }
 
     #[test]
-    fn a_code_minted_without_an_origin_serializes_to_the_body_it_always_had() {
+    fn a_code_minted_without_an_origin_only_adds_the_secret() {
         // `lucidos pair` sends no origin and parses this body. A `null` field
         // is a contract change to a caller that may be older than the gateway.
         let body = PairingCodeBody {
             code: "01234567".into(),
+            secret: "ldp_abcdefghijklmnopqrstuvwxyz".into(),
             expires_in_secs: 300,
             pair_url: None,
             qr_svg: None,
         };
         let json = serde_json::to_string(&body).unwrap();
-        assert_eq!(json, r#"{"code":"01234567","expires_in_secs":300}"#);
+        assert_eq!(
+            json,
+            r#"{"code":"01234567","secret":"ldp_abcdefghijklmnopqrstuvwxyz","expires_in_secs":300}"#
+        );
     }
 
     #[test]

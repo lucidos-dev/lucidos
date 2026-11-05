@@ -6,44 +6,49 @@ use crate::api::SharedEngine;
 use crate::core::backup::crypto::SealingKey;
 use crate::core::backup::recipient;
 use crate::core::keep_awake::{self, AwakeHold, Work};
+use crate::core::snapshot::{ArchiveJobGuard, ArchiveJobSlot, Busy};
 use crate::scheduler::notifications::SettingsPage;
+use tokio_util::sync::CancellationToken;
 
 use super::push;
 
-/// RAII guard for `engine.backup_in_progress`. Acquired atomically so two
-/// concurrent backup attempts can't both pass the check; cleared on drop so
-/// a panic mid-backup doesn't permanently strand the flag. It keeps the
-/// computer awake for as long as it lives.
+/// Holds the shared archive-job slot and keeps the computer awake for backup.
 pub(crate) struct BackupGuard {
-    engine: SharedEngine,
+    _slot: ArchiveJobGuard,
     _awake: AwakeHold,
 }
 
 impl BackupGuard {
     /// Returns `Some` when the caller has exclusive ownership of the backup
-    /// slot, `None` if another backup is already running.
+    /// slot, `None` if another archive job is already running.
     pub(crate) fn try_acquire(engine: &SharedEngine) -> Option<Self> {
         engine
-            .backup_in_progress
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .ok()
-            .map(|_| Self {
-                engine: engine.clone(),
-                _awake: keep_awake::hold(Work::Backup, "backup"),
-            })
+            .archive_job_slot
+            .try_acquire(crate::core::snapshot::ArchiveJobKind::Backup)
+            .map(Self::holding)
+    }
+
+    fn holding(slot: ArchiveJobGuard) -> Self {
+        Self {
+            _slot: slot,
+            _awake: keep_awake::hold(Work::Backup, "backup"),
+        }
     }
 }
 
-impl Drop for BackupGuard {
-    fn drop(&mut self) {
-        self.engine
-            .backup_in_progress
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+/// How long a scheduled backup waits for a snapshot job to free the slot.
+const SNAPSHOT_WAIT: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// Take the archive slot for a scheduled backup. `None` means the schedule
+/// was cancelled first: the wait can outlast the schedule that fired it.
+async fn slot_for_schedule(
+    slot: &ArchiveJobSlot,
+    limit: std::time::Duration,
+    cancel: &CancellationToken,
+) -> Option<Result<ArchiveJobGuard, Busy>> {
+    tokio::select! {
+        acquired = slot.acquire_for_backup(limit) => (!cancel.is_cancelled()).then_some(acquired),
+        _ = cancel.cancelled() => None,
     }
 }
 
@@ -210,12 +215,32 @@ pub(crate) fn backups_not_set_up_message() -> String {
 }
 
 /// Execute a scheduled backup. Called by the cron job.
-pub(super) async fn run_scheduled_backup(engine: SharedEngine, provider_id: String) {
+pub(super) async fn run_scheduled_backup(
+    engine: SharedEngine,
+    provider_id: String,
+    cancel: &CancellationToken,
+) {
     use crate::core::backup;
 
-    let Some(guard) = BackupGuard::try_acquire(&engine) else {
-        log!("[Backup] Skipping scheduled backup — another backup is already running");
+    let Some(acquired) = slot_for_schedule(&engine.archive_job_slot, SNAPSHOT_WAIT, cancel).await
+    else {
         return;
+    };
+    if engine.is_shutting_down() {
+        return;
+    }
+    let guard = match acquired {
+        Ok(slot) => BackupGuard::holding(slot),
+        Err(Busy::Backup) => {
+            log!("[Backup] Skipping scheduled backup: another backup is already running");
+            return;
+        }
+        Err(Busy::Snapshot) => {
+            let msg = "A workspace snapshot job held the archive slot for six hours, so the scheduled backup did not run.";
+            log!("[Backup] {}", msg);
+            notify_backup_failure(&engine, &provider_id, msg).await;
+            return;
+        }
     };
 
     log!(
@@ -499,14 +524,131 @@ pub(crate) async fn notify_backup_failure(engine: &SharedEngine, provider_id: &s
     .await;
 }
 
+/// What the startup backup catch-up measures from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct BackupCatchUpFloor {
+    /// When the newest completed backup started. A failed run does not count.
+    pub(super) last_completed_start: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the schedule preference was last written, on the database clock.
+    pub(super) schedule_written: Option<chrono::DateTime<chrono::Utc>>,
+    /// When a snapshot restore last rewound the backup history.
+    pub(super) restored_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl BackupCatchUpFloor {
+    /// The latest known instant. A slot before it is never owed.
+    pub(super) fn floor(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.last_completed_start
+            .max(self.schedule_written)
+            .max(self.restored_at)
+    }
+}
+
+/// A run with no recorded start counts from its finish, which is later and so
+/// never owes a backup the start would not.
+pub(super) async fn load_backup_catch_up_floor(
+    pool: &sqlx::PgPool,
+) -> Result<BackupCatchUpFloor, Box<dyn std::error::Error + Send + Sync>> {
+    let last_completed_start = crate::core::backup::load_last_successful_backup_run(pool)
+        .await?
+        .map(|run| run.started_at.unwrap_or(run.finished_at));
+    let schedule_written = crate::core::prefs::BACKUP_SCHEDULE
+        .try_stored_written_at(pool)
+        .await?;
+    let restored_at = crate::core::snapshot::boundary::read(pool)
+        .await?
+        .map(|boundary| boundary.restored_at);
+    Ok(BackupCatchUpFloor {
+        last_completed_start,
+        schedule_written,
+        restored_at,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         backup_failure_body, backup_failure_page, backups_not_set_up_message,
-        describe_backup_failure, spoken_duration, switch_pending_message, time_asleep,
-        verify_due_message, verify_is_due, BACKUP_FAILURE_TITLE,
+        describe_backup_failure, load_backup_catch_up_floor, spoken_duration,
+        switch_pending_message, time_asleep, verify_due_message, verify_is_due,
+        BACKUP_FAILURE_TITLE,
     };
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn the_catch_up_floor_reads_the_last_completed_start_and_the_schedule_write() {
+        use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+
+        let empty = load_backup_catch_up_floor(&pool).await.unwrap();
+        assert_eq!(empty.last_completed_start, None);
+        assert_eq!(empty.schedule_written, None);
+        assert_eq!(empty.restored_at, None);
+
+        let completed = at("2026-11-01T02:00:01Z");
+        bus.emit(BusEvent::System(SystemEvent::BackupCompleted {
+            filename: "a.tar.gz".into(),
+            size_bytes: 1,
+            started_at: completed,
+            finished_at: completed + chrono::Duration::minutes(3),
+        }))
+        .await
+        .unwrap();
+        // A later failure is no backup.
+        bus.emit(BusEvent::System(SystemEvent::BackupFailed {
+            error: "offline".into(),
+            started_at: at("2026-11-02T02:00:01Z"),
+            finished_at: at("2026-11-02T02:00:09Z"),
+        }))
+        .await
+        .unwrap();
+        crate::core::PreferenceStore::set(
+            &pool,
+            &bus,
+            crate::core::prefs::BACKUP_SCHEDULE.key(),
+            "0 0 3 * * *",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let floor = load_backup_catch_up_floor(&pool).await.unwrap();
+        assert_eq!(floor.last_completed_start, Some(completed));
+        let written = floor.schedule_written.expect("the write is recorded");
+        assert!(written > chrono::Utc::now() - chrono::Duration::minutes(5));
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// A schedule turned off mid-wait must not run its backup later.
+    #[tokio::test]
+    async fn a_cancelled_schedule_stops_waiting_for_the_slot() {
+        use crate::core::snapshot::{ArchiveJobKind, ArchiveJobSlot};
+        let slot = ArchiveJobSlot::default();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let capture = slot.try_acquire(ArchiveJobKind::SnapshotCapture).unwrap();
+        let waiting = tokio::spawn({
+            let (slot, cancel) = (slot.clone(), cancel.clone());
+            async move {
+                super::slot_for_schedule(&slot, Duration::from_secs(60), &cancel)
+                    .await
+                    .is_none()
+            }
+        });
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        assert!(waiting.await.unwrap(), "a cancelled wait takes no slot");
+        drop(capture);
+        assert!(!slot.is_busy());
+    }
 
     /// The reported run: 24m49s on the wall clock, of which the process ran for
     /// under 12 minutes.
@@ -567,7 +709,7 @@ mod tests {
                 assert_eq!(to.target, NavigateTarget::Settings);
                 to.settings_view
             }
-            Tap::Modal => None,
+            Tap::Modal | Tap::RestoreSnapshot { .. } => None,
         }
     }
 

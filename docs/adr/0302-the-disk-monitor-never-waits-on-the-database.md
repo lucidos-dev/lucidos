@@ -48,7 +48,7 @@ every pressure decision, after the queries that decision depends on.
   monitor keeps deciding and logs each failed attempt with its fresh reading.
   The alert goes out on the first tick after the database answers, if disk is
   still low then.
-- **A 60 s tick needs a re-arm band.** Re-arming exactly at 20 GB would ping
+- **A 60 s tick needs a re-arm band.** Re-arming exactly at the soft threshold would ping
   the user each time free space jitters across the line. The alert re-arms at
   soft + 2 GB, which keeps "one alert per crossing, re-arm on recovery".
 

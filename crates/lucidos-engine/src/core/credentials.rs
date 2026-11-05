@@ -1177,10 +1177,19 @@ const MENTION_SCAN_MAX_SIBLINGS: usize = 32;
 /// digits and `_`, as a custom alias may be. A name built at run time is
 /// declared with a header comment, `# lucidos-credentials: CRED_A CRED_B`,
 /// which is just another mention.
+///
+/// Any mention injects, but only a *lookup* can be reported unknown: a name
+/// on a header line, after a lookup such as `$` or `process.env.`, or alone
+/// in a string literal. A name in prose is not a request, so it gets no note.
 #[derive(Debug, Default, Clone)]
 pub struct SecretMentions {
     words: BTreeSet<String>,
+    looked_up: BTreeSet<String>,
+    searched_prefixes: BTreeSet<&'static str>,
 }
+
+/// What starts a header comment's list of declared names.
+const CREDENTIALS_HEADER: &str = "lucidos-credentials:";
 
 impl SecretMentions {
     /// The mentions in one piece of text.
@@ -1232,9 +1241,25 @@ impl SecretMentions {
     }
 
     fn add_text(&mut self, text: &str) {
-        let words = text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
-        for word in words.filter(|word| is_env_shaped(word)) {
-            self.words.insert(word.to_string());
+        for line in text.lines() {
+            let declared_from = declaration_start(line);
+            let comment = comment_body(line).is_some();
+            for (start, word) in words_with_offsets(line) {
+                if !is_env_shaped(word) {
+                    continue;
+                }
+                self.words.insert(word.to_string());
+                let (before, after) = (&line[..start], &line[start + word.len()..]);
+                if let Some(prefix) = SECRET_VAR_PREFIXES.iter().find(|prefix| **prefix == word) {
+                    if !comment && is_name_search(after) {
+                        self.searched_prefixes.insert(prefix);
+                    }
+                } else if declared_from.is_some_and(|from| start >= from)
+                    || reads_literally(before, after)
+                {
+                    self.looked_up.insert(word.to_string());
+                }
+            }
         }
     }
 
@@ -1268,21 +1293,96 @@ impl SecretMentions {
         self.asks_for_names() || self.secret_names().any(|name| name.starts_with("OAUTH_"))
     }
 
-    /// Whether the text holds a bare prefix, as `env | grep CRED_` does. It
-    /// names nothing, so it is a search for the names.
+    /// Whether the text searches with a bare prefix, as `env | grep CRED_`
+    /// does. It names nothing, so it asks for the names.
     fn asks_for_names(&self) -> bool {
-        SECRET_VAR_PREFIXES
-            .iter()
-            .any(|prefix| self.words.contains(*prefix))
+        !self.searched_prefixes.is_empty()
     }
 
     /// Every `CRED_*` / `OAUTH_*` name the text mentions.
     fn secret_names(&self) -> impl Iterator<Item = &str> {
-        self.words.iter().map(String::as_str).filter(|word| {
-            SECRET_VAR_PREFIXES
-                .iter()
-                .any(|prefix| word.len() > prefix.len() && word.starts_with(prefix))
-        })
+        secret_names_in(&self.words)
+    }
+
+    /// Every `CRED_*` / `OAUTH_*` name the text looks up.
+    fn looked_up_secret_names(&self) -> impl Iterator<Item = &str> {
+        secret_names_in(&self.looked_up)
+    }
+}
+
+fn secret_names_in(words: &BTreeSet<String>) -> impl Iterator<Item = &str> {
+    words.iter().map(String::as_str).filter(|word| {
+        SECRET_VAR_PREFIXES
+            .iter()
+            .any(|prefix| word.len() > prefix.len() && word.starts_with(prefix))
+    })
+}
+
+/// Each maximal run of `[A-Za-z0-9_]` in `line`, with its byte offset.
+fn words_with_offsets(line: &str) -> Vec<(usize, &str)> {
+    let mut words = Vec::new();
+    let mut start = None;
+    for (i, c) in line.char_indices().chain([(line.len(), ' ')]) {
+        match (c.is_ascii_alphanumeric() || c == '_', start) {
+            (true, None) => start = Some(i),
+            (false, Some(from)) => {
+                words.push((from, &line[from..i]));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    words
+}
+
+/// The text after a line's `#` or `//` comment marker.
+fn comment_body(line: &str) -> Option<&str> {
+    let line = line.trim_start();
+    line.strip_prefix('#').or_else(|| line.strip_prefix("//"))
+}
+
+/// Where a header comment's names begin. Only a comment that starts with
+/// the header is a header, so a header quoted inside prose is not.
+fn declaration_start(line: &str) -> Option<usize> {
+    let names = comment_body(line)?
+        .trim_start()
+        .strip_prefix(CREDENTIALS_HEADER)?;
+    Some(line.len() - names.len())
+}
+
+/// What reads the variable named right after it: shell `$X`, `${X}` and
+/// `${!X}`, PowerShell `$env:X`, and `process.env.X`.
+const LOOKUP_SIGILS: [&str; 5] = ["$", "${", "${!", "$env:", "env."];
+
+/// Whether the word between `before` and `after` is read as a variable:
+/// after a [`LOOKUP_SIGILS`] entry or `printenv`, or as a whole string
+/// literal, `"CRED_X"`.
+fn reads_literally(before: &str, after: &str) -> bool {
+    if LOOKUP_SIGILS.iter().any(|sigil| before.ends_with(sigil)) {
+        return true;
+    }
+    let command = before.trim_end();
+    if command.len() < before.len()
+        && command
+            .strip_suffix("printenv")
+            .is_some_and(|rest| !rest.ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))
+    {
+        return true;
+    }
+    ['"', '\'']
+        .into_iter()
+        .any(|quote| before.ends_with(quote) && after.starts_with(quote))
+}
+
+/// Whether a bare prefix followed by `after` searches for the names. A
+/// placeholder (`CRED_<NAME>`), an f-string (`f"OAUTH_{p}"`), an expansion
+/// (`"CRED_$X"`) and a concatenation (`"OAUTH_" + p`) build a name instead.
+fn is_name_search(after: &str) -> bool {
+    let mut chars = after.chars();
+    match chars.next() {
+        Some('<' | '{' | '$' | '+' | '%' | '[' | '(' | '`') => false,
+        Some('"' | '\'') => !chars.as_str().trim_start().starts_with(['+', '.', '%']),
+        _ => true,
     }
 }
 
@@ -1449,9 +1549,9 @@ pub async fn named_credential_env_vars<R: SecretResolver + ?Sized>(
     named
 }
 
-/// The note a tool result carries when its text names a `CRED_*` / `OAUTH_*`
-/// variable the workspace does not have, or holds a bare prefix. `None` when
-/// every name resolved.
+/// The note for a text that looks up a `CRED_*` / `OAUTH_*` variable the
+/// workspace does not have, or searches with a bare prefix. `None` when every
+/// name resolved.
 ///
 /// It lists names only, never values, nearest to the first unknown name first.
 /// A mention that prefixes a known name, like `CRED_MAIL` for
@@ -1462,7 +1562,7 @@ pub fn secret_names_note(
 ) -> Option<String> {
     const LISTED: usize = 20;
     let unknown: Vec<&str> = mentions
-        .secret_names()
+        .looked_up_secret_names()
         .filter(|name| {
             !known_names.contains(*name)
                 && !known_names
@@ -1470,10 +1570,7 @@ pub fn secret_names_note(
                     .any(|known| known.starts_with(&format!("{name}_")))
         })
         .collect();
-    let bare: Vec<&str> = SECRET_VAR_PREFIXES
-        .into_iter()
-        .filter(|prefix| mentions.names(prefix))
-        .collect();
+    let bare: Vec<&str> = mentions.searched_prefixes.iter().copied().collect();
     let first = *unknown.first().or(bare.first())?;
 
     let mut note = String::new();
@@ -2552,6 +2649,73 @@ mod tests {
             )
             .is_empty(),
             "a bare prefix sets nothing"
+        );
+    }
+
+    /// A prefix that builds a name, in a placeholder, an f-string or a
+    /// concatenation, is not a search. Nor is one in a comment.
+    #[test]
+    fn a_prefix_that_builds_a_name_gets_no_note() {
+        let known: BTreeSet<String> = ["CRED_GITHUB".to_string()].into();
+        for text in [
+            "LOGIN with `CRED_<NAME>_PASSWORD` from the store.",
+            "Reads `OAUTH_<PROVIDER>_ACCESS_TOKEN`.",
+            r#"token = os.environ[f"OAUTH_{env_key(provider)}_ACCESS_TOKEN"]"#,
+            r#"name = "OAUTH_" + re.sub(r"\W", "_", provider).upper()"#,
+            r#"echo "CRED_${NAME}""#,
+            "# env | grep CRED_ lists them in a terminal.",
+        ] {
+            let mentions = SecretMentions::scan(text);
+            assert_eq!(secret_names_note(&mentions, &known), None, "{text}");
+        }
+        for text in ["grep 'CRED_' notes.txt", r#"env | grep "OAUTH_""#] {
+            assert!(
+                secret_names_note(&SecretMentions::scan(text), &known).is_some(),
+                "a quoted search is still a search: {text}"
+            );
+        }
+    }
+
+    /// Only a lookup is reported unknown: a header line, a shell, PowerShell
+    /// or Node read, or a whole string literal. A name in prose, or a header
+    /// quoted inside a comment,
+    /// injects when it exists and is otherwise silent.
+    #[test]
+    fn only_a_looked_up_name_is_reported_unknown() {
+        let known: BTreeSet<String> = ["OAUTH_MICROSOFT_ACCESS_TOKEN".to_string()].into();
+        let script = "# lucidos-credentials: OAUTH_MICROSOFT_ACCESS_TOKEN\n\
+                      # Declare names built at run time as \
+                      `# lucidos-credentials: CRED_A CRED_B`, which is what gets them injected here.\n\
+                      token = os.environ[f\"OAUTH_{p}_ACCESS_TOKEN\"]\n";
+        let mentions = SecretMentions::scan(script);
+        assert!(mentions.names("OAUTH_MICROSOFT_ACCESS_TOKEN"));
+        assert!(mentions.wants_oauth());
+        assert_eq!(secret_names_note(&mentions, &known), None);
+
+        for text in [
+            "# lucidos-credentials: CRED_TYPO",
+            "  #lucidos-credentials: CRED_TYPO",
+            "// lucidos-credentials: CRED_TYPO",
+            "echo $CRED_TYPO",
+            "echo ${CRED_TYPO:-}",
+            "echo ${!CRED_TYPO}",
+            "printenv CRED_TYPO",
+            "Write-Output $env:CRED_TYPO",
+            r#"node -e "console.log(process.env.CRED_TYPO)""#,
+            r#"os.environ["CRED_TYPO"]"#,
+            "os.getenv('CRED_TYPO')",
+        ] {
+            let note = secret_names_note(&SecretMentions::scan(text), &known)
+                .unwrap_or_else(|| panic!("a looked-up typo gets a note: {text}"));
+            assert!(note.contains("CRED_TYPO is not a credential"), "{note}");
+        }
+        assert!(
+            named_vars(
+                vec![make_cred("github", AuthType::Bearer, "gh-value")],
+                "# Reads CRED_GITHUB, see the README."
+            )
+            .contains_key("CRED_GITHUB"),
+            "a mention in prose still injects"
         );
     }
 

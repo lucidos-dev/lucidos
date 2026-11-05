@@ -42,6 +42,7 @@ import { scaleModalOpen } from './components/shared/scaleModalState';
 import { DrawerChunk, drawerOpen } from './components/layout/drawerState';
 import { releaseNoticeModalOpen } from './store/releaseNotices';
 import { memoryChoiceOpen } from './store/memoryChoice';
+import { engineBuildLogOpen } from './store/engineBuildLog';
 import { viewportIsMobile } from './utils/viewport';
 import { CameraCaptureSlot } from './components/chat/PromptInput';
 import { DashboardRail } from './components/dashboard/DashboardRail';
@@ -52,6 +53,7 @@ export { startShell } from './shellStartup';
 const FileSearchModal = lazyComponent(() => import('./components/files/FileSearchModal').then(m => m.FileSearchModal));
 const ImagePopup = lazyComponent(() => import('./components/shared/ImagePopup').then(m => m.ImagePopup));
 const MessageRoutePanel = lazyComponent(() => import('./components/chat/MessageRoutePanel').then(m => m.MessageRoutePanel));
+const EngineBuildLogModal = lazyComponent(() => import('./components/layout/EngineBuildLogModal').then(m => m.EngineBuildLogModal));
 const StepDetailModal = lazyComponent(() => import('./components/chat/StepDetailModal').then(m => m.StepDetailModal));
 const CheckpointDiffModal = lazyComponent(() => import('./components/chat/CheckpointDiffModal').then(m => m.CheckpointDiffModal));
 const ContextViewerModal = lazyComponent(() => import('./components/chat/ContextViewerModal').then(m => m.ContextViewerModal));
@@ -69,6 +71,7 @@ registerAskDialogChunk(ConfirmAndPromptDialogs);
 // a flip re-renders the slot, not all of App and its descendants.
 function ImagePopupSlot()        { return popupImage.value           ? <ImagePopup />        : null; }
 function MessageRoutePanelSlot() { return messageRoutePanel.value    ? <MessageRoutePanel /> : null; }
+function EngineBuildLogSlot()    { return engineBuildLogOpen.value ? <EngineBuildLogModal /> : null; }
 function StepDetailModalSlot()   { return stepDetailModal.value      ? <StepDetailModal />   : null; }
 function CheckpointDiffSlot()    { return checkpointDiffModal.value  ? <CheckpointDiffModal /> : null; }
 function ContextViewerSlot()     { return contextViewer.value        ? <ContextViewerModal /> : null; }
@@ -176,6 +179,7 @@ export function App() {
         <ConfirmAndPromptSlot />
         <ProgressDialog />
         <StepDetailModalSlot />
+        <EngineBuildLogSlot />
         <CheckpointDiffSlot />
         <ContextViewerSlot />
         <EventConditionSlot />

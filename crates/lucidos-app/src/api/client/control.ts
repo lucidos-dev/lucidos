@@ -19,7 +19,7 @@ import type { AppUpdateProgress } from '../../utils/tauri';
 
 const CONTROL = '/~/api/v1/control';
 
-export type WorkspaceHealth = 'booting' | 'healthy' | 'unhealthy';
+export type WorkspaceHealth = 'booting' | 'healthy' | 'unhealthy' | 'restoring';
 
 export interface WorkspaceStatus {
   id: string;
@@ -140,14 +140,104 @@ export async function setAutostart(id: string, enabled: boolean): Promise<void> 
   });
 }
 
-/** Delete-to-trash. `confirm` must equal the workspace's current display name
- *  (the server re-checks the type-the-name confirmation). */
-export async function deleteWorkspace(id: string, confirm: string): Promise<void> {
-  await controlJson<void>(`/workspaces/${encodeURIComponent(id)}`, {
-    method: 'DELETE',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ confirm }),
+export type WorkspaceOrigin = 'user' | 'demo' | 'eval' | 'e2e' | 'unknown';
+
+export interface CleanupWorkspace {
+  id: string;
+  name: string;
+  dir: string;
+  port: number;
+  autostart: boolean;
+  origin: WorkspaceOrigin;
+  ephemeral: boolean;
+  expires_at: string | null;
+  last_opened_at: string | null;
+}
+
+export interface CleanupRow {
+  id: string;
+  workspace: CleanupWorkspace | null;
+  directory: string;
+  state: string;
+  folder_bytes: number | null;
+  folder_modified: string | null;
+  warning: string | null;
+  database: { name: string; bytes: number; last_event: string | null; warning: string | null } | null;
+  running: boolean | null;
+  fingerprint: string | null;
+}
+
+export interface CleanupReview {
+  scanned_at: string | null;
+  refreshing: boolean;
+  rows: CleanupRow[];
+  searched_parents: string[];
+  registered_databases: string[] | null;
+  warnings: string[];
+}
+
+export interface CleanupSelection { id: string; fingerprint: string }
+export interface CleanupResult { id: string; status: string; detail: string | null }
+export interface CleanupMember extends CleanupSelection {
+  retained_branches: string[];
+  workspace?: CleanupWorkspace;
+  directory?: string;
+  database?: string;
+}
+export interface CleanupBatch {
+  id: string;
+  phrase: string;
+  members: CleanupMember[];
+  results: CleanupResult[];
+}
+export interface TrashEntry {
+  id: string;
+  name: string;
+  status: string;
+  restore_available: boolean;
+  bytes: number | null;
+  warning: string | null;
+}
+export interface EmptyTrashBatch {
+  id: string;
+  phrase: string;
+  members: { id: string; bytes: number }[];
+  results: CleanupResult[];
+}
+
+function cleanupPost<T>(path: string, body?: unknown): Promise<T> {
+  return controlJson<T>(path, {
+    method: 'POST',
+    headers: { ...deviceIdHeader(), 'Content-Type': 'application/json' },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
+}
+
+export function getCleanupReview(): Promise<CleanupReview> {
+  return controlJson<CleanupReview>('/cleanup');
+}
+export function freezeCleanup(members: CleanupSelection[]): Promise<CleanupBatch> {
+  return cleanupPost<CleanupBatch>('/cleanup/batches', { members });
+}
+export function confirmCleanup(id: string, confirm: string): Promise<CleanupBatch> {
+  return cleanupPost<CleanupBatch>(`/cleanup/batches/${encodeURIComponent(id)}/confirm`, { confirm });
+}
+export function listTrash(): Promise<TrashEntry[]> {
+  return controlJson<TrashEntry[]>('/trash');
+}
+export function restoreTrash(id: string): Promise<void> {
+  return cleanupPost<void>(`/trash/${encodeURIComponent(id)}/restore`);
+}
+/** Retains the occupied unmarked staging database and rotates its journal
+ *  identity. The gateway refuses target/owned-marker collisions. */
+export function abandonTrashStaging(id: string): Promise<void> {
+  return cleanupPost<void>(`/trash/${encodeURIComponent(id)}/abandon-staging`);
+}
+export function freezeEmptyTrash(): Promise<EmptyTrashBatch> {
+  return cleanupPost<EmptyTrashBatch>('/trash/empty-batches');
+}
+export function confirmEmptyTrash(id: string, confirm: string): Promise<EmptyTrashBatch> {
+  return cleanupPost<EmptyTrashBatch>(`/trash/empty-batches/${encodeURIComponent(id)}/confirm`, { confirm });
 }
 
 /** Navigate the browser to a workspace (`/<slug>/`, ADR 0014), optionally
@@ -507,6 +597,9 @@ export interface ExternalAddressInfo {
   env_var: string;
   suggestions: ExternalAddressSuggestion[];
   probe: ExternalAddressProbe | null;
+  /** The loopback port a tunnel or reverse proxy here should point at, where
+   *  every request counts as public. `null` when the listener is switched off. */
+  public_port: number | null;
 }
 
 export async function getExternalAddress(): Promise<ExternalAddressInfo> {
@@ -653,9 +746,9 @@ export async function revokePairedDevice(id: string): Promise<void> {
 }
 
 // Gateway pairing (ADR 0590). This gateway, as B, grants another gateway
-// access with a gateway pairing code. As A, it adds remote gateways.
+// access with a gateway pairing secret. As A, it adds remote gateways.
 
-/** A gateway pairing code. It never pairs a device. */
+/** A gateway pairing secret, sent as `code`. It never pairs a device. */
 export interface GatewayPairingCode {
   code: string;
   expires_in_secs: number;
@@ -666,15 +759,19 @@ export interface PairedGateway {
   id: string;
   label: string;
   paired_at: string;
+  last_used_at?: string | null;
 }
 
 /** A remote gateway this one has paired with. Never carries the credential. */
 export interface RemoteGateway {
+  header_names: string[];
   name: string;
   address: string;
   pairing_id: string;
   gateway_protocol: number;
   added_at: string;
+  last_rotated_at?: string | null;
+  rotation_error?: string | null;
 }
 
 /** What Remove reports: whether the remote gateway forgot the pairing too. */
@@ -704,6 +801,7 @@ export function listRemoteGateways(): Promise<RemoteGateway[]> {
 /** Pair with a remote gateway. The gateway checks it over https first, and
  *  its refusal sentence names what to fix. */
 export function addRemoteGateway(request: {
+  headers?: Record<string, string>;
   address: string;
   code: string;
   name: string;
@@ -715,15 +813,29 @@ export function addRemoteGateway(request: {
   });
 }
 
+/** Rotate this pairing's credential, recovering a pending attempt if needed. */
+export function rotateRemoteGateway(name: string): Promise<void> {
+  return gatewayJson<void>(`${REMOTE_GATEWAYS}/${encodeURIComponent(name)}/rotate`, { method: 'POST' });
+}
+
+/** Replace all proxy headers without re-pairing. An empty object clears them. */
+export function updateRemoteGatewayHeaders(name: string, headers: Record<string, string>): Promise<RemoteGateway> {
+  return gatewayJson<RemoteGateway>(`${REMOTE_GATEWAYS}/${encodeURIComponent(name)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ headers }),
+  });
+}
+
 /** One of a remote gateway's workspaces. Mirrors `gateway_protocol::ListedWorkspace`,
  *  which carries the fields `workspaceState` reads and no port. */
 export type ListedWorkspace = Pick<WorkspaceStatus, 'id' | 'name' | 'health' | 'last_error'>;
 
 /** One remote gateway's workspaces, or why this gateway could not list them.
  *  Mirrors `remote_workspaces::RemoteGatewayListing`. */
-export type RemoteGatewayListing = { gateway: string } & (
+export type RemoteGatewayListing = { gateway: string; host?: string; pairing_id?: string; last_seen_at?: string | null } & (
   | { state: 'reachable'; workspaces: ListedWorkspace[] }
-  | { state: 'unreachable'; reason: string }
+  | { state: 'unreachable'; reason: string; reason_kind?: 'timeout' | 'refused' | 'tls' | 'revoked' | 'incompatible' }
 );
 
 /** Every remote gateway's workspaces, asked of each one at once. */

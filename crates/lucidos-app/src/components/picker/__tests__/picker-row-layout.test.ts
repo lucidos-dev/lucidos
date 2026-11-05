@@ -51,7 +51,7 @@ describe('the note is announced, exactly once', () => {
     // An `aria-label` on the row replaces everything inside it, note included.
     // Composed once into `rowLabel`, because there are now two sentences to
     // fold in and an inline ternary could carry only the fault.
-    expect(source).toMatch(/const rowLabel = \[\s*fault \? `Retry \$\{w\.name\} · \$\{fault\}`/);
+    expect(source).toMatch(/const rowLabel = \[\s*w\.health === 'restoring' \? `Restoring \$\{w\.name\}` : fault \? `Retry \$\{w\.name\} · \$\{fault\}`/);
     expect(source).toContain('aria-label={rowLabel}');
   });
 

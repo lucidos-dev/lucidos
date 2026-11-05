@@ -16,8 +16,9 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub(crate) const FIRE_RETRY_WINDOW_SECS: i64 = 24 * 60 * 60;
-/// Find graceful-stop cuts even after several days offline, without reviving history.
-const CUT_FIRE_LOOKBACK_SECS: i64 = 7 * 24 * 60 * 60;
+/// Find graceful-stop cuts and skipped slots even after several days offline,
+/// without reviving history.
+pub(super) const BOOT_REPORT_LOOKBACK_SECS: i64 = 7 * 24 * 60 * 60;
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
 const CUT_TRIGGER_FIRES_SQL: &str = concat!(
@@ -34,8 +35,12 @@ const CUT_TRIGGER_FIRES_SQL: &str = concat!(
          WHERE aggregate_id = ts.thread_id::text AND sequence > fire.sequence \
            AND event_type IN (",
     crate::engine::turn_terminal_events!(),
-    ") ORDER BY sequence DESC LIMIT 1) terminal \
+    concat!(
+        ") ORDER BY sequence DESC LIMIT 1) terminal \
      WHERE ts.source = 'trigger' AND ts.parent_thread_id IS NULL \
+       AND fire.sequence > ",
+        crate::core::snapshot::boundary::restore_floor_sql!(),
+        " \
        AND terminal.created > now() - make_interval(secs => $1) \
        AND NOT EXISTS(SELECT 1 FROM events WHERE aggregate_id = ts.thread_id::text \
            AND sequence > fire.sequence AND ({human_message})) \
@@ -43,6 +48,7 @@ const CUT_TRIGGER_FIRES_SQL: &str = concat!(
            AND event_type = 'TriggerRunInterrupted' AND sequence > terminal.sequence) \
        AND NOT {parked} \
      ORDER BY fire.sequence"
+    )
 );
 
 #[derive(sqlx::FromRow)]
@@ -75,7 +81,7 @@ async fn find_cut_fires(pool: &PgPool) -> Result<Vec<CutFire>, Error> {
             &crate::engine::agent_recovery::unanswered_question_exists_sql("ts.thread_id::text"),
         );
     let rows = sqlx::query_as::<_, Candidate>(&sql)
-        .bind(CUT_FIRE_LOOKBACK_SECS as f64)
+        .bind(BOOT_REPORT_LOOKBACK_SECS as f64)
         .bind(ActorMode::Human.as_str())
         .fetch_all(pool)
         .await?;

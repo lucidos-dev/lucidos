@@ -188,5 +188,23 @@ expect_flagged "$(scan_engine_build_only "$bare")" \
     "a bare check_prereqs is caught"
 
 echo ""
+# A failed compile or publish must leave the serving engine alive.
+for launch_script in "$WEB_DEV" "$SCRIPT_DIR/../tauri-dev.sh"; do
+    launch_build="$(line_of "$launch_script" '^build_or_find_engine$')"
+    launch_outputs="$(line_of "$launch_script" '^generate_build_outputs$')"
+    launch_stop="$(line_of "$launch_script" '^kill_stale_processes$')"
+    if [ "$launch_build" -lt "$launch_stop" ] && [ "$launch_outputs" -lt "$launch_stop" ]; then
+        pass "$(basename "$launch_script") builds before stopping the engine"
+    else
+        fail "$(basename "$launch_script") stops the engine before a build failure can be reported"
+    fi
+done
+# shellcheck disable=SC2016 # matches literal $SCRIPT_DIR in the launcher source
+if [ -n "$(line_of "$SCRIPT_DIR/../run.sh" '^exec "\$SCRIPT_DIR/web-dev.sh"')" ]; then
+    pass "run.sh delegates to the checked web launch sequence"
+else
+    fail "run.sh no longer uses the checked web launch sequence"
+fi
+
 echo "engine_build_only_test.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

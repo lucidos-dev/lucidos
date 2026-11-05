@@ -3,7 +3,7 @@
 //! The harness gives the e2e engine a gateway identity only when a live gateway
 //! lists this workspace at the engine's port. Otherwise the engine has none
 //! (ADR 0385, `scripts/lib/e2e_gateway.sh`). A local run usually finds the dev
-//! gateway; a GitHub API shard has none. So the expected label is read from the identity
+//! gateway, and a GitHub shard starts its own. So the expected label is read from the identity
 //! the engine actually holds, never assumed.
 //!
 //! The engine stamps that identity into the shell it serves, as the

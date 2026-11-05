@@ -17,6 +17,9 @@ mod ws_echo_test;
 #[path = "api_support/voice_ticket_test.rs"]
 mod voice_ticket_test;
 
+#[path = "api_support/engine_build_log_test.rs"]
+mod engine_build_log_test;
+
 #[path = "api_support/changelog_test.rs"]
 mod changelog_test;
 
@@ -319,3 +322,6 @@ mod successor_test;
 
 #[path = "api_support/intelligence_ladder_test.rs"]
 mod intelligence_ladder_test;
+
+#[path = "api_support/workspace_snapshots_test.rs"]
+mod workspace_snapshots_test;

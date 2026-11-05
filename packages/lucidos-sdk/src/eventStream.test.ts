@@ -47,7 +47,7 @@ describe('postPong', () => {
   });
 
   it('POSTs the notification id merged into the answer', () => {
-    postPong('http://test/api/v1/presence-pong', 'n-1', ANSWER);
+    postPong('http://test/api/v1/presence-pong', 'n-1', ANSWER, null);
 
     expect(fetchMock).toHaveBeenCalledOnce();
     const [url, init] = fetchMock.mock.calls[0];
@@ -63,7 +63,7 @@ describe('postPong', () => {
   it('sets keepalive, so a pong survives the document going away', () => {
     // A notification can fire as the tab is closing. Without this the pong is
     // dropped mid-flight and the engine waits out its deadline for nothing.
-    postPong('http://test/api/v1/presence-pong', 'n-1', ANSWER);
+    postPong('http://test/api/v1/presence-pong', 'n-1', ANSWER, null);
     expect(fetchMock.mock.calls[0][1].keepalive).toBe(true);
   });
 
@@ -74,7 +74,7 @@ describe('postPong', () => {
     fetchMock.mockRejectedValue(new Error('network down'));
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-    expect(() => postPong('http://test/api/v1/presence-pong', 'n-1', ANSWER)).not.toThrow();
+    expect(() => postPong('http://test/api/v1/presence-pong', 'n-1', ANSWER, null)).not.toThrow();
     await new Promise((r) => setTimeout(r, 0));
 
     expect(warn).toHaveBeenCalled();
@@ -126,6 +126,48 @@ describe('openEventStream', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it('requires a hello and never borrows a restored generation for direct pongs', () => {
+    vi.stubGlobal('SharedWorker', undefined);
+    const fetchMock = vi.fn().mockResolvedValue({});
+    vi.stubGlobal('fetch', fetchMock);
+    const stream = openEventStream(TARGETS, NO_OP_HANDLERS, { pongs: true });
+    stream.submitPong('early', ANSWER);
+    expect(fetchMock).not.toHaveBeenCalled();
+    const hello = (generation: string | null) => FakeEventSource.last!.onmessage!({
+      data: JSON.stringify({ type: 'StreamHello', data: { restore_generation: generation } }),
+    } as MessageEvent);
+    hello('original');
+    stream.submitPong('current', ANSWER);
+    expect(new Headers(fetchMock.mock.calls[0][1].headers)
+      .get('x-lucidos-restore-generation')).toBe('original');
+    hello('restored');
+    stream.submitPong('delayed', ANSWER);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    stream.close();
+  });
+
+  it('keeps a shared document origin after a restored hello', () => {
+    const port = fakePort();
+    vi.stubGlobal('SharedWorker', class { port = port; });
+    const stream = openEventStream(TARGETS, NO_OP_HANDLERS, { pongs: true });
+    const hello = (generation: string | null) =>
+      (port.onmessage as (event: { data: unknown }) => void)({
+        data: { t: 'frame', data: JSON.stringify({ type: 'StreamHello', data: { restore_generation: generation } }) },
+      });
+    stream.submitPong('early', ANSWER);
+    expect(port.postMessage.mock.calls.some(([msg]) => msg.t === 'pong')).toBe(false);
+    hello(null);
+    stream.submitPong('current', ANSWER);
+    expect(port.postMessage).toHaveBeenLastCalledWith({
+      t: 'pong', notificationId: 'current', answer: ANSWER, sourceGeneration: null,
+    });
+    hello('restored');
+    const count = port.postMessage.mock.calls.length;
+    stream.submitPong('delayed', ANSWER);
+    expect(port.postMessage).toHaveBeenCalledTimes(count);
+    stream.close();
   });
 
   it('uses the shared worker when the browser has one', () => {
@@ -280,6 +322,9 @@ describe('openEventStream', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const stream = openEventStream(TARGETS, NO_OP_HANDLERS, { pongs: true });
+    (port.onmessage as (event: { data: unknown }) => void)({
+      data: { t: 'frame', data: JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } }) },
+    });
     stream.submitPong('n-1', ANSWER);
 
     expect(fetchMock).not.toHaveBeenCalled();
@@ -287,6 +332,7 @@ describe('openEventStream', () => {
       t: 'pong',
       notificationId: 'n-1',
       answer: ANSWER,
+      sourceGeneration: null,
     });
   });
 });
@@ -649,10 +695,11 @@ describe('shared stream recovery', () => {
     expect(ports[0].closed).toBe(true);
     expect(ports[1].sent).toEqual([HELLO]);
 
+    fromWorker(ports[1], { t: 'frame', data: JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } }) });
     stream.submitPong('n-1', ANSWER);
     stream.close();
     expect(ports[1].sent.slice(1)).toEqual([
-      { t: 'pong', notificationId: 'n-1', answer: ANSWER },
+      { t: 'pong', notificationId: 'n-1', answer: ANSWER, sourceGeneration: null },
       { t: 'bye' },
     ]);
   });

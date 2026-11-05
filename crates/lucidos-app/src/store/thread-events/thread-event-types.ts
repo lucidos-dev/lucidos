@@ -94,19 +94,10 @@ export function isSideQuestionEvent(event: { type: string }): event is SideQuest
   return (SIDE_QUESTION_TYPES as readonly string[]).includes(event.type);
 }
 
-/** The events that pin a widget's chip to a thread's widget shelf or unpin it
- *  (ADR 0407). They draw nothing in a turn. The last two are their legacy
- *  names, which the snapshot serves raw from rows written before the rename. */
-export const WIDGET_SHELF_CHANGE_TYPES = ['WidgetPinned', 'WidgetUnpinned', 'WidgetRestored', 'WidgetHidden'] as const;
-
-/** Every widget event: a widget shown in a thread, and its chip pinned or unpinned. */
-export const WIDGET_EVENT_TYPES = ['WidgetShown', ...WIDGET_SHELF_CHANGE_TYPES] as const;
-
-export type WidgetEvent = Extract<ThreadEvent, { type: (typeof WIDGET_EVENT_TYPES)[number] }>;
-
-export function isWidgetEvent(event: { type: string }): event is WidgetEvent {
-  return (WIDGET_EVENT_TYPES as readonly string[]).includes(event.type);
-}
+/** Legacy pin and unpin rows: nothing writes them any more, and they draw
+ *  nothing in a turn. The last two are older names still, which the snapshot
+ *  serves raw from rows written before a rename. */
+export const LEGACY_WIDGET_PIN_TYPES = ['WidgetPinned', 'WidgetUnpinned', 'WidgetRestored', 'WidgetHidden'] as const;
 
 export type ThreadInitiator = 'user' | 'system';
 
@@ -244,6 +235,7 @@ const ABORT_CAUSE_STATE: Record<AbortCause, string> = {
   process_killed: 'Agent stopped unexpectedly',
   stale_settle: 'Nothing was running',
   session_dropped: 'Its caller went away',
+  snapshot_restored: 'The workspace was restored from a snapshot',
   unknown: 'Reason not recorded',
 };
 

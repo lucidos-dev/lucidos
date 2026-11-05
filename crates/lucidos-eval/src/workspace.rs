@@ -1,9 +1,10 @@
 //! Create, seed, digest, boot, stop and tear down one arm's workspace.
 //!
 //! Two guarantees live here and both fail closed. I5: nothing outside a
-//! directory named `eval-…` is ever written to or dropped. I1: the two arms are
-//! proved byte-identical, in the three seeded tables and in the whole data
-//! tree, before the first prompt is sent.
+//! directory named `eval-…` is ever written to. Seeding exclusively creates
+//! resources; a name collision never authorizes resetting existing data. I1:
+//! the two arms are proved byte-identical, in the three seeded tables and in
+//! the whole data tree, before the first prompt is sent.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -17,7 +18,7 @@ use crate::arm::Arm;
 type Fallible<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Every eval workspace directory name starts with this. The harness refuses
-/// anything else, because seeding drops a database and clears a data tree.
+/// anything else. Seeding additionally requires a new directory and database.
 pub const EVAL_WORKSPACE_PREFIX: &str = "eval-";
 
 /// Tables the seed writes and the digest covers. Nothing else is seeded, so
@@ -29,7 +30,7 @@ pub const SEEDED_TABLES: [&str; 3] = ["preferences", "memory_entries", "models"]
 /// Two things are checked. The final path component is the workspace name the
 /// operator chose, and it must carry the prefix. The path itself must not be a
 /// symlink: a name check alone passes `eval-lean-1` pointing at a live
-/// workspace, and clearing the data tree would follow it.
+/// workspace, and fixture writes would follow it.
 pub fn checked_eval_workspace(path: &Path) -> Fallible<PathBuf> {
     let name = path
         .file_name()
@@ -51,10 +52,7 @@ pub fn checked_eval_workspace(path: &Path) -> Fallible<PathBuf> {
     // An absent path is fine: the first seed creates it.
     if let Ok(metadata) = std::fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() {
-            return Err(refusal(
-                path,
-                "it is a symlink, and clearing it would follow",
-            ));
+            return Err(refusal(path, "it is a symlink, and writes would follow"));
         }
         if !metadata.is_dir() {
             return Err(refusal(path, "it exists and is not a directory"));
@@ -63,11 +61,20 @@ pub fn checked_eval_workspace(path: &Path) -> Fallible<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+/// Claim the directory with an exclusive create. Prefixes and old owner files
+/// never authorize replacing pre-existing data, even when a run label repeats.
+pub fn create_seed_workspace(path: &Path) -> Fallible<()> {
+    checked_eval_workspace(path)?;
+    let parent = path.parent().ok_or("workspace has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    std::fs::create_dir(path)
+        .map_err(|error| refusal(path, &format!("exclusive creation failed: {error}")))
+}
+
 fn refusal(path: &Path, why: &str) -> Box<dyn std::error::Error + Send + Sync> {
     format!(
-        "refusing to use {} as an eval workspace: {why}. The harness drops this \
-         workspace's database and clears its data tree, so it only ever runs \
-         against a directory it created.",
+        "refusing to use {} as an eval workspace: {why}. Choose a fresh run label \
+         for a new seed, or resume the recorded run without reseeding.",
         path.display()
     )
     .into()
@@ -426,17 +433,11 @@ pub fn compare_digests(control: &SeedDigest, lean: &SeedDigest) -> Fallible<()> 
     .into())
 }
 
-/// Copy the checked-in fixture tree over a workspace's `data/`, clearing first.
-///
-/// Clearing is what makes a re-seed reproducible: a file the previous run left
-/// behind would otherwise ride into the digest. The workspace must already have
-/// passed [`checked_eval_workspace`].
+/// Install fixtures only into a new data directory. Never clear existing data.
 pub fn install_fixture_tree(workspace: &Path, fixture_root: &Path) -> Fallible<()> {
     checked_eval_workspace(workspace)?;
     let data = workspace.join("data");
-    if data.exists() {
-        std::fs::remove_dir_all(&data)?;
-    }
+    std::fs::create_dir(&data)?;
     copy_tree(fixture_root, &data)
 }
 
@@ -534,30 +535,16 @@ impl EngineTls {
     }
 }
 
-/// Drop and recreate this arm's database, and forget the workspace's migration
-/// marker first. A rerun reuses the workspace directory, and the engine would
-/// refuse the fresh database as wiped (ADR 0481).
-///
-/// Destructive, and gated on the workspace name having passed
-/// [`checked_eval_workspace`] first. The caller owns that order.
-pub fn recreate_database(pg_base: &str, database: &str, workspace: &Path) -> Fallible<()> {
-    lucidos_engine::core::migration_marker::forget(workspace)?;
+/// Create the database exclusively. PostgreSQL refuses a collision atomically;
+/// directory ownership never proves ownership of a same-named database.
+pub fn create_database(pg_base: &str, database: &str) -> Fallible<()> {
     let admin = format!("{}/postgres", pg_base.trim_end_matches('/'));
-    let (drop, create) = recreate_statements(database);
-    psql(&admin, &["-c", &drop, "-c", &create])
+    psql(&admin, &["-c", &create_database_statement(database)])
 }
 
-/// The two statements [`recreate_database`] runs, so a test can read them.
-///
-/// The name carries hyphens, because the gateway derives it from a slug and a
-/// slug is `[a-z0-9-]`. Unquoted, Postgres parses `lucidos_eval-lean-1` as
-/// subtraction and fails at the first hyphen.
-fn recreate_statements(database: &str) -> (String, String) {
-    let ident = quote_ident(database);
-    (
-        format!("DROP DATABASE IF EXISTS {ident} WITH (FORCE)"),
-        format!("CREATE DATABASE {ident}"),
-    )
+/// Slugs contain hyphens, so database identifiers must be quoted.
+fn create_database_statement(database: &str) -> String {
+    format!("CREATE DATABASE {}", quote_ident(database))
 }
 
 /// Quote a Postgres identifier, doubling any embedded quote.
@@ -901,6 +888,28 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn seed_refuses_an_existing_directory_without_changing_it() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("eval-existing-lean-1");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("user-data"), "keep").unwrap();
+        assert!(create_seed_workspace(&path).is_err());
+        assert_eq!(
+            std::fs::read_to_string(path.join("user-data")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[test]
+    fn seed_exclusively_creates_a_new_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("eval-new-lean-1");
+        create_seed_workspace(&path).unwrap();
+        assert!(path.is_dir());
+        assert!(create_seed_workspace(&path).is_err());
+    }
+
     /// I5.
     #[test]
     fn a_workspace_without_the_eval_prefix_is_refused() {
@@ -921,7 +930,7 @@ mod tests {
     }
 
     /// I5's other half. A correctly named symlink aimed at a live workspace
-    /// would pass a name check, and clearing the data tree would follow it.
+    /// would pass a name check, and fixture writes would follow it.
     #[test]
     fn a_correctly_named_symlink_is_refused() {
         let root = tempfile::tempdir().unwrap();
@@ -1170,12 +1179,10 @@ mod tests {
     #[test]
     fn the_hyphenated_database_name_is_quoted_in_every_statement() {
         let name = arm_database_name(&RunLabel::recorded("m"), Arm::LEAN, 1);
-        let (drop, create) = recreate_statements(&name);
         assert_eq!(
-            drop,
-            "DROP DATABASE IF EXISTS \"lucidos_eval-m-lean-1\" WITH (FORCE)"
+            create_database_statement(&name),
+            "CREATE DATABASE \"lucidos_eval-m-lean-1\""
         );
-        assert_eq!(create, "CREATE DATABASE \"lucidos_eval-m-lean-1\"");
         assert_eq!(quote_ident("we\"ird"), "\"we\"\"ird\"");
     }
 

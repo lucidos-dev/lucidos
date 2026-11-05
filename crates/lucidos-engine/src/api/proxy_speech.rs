@@ -153,6 +153,7 @@ pub(crate) async fn finish(
 /// card is per 1M characters.
 fn per_character_call(model: String, characters: usize) -> ReportedCall {
     ReportedCall {
+        provider: Some("openai".into()),
         usage: ApiUsage {
             input_tokens: u32::try_from(characters).unwrap_or(u32::MAX),
             ..ApiUsage::default()

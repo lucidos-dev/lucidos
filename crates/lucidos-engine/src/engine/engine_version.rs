@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub(crate) const ENGINE_BUILD_LOG_PATH: &str = ".lucidos/engine-build.log";
+
 /// How long a `source_behind_head` verdict is reused before the underlying
 /// `git diff` is re-run. version-status is polled ~4s per client; a shared TTL
 /// bounds the git fork to at most one per interval regardless of client count.
@@ -55,17 +57,12 @@ pub enum BuildState {
     /// knows since when" is unrepresentable. In-memory only: a build dies with
     /// the engine, and a restart starts from `Idle`.
     Building { started_at: Instant },
-    /// The rebuild finished successfully. Usually that means a newer on-disk
-    /// binary is ready to switch onto, but NOT always: a build can succeed and
-    /// publish nothing this engine can see, which is the wedge
-    /// [`rebuild_is_wedged`] exists to name.
+    /// Checking the published executable after a successful build.
+    Verifying,
+    /// The published executable is newer than the running engine and covers HEAD.
     ///
-    /// Carries the HEAD the build STARTED from, or `None` when git could not
-    /// say. In the variant for the same reason `Building` carries its instant:
-    /// "a build finished, but nobody knows what it built" is the ambiguity that
-    /// makes the wedge verdict unanswerable. Started-from rather than
-    /// finished-at, because an Apply landing mid-build would otherwise make the
-    /// finished build claim a HEAD it did not compile.
+    /// Carries the HEAD whose delivery was proved, rather than assuming that
+    /// a successful script built everything present when it finished.
     Ready { built_head: Option<String> },
     /// The rebuild failed. The old engine keeps running.
     ///
@@ -78,8 +75,7 @@ pub enum BuildState {
 
 /// Why a background build failed, reduced to what a toast can carry.
 ///
-/// One line, not a log tail. The reader is often on a phone, where the engine
-/// log is unreachable. So this has to BE the message, rather than point at one.
+/// A concise cause for the toast; full build output is available separately.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct BuildFailure {
     /// The first real error line from the build, already trimmed.
@@ -89,9 +85,8 @@ pub struct BuildFailure {
     /// decide whether Retry is offered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remedy: Option<String>,
-    /// True only when retrying is PROVED futile, which is what lets the toast
-    /// withhold Retry. That is the `rebuild_wedged` treatment, applied to a
-    /// failing build rather than a fruitless successful one.
+    /// Whether an identical recognized artifact failure survived a retry.
+    /// Diagnostic only: the user can always request another build.
     ///
     /// **Proof takes a recognized failure AND an observed repeat**, because
     /// either alone over-fires. See the two paragraphs in
@@ -99,9 +94,83 @@ pub struct BuildFailure {
     ///
     /// So an unreadable, unrecognized, or first-time failure is `false`.
     pub repeatable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<BuildFailureKind>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BuildFailureKind {
+    NotDelivered,
+    UnsupportedLaunch,
+}
+
+/// The fresh retry budget belongs to the observed HEAD, including unknown.
+#[derive(Default)]
+struct DeliveryRetry {
+    attempted: std::collections::HashSet<Option<String>>,
+}
+impl DeliveryRetry {
+    fn can_fresh(&self, head: Option<&str>) -> bool {
+        !self.attempted.contains(&head.map(str::to_owned))
+    }
+
+    fn fresh_for(&mut self, head: Option<&str>) -> bool {
+        let head = head.map(str::to_owned);
+        self.attempted.insert(head)
+    }
+}
+
+/// Linux retains the unlinked inode as `/proc/self/exe` after atomic publish.
+/// Probe the published pathname, rather than the old inode's deleted spelling.
+pub(crate) fn published_engine_exe() -> Option<std::path::PathBuf> {
+    Some(published_engine_path(
+        std::env::current_exe().ok()?,
+        cfg!(target_os = "linux"),
+    ))
+}
+
+fn published_engine_path(exe: std::path::PathBuf, linux: bool) -> std::path::PathBuf {
+    if linux && exe.file_name() == Some(std::ffi::OsStr::new("lucidos-engine (deleted)")) {
+        return exe.with_file_name("lucidos-engine");
+    }
+    exe
+}
+
+/// A source build and a standalone Switch must target the same published layout.
+pub(crate) fn published_launch_dir(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = exe.parent()?;
+    (dir.parent()?.parent()?.file_name()? == std::ffi::OsStr::new(".launch"))
+        .then(|| dir.to_path_buf())
+}
+
+async fn uncached_engine_disk_build_id() -> Option<String> {
+    let exe = published_engine_exe()?;
+    let out = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new(exe)
+            .arg("--build-id")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let id = String::from_utf8(out.stdout).ok()?.trim().to_owned();
+    (!id.is_empty()).then_some(id)
 }
 
 impl BuildFailure {
+    fn delivery(kind: BuildFailureKind, summary: &str) -> Self {
+        Self {
+            kind: Some(kind),
+            ..Self::plain(summary.into())
+        }
+    }
+
     /// A failure with a summary and nothing else: no remedy to suggest, and
     /// never proved repeatable, so Retry stays offered.
     pub(crate) fn plain(summary: String) -> Self {
@@ -109,6 +178,7 @@ impl BuildFailure {
             summary,
             remedy: None,
             repeatable: false,
+            kind: None,
         }
     }
 }
@@ -167,13 +237,13 @@ pub fn classify_build_failure(
     // The shape alone over-fires too. A build script reporting a missing file
     // may be missing a real input, which a rebuild fixes once it is back.
     //
-    // Together they are the standard `rebuild_is_wedged` sets: a specific
-    // failure we recognize, observed to survive an attempt that changed nothing.
+    // Record a specific recognized failure observed to survive a retry.
     let remedy = stale_artifact_remedy(output);
     Some(BuildFailure {
         repeatable: remedy.is_some() && previous_summary == Some(summary.as_str()),
         remedy,
         summary,
+        kind: None,
     })
 }
 
@@ -262,6 +332,7 @@ impl BuildState {
         match self {
             BuildState::Idle => "idle",
             BuildState::Building { .. } => "building",
+            BuildState::Verifying => "verifying",
             BuildState::Ready { .. } => "ready",
             BuildState::Failed { .. } => "failed",
         }
@@ -301,26 +372,6 @@ impl BuildState {
     /// its two siblings above.
     pub fn failed_with(reason: BuildFailure) -> Self {
         BuildState::Failed { reason }
-    }
-}
-
-/// Has a rebuild already been PROVED unable to deliver the pending version?
-///
-/// True when a build for the checkout's current HEAD finished successfully and
-/// the caller has separately established that nothing switchable came of it
-/// (`source_behind_head && !update_available`). Rebuilding again runs the same
-/// build from the same source, so stop offering the button and name the
-/// operator fix instead.
-///
-/// **Scoped to the HEAD the build was started from, and that scoping is the
-/// whole point.** A build that succeeded before new commits landed says nothing
-/// about whether a rebuild would help NOW, so `built_head != head` re-arms the
-/// rebuild. An unknown `built_head` or an unknown HEAD is likewise not a proof:
-/// both fall to `false`, which keeps the escape hatch offered.
-pub fn rebuild_is_wedged(build_state: &BuildState, head: Option<&str>) -> bool {
-    match (build_state, head) {
-        (BuildState::Ready { built_head }, Some(head)) => built_head.as_deref() == Some(head),
-        _ => false,
     }
 }
 
@@ -573,17 +624,10 @@ pub struct VersionStatus {
     /// stops matching.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head_commit: Option<String>,
-    /// True when a rebuild has already been proved unable to deliver the pending
-    /// version ([`rebuild_is_wedged`], plus the surrounding "and nothing
-    /// switchable came of it" context). The frontend withholds the *Rebuild*
-    /// button here and names the operator fix instead: the button re-runs the
-    /// same build from the same source, so it completes in seconds and puts the
-    /// same toast straight back. Always false packaged.
-    pub rebuild_wedged: bool,
     /// Why the last build failed, absent unless `build_state` is `failed`.
     ///
-    /// The toast renders this INSTEAD of pointing at the engine log, which a
-    /// phone cannot open. Always present on a failure from this engine.
+    /// The toast shows the cause alongside a link to build output.
+    /// Always present on a failure from this engine.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_failure: Option<BuildFailure>,
     /// How long THIS engine's own background rebuild has been running, in ms,
@@ -890,7 +934,7 @@ impl LucidosEngine {
         if crate::runtime::is_packaged() {
             return None;
         }
-        let exe = std::env::current_exe().ok()?;
+        let exe = published_engine_exe()?;
         let mtime = std::fs::metadata(&exe).and_then(|m| m.modified()).ok();
         {
             let cache = self.update_check.lock().unwrap();
@@ -898,19 +942,11 @@ impl LucidosEngine {
                 return cache.disk_build_id.clone();
             }
         }
-        let disk_id = match tokio::process::Command::new(&exe)
-            .arg("--build-id")
-            .output()
-            .await
-        {
-            Ok(out) if out.status.success() => {
-                let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                (!id.is_empty()).then_some(id)
-            }
-            // Unreadable, mid-rewrite: leave the cache untouched so the next
-            // poll retries once the mtime settles.
-            _ => return self.update_check.lock().unwrap().disk_build_id.clone(),
+        let Some(disk_id) = uncached_engine_disk_build_id().await else {
+            // Observation cache may retain its last value; delivery proof never does.
+            return self.update_check.lock().unwrap().disk_build_id.clone();
         };
+        let disk_id = Some(disk_id);
         let mut cache = self.update_check.lock().unwrap();
         cache.last_mtime = mtime;
         cache.disk_build_id = disk_id.clone();
@@ -965,7 +1001,7 @@ impl LucidosEngine {
     /// Cached `git merge-base --is-ancestor <disk-commit> <running-commit>`.
     /// `Some(true)` means the on-disk binary is provably OLDER, and `None` means
     /// git could not tell. Logs the downgrade case once per distinct on-disk
-    /// build id, so the wedge is diagnosable from the engine log.
+    /// build id, so a downgrade is diagnosable from the engine log.
     async fn disk_is_older(&self, disk_id: &str) -> Option<bool> {
         {
             let cache = self.disk_direction_cache.lock().unwrap();
@@ -1048,9 +1084,8 @@ impl LucidosEngine {
     /// The checkout's HEAD sha, TTL-cached ([`SOURCE_BEHIND_TTL`]), or `None`
     /// when git could not say.
     ///
-    /// Three hot-path callers share this: the version-status response (which
-    /// publishes it as the pending version's identity), the wedged-rebuild
-    /// verdict, and the self-heal driver's per-HEAD budget. Uncached, that is a
+    /// The version-status response and self-heal driver's per-HEAD budget
+    /// share this cache. Uncached, that is a
     /// `git rev-parse` per caller per ~4s poll per connected client, on a
     /// question whose answer only changes when someone commits. Dev-only: no
     /// caller reaches it packaged.
@@ -1119,15 +1154,6 @@ impl LucidosEngine {
         } else {
             None
         };
-        // Wedged is a claim about the PENDING version specifically, so all three
-        // terms are required: the source is ahead, nothing switchable came of
-        // the build anyway, and the build that proved it was for this HEAD.
-        // Dropping the middle term would call a workspace wedged the moment a
-        // successful build produced something the user simply hasn't switched
-        // onto yet.
-        let rebuild_wedged = source_behind_head
-            && !update_available
-            && rebuild_is_wedged(&build_state, head_commit.as_deref());
         VersionStatus {
             build_id: crate::ENGINE_BUILD_ID.to_string(),
             update_available,
@@ -1136,7 +1162,6 @@ impl LucidosEngine {
             build_state: build_state.as_wire(),
             source_behind_head,
             head_commit,
-            rebuild_wedged,
             build_failure: build_state.failure().cloned(),
             shared_build_in_progress,
             build_elapsed_ms: build_state
@@ -1234,8 +1259,7 @@ impl LucidosEngine {
     ///   OLDER binary as fresh and suppress the rebuild that would fix it.
     /// - Bounded to [`SELF_HEAL_MAX_ATTEMPTS_PER_HEAD`] per HEAD, so a broken
     ///   `main` cannot spin builds forever. The count resets when HEAD moves.
-    /// - Gives up once a rebuild it triggered SUCCEEDED without advancing the
-    ///   binary ([`self_heal_is_wedged`]), which retrying cannot fix.
+    /// - Stops after a named failure for this HEAD; explicit Retry stays available.
     ///
     /// No-op packaged or when git is unavailable. Driven by the dev periodic
     /// loop (`frontend_refresh::spawn_served_frontend_sync`).
@@ -1249,7 +1273,10 @@ impl LucidosEngine {
         }
         // `matches!` rather than `==`: `Building` carries its start instant, so
         // two in-flight builds are never equal to each other.
-        if matches!(self.build_state(), BuildState::Building { .. }) {
+        if matches!(
+            self.build_state(),
+            BuildState::Building { .. } | BuildState::Verifying
+        ) {
             return;
         }
         // An unreadable disk id reads as "no upgrade" and falls through to the
@@ -1269,26 +1296,13 @@ impl LucidosEngine {
                 sh.head = head;
                 sh.attempts = 0;
             }
-            // Budget spent for this HEAD: stay silent until a new commit lands.
-            // Checked BEFORE the wedge branch below so the give-up is announced
-            // exactly once. The wedge condition stays true on every later tick,
-            // since nothing clears `Ready`, so evaluating it first would re-log
-            // the same line every tick.
+            // Budget spent for this HEAD: wait for a new commit or explicit retry.
             if sh.attempts >= SELF_HEAL_MAX_ATTEMPTS_PER_HEAD {
                 return;
             }
-            // A rebuild we triggered for this HEAD finished successfully and
-            // STILL left no upgrade on disk. That is a wedged build
-            // configuration, which no number of retries fixes, so burn the
-            // budget and say so once rather than rebuilding forever.
-            if self_heal_is_wedged(sh.attempts, &build_state, sh.head.as_deref()) {
-                sh.attempts = SELF_HEAL_MAX_ATTEMPTS_PER_HEAD;
-                crate::log!(
-                    "[Rebuild] self-heal: a rebuild succeeded but the on-disk binary is still not \
-                     newer than the running engine ({}), so giving up for this HEAD. Rebuild \
-                     manually with `web-dev.sh -w <ws> -b`.",
-                    crate::ENGINE_BUILD_ID
-                );
+            // A named failure ends automatic attempts for this HEAD. The user
+            // can always retry explicitly; a new HEAD resets this budget.
+            if sh.attempts > 0 && matches!(build_state, BuildState::Failed { .. }) {
                 return;
             }
             // Racy probe; the in-build lock in `run_engine_build` is the real
@@ -1350,6 +1364,170 @@ impl LucidosEngine {
     }
 }
 
+/// Injectable build and delivery observations; production and regressions use
+/// the same bounded loop rather than testing only the retry counter.
+#[async_trait::async_trait]
+trait DeliveryHost: BuildHost {
+    async fn head(&self) -> Option<String>;
+    async fn build(&self, previous_failure: Option<&str>, fresh: bool) -> EngineBuildOutcome;
+    async fn delivered(&self, head: Option<&str>) -> Result<bool, BuildFailure>;
+}
+
+fn delivery_probe_failure(cause: &str) -> BuildFailure {
+    BuildFailure::plain(format!(
+        "Could not verify engine delivery: {cause}. Retry build."
+    ))
+}
+
+async fn publish_build_progress(host: &impl BuildHost, generation: u64, state: BuildState) {
+    if super::background_build::with_current_build(host, generation, || {
+        host.set_build_state(state.clone())
+    })
+    .is_some()
+    {
+        host.emit_build_state_changed(&state).await;
+    }
+}
+
+async fn build_and_verify(
+    host: &impl DeliveryHost,
+    previous_failure: Option<&str>,
+    generation: u64,
+) -> FinishedBuild {
+    let mut retry = DeliveryRetry::default();
+    let mut fresh = false;
+    // Bound HEAD churn too: a busy checkout must eventually yield a named
+    // failure rather than keep this task rebuilding forever.
+    for _ in 0..6 {
+        let mut built_head = host.head().await;
+        if fresh && built_head.is_none() {
+            return FinishedBuild {
+                state: BuildState::failed_with(delivery_probe_failure("cannot read checkout HEAD")),
+                built_head,
+            };
+        }
+        if fresh && !retry.fresh_for(built_head.as_deref()) {
+            // Charge the HEAD actually built, since a checkout may advance or
+            // return to an earlier HEAD after the retry was scheduled.
+            return FinishedBuild {
+                state: BuildState::failed_with(BuildFailure::delivery(
+                    BuildFailureKind::NotDelivered,
+                    "This HEAD already used its fresh build retry. Retry build to start a new attempt.",
+                )),
+                built_head,
+            };
+        }
+        let outcome = host.build(previous_failure, fresh).await;
+        let state = match outcome {
+            EngineBuildOutcome::Succeeded => {
+                publish_build_progress(host, generation, BuildState::Verifying).await;
+                let build_head = built_head.clone();
+                let head = host.head().await;
+                let head_moved = head.is_some() && head != built_head;
+                built_head = head.clone();
+                let delivered = match host.delivered(head.as_deref()).await {
+                    Ok(delivered) => delivered,
+                    Err(reason) => {
+                        return FinishedBuild {
+                            state: BuildState::failed_with(reason),
+                            built_head,
+                        }
+                    }
+                };
+                let earlier_delivered = if !delivered && head_moved && build_head.is_some() {
+                    match host.delivered(build_head.as_deref()).await {
+                        Ok(delivered) => delivered,
+                        Err(reason) => {
+                            return FinishedBuild {
+                                state: BuildState::failed_with(reason),
+                                built_head,
+                            }
+                        }
+                    }
+                } else {
+                    false
+                };
+                if delivered {
+                    BuildState::ready_from(head)
+                } else if earlier_delivered {
+                    fresh = false;
+                    publish_build_progress(host, generation, BuildState::building_now()).await;
+                    continue;
+                } else if retry.can_fresh(head.as_deref()) {
+                    fresh = true;
+                    publish_build_progress(host, generation, BuildState::building_now()).await;
+                    continue;
+                } else {
+                    BuildState::failed_with(BuildFailure::delivery(
+                            BuildFailureKind::NotDelivered,
+                            "The build did not publish a new executable covering HEAD after a fresh retry.",
+                        ))
+                }
+            }
+            EngineBuildOutcome::HeadMoved => {
+                let head = host.head().await;
+                if head.is_some() && head != built_head {
+                    fresh = false;
+                    continue;
+                }
+                if retry.can_fresh(head.as_deref()) {
+                    fresh = true;
+                    continue;
+                }
+                BuildState::failed_with(BuildFailure::delivery(
+                    BuildFailureKind::NotDelivered,
+                    "The published executable is still stale after a fresh retry.",
+                ))
+            }
+            EngineBuildOutcome::Failed(reason) => BuildState::failed_with(reason),
+            EngineBuildOutcome::SkippedLocked => BuildState::Idle,
+        };
+        return FinishedBuild { state, built_head };
+    }
+    FinishedBuild {
+        state: BuildState::failed_with(BuildFailure::plain(
+            "HEAD kept moving during the build. Retry build when the checkout settles.".into(),
+        )),
+        built_head: host.head().await,
+    }
+}
+
+#[async_trait::async_trait]
+impl DeliveryHost for LucidosEngine {
+    async fn head(&self) -> Option<String> {
+        current_head_sha().await
+    }
+    async fn build(&self, previous_failure: Option<&str>, fresh: bool) -> EngineBuildOutcome {
+        run_engine_build(
+            self.workspace_path(),
+            previous_failure,
+            &self.build_process_group,
+            fresh,
+        )
+        .await
+    }
+    async fn delivered(&self, head: Option<&str>) -> Result<bool, BuildFailure> {
+        let head = head.ok_or_else(|| delivery_probe_failure("cannot read checkout HEAD"))?;
+        let disk = uncached_engine_disk_build_id()
+            .await
+            .ok_or_else(|| delivery_probe_failure("published executable build-ID probe failed"))?;
+        if disk == crate::ENGINE_BUILD_ID {
+            return Ok(false);
+        }
+        let Some(commit) = build_id_commit(&disk) else {
+            return Ok(false);
+        };
+        let root = crate::paths::repo_root()
+            .map_err(|_| delivery_probe_failure("cannot resolve source checkout"))?;
+        if head.starts_with(commit) {
+            return Ok(true);
+        }
+        no_restart_between(commit, head, &root)
+            .await
+            .ok_or_else(|| delivery_probe_failure("source coverage probe failed"))
+    }
+}
+
 #[async_trait::async_trait]
 impl BuildHost for LucidosEngine {
     fn background_build(&self) -> &BackgroundBuild {
@@ -1368,35 +1546,16 @@ impl BuildHost for LucidosEngine {
         LucidosEngine::emit_build_state_changed(self, state).await;
     }
 
-    async fn run_build(&self, previous_failure: Option<&str>) -> FinishedBuild {
-        // Read BEFORE the build, so a `Ready` records the source it
-        // actually compiled. Read after, an Apply landing mid-build would
-        // give `Ready` commits it never saw, and `rebuild_is_wedged` would
-        // declare futile a rebuild nobody has attempted yet.
-        //
-        // UNCACHED, unlike every other caller. Here a stale read is recorded
-        // as fact: an Apply that moves HEAD and triggers a build inside one
-        // TTL window hands this build the PREVIOUS commit. The stamp is then
-        // wrong forever, and the wedge for that HEAD is missed. One fork per
-        // build, against a build running for tens of seconds, is cheap.
-        let built_head = current_head_sha().await;
-        let outcome = run_engine_build(
-            self.workspace_path(),
-            previous_failure,
-            &self.build_process_group,
-        )
-        .await;
-        let state = match outcome {
-            EngineBuildOutcome::Succeeded => BuildState::ready_from(built_head.clone()),
-            EngineBuildOutcome::Failed(reason) => BuildState::failed_with(reason),
-            // A co-located engine holds the shared build lock. This is
-            // NOT our compile failure, so it must not surface the
-            // build-failed toast. The peer's build advances the shared
-            // binary, and the self-heal driver retries next tick if it
-            // does not land.
-            EngineBuildOutcome::SkippedLocked => BuildState::Idle,
-        };
-        FinishedBuild { state, built_head }
+    async fn run_build(&self, previous_failure: Option<&str>, generation: u64) -> FinishedBuild {
+        let finished = build_and_verify(self, previous_failure, generation).await;
+        if matches!(finished.state, BuildState::Failed { .. }) {
+            let _ = super::background_build::with_current_build(self, generation, || {
+                let mut sh = self.self_heal_state.lock().unwrap();
+                sh.head = finished.built_head.clone();
+                sh.attempts = SELF_HEAL_MAX_ATTEMPTS_PER_HEAD;
+            });
+        }
+        finished
     }
 
     /// A success is judged by the binary it published, which the build
@@ -1406,13 +1565,11 @@ impl BuildHost for LucidosEngine {
             // A peer holds the build lock and builds for us. Self-heal follows
             // that build up, as it did before any join.
             BuildState::Idle => return true,
-            BuildState::Ready { .. } => self
-                .engine_disk_build_id()
+            BuildState::Ready { .. } => uncached_engine_disk_build_id()
                 .await
                 .as_deref()
                 .and_then(build_id_commit)
-                .map(str::to_string)
-                .or_else(|| finished.built_head.clone()),
+                .map(str::to_string),
             _ => finished.built_head.clone(),
         };
         let (Some(built), Some(head), Ok(root)) =
@@ -1437,6 +1594,7 @@ async fn build_covers_head(built: &str, head: &str, root: &std::path::Path) -> b
 /// surface the "build failed" toast.
 enum EngineBuildOutcome {
     Succeeded,
+    HeadMoved,
     /// Carries why, so the toast can say it.
     Failed(BuildFailure),
     SkippedLocked,
@@ -1906,23 +2064,6 @@ fn disk_upgrade_verdict(
     }
 }
 
-/// Has SELF-HEAL proved that rebuilding cannot help for this HEAD? The wedge
-/// verdict ([`rebuild_is_wedged`], the shared definition the wire also reports)
-/// plus the one extra condition that belongs to the driver rather than to the
-/// verdict: self-heal must have triggered a rebuild in this process
-/// (`attempts > 0`) before it is entitled to spend its own budget on the answer.
-///
-/// The caller only reaches this after establishing that no upgrade is on disk,
-/// which is the "and nothing switchable came of it" half `version_status` states
-/// explicitly.
-///
-/// `Failed` deliberately does NOT count: a compile error is exactly what
-/// self-heal exists to retry, under the per-HEAD attempt cap. See
-/// `docs/plans/2026-07-03-engine-version-switch-selfheal.md`.
-fn self_heal_is_wedged(attempts: u32, build_state: &BuildState, head: Option<&str>) -> bool {
-    attempts > 0 && rebuild_is_wedged(build_state, head)
-}
-
 /// Is `ancestor` a STRICT ancestor of `descendant`? That is `git merge-base
 /// --is-ancestor` plus the two being different commits. `None` when git cannot
 /// answer, so callers can tell "provably older" from "don't know".
@@ -1970,7 +2111,7 @@ async fn current_head_sha() -> Option<String> {
 }
 
 /// Run `web-dev.sh --engine-build -w <ws>` to rebuild the engine binary on disk,
-/// copying its output into the workspace engine log. The build runs in its own
+/// copying its output into the workspace build log. The build runs in its own
 /// process group so a restart kills `cargo` too, not just the script
 /// (see [`BuildProcessGroupGuard`]). Holds the checkout-shared build lock for
 /// the whole build, and returns `SkippedLocked` when a peer already holds it.
@@ -1978,6 +2119,7 @@ async fn run_engine_build(
     workspace: &std::path::Path,
     previous_failure: Option<&str>,
     published_group: &AtomicU32,
+    fresh: bool,
 ) -> EngineBuildOutcome {
     // Elect a single builder across co-located engines. With no resolvable
     // checkout there is no shared `target/` to coordinate on, so proceed
@@ -2007,10 +2149,18 @@ async fn run_engine_build(
             )));
         }
     };
-    let cmd = engine_build_command(&script, workspace);
-    let log_path = workspace.join(".lucidos/engine.log");
+    let publish_to = match published_engine_exe().as_deref().and_then(published_launch_dir) {
+        Some(path) => path,
+        _ => return EngineBuildOutcome::Failed(BuildFailure::delivery(
+            BuildFailureKind::UnsupportedLaunch,
+            "Launch the engine from the checkout's published .launch/<profile>/<variant>/ path to enable background builds.",
+        )),
+    };
+    let cmd = engine_build_command(&script, workspace, &publish_to, fresh);
+    let log_path = workspace.join(ENGINE_BUILD_LOG_PATH);
     match run_capturing_output(cmd, &log_path, BUILD_OUTPUT_DRAIN_GRACE, published_group).await {
         Ok((status, _)) if status.success() => EngineBuildOutcome::Succeeded,
+        Ok((status, _)) if status.code() == Some(75) => EngineBuildOutcome::HeadMoved,
         Ok((status, output)) => {
             crate::log!("[Rebuild] engine build exited {status}");
             let reason = classify_build_failure(&output.head_text(), previous_failure)
@@ -2034,13 +2184,20 @@ async fn run_engine_build(
 fn engine_build_command(
     script: &std::path::Path,
     workspace: &std::path::Path,
+    publish_to: &std::path::Path,
+    fresh: bool,
 ) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(script);
     cmd.arg("-w")
         .arg(workspace)
         .arg("--engine-build")
+        .arg("--publish-to")
+        .arg(publish_to)
         .env(lucidos_build_slot::ENV_PRIORITY, "1")
         .kill_on_drop(true);
+    if fresh {
+        cmd.arg("--fresh");
+    }
     // Own process group, so a restart can reach the `cargo` grandchild
     // and not just this script. See `BuildProcessGroupGuard`.
     crate::runtime::spawn_env::isolate_in_process_group(&mut cmd);
@@ -2143,7 +2300,7 @@ const BUILD_OUTPUT_HEAD_CAP: usize = 512 * 1024;
 const BUILD_OUTPUT_TAIL_CAP: usize = 4 * 1024;
 
 /// What a build printed, as it arrives: the head the classifier reads, a short
-/// tail for the last line, and the copy into the engine log.
+/// tail for the last line, and the copy into the build log.
 struct BuildOutput {
     head: Vec<u8>,
     tail: Vec<u8>,
@@ -2218,11 +2375,11 @@ mod tests {
         classify_commit_subject, classify_pending_commits, commit_is_strict_ancestor,
         compatible_served_commit, disk_upgrade_verdict, engine_build_command,
         engine_build_lock_path, group_commit_subjects, lock_held_at, newer_version_visible,
-        no_restart_between, open_teardown, pending_commits_since, queued_behind, rebuild_is_wedged,
-        run_capturing_output, self_heal_is_wedged, source_state_word, stash_first_restart_actor,
-        try_lock_file, unrecognized_build_failure, wants_pending_commits, BuildFailure,
-        BuildOutput, BuildProcessGroupGuard, BuildState, CommitGroupKind, QueuedBuild,
-        VersionTracking, BUILD_FAILURE_SUMMARY_CAP, BUILD_OUTPUT_HEAD_CAP, BUILD_OUTPUT_TAIL_CAP,
+        no_restart_between, open_teardown, pending_commits_since, queued_behind,
+        run_capturing_output, source_state_word, stash_first_restart_actor, try_lock_file,
+        unrecognized_build_failure, wants_pending_commits, BuildFailure, BuildOutput,
+        BuildProcessGroupGuard, BuildState, CommitGroupKind, QueuedBuild, VersionTracking,
+        BUILD_FAILURE_SUMMARY_CAP, BUILD_OUTPUT_HEAD_CAP, BUILD_OUTPUT_TAIL_CAP,
         COMMIT_GROUP_ORDER, PENDING_COMMIT_DESCRIPTION_CAP, UNLABELLED_HOLDER,
     };
     use crate::engine::thread_events::MessageOrigin;
@@ -2273,9 +2430,8 @@ Caused by:
     }
 
     #[test]
-    fn an_identical_repeat_is_what_proves_retrying_futile() {
-        // The build in between changed nothing, so the button goes. Same
-        // evidence-based shape as `rebuild_is_wedged`.
+    fn an_identical_repeat_is_recorded_for_diagnostics() {
+        // Record the repeated artifact failure without withholding Retry.
         let first = classify_build_failure(STALE_BUILD_SCRIPT_OUTPUT, None).expect("must classify");
         let second = classify_build_failure(STALE_BUILD_SCRIPT_OUTPUT, Some(&first.summary))
             .expect("must classify");
@@ -2851,11 +3007,276 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         );
     }
 
+    #[derive(Default)]
+    struct DeliveryStub {
+        background: super::BackgroundBuild,
+        states: std::sync::Mutex<Vec<BuildState>>,
+        fresh: std::sync::Mutex<Vec<bool>>,
+        delivered: bool,
+        probe_failure: bool,
+        delivered_head: Option<String>,
+        heads: std::sync::Mutex<std::collections::VecDeque<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::BuildHost for DeliveryStub {
+        fn background_build(&self) -> &super::BackgroundBuild {
+            &self.background
+        }
+        fn build_state(&self) -> BuildState {
+            self.states
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap_or_default()
+        }
+        fn set_build_state(&self, state: BuildState) {
+            self.states.lock().unwrap().push(state);
+        }
+        async fn emit_build_state_changed(&self, _: &BuildState) {}
+        async fn run_build(&self, previous: Option<&str>, generation: u64) -> super::FinishedBuild {
+            super::build_and_verify(self, previous, generation).await
+        }
+        async fn covers_head(&self, _: &super::FinishedBuild) -> bool {
+            true
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::DeliveryHost for DeliveryStub {
+        async fn head(&self) -> Option<String> {
+            self.heads
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Some("head1".into()))
+        }
+        async fn build(&self, _: Option<&str>, fresh: bool) -> super::EngineBuildOutcome {
+            self.fresh.lock().unwrap().push(fresh);
+            // A real successful process that publishes nothing, the original
+            // false-success contract. It must never be enough to report Ready.
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.args(["-c", "true"]);
+            let dir = tempfile::tempdir().unwrap();
+            let group = std::sync::atomic::AtomicU32::new(0);
+            let (status, _) = super::run_capturing_output(
+                cmd,
+                &dir.path().join("build.log"),
+                std::time::Duration::from_secs(2),
+                &group,
+            )
+            .await
+            .unwrap();
+            assert!(status.success());
+            super::EngineBuildOutcome::Succeeded
+        }
+        async fn delivered(&self, head: Option<&str>) -> Result<bool, super::BuildFailure> {
+            if self.probe_failure {
+                return Err(super::BuildFailure::plain(
+                    "Delivery probe unavailable.".into(),
+                ));
+            }
+            Ok(self.delivered
+                || self
+                    .delivered_head
+                    .as_deref()
+                    .is_some_and(|covered| head == Some(covered)))
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_delivery_probe_fails_without_cleaning_or_claiming_non_delivery() {
+        let host = DeliveryStub {
+            probe_failure: true,
+            ..Default::default()
+        };
+        let finished = super::build_and_verify(&host, None, 0).await;
+        let failure = finished.state.failure().unwrap();
+        assert_eq!(failure.kind, None);
+        assert!(failure.summary.contains("probe unavailable"));
+        assert_eq!(*host.fresh.lock().unwrap(), [false]);
+    }
+
+    #[tokio::test]
+    async fn losing_head_before_a_fresh_build_does_not_clean_unknown_source() {
+        let host = DeliveryStub::default();
+        *host.heads.lock().unwrap() = [Some("head1".into()), Some("head1".into()), None]
+            .into_iter()
+            .collect();
+        let finished = super::build_and_verify(&host, None, 0).await;
+        let failure = finished.state.failure().unwrap();
+        assert_eq!(failure.kind, None);
+        assert!(failure.summary.contains("cannot read checkout HEAD"));
+        assert_eq!(*host.fresh.lock().unwrap(), [false]);
+    }
+
+    #[tokio::test]
+    async fn successful_script_without_delivery_verifies_retries_once_and_fails() {
+        let host = DeliveryStub::default();
+        for _ in 0..2 {
+            // A manual retry starts a new delivery budget.
+            let finished = super::build_and_verify(&host, None, 0).await;
+            assert_eq!(
+                finished.state.failure().unwrap().kind,
+                Some(super::BuildFailureKind::NotDelivered)
+            );
+            assert_eq!(finished.built_head.as_deref(), Some("head1"));
+        }
+        assert_eq!(*host.fresh.lock().unwrap(), [false, true, false, true]);
+        let states = host.states.lock().unwrap();
+        assert_eq!(
+            states
+                .iter()
+                .filter(|s| matches!(s, BuildState::Verifying))
+                .count(),
+            4
+        );
+        assert!(!states.iter().any(|s| matches!(s, BuildState::Ready { .. })));
+    }
+
+    #[tokio::test]
+    async fn head_moving_after_script_success_rebuilds_incrementally_before_cleaning() {
+        let host = DeliveryStub {
+            delivered_head: Some("old".into()),
+            ..Default::default()
+        };
+        *host.heads.lock().unwrap() = ["old", "head1", "head1", "head1"]
+            .into_iter()
+            .map(|head| Some(head.to_owned()))
+            .collect();
+        let finished = super::build_and_verify(&host, None, 0).await;
+        assert_eq!(
+            finished.state.failure().unwrap().kind,
+            Some(super::BuildFailureKind::NotDelivered)
+        );
+        assert_eq!(*host.fresh.lock().unwrap(), [false, false, true]);
+    }
+
+    #[tokio::test]
+    async fn head_moving_during_an_undelivered_build_still_gets_a_fresh_retry() {
+        let host = DeliveryStub::default();
+        *host.heads.lock().unwrap() = ["old", "head1", "head1", "head1"]
+            .into_iter()
+            .map(|head| Some(head.to_owned()))
+            .collect();
+        let finished = super::build_and_verify(&host, None, 0).await;
+        assert_eq!(
+            finished.state.failure().unwrap().kind,
+            Some(super::BuildFailureKind::NotDelivered)
+        );
+        assert_eq!(*host.fresh.lock().unwrap(), [false, true]);
+    }
+
+    #[tokio::test]
+    async fn verified_delivery_is_ready_without_a_fresh_build() {
+        let host = DeliveryStub {
+            delivered: true,
+            ..Default::default()
+        };
+        let finished = super::build_and_verify(&host, None, 0).await;
+        assert!(matches!(finished.state, BuildState::Ready { .. }));
+        assert_eq!(*host.fresh.lock().unwrap(), [false]);
+    }
+
+    #[tokio::test]
+    async fn returning_to_a_previously_cleaned_head_does_not_clean_it_again() {
+        let host = DeliveryStub::default();
+        *host.heads.lock().unwrap() = ["head1", "head1", "head1", "head2", "head1", "head2"]
+            .into_iter()
+            .map(|head| Some(head.to_owned()))
+            .collect();
+        let finished = super::build_and_verify(&host, None, 0).await;
+        assert_eq!(
+            finished.state.failure().unwrap().kind,
+            Some(super::BuildFailureKind::NotDelivered)
+        );
+        assert_eq!(*host.fresh.lock().unwrap(), [false, true]);
+    }
+
+    #[tokio::test]
+    async fn head_advancing_before_fresh_build_consumes_its_retry_budget() {
+        let host = DeliveryStub::default();
+        *host.heads.lock().unwrap() = ["old", "old", "head1", "head1"]
+            .into_iter()
+            .map(|head| Some(head.to_owned()))
+            .collect();
+        let finished = super::build_and_verify(&host, None, 0).await;
+        assert_eq!(
+            finished.state.failure().unwrap().kind,
+            Some(super::BuildFailureKind::NotDelivered)
+        );
+        assert_eq!(*host.fresh.lock().unwrap(), [false, true]);
+    }
+
+    #[test]
+    fn launch_directory_requires_the_published_layout() {
+        let published =
+            std::path::Path::new("/checkout/.launch/release/real-embedder-tests/lucidos-engine");
+        assert_eq!(
+            super::published_launch_dir(published),
+            published.parent().map(std::path::Path::to_path_buf)
+        );
+        assert_eq!(
+            super::published_launch_dir(std::path::Path::new(
+                "/checkout/target/debug/lucidos-engine"
+            )),
+            None
+        );
+        assert_eq!(
+            super::published_launch_dir(std::path::Path::new(
+                "/checkout/.launch/plain/lucidos-engine"
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn published_path_recovers_only_linux_deleted_engine_name() {
+        let path =
+            std::path::PathBuf::from("/checkout/.launch/release/plain/lucidos-engine (deleted)");
+        assert_eq!(
+            super::published_engine_path(path.clone(), true),
+            path.with_file_name("lucidos-engine")
+        );
+        assert_eq!(super::published_engine_path(path.clone(), false), path);
+        let other = path.with_file_name("other (deleted)");
+        assert_eq!(super::published_engine_path(other.clone(), true), other);
+    }
+
+    #[test]
+    fn verification_and_delivery_failure_have_distinct_wire_states() {
+        assert_eq!(BuildState::Verifying.as_wire(), "verifying");
+        let failure =
+            BuildFailure::delivery(super::BuildFailureKind::NotDelivered, "stale executable");
+        assert_eq!(
+            serde_json::to_value(&failure).unwrap()["kind"],
+            "not-delivered"
+        );
+        assert!(!failure.repeatable);
+        assert_eq!(BuildState::failed_with(failure).as_wire(), "failed");
+    }
+
+    #[test]
+    fn delivery_retry_is_bounded_and_rearms_for_a_new_head() {
+        let mut retry = super::DeliveryRetry::default();
+        assert!(retry.fresh_for(Some("head1")));
+        assert!(!retry.fresh_for(Some("head1")));
+        assert!(retry.fresh_for(Some("head2")));
+        assert!(!retry.fresh_for(Some("head2")));
+        assert!(!retry.fresh_for(Some("head1")));
+        // Unknown HEAD must not open an unlimited retry budget.
+        assert!(retry.fresh_for(None));
+        assert!(!retry.fresh_for(None));
+    }
+
     #[test]
     fn the_engine_rebuild_waits_as_a_priority_build() {
         let cmd = engine_build_command(
             std::path::Path::new("/repo/scripts/web-dev.sh"),
             std::path::Path::new("/ws"),
+            std::path::Path::new("/repo/target/.launch/release/plain"),
+            true,
         );
         let priority = cmd
             .as_std()
@@ -2864,7 +3285,17 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
             .and_then(|(_, v)| v);
         assert_eq!(priority, Some(std::ffi::OsStr::new("1")));
         let args: Vec<_> = cmd.as_std().get_args().collect();
-        assert_eq!(args, ["-w", "/ws", "--engine-build"]);
+        assert_eq!(
+            args,
+            [
+                "-w",
+                "/ws",
+                "--engine-build",
+                "--publish-to",
+                "/repo/target/.launch/release/plain",
+                "--fresh"
+            ]
+        );
     }
 
     fn held(pid: u32, label: &str) -> lucidos_build_slot::SlotState {
@@ -3225,64 +3656,6 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         ));
     }
 
-    /// Retrying a rebuild is only futile once one has SUCCEEDED without
-    /// advancing the binary. A failed build keeps its retry budget, which is
-    /// the case self-heal exists for.
-    #[test]
-    fn self_heal_gives_up_only_after_a_successful_build_changed_nothing() {
-        let ready = BuildState::ready_from(Some("head1".into()));
-        assert!(self_heal_is_wedged(1, &ready, Some("head1")));
-        assert!(self_heal_is_wedged(3, &ready, Some("head1")));
-        // Nothing tried yet this process, so the Ready state is not ours to
-        // conclude from.
-        assert!(!self_heal_is_wedged(0, &ready, Some("head1")));
-        // A compile error is retryable, not wedged.
-        assert!(!self_heal_is_wedged(
-            1,
-            &BuildState::failed_with(BuildFailure::plain("error: boom".into())),
-            Some("head1")
-        ));
-        // Idle: no build outcome to judge (the caller already excluded Building).
-        assert!(!self_heal_is_wedged(1, &BuildState::Idle, Some("head1")));
-        // Deliberately still true at the cap: nothing clears `Ready`, so the
-        // predicate stays hot on every later tick. That is WHY the caller
-        // checks the spent budget FIRST. Reordering those two checks makes the
-        // give-up line re-log every tick instead of once.
-        assert!(self_heal_is_wedged(
-            super::SELF_HEAL_MAX_ATTEMPTS_PER_HEAD,
-            &ready,
-            Some("head1")
-        ));
-    }
-
-    /// The wedge verdict is a claim about ONE head. Commits landing after the
-    /// build that proved nothing must re-arm the rebuild, or a workspace that
-    /// wedged once would refuse to offer a rebuild for every future commit.
-    #[test]
-    fn a_wedge_belongs_to_the_head_the_build_was_started_from() {
-        let ready = BuildState::ready_from(Some("head1".into()));
-        assert!(rebuild_is_wedged(&ready, Some("head1")));
-        // New work landed since that build: nothing has been proved about it.
-        assert!(!rebuild_is_wedged(&ready, Some("head2")));
-        // Neither side of the comparison may be guessed at. An unknown is not a
-        // proof, and the safe direction is to keep offering the escape hatch.
-        assert!(!rebuild_is_wedged(
-            &BuildState::ready_from(None),
-            Some("head1")
-        ));
-        assert!(!rebuild_is_wedged(&ready, None));
-        // Only a COMPLETED build is evidence.
-        assert!(!rebuild_is_wedged(&BuildState::Idle, Some("head1")));
-        assert!(!rebuild_is_wedged(
-            &BuildState::failed_with(BuildFailure::plain("error: boom".into())),
-            Some("head1")
-        ));
-        assert!(!rebuild_is_wedged(
-            &BuildState::building_now(),
-            Some("head1")
-        ));
-    }
-
     /// The real git probe behind the direction check, against a throwaway repo:
     /// ancestor → `Some(true)`, the reverse → `Some(false)`, an unknown object →
     /// `None` (so an unresolvable id can't be mistaken for "provably older").
@@ -3543,8 +3916,7 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
                 .is_none()
         );
         assert_eq!(BuildState::building_now().as_wire(), "building");
-        // The HEAD a build was started from is bookkeeping for the wedge
-        // verdict, not a new wire state: `ready` stays `ready` either way.
+        // The verified HEAD is internal bookkeeping; the wire state stays ready.
         assert_eq!(BuildState::ready_from(None).as_wire(), "ready");
         assert_eq!(
             BuildState::ready_from(Some("head1".into())).as_wire(),

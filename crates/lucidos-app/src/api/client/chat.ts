@@ -1,3 +1,4 @@
+import { remoteConnectionFailure } from '../../utils/remoteConnection';
 import { toFailed } from '../../store/types';
 import { HEALTH_PROBE_TIMEOUT_MS } from '../../store/store';
 import { API, ApiError, json, mutatingFetch, mutatingFetchIdempotent, throwIfNotOk } from './_core';
@@ -60,8 +61,14 @@ export type HealthProbe = Loadable<HealthInfo> | { status: 'stopped' };
  *  belongs to one attempt. */
 export async function checkHealth(): Promise<HealthProbe> {
   try {
-    return { status: 'loaded', data: await json<HealthInfo>(`${API}/health`, undefined, HEALTH_PROBE_TIMEOUT_MS) };
+    const data = await json<HealthInfo>(`${API}/health`, undefined, HEALTH_PROBE_TIMEOUT_MS);
+    remoteConnectionFailure.value = null;
+    return { status: 'loaded', data };
   } catch (err) {
+    remoteConnectionFailure.value = null;
+    if (err instanceof ApiError && err.body && typeof err.body === 'object' && 'remote_gateway' in err.body && 'reason_kind' in err.body) {
+      remoteConnectionFailure.value = { reason: err.reason, reason_kind: String(err.body.reason_kind) };
+    }
     if (err instanceof ApiError && err.workspaceStopped) return { status: 'stopped' };
     return toFailed<HealthInfo>(err);
   }

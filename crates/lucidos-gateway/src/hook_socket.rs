@@ -56,17 +56,12 @@ const HOOK_PORT_OFFSET: u16 = 10;
 /// an unparseable value gets: a listener on a port nobody meant to open is
 /// worse than none.
 pub fn hook_port(configured: Option<&str>, gateway_port: u16) -> Option<u16> {
-    match configured.map(str::trim) {
-        Some(raw) if !raw.is_empty() => match raw.parse::<u16>() {
-            Ok(0) => None,
-            Ok(port) => Some(port),
-            Err(_) => {
-                crate::log!("[Hook] LUCIDOS_HOOK_PORT '{raw}' is not a port, so no hook socket");
-                None
-            }
-        },
-        _ => gateway_port.checked_add(HOOK_PORT_OFFSET),
-    }
+    crate::net_config::side_port(
+        "LUCIDOS_HOOK_PORT",
+        configured,
+        gateway_port,
+        HOOK_PORT_OFFSET,
+    )
 }
 
 /// The same answer, read from this process's environment.

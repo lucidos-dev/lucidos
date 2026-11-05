@@ -1046,9 +1046,9 @@ mod tests {
             let section = build_widgets_section(&[], automatic);
             for rule in [
                 "then embed it in your reply",
-                "not on the shelf unless pinned",
-                "one phone screen with no scroll area inside",
-                "top screen carries the answer",
+                "fixed box of its size, the same in its thread card and on a dashboard",
+                "style under html[data-widget-size]",
+                "never by shrinking text or scrolling inside",
                 "two or three words (\"Flight picker\")",
                 "pick among data items",
             ] {
@@ -1057,14 +1057,16 @@ mod tests {
         }
     }
 
-    /// ADR 0407's guidance: pin only what the user returns to, animate what a
-    /// tap changes calmly, and read live data instead of baking it in.
+    /// The agent sizes nothing unasked (I11). It animates what a tap changes
+    /// calmly, and reads live data instead of baking it in.
     #[test]
-    fn the_widgets_section_says_when_to_pin_how_to_move_and_where_data_comes_from() {
+    fn the_widgets_section_says_when_to_size_how_to_move_and_where_data_comes_from() {
         for automatic in [true, false] {
             let section = build_widgets_section(&[], automatic);
+            assert!(!section.contains("pin"), "no pin (I8): {section}");
             for rule in [
-                "widgets(action=\"pin\") only when the user will come back to it",
+                "resize a card only when the user asks in this turn",
+                "never choose a size yourself",
                 "Animate what a tap changes",
                 "--duration-* tokens",
                 "data-motion=\"reduce\"",

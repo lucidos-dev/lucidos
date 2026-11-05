@@ -355,7 +355,7 @@ export interface EngineVersionStatus {
    *  THIS on-disk build but a genuinely newer build re-surfaces the switch. */
   disk_build_id?: string;
   packaged: boolean;
-  build_state: 'idle' | 'building' | 'ready' | 'failed';
+  build_state: 'idle' | 'building' | 'verifying' | 'ready' | 'failed';
   /** Dev only: the engine SOURCE is behind HEAD by a restart-requiring change —
    *  a NEW engine version exists in source even if no fresh binary is on disk yet
    *  (rebuild failed / not run). Distinct from `update_available` (a fresh binary
@@ -370,14 +370,8 @@ export interface EngineVersionStatus {
    *  name (that absence is what makes it pending), so without this the toast
    *  had nothing to remember and could not be dismissed at all. */
   head_commit?: string;
-  /** Dev only: a rebuild for this HEAD already completed and produced nothing
-   *  switchable, so pressing *Rebuild* runs the same build from the same source
-   *  and lands right back here. The UI withholds the button and names the
-   *  operator fix instead. Absent/false when packaged. */
-  rebuild_wedged?: boolean;
   /** Dev only: why the last build failed, present only with
-   *  `build_state: 'failed'`. The toast renders this INSTEAD of pointing at the
-   *  engine log, which is unreachable on the phone the toast is often read on.
+   *  `build_state: 'failed'`. The toast shows the cause alongside a build-log link.
    *
    *  The engine always sends it with a failure. An older engine may not, and
    *  the toast then says the cause was not reported, rather than dressing one
@@ -427,8 +421,7 @@ export interface QueuedBuild {
 
 /** Why a background build failed, reduced to what a toast can carry.
  *
- *  One line rather than a log tail, because this IS the message: the engine log
- *  it replaces cannot be opened from a phone. See engine `BuildFailure`. */
+ *  Full build output remains available through Show build log. */
 export interface BuildFailure {
   /** The first real error line from the build. For a build-script panic this is
    *  the panic message, not cargo's generic "failed to run custom build
@@ -438,10 +431,9 @@ export interface BuildFailure {
    *  and its fix is exact. Absent for an ordinary compile error, whose fix is
    *  to change the code. */
   remedy?: string;
-  /** Retrying is PROVED futile, so the toast withholds Retry (the
-   *  `rebuild_wedged` treatment for a failing build). Never inferred from
-   *  silence: an unreadable or unrecognized failure is `false`, since retiring
-   *  the button wrongly strands a build that would have succeeded. */
+  /** A named delivery failure, absent for ordinary build errors. */
+  kind?: 'not-delivered' | 'unsupported-launch';
+  /** Whether the same recognized failure has repeated. Retry remains available. */
   repeatable: boolean;
 }
 
@@ -517,4 +509,9 @@ export async function engineChangelog(): Promise<ChangelogRelease[]> {
 export async function rebuildEngine(): Promise<void> {
   const res = await mutatingFetch(`${API}/engine/rebuild`, { method: 'POST' });
   await throwIfNotOk(res);
+}
+
+/** Read build diagnostics with this window's pairing session. */
+export function getEngineBuildLog(signal?: AbortSignal): Promise<string> {
+  return text(`${API}/engine/build-log`, { signal, credentials: 'same-origin' });
 }

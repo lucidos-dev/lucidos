@@ -15,6 +15,7 @@ use tokio_rustls::server::TlsStream;
 use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor};
 
 use super::{is_loopback, Connection, ListenerTls, ManagedCert};
+use crate::pairing::Peer;
 
 /// How long a client gets to send its first byte, and then to finish the TLS
 /// handshake. The same bound `axum_server`'s own rustls acceptor uses.
@@ -26,11 +27,24 @@ const TLS_HANDSHAKE_RECORD: u8 = 0x16;
 #[derive(Clone)]
 pub struct GatewayAcceptor {
     tls: ListenerTls,
+    public_listener: bool,
 }
 
 impl GatewayAcceptor {
     pub fn new(tls: ListenerTls) -> Self {
-        GatewayAcceptor { tls }
+        GatewayAcceptor {
+            tls,
+            public_listener: false,
+        }
+    }
+
+    /// The acceptor for the public listener: every request it accepts is
+    /// stamped public.
+    pub fn public(tls: ListenerTls) -> Self {
+        GatewayAcceptor {
+            tls,
+            public_listener: true,
+        }
     }
 }
 
@@ -41,9 +55,10 @@ impl<S: Send + 'static> axum_server::accept::Accept<TcpStream, S> for GatewayAcc
 
     fn accept(&self, stream: TcpStream, service: S) -> Self::Future {
         let tls = self.tls.clone();
+        let public_listener = self.public_listener;
         Box::pin(async move {
             let local = stream.local_addr()?;
-            accept_at(tls, stream, local, service).await
+            accept_at(tls, stream, local, public_listener, service).await
         })
     }
 }
@@ -54,14 +69,21 @@ pub(super) async fn accept_at<S>(
     tls: ListenerTls,
     stream: TcpStream,
     local: SocketAddr,
+    public_listener: bool,
     service: S,
 ) -> io::Result<(MaybeTlsStream, Tagged<S>)> {
+    let peer = Peer {
+        remote: stream.peer_addr()?,
+        local,
+        public_listener,
+    };
     let (stream, connection) = negotiate(tls, stream, local).await?;
     Ok((
         stream,
         Tagged {
             inner: service,
             connection,
+            peer,
         },
     ))
 }
@@ -210,11 +232,13 @@ impl AsyncWrite for MaybeTlsStream {
     }
 }
 
-/// The connection's service, stamping its [`Connection`] on every request.
+/// The connection's service, stamping its [`Connection`] and [`Peer`] on
+/// every request.
 #[derive(Clone)]
 pub struct Tagged<S> {
     inner: S,
     connection: Connection,
+    peer: Peer,
 }
 
 impl<S, B> tower::Service<Request<B>> for Tagged<S>
@@ -231,6 +255,7 @@ where
 
     fn call(&mut self, mut req: Request<B>) -> Self::Future {
         req.extensions_mut().insert(self.connection.clone());
+        req.extensions_mut().insert(self.peer);
         self.inner.call(req)
     }
 }

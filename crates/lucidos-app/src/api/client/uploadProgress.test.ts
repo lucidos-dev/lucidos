@@ -3,6 +3,9 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { postWithUploadProgress, UPLOAD_STALL_MS, UPLOAD_RESPONSE_MS } from './uploadProgress';
 import { ApiError, isTransientFetchError, throwIfNotOk } from './_core';
 
+import { observeSourceGeneration } from '../../utils/restoreSourceGeneration';
+import { installRestoreAdmission } from '../../utils/restoreAdmission';
+
 type Handler = ((e: any) => void) | null;
 
 /** Just enough of `XMLHttpRequest` to drive every path the transport takes. */
@@ -59,8 +62,36 @@ describe('postWithUploadProgress', () => {
     (globalThis as any).XMLHttpRequest = FakeXhr;
   });
   afterEach(() => {
+    observeSourceGeneration(null);
+    installRestoreAdmission({ ready: () => true, wait: async () => {} });
     vi.useRealTimers();
     delete (globalThis as any).XMLHttpRequest;
+  });
+
+  it('rejects uploads waiting across a restore without sending bytes', async () => {
+    // The page was admitted before the restore, so the upload is bound to it.
+    observeSourceGeneration(null);
+    let release!: () => void;
+    let ready = false;
+    const wait = new Promise<void>((resolve) => { release = resolve; });
+    installRestoreAdmission({ ready: () => ready, wait: () => wait });
+    const request = postWithUploadProgress('/api/v1/threads/t/blobs', new FormData());
+    const rejected = expect(request).rejects.toMatchObject({ httpCode: 409 });
+    observeSourceGeneration('00000000-0000-4000-8000-000000000001');
+    ready = true;
+    release();
+    await rejected;
+    expect(FakeXhr.last).toBeNull();
+  });
+
+  it('rejects an upload response from an earlier generation', async () => {
+    const request = postWithUploadProgress('/api/v1/threads/t/blobs', new FormData());
+    const rejected = expect(request).rejects.toMatchObject({ httpCode: 409 });
+    const xhr = await sent();
+    expect(xhr.requestHeaders['x-lucidos-restore-generation']).toBe('none');
+    observeSourceGeneration('00000000-0000-4000-8000-000000000001');
+    xhr.respond(201, '{}');
+    await rejected;
   });
 
   it('reports progress and the moment the body has left', async () => {

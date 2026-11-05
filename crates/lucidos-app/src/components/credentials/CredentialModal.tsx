@@ -27,7 +27,15 @@ import { copyToClipboard } from '../../utils/clipboard';
 import { SecretField } from './SecretField';
 import { isMobile } from '../../utils/viewport';
 import { pickCredentialAutofocus } from './credentialAutofocus';
-import { parseSecret, buildSecret, emptyFields, type CredentialFields } from './credentialSecret';
+import {
+  parseSecret,
+  buildSecret,
+  emptyFields,
+  webRedirectUriFor,
+  webRedirectUriLines,
+  type CredentialFields,
+} from './credentialSecret';
+import { OAUTH_WEB_CALLBACK_PATH } from '../../generated/gateway-constants';
 import {
   addScopeRow,
   initialScopeRows,
@@ -271,6 +279,13 @@ function CredentialFormInner({
   const initialAuthorizeParams =
     initialFields.authorizeParams || oauthDefaults?.authorize_params || '';
   const initialRedirectUri = initialFields.redirectUri || oauthDefaults?.redirect_uri || '';
+  /** Controlled, so the one-click add can append this page's own URI. */
+  const [webRedirectUris, setWebRedirectUris] = useState(initialFields.webRedirectUris);
+  /** This page's web redirect URI, offered only over https: a provider refuses
+   *  a plain-http web redirect. */
+  const thisPageWebUri =
+    window.location.protocol === 'https:' ? webRedirectUriFor(window.location.origin) : '';
+  const thisPageListed = webRedirectUriLines(webRedirectUris).includes(thisPageWebUri);
 
   const [selectedAuthType, setSelectedAuthType] = useState<AuthType>(initialAuthType);
   /** The Base URLs field, one row per host. State rather than ref writes,
@@ -426,6 +441,7 @@ function CredentialFormInner({
       userinfoMethod,
       authorizeParams: authorizeParamsRef.current?.value.trim() || '',
       redirectUri: redirectUriRef.current?.value.trim() || '',
+      webRedirectUris,
     };
   }
 
@@ -791,6 +807,40 @@ function CredentialFormInner({
                   : 'Leave blank for a desktop/native app'
               }
             />
+            <div class="form-group">
+              <FieldLabel
+                title="Web redirect URIs"
+                label={<>Web redirect URIs <span class="form-hint">(optional)</span></>}
+              >
+                  <p>
+                    For connecting from a phone, or any browser on a computer not running
+                    Lucidos. A browser on this computer uses the loopback redirect URI.
+                  </p>
+                  <p>
+                    Register each one on a Web client in the provider's console, one per
+                    line. A Web client has a client secret, so add that too.
+                  </p>
+              </FieldLabel>
+              <textarea
+                rows={2}
+                value={webRedirectUris}
+                onInput={(e) => setWebRedirectUris((e.target as HTMLTextAreaElement).value)}
+                placeholder={`https://lucidos.example.com${OAUTH_WEB_CALLBACK_PATH}`}
+              />
+              {thisPageWebUri && !thisPageListed && (
+                <div class="credential-web-redirect-add">
+                  <button
+                    type="button"
+                    class="action-btn"
+                    onClick={() =>
+                      setWebRedirectUris((current) =>
+                        [...webRedirectUriLines(current), thisPageWebUri].join('\n'),
+                      )
+                    }
+                  >Add this address</button>
+                </div>
+              )}
+            </div>
             <details
               class="credential-oauth-endpoints"
               open={!hasPrefilledEndpoints || repairNamedEndpoints}

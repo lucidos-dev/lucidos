@@ -477,3 +477,25 @@ fn a_bespoke_row_is_refused_rather_than_misread() {
     };
     assert!(SystemEvent::from_stored(trigger.to_payload()).is_err());
 }
+
+#[test]
+fn snapshot_keep_changes_replay_with_actor_and_retention_state() {
+    let handle = crate::core::snapshot::handle::Handle::generate();
+    for keep in [true, false] {
+        let written = SystemEvent::SnapshotKeepChanged {
+            workspace_id: "demo".into(),
+            handle: handle.clone(),
+            keep,
+            actor: Some(device_actor()),
+        };
+        assert!(written.is_persisted());
+        assert!(SystemEvent::is_persisted_type_name("SnapshotKeepChanged"));
+        assert_eq!(written.aggregate(), "snapshot");
+        assert_eq!(written.aggregate_id(), handle.as_str());
+        let read = SystemEvent::from_stored(written.to_payload()).expect("keep change replay");
+        assert_eq!(
+            serde_json::to_value(read).unwrap(),
+            serde_json::to_value(written).unwrap()
+        );
+    }
+}

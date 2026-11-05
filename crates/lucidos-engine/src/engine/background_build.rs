@@ -24,7 +24,7 @@ pub(crate) trait BuildHost: Send + Sync + 'static {
     fn set_build_state(&self, state: BuildState);
     async fn emit_build_state_changed(&self, state: &BuildState);
     /// Run one build. `previous_failure` is the failure it retries, if any.
-    async fn run_build(&self, previous_failure: Option<&str>) -> FinishedBuild;
+    async fn run_build(&self, previous_failure: Option<&str>, generation: u64) -> FinishedBuild;
     /// Whether `finished` already reflects HEAD, so a join needs no follow-up.
     async fn covers_head(&self, finished: &FinishedBuild) -> bool;
 }
@@ -61,6 +61,21 @@ impl BuildSlot {
     }
 }
 
+/// Apply a running build's update atomically with the restart generation check.
+pub(crate) fn with_current_build<H: BuildHost, R>(
+    host: &H,
+    generation: u64,
+    update: impl FnOnce() -> R,
+) -> Option<R> {
+    let slot = host.background_build().slot.lock().unwrap();
+    if slot.generation != generation {
+        return None;
+    }
+    let result = update();
+    drop(slot);
+    Some(result)
+}
+
 /// Start a build, or join the one in flight without disturbing it.
 pub(crate) fn join_or_start<H: BuildHost>(host: &Arc<H>) {
     let mut slot = host.background_build().slot.lock().unwrap();
@@ -92,8 +107,7 @@ fn start<H: BuildHost>(host: &Arc<H>, slot: &mut BuildSlot, superseded: Option<J
     // elapsed counter reads are the same start moment.
     let building = BuildState::building_now();
     // Read the failure this build is retrying BEFORE `Building` overwrites
-    // it. An identical repeat is the only PROOF that retrying is futile,
-    // and it is what lets the toast withhold Retry.
+    // it, so repeated failures retain their diagnostic classification.
     let previous_failure = host.build_state().failure().map(|f| f.summary.clone());
     host.set_build_state(building.clone());
     slot.task = Some(tokio::spawn(drive(
@@ -128,7 +142,9 @@ async fn drive<H: BuildHost>(
         let _ = old.await;
     }
     let settled = loop {
-        let finished = host.run_build(previous_failure.as_deref()).await;
+        let finished = host
+            .run_build(previous_failure.as_deref(), generation)
+            .await;
         match settle(&host, generation, &finished).await {
             Settled::Done => break finished.state,
             Settled::Restarted => return,

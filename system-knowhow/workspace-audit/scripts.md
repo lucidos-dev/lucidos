@@ -21,6 +21,12 @@ scan db-defaults "(^|[^[:alnum:]_])(psql|pg_dump)([^[:alnum:]_.-]|\$)|psycopg2?\
 
 ## Checks
 
+- **Harness cleanup.** Check cleanup recipes against the scoped owner-token contract in `docs/dev-runtime.md`. An eval prefix never authorizes filesystem or database deletion.
+
+- Snapshot automation follows `system-knowhow/lucidos-cli.md` § `lucidos snapshot`.
+  Flag a script that repeats restore after a lost response as **broken**.
+  Recommend the documented restore-status command.
+
 For each finding, capture: **location**, **what's wrong**, **which reference owns the rule** (link, don't quote), **suggested fix**.
 
 Per `system-knowhow/lucidos-cli.md`:

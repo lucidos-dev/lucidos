@@ -99,6 +99,7 @@ impl Fixture {
                     dir: format!("workspaces/{id}"),
                     port: 5400,
                     database_url: None,
+                    cleanup: Default::default(),
                     autostart: true,
                 })
                 .collect(),

@@ -19,6 +19,15 @@ const postClientLog = vi.fn();
 vi.mock('../../utils/clientLog', () => ({ postClientLog }));
 
 const ERROR: StreamDrop = { reason: 'error' };
+let restoreRuntimeActive = false;
+let restoreEpoch = 0;
+const acceptRestoreHello = vi.fn(async (_epoch: number, _generation: string | null) => true);
+vi.mock('../restoreRuntime', () => ({
+  hasRestoreRuntime: () => restoreRuntimeActive,
+  beginRestoreConnection: () => ++restoreEpoch,
+  acceptRestoreHello,
+}));
+afterEach(() => { restoreRuntimeActive = false; });
 
 const refreshThreadEvents = vi.fn(async (_id: string) => {});
 const markLoadedThreadsStale = vi.fn();
@@ -167,6 +176,88 @@ const { NO_BACKFILL_PROGRESS, applyTreeBackfillProgress, treeBackfill } = await 
 /** What the shell reports to the DOM, which is the only thing telling a user
  *  the stream is down. */
 const status = () => document.documentElement.dataset.lucidosEventStream;
+
+describe('production restore generation admission', () => {
+  afterEach(() => { disconnectThreadEvents(); });
+
+  it('queues domain frames behind durable hello admission and announces open afterward', async () => {
+    vi.useRealTimers();
+    vi.clearAllMocks();
+    disconnectThreadEvents();
+    restoreRuntimeActive = true;
+    let admit!: (accepted: boolean) => void;
+    acceptRestoreHello.mockImplementationOnce(() => new Promise<boolean>((resolve) => { admit = resolve; }));
+    connectThreadEvents();
+    opened!.handlers.onOpen();
+    const hello = JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } });
+    opened!.handlers.onFrame(hello);
+    opened!.handlers.onFrame(JSON.stringify({ type: 'RestoreAdmissionTestFrame', data: { value: 1 } }));
+    await vi.waitFor(() => expect(acceptRestoreHello).toHaveBeenCalled());
+    expect(fanOutEventStreamStatus).not.toHaveBeenCalledWith('open');
+    expect(processSSEForReferences).not.toHaveBeenCalled();
+    admit(true);
+    await vi.waitFor(() => expect(processSSEForReferences).toHaveBeenCalledWith('RestoreAdmissionTestFrame', { value: 1 }));
+    expect(fanOutEventStreamStatus).toHaveBeenCalledWith('open');
+  });
+
+  // A connection sends one hello. A failed admission must open a new one, or
+  // every request parked behind admission would wait forever.
+  it('reconnects to retry admission after a hello fails', async () => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+    disconnectThreadEvents();
+    restoreRuntimeActive = true;
+    acceptRestoreHello.mockRejectedValueOnce(new Error('storage full'));
+    connectThreadEvents();
+    const first = opened!;
+    first.handlers.onOpen();
+    first.handlers.onFrame(JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } }));
+    await vi.waitFor(() => expect(first.stream.close).toHaveBeenCalled());
+    expect(openEventStream).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(openEventStream).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+  });
+
+  // The failed connection dropped every frame it held back, so the retry must
+  // reconcile the gap rather than run the first-open read.
+  it('reconciles the gap on the connection that retries a failed hello', async () => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+    disconnectThreadEvents();
+    restoreRuntimeActive = true;
+    acceptRestoreHello.mockRejectedValueOnce(new Error('storage full'));
+    connectThreadEvents();
+    const first = opened!;
+    first.handlers.onOpen();
+    first.handlers.onFrame(JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } }));
+    await vi.waitFor(() => expect(first.stream.close).toHaveBeenCalled());
+    await vi.advanceTimersByTimeAsync(10_000);
+    const retry = opened!;
+    retry.handlers.onOpen();
+    retry.handlers.onFrame(JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } }));
+    await vi.waitFor(() => expect(fanOutEventStreamStatus).toHaveBeenCalledWith('open'));
+    await vi.runAllTimersAsync();
+    expect(refreshThreadList).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
+
+  it('discards frames when a restore hello requests reload instead of admission', async () => {
+    vi.useRealTimers();
+    vi.clearAllMocks();
+    disconnectThreadEvents();
+    restoreRuntimeActive = true;
+    acceptRestoreHello.mockResolvedValueOnce(false);
+    connectThreadEvents();
+    opened!.handlers.onOpen();
+    opened!.handlers.onFrame(JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } }));
+    opened!.handlers.onFrame(JSON.stringify({ type: 'RestoreAdmissionTestFrame', data: {} }));
+    await vi.waitFor(() => expect(acceptRestoreHello).toHaveBeenCalled());
+    await Promise.resolve(); await Promise.resolve();
+    expect(fanOutEventStreamStatus).not.toHaveBeenCalledWith('open');
+    expect(processSSEForReferences).not.toHaveBeenCalled();
+  });
+});
 
 describe('the shell attaching to a transport', () => {
   beforeEach(() => {

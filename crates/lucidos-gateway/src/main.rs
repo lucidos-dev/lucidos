@@ -41,6 +41,9 @@ mod build_id;
 /// The one test that needs a live engine, run by `./scripts/e2e-api.sh`.
 #[cfg(test)]
 mod chain_tests;
+mod cleanup;
+mod cleanup_audit;
+mod cleanup_process;
 mod control;
 mod engine_hop;
 mod error;
@@ -52,9 +55,14 @@ mod installs;
 mod net_config;
 mod next_boot;
 mod nudge;
+mod oauth_callback;
+mod pairing;
 mod pairing_qr;
+mod peer_connection;
 mod peers;
 mod postgres;
+#[cfg(test)]
+mod preference_test_keys;
 mod proxy;
 mod registry;
 mod relay;
@@ -66,6 +74,7 @@ mod shell_env;
 mod slowness;
 mod stack;
 mod tls;
+mod trash;
 mod update_relay;
 #[cfg(test)]
 mod value_pins_tests;

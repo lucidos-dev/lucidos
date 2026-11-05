@@ -1520,6 +1520,7 @@ function noteHistoryFloor(thread: ThreadState, snapshot: ThreadEventsSnapshot): 
   if (oldest) thread.historyFloor = { created: oldest.created, sequence: oldest.sequence };
   thread.hasOlderEvents = snapshot.hasMore === true;
   if (snapshot.pairStamps) thread.pairStamps = snapshot.pairStamps;
+  if (snapshot.cardSizes) thread.cardSizes = snapshot.cardSizes;
 }
 
 /** Put a page of OLDER events in front of the ones already held, and report

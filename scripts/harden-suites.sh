@@ -37,8 +37,15 @@
 # once its tests pass it clears the record and says RERUN, so the full set runs
 # once more (ADR 0536).
 #
-# The touched specs mobile-webkit runs go to GitHub in their own suite,
-# e2e-touched-webkit, as the run starts. The rest run on this host.
+# A passing touched-spec suite records each spec it ran in .lucidos/harden-carried,
+# with the commit it ran at. The next round leaves out a spec whose record is
+# valid: every path changed since that commit is a safe path. A suite with no
+# specs left reads PASS carried from <commit>. A FAIL, SKIP or VOID records
+# nothing.
+#
+# The touched specs mobile-webkit runs get their own suite, e2e-touched-webkit.
+# A macOS host runs it after e2e-touched, on the e2e cargo profile. Any other
+# host sends it to GitHub as the run starts. The rest run on this host.
 #
 # The verdict prints one line per suite: PASS, SKIP <reason>, FAIL, VOID
 # <reason>, RUNNING or MISSING. A touched-spec suite refused by a busy e2e lock
@@ -84,6 +91,7 @@ fi
 STATE="$ROOT/.lucidos/harden-suites"
 # Outside STATE, which every start clears: the record outlives the run.
 RETRY_FILE="$ROOT/.lucidos/harden-retry"
+CARRY_FILE="$ROOT/.lucidos/harden-carried"
 REVIEW_OUT="$ROOT/.lucidos/other-model-review.out"
 REVIEW_DONE="$ROOT/.lucidos/other-model-review.done"
 
@@ -188,6 +196,16 @@ run_codegen_step() {
     run_step codegen-step "$cmd" "the /harden codegen step"
 }
 
+# A local WebKit run takes both e2e slots, so it starts after e2e-touched
+# ends. A run gone with no exit file leaves the suite MISSING, so the verdict reruns.
+await_local_touched_specs() {
+    [ -f "$STATE/e2e-touched.queued" ] || return 0
+    while [ ! -f "$STATE/e2e-touched.exit" ]; do
+        runner_alive || return 1
+        sleep 1
+    done
+}
+
 # A suite that waits for the codegen step takes a failed step's exit code as
 # its own, so a refused gate (72) voids it and any other failure fails it.
 run_suite() { # <suite>
@@ -211,6 +229,9 @@ run_suite() { # <suite>
         fi
     fi
     hs_is_cargo_suite "$suite" && gate="the /harden $suite suite"
+    if [ "$suite" = e2e-touched-webkit ] && hs_runs_webkit_here; then
+        await_local_touched_specs || return
+    fi
     run_step "$suite" "$cmd" "$gate"
 }
 
@@ -282,6 +303,7 @@ cmd_start() {
         echo "Safe-path allowlist disabled for this run, so any change voids it. These files may read a safe path:"
         printf '  %s\n' "$disabled"
     fi
+    hs_carried_valid "$ROOT" "$CARRY_FILE" "$STATE/compile-inputs" "$([ -f "$STATE/allowlist-disabled" ] && echo 1 || echo 0)" > "$STATE/carried"
     label="$mode"
     if [ "$tier" = fast ]; then label="$mode, fast tier"; fi
 
@@ -497,9 +519,16 @@ suite_state() { # <suite>
         echo "FAIL ran no tests"
     elif [ "$suite" = engine-filtered ] && [ ! -s "$STATE/$suite.retry" ] && [ -n "$(engine_dead_filters)" ]; then
         echo "FAIL no test matched the filter: $(engine_dead_filters)"
+    elif [ -f "$STATE/$suite.all-carried" ]; then
+        echo "PASS carried from $(awk -v s="$suite" '$1 == s { print substr($3, 1, 10) }' "$STATE/carried" | sort -u | tr '\n' ' ' | sed 's/ $//')"
     else
         echo PASS
     fi
+}
+
+# A touched-spec suite that passed leaves a record the next round can carry.
+record_carry() { # <suite>
+    hs_record_carry "$CARRY_FILE" "$1" "$(cat "$STATE/start-sha")" "$STATE/$1.specs" "$STATE/untracked-at-start"
 }
 
 cmd_verdict() {
@@ -530,7 +559,8 @@ cmd_verdict() {
         state="$(suite_state "$s")"
         echo "$s $state"
         case "$state" in
-            PASS | SKIP*) ;;
+            PASS) ! hs_is_e2e_suite "$s" || record_carry "$s" ;;
+            PASS* | SKIP*) ;;
             FAIL*) fail=1; failure_record "$s" >> "$STATE/failed" ;;
             RUNNING) return 3 ;;
             *) rerun=1 ;;
@@ -555,13 +585,7 @@ cmd_verdict() {
 
 # The specs a touched-spec suite ran.
 suite_specs() { # <suite>
-    if [ -s "$STATE/$1.retry" ]; then
-        cat "$STATE/$1.retry"
-    elif [ "$1" = e2e-touched-webkit ]; then
-        hs_webkit_specs < "$STATE/touched-specs"
-    else
-        cat "$STATE/touched-specs"
-    fi
+    cat "$STATE/$1.specs"
 }
 
 # The record lines for one failed suite: "<suite> <test>" for each test its log

@@ -6,6 +6,8 @@ import { addToDashboard, removeFromDashboard, rereadDashboard } from '../../stor
 import { currentDashboard, dashboardFor } from '../../store/dashboards';
 import { dashboardTileKey } from '../../store/widgets';
 import { widgetInstanceKey, type WidgetParams } from '../../utils/widgetParams';
+import type { DashboardTileRef } from '../../api/client/widgets';
+import type { WidgetSize } from '../../store/types';
 
 /** One widget instance: what a dashboard tile names, and what a menu calls it. */
 export interface WidgetInstance {
@@ -15,6 +17,8 @@ export interface WidgetInstance {
   label?: string;
   /** What the menu calls it: the label, else the widget's name. */
   name: string;
+  /** Its card's size, which Add to dashboard starts the tile at. */
+  size?: WidgetSize;
 }
 
 export type Run = OverflowMenuContext['run'];
@@ -43,8 +47,21 @@ export function Item({ icon, label, hint, disabled, onClick }: {
   );
 }
 
-export function tileRef({ appId, params, label }: WidgetInstance) {
-  return { appId, params, label };
+export function tileRef({ appId, params, label, size }: WidgetInstance): DashboardTileRef {
+  return { appId, params, label, size };
+}
+
+/** The dashboard this layout shows, read, and whether it holds `tile`. Until
+ *  the read lands `held` is false. */
+function useDashboardHolding(tile: WidgetInstance) {
+  const dashboard = currentDashboard();
+  const view = dashboardFor(dashboard);
+  useEffect(() => {
+    if (view.status === 'not-loaded') void rereadDashboard(dashboard);
+  }, [view.status, dashboard]);
+  const key = widgetInstanceKey(tile.appId, tile.params);
+  const held = view.status === 'loaded' && view.data.tiles.some((t) => dashboardTileKey(t) === key);
+  return { dashboard, view, held };
 }
 
 /** Add to dashboard, offered in every thread, Home included, and on an app's
@@ -53,13 +70,7 @@ export function tileRef({ appId, params, label }: WidgetInstance) {
  *  dashboard is read, the row draws at once but stays inert, so it never
  *  offers the wrong action. `noun` names the tile in a failure toast. */
 export function DashboardItem({ tile, noun, run }: { tile: WidgetInstance; noun: 'widget' | 'app'; run: Run }) {
-  const dashboard = currentDashboard();
-  const view = dashboardFor(dashboard);
-  useEffect(() => {
-    if (view.status === 'not-loaded') void rereadDashboard(dashboard);
-  }, [view.status, dashboard]);
-  const key = widgetInstanceKey(tile.appId, tile.params);
-  const held = view.status === 'loaded' && view.data.tiles.some((t) => dashboardTileKey(t) === key);
+  const { dashboard, view, held } = useDashboardHolding(tile);
   if (held) {
     return (
       <Item
@@ -79,5 +90,24 @@ export function DashboardItem({ tile, noun, run }: { tile: WidgetInstance; noun:
       disabled={view.status !== 'loaded'}
       onClick={run(() => void addToDashboard(dashboard, tileRef(tile), tile.name, noun))}
     />
+  );
+}
+
+/** "+ Dashboard" on a card's bar: Add to dashboard in one tap. It shows only
+ *  once the dashboard is read and does not hold the widget yet. The ⋯ menu
+ *  still offers both actions. */
+export function AddToDashboardButton({ tile }: { tile: WidgetInstance }) {
+  const { dashboard, view, held } = useDashboardHolding(tile);
+  if (view.status !== 'loaded' || held) return null;
+  return (
+    <button
+      type="button"
+      class="action-btn action-btn-secondary widget-bar-add"
+      aria-label={`Add ${tile.name} to the ${dashboard} dashboard`}
+      data-tooltip={`A tile on the ${dashboard} dashboard`}
+      onClick={() => void addToDashboard(dashboard, tileRef(tile), tile.name, 'widget')}
+    >
+      + Dashboard
+    </button>
   );
 }

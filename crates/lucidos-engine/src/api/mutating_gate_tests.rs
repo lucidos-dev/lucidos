@@ -25,6 +25,11 @@ const GATED_ROUTES: &[&str] = &[
     "/app-capture",
     "/app/:app_id/source",
     "/app/opened",
+    "/snapshots",
+    "/snapshots/:handle",
+    "/snapshots/:handle/check",
+    "/snapshots/:handle/restore",
+    "/snapshots/restore-caller",
     "/backup",
     "/backup/key/reveal-token",
     "/backup/recipient",
@@ -186,9 +191,8 @@ const GATED_ROUTES: &[&str] = &[
     "/widgets/dashboard-add",
     "/widgets/dashboard-remove",
     "/widgets/make-reusable",
-    "/widgets/pin",
+    "/widgets/size",
     "/widgets/stop-reusing",
-    "/widgets/unpin",
 ];
 
 /// Methods that write. Mirrors [`method_mutates`], which takes a `Method`.
@@ -472,7 +476,9 @@ async fn a_voice_upgrade_is_named_by_its_ticket_but_never_over_the_header() {
     crate::test_support::seed_device(&pool, "owners-phone", Some("Mozilla/5.0"), None).await;
     let tickets = crate::api::voice_ticket::CallTickets::new();
     let thread_id = uuid::Uuid::new_v4();
-    let ticket = tickets.mint("owners-phone", thread_id).expect("a ticket");
+    let ticket = tickets
+        .mint("owners-phone", thread_id, None)
+        .expect("a ticket");
 
     refuse_unidentified(
         &pool,
@@ -485,7 +491,7 @@ async fn a_voice_upgrade_is_named_by_its_ticket_but_never_over_the_header() {
     .await
     .expect("a live ticket identifies the caller");
     assert!(
-        tickets.peek_device(&ticket).is_some(),
+        tickets.peek_device(&ticket, None).is_some(),
         "the gate must not spend the ticket the handler redeems"
     );
 

@@ -1325,3 +1325,39 @@ describe('refreshActiveNotificationsTab', () => {
     expect(notifications.value).toEqual({ status: 'loaded', data: [fresh] });
   });
 });
+
+describe('notification read source generation', () => {
+  beforeEach(() => {
+    vi.mocked(markNotificationRead).mockClear();
+    resetViewDedup();
+    servedNotifications.value = { status: 'not-loaded' };
+    servedUnreadNotifications.value = { status: 'not-loaded' };
+  });
+  it('does not mark a reused id from an old or unknown push', async () => {
+    const { observeSourceGeneration } = await import('../../utils/restoreSourceGeneration');
+    const generation = '11111111-1111-4111-8111-111111111111';
+    observeSourceGeneration(generation);
+    try {
+      for (const source of ['unknown', 'none', '22222222-2222-4222-8222-222222222222']) {
+        markReadOptimistic('reused', source);
+      }
+      await Promise.resolve();
+      expect(markNotificationRead).not.toHaveBeenCalled();
+      markReadOptimistic('reused', generation);
+      expect(markNotificationRead).toHaveBeenCalledTimes(1);
+    } finally { observeSourceGeneration(null); }
+  });
+
+  it('retains the original generation across a detail GET', async () => {
+    const { observeSourceGeneration } = await import('../../utils/restoreSourceGeneration');
+    const pending = deferred<Notification>();
+    (getNotification as Mock).mockReturnValueOnce(pending.promise);
+    const viewing = viewNotification('delayed-source', 'none');
+    observeSourceGeneration('11111111-1111-4111-8111-111111111111');
+    try {
+      pending.resolve(makeNotification('delayed-source', false));
+      await viewing;
+      expect(markNotificationRead).not.toHaveBeenCalled();
+    } finally { observeSourceGeneration(null); }
+  });
+});

@@ -1087,10 +1087,20 @@ enum CommandStatic {
 /// Codex wraps every command as `/bin/zsh -lc '<script>'`, so the inner script
 /// is what gets classified. Without that a wrapped side-effect hides behind
 /// `zsh`.
+#[cfg(test)]
 fn static_command_verdict(
     tool_name: &str,
     input: &serde_json::Value,
     trusted: &TrustedHeads,
+) -> CommandStatic {
+    static_command_verdict_at(tool_name, input, trusted, None)
+}
+
+fn static_command_verdict_at(
+    tool_name: &str,
+    input: &serde_json::Value,
+    trusted: &TrustedHeads,
+    root: Option<&Path>,
 ) -> CommandStatic {
     match coding_agent_command(tool_name, input) {
         CommandPayload::NotACommand => CommandStatic::NotACommand,
@@ -1100,7 +1110,7 @@ fn static_command_verdict(
             CommandStatic::Verdict(command_guard::static_classify_trusting(
                 tn::RUN_BASH,
                 &synthetic,
-                CommandSite::TextOnly { root: None },
+                CommandSite::TextOnly { root },
                 trusted,
             ))
         }
@@ -1131,7 +1141,16 @@ pub fn classify_coding_agent_request(
     input: &serde_json::Value,
     workspace_path: &Path,
 ) -> RequestVerdict {
-    match static_command_verdict(tool_name, input, &TrustedHeads::NONE) {
+    classify_coding_agent_request_at(tool_name, input, workspace_path, Some(workspace_path))
+}
+
+fn classify_coding_agent_request_at(
+    tool_name: &str,
+    input: &serde_json::Value,
+    workspace_path: &Path,
+    root: Option<&Path>,
+) -> RequestVerdict {
+    match static_command_verdict_at(tool_name, input, &TrustedHeads::NONE, root) {
         // A command we cannot read is the opposite of benign. The whole
         // classification below reads the command text, so there is nothing
         // left to decide on.
@@ -1337,11 +1356,13 @@ async fn judge_escalation_lane(
 ///   verdict sees. See [`destroys_from_request_cwd`].
 ///
 /// A secret read settles `IrreversibleDanger` in the static pass, so it cards.
+#[allow(clippy::too_many_arguments)]
 async fn attended_command_allowed(
     engine: Option<&LucidosEngine>,
     tool_name: &str,
     input: &serde_json::Value,
     workspace_path: &Path,
+    root: Option<&Path>,
     thread_id: Uuid,
     guard_coding_agents: bool,
     trusted: &TrustedHeads,
@@ -1354,7 +1375,7 @@ async fn attended_command_allowed(
     if !in_scope {
         return false;
     }
-    let (lane, why) = match static_command_verdict(tool_name, input, trusted) {
+    let (lane, why) = match static_command_verdict_at(tool_name, input, trusted, root) {
         CommandStatic::Verdict(StaticVerdict::Settled(lane)) => {
             (Some(lane), format!("static verdict {lane:?}"))
         }
@@ -1419,10 +1440,21 @@ fn command_privilege_escalation(tool_name: &str, input: &serde_json::Value) -> b
 /// Matching a single derived pattern instead let `git status && rm -rf /` ride
 /// a grant naming only `git`. Every other tool matches its one derived pattern
 /// exactly, as before. No grant covers a secret read, by command or file tool.
+#[cfg(test)]
 fn session_allow_covers(
     tool_name: &str,
     input: &serde_json::Value,
     trusted: &TrustedHeads,
+    allowed: impl Fn(&str) -> bool,
+) -> bool {
+    session_allow_covers_at(tool_name, input, trusted, None, allowed)
+}
+
+fn session_allow_covers_at(
+    tool_name: &str,
+    input: &serde_json::Value,
+    trusted: &TrustedHeads,
+    root: Option<&Path>,
     allowed: impl Fn(&str) -> bool,
 ) -> bool {
     use crate::engine::claude_code::{derive_allow_pattern, AllowScope};
@@ -1436,7 +1468,7 @@ fn session_allow_covers(
         return command_guard::grant_covers_command(
             tool_name,
             command,
-            CommandSite::TextOnly { root: None },
+            CommandSite::TextOnly { root },
             trusted,
             allowed,
         );
@@ -1463,10 +1495,21 @@ fn session_allow_covers(
 /// [`command_guard::grant_covers_command`]. Claude Code and Codex both read the
 /// `Bash` and `Bash(<head>:*)` lines, so a line means the same whichever agent
 /// asks (ADR 0571).
+#[cfg(test)]
 fn persisted_allow_covers(
     tool_name: &str,
     input: &serde_json::Value,
     trusted: &TrustedHeads,
+    allowed: impl Fn(&str) -> bool,
+) -> bool {
+    persisted_allow_covers_at(tool_name, input, trusted, None, allowed)
+}
+
+fn persisted_allow_covers_at(
+    tool_name: &str,
+    input: &serde_json::Value,
+    trusted: &TrustedHeads,
+    root: Option<&Path>,
     allowed: impl Fn(&str) -> bool,
 ) -> bool {
     use crate::engine::claude_code::{derive_allow_pattern, AllowScope};
@@ -1489,7 +1532,7 @@ fn persisted_allow_covers(
     command_guard::grant_covers_command(
         CLAUDE_CODE_COMMAND_TOOL,
         command,
-        CommandSite::TextOnly { root: None },
+        CommandSite::TextOnly { root },
         trusted,
         allowed,
     )
@@ -1499,19 +1542,25 @@ fn persisted_allow_covers(
 /// kept only when storing it would cover this same request. So no button
 /// stores a line that covers nothing (ADR 0571). Read from the verbatim input,
 /// under the trust the request resolved.
-pub(crate) fn grant_offer(
+#[cfg(test)]
+fn grant_offer(tool_name: &str, input: &serde_json::Value, trusted: &TrustedHeads) -> GrantOffer {
+    grant_offer_at(tool_name, input, trusted, None)
+}
+
+fn grant_offer_at(
     tool_name: &str,
     input: &serde_json::Value,
     trusted: &TrustedHeads,
+    root: Option<&Path>,
 ) -> GrantOffer {
     use crate::engine::claude_code::{derive_allow_pattern, AllowScope};
     let offered = |scope| {
         let pattern = derive_allow_pattern(tool_name, input, scope, trusted)?;
         let only = |p: &str| p == pattern;
         let covers = match scope {
-            AllowScope::Session => session_allow_covers(tool_name, input, trusted, only),
+            AllowScope::Session => session_allow_covers_at(tool_name, input, trusted, root, only),
             AllowScope::Broad | AllowScope::Narrow => {
-                persisted_allow_covers(tool_name, input, trusted, only)
+                persisted_allow_covers_at(tool_name, input, trusted, root, only)
             }
         };
         covers.then_some(pattern)
@@ -1680,6 +1729,43 @@ pub async fn prompt_coding_agent_permission(
         input,
     } = request;
 
+    // No grant or preference can lift the catastrophic floor. Use the session's
+    // trusted worktree for its exemption, while retaining the request's cwd.
+    if let CommandPayload::Known(command) = coding_agent_command(&tool_name, &input) {
+        let command = if let Some(cwd) = input
+            .get("cwd")
+            .or_else(|| input.get("workdir"))
+            .and_then(|v| v.as_str())
+        {
+            format!("cd {:?} && {}", cwd, command)
+        } else {
+            command.to_string()
+        };
+        if let Some(reason) = command_guard::catastrophic_reason_for_command_at(
+            &command,
+            worktree_path.or(Some(workspace_path)),
+        ) {
+            let reason = match resolve_attend_mode(pool, trigger_configs, thread_id).await {
+                AttendMode::Unattended { .. } => UNATTENDED_DENY_CATASTROPHIC_REASON.to_string(),
+                AttendMode::Interactive => format!("Refused by the command guard: {reason}"),
+            };
+            record_permission_denial(
+                pool,
+                event_bus,
+                thread_id,
+                &tool_use_id,
+                &tool_name,
+                &input,
+                &reason,
+            )
+            .await;
+            return PermissionPromptOutcome {
+                allowed: false,
+                reason: Some(reason),
+            };
+        }
+    }
+
     // Cheapest gate first: a pure path check, no lock and no DB.
     if worktree_write_auto_allowed(&tool_name, &input, worktree_path) {
         return PermissionPromptOutcome {
@@ -1699,9 +1785,13 @@ pub async fn prompt_coding_agent_permission(
 
     let is_session_allowed = {
         let pending = pending.lock().unwrap();
-        session_allow_covers(&tool_name, &input, &trusted, |p| {
-            pending.matches_session_allow(thread_id, p)
-        })
+        session_allow_covers_at(
+            &tool_name,
+            &input,
+            &trusted,
+            worktree_path.or(Some(workspace_path)),
+            |p| pending.matches_session_allow(thread_id, p),
+        )
     };
     if is_session_allowed {
         return PermissionPromptOutcome {
@@ -1714,12 +1804,17 @@ pub async fn prompt_coding_agent_permission(
     // the inherited side-effect grant plus a static benign check. The session
     // NEVER hangs, and nothing here waits. An auto-ALLOW emits no events, like
     // the fast path above: it surfaces as the normal tool call. An auto-DENY
-    // records the pair (see `record_unattended_denial`), because the agent's
+    // records the pair (see `record_permission_denial`), because the agent's
     // own failure report is not something the user can read back later.
     if let AttendMode::Unattended { grant } =
         resolve_attend_mode(pool, trigger_configs, thread_id).await
     {
-        let verdict = classify_coding_agent_request(&tool_name, &input, workspace_path);
+        let verdict = match worktree_path {
+            Some(root) => {
+                classify_coding_agent_request_at(&tool_name, &input, workspace_path, Some(root))
+            }
+            None => classify_coding_agent_request(&tool_name, &input, workspace_path),
+        };
         let (allowed, reason) = decide_unattended(verdict, &grant);
         crate::log!(
             "[CCPermission] unattended auto-resolve thread={} tool={} -> {} ({})",
@@ -1729,7 +1824,7 @@ pub async fn prompt_coding_agent_permission(
             reason
         );
         if !allowed {
-            record_unattended_denial(
+            record_permission_denial(
                 pool,
                 event_bus,
                 thread_id,
@@ -1756,9 +1851,13 @@ pub async fn prompt_coding_agent_permission(
         &crate::core::grants_dir(workspace_path),
         crate::core::grants::GrantFile::CodingAgentTools,
     );
-    if persisted_allow_covers(&tool_name, &input, &trusted, |p| {
-        granted.iter().any(|g| g == p)
-    }) {
+    if persisted_allow_covers_at(
+        &tool_name,
+        &input,
+        &trusted,
+        worktree_path.or(Some(workspace_path)),
+        |p| granted.iter().any(|g| g == p),
+    ) {
         return PermissionPromptOutcome {
             allowed: true,
             reason: Some(PERSISTED_ALLOW_REASON.to_string()),
@@ -1778,6 +1877,7 @@ pub async fn prompt_coding_agent_permission(
         &tool_name,
         &input,
         workspace_path,
+        worktree_path.or(Some(workspace_path)),
         thread_id,
         guard_coding_agents,
         &trusted,
@@ -1804,7 +1904,12 @@ pub async fn prompt_coding_agent_permission(
     // built from the redacted copy, because it interpolates the command.
     let event_input = permission_event_input(&input);
     let summary = build_permission_summary(&tool_name, &event_input);
-    let offer = without_secret_patterns(grant_offer(&tool_name, &input, &trusted));
+    let offer = without_secret_patterns(grant_offer_at(
+        &tool_name,
+        &input,
+        &trusted,
+        worktree_path.or(Some(workspace_path)),
+    ));
 
     let (request_id, mut rx, is_canonical) = {
         let mut pending = pending.lock().unwrap();
@@ -1851,7 +1956,7 @@ pub async fn prompt_coding_agent_permission(
     outcome_from_permission_recv(rx.recv().await)
 }
 
-/// Record an unattended auto-DENY in the thread's timeline, as the ordinary
+/// Record an automatic denial in the thread's timeline, as the ordinary
 /// request/resolved pair rather than a new event type.
 ///
 /// The unattended lane emits nothing on an ALLOW, deliberately: there is no
@@ -1862,7 +1967,7 @@ pub async fn prompt_coding_agent_permission(
 ///
 /// The command text is redacted for the event exactly as the interactive path
 /// redacts it: it is persisted AND fanned out over SSE.
-async fn record_unattended_denial(
+async fn record_permission_denial(
     pool: &sqlx::PgPool,
     event_bus: &EventBus,
     thread_id: Uuid,
@@ -2944,11 +3049,16 @@ mod tests {
                 "{cmd}"
             );
         }
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
         assert_eq!(
             classify_coding_agent_request(
                 "command_execution",
-                &serde_json::json!({ "command": "cd /ws/../etc && rm -rf x" }),
-                Path::new("/ws"),
+                &serde_json::json!({ "command": format!("cd {} && rm -rf x", outside.display()) }),
+                &workspace,
             ),
             RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction)
         );
@@ -3143,6 +3253,7 @@ mod tests {
             tool_name,
             &input,
             Path::new("/ws"),
+            None,
             Uuid::new_v4(),
             guard_coding_agents,
             &TrustedHeads::NONE,
@@ -4026,6 +4137,7 @@ mod tests {
                     CODEX_COMMAND_TOOL,
                     &input,
                     Path::new("/ws"),
+                    None,
                     Uuid::new_v4(),
                     flag,
                     &TrustedHeads::NONE
@@ -4429,6 +4541,63 @@ mod tests {
             &[SideEffectCategory::ExternalApi],
         );
         assert!(!denied);
+    }
+
+    #[tokio::test]
+    async fn cleanup_floor_precedes_broad_session_grants_on_coding_agent_gate() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("protected");
+        std::fs::create_dir_all(root.join(".lucidos")).unwrap();
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        let pending = Mutex::new(PermissionState::default());
+        let thread_id = Uuid::new_v4();
+        seed_cc_thread(&bus, thread_id).await;
+        pending
+            .lock()
+            .unwrap()
+            .allow_session(thread_id, "Bash".to_string());
+        for tool in ["Bash", "command_execution"] {
+            let outcome = prompt_coding_agent_permission(
+                &pool,
+                &bus,
+                &pending,
+                &empty_trigger_configs(),
+                temp.path(),
+                None,
+                None,
+                CodingAgentPermissionInput {
+                    thread_id,
+                    tool_use_id: tool.to_string(),
+                    tool_name: tool.to_string(),
+                    input: serde_json::json!({"command": "rm -rf protected", "cwd": temp.path()}),
+                },
+            )
+            .await;
+            assert!(!outcome.allowed, "{tool}");
+        }
+        let worktree = temp.path().join("own-worktree");
+        let gitdir = temp.path().join("git-admin");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(gitdir.join("commondir"), "..").unwrap();
+        std::fs::create_dir_all(worktree.join(".lucidos")).unwrap();
+        std::fs::create_dir_all(worktree.join("data")).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}", gitdir.display()),
+        )
+        .unwrap();
+        let outcome = prompt_coding_agent_permission(&pool, &bus, &pending, &empty_trigger_configs(),
+            temp.path(), Some(&worktree), None, CodingAgentPermissionInput { thread_id,
+                tool_use_id: "own-worktree".into(), tool_name: "Bash".into(),
+                input: serde_json::json!({"command": format!("rm -rf {}", worktree.display()), "cwd": worktree})
+            }).await;
+        assert!(outcome.allowed, "the session's own worktree is exempt");
+        assert!(root.exists());
+        pool.close().await;
+        teardown_test_db(&db_name).await;
     }
 
     // --- resolver (DB-backed) ----------------------------------------------

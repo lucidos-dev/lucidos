@@ -2022,3 +2022,79 @@ async fn restore_archive_into_brings_back_pending_change_branches() {
         "the bundles go back into their repositories, not the workspace"
     );
 }
+
+/// The capture boundary keeps the legacy backup layout, including the sealed
+/// secret key entry and the dump at the archive root.
+#[test]
+fn captured_backup_preserves_payload_bytes_and_layout() {
+    use std::io::Read;
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(ws.path().join("data/blobs")).unwrap();
+    std::fs::write(ws.path().join("data/blobs/sample"), b"blob bytes").unwrap();
+    let dump = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(dump.path(), b"dump bytes").unwrap();
+    let key = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(key.path(), b"synthetic backup key").unwrap();
+    let output = tempfile::NamedTempFile::new().unwrap();
+    tar_and_compress(
+        ws.path(),
+        dump.path(),
+        key.path(),
+        None,
+        output.path(),
+        &BackupIgnore::default(),
+    )
+    .unwrap();
+    let decoder = zstd::Decoder::new(std::fs::File::open(output.path()).unwrap()).unwrap();
+    let mut archive = tar::Archive::new(decoder);
+    let mut entries = std::collections::BTreeMap::new();
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let path = entry.path().unwrap().into_owned();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).unwrap();
+        assert!(entries.insert(path, bytes).is_none());
+    }
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[Path::new("data/blobs/sample")], b"blob bytes");
+    assert_eq!(entries[Path::new("lucidos_backup.dump")], b"dump bytes");
+    assert_eq!(
+        entries[Path::new(SECRET_STORE_KEY_ENTRY)],
+        b"synthetic backup key"
+    );
+}
+
+/// A file pruned between the walk and its stat must not fail a capture.
+#[test]
+fn the_size_sum_skips_a_file_that_vanished_after_the_walk() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("data")).unwrap();
+    std::fs::write(ws.join("data/kept.bin"), vec![0u8; 700]).unwrap();
+    let walked = vec![ws.join("data/kept.bin"), ws.join("data/pruned.bin")];
+    for unreadable in [Unreadable::Skip, Unreadable::Refuse] {
+        assert_eq!(
+            sum_file_bytes(ws, walked.clone(), &BackupIgnore::default(), unreadable).unwrap(),
+            700
+        );
+    }
+}
+
+/// One unreadable file must not zero the backup preflight's estimate, while a
+/// snapshot capture refuses the tree rather than check its floor against less.
+#[test]
+fn only_the_snapshot_estimate_refuses_an_unreadable_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("data")).unwrap();
+    std::fs::write(ws.join("data/kept.bin"), vec![0u8; 700]).unwrap();
+    // A path through a regular file fails its stat with something other than
+    // NotFound.
+    let walked = vec![ws.join("data/kept.bin"), ws.join("data/kept.bin/child")];
+    let ignore = BackupIgnore::default();
+    assert_eq!(
+        sum_file_bytes(ws, walked.clone(), &ignore, Unreadable::Skip).unwrap(),
+        700
+    );
+    assert!(sum_file_bytes(ws, walked, &ignore, Unreadable::Refuse).is_err());
+}

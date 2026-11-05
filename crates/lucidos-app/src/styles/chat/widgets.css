@@ -1,101 +1,9 @@
-/* --- Widgets (ADRs 0402, 0407, 0466) ---
-   A widget is an inline widget in its turn (.inline-widget), and a
-   chip on the thread's widget shelf once pinned. A chip tap drops the widget
-   open under the title (.widget-shelf-drop). The inline frame never scrolls,
-   so no scroller sits inside the transcript's own. */
+/* --- Widgets (ADRs 0402, 0432, 0466) ---
+   A widget is an inline widget in its turn (.inline-widget): a bar over a
+   widget box, the same box a dashboard tile is. No frame scrolls inside the
+   transcript. */
 
-/* A chip never squeezes the title. On desktop the shelf sits beside the title
-   when the row has room and wraps under it when not. On the phone it always
-   takes its own line. Each row sets its own row gap. */
-.thread-view-header,
-.mobile-thread-title-row {
-    flex-wrap: wrap;
-}
-
-.mobile-thread-title-row .widget-shelf {
-    flex-basis: 100%;
-}
-
-.widget-shelf {
-    display: flex;
-    align-items: center;
-    gap: 0.375rem;
-    min-width: 0;
-    flex: 0 1 auto;
-    overflow-x: auto;
-    scrollbar-width: none;
-    /* Ring room: the scroll box clips, so it pads the chips' focus ring in
-       and hands the space back. The chips stay centred on the title's first
-       line. */
-    padding: var(--focus-ring-width);
-    margin: calc(0.125rem - var(--focus-ring-width)) calc(-1 * var(--focus-ring-width));
-}
-
-.widget-shelf::-webkit-scrollbar {
-    display: none;
-}
-
-.widget-chip {
-    --app-icon-size: 1.125rem;
-    display: inline-flex;
-    align-items: center;
-    gap: 0.375rem;
-    flex-shrink: 0;
-    padding: 0.1875rem 0.625rem;
-    border: 1px solid var(--border-color);
-    border-radius: var(--radius-round);
-    background: var(--bg-secondary);
-    color: var(--text-secondary);
-    font-size: var(--font-size-sm);
-    white-space: nowrap;
-    cursor: pointer;
-    -webkit-user-select: none;
-    user-select: none;
-    transition: border-color var(--duration-fast) ease, color var(--duration-fast) ease;
-}
-
-.widget-chip-name {
-    min-width: 0;
-    max-width: 14rem;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-/* A shelf too narrow for every label shows icons only, each chip keeping its
-   pill. The name stays the tooltip and the accessible name (invariant I16). */
-.widget-shelf.is-tight .widget-chip {
-    padding: 0.1875rem;
-}
-
-.widget-shelf.is-tight .widget-chip-name {
-    display: none;
-}
-
-.widget-chip.is-open {
-    border-color: var(--accent);
-    color: var(--text-primary);
-}
-
-.widget-chip:focus-visible {
-    outline: 0.125rem solid transparent;
-    box-shadow: var(--focus-ring);
-}
-
-@media (hover: hover) {
-    .widget-chip:hover {
-        color: var(--text-primary);
-        border-color: var(--accent);
-    }
-}
-
-/* The dropped open widget: an anchored overlay under the title row, the
-   row's own width. Its card carries the surface. */
-.widget-shelf-drop {
-    z-index: var(--z-float);
-    padding: 0 var(--space-sm);
-}
-
-.widget-shelf-drop .widget-panel {
+.widget-panel {
     margin: 0.25rem 0 0;
     background: var(--bg-primary);
     box-shadow: var(--shadow-md);
@@ -108,37 +16,95 @@
     overflow: hidden;
 }
 
-.inline-widget {
-    margin: var(--space-sm) 0;
-}
-
-/* About one phone screen. A taller widget is cut here, never scrolled: the
-   clip has no scrollbar, so a swipe over it moves the transcript. */
-.inline-widget-clip {
+/* --- The widget box: a thread card's and a dashboard tile's (WidgetBox) ---
+   The size sets the box and the frame fills it. A report never sizes it, and
+   it never scrolls inside: content past it is clipped under a fade. */
+.widget-box {
     position: relative;
-    max-height: min(70dvh, 36rem);
     overflow: hidden;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-surface);
+    background: var(--bg-secondary);
+    isolation: isolate;
 }
 
-/* Over the clipped edge: the widget dissolves into its panel, and Expand opens
-   it in full. Only the button takes a tap; the rest reaches the widget. */
-.inline-widget-fade {
+/* The frame takes the bottom layer and everything the box draws over it
+   stacks above. Tree order alone fails on iOS: a frame whose widget
+   composites, such as an animated transform, paints over later siblings. */
+.widget-box > .widget-frame {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+}
+
+.widget-box > :not(.widget-frame) {
+    z-index: 1;
+}
+
+.widget-box .app-ui-iframe {
+    background: transparent;
+}
+
+.widget-box .app-ui-cover {
+    background: var(--bg-secondary);
+}
+
+/* A widget with its own shape, such as a round clock, draws on the surface
+   behind the box. */
+.widget-box.is-transparent {
+    border-color: transparent;
+    background: transparent;
+}
+
+.widget-box.is-transparent .app-ui-cover {
+    background: var(--bg-primary);
+}
+
+/* Marks a clipped box. A tap or a scroll here reaches the widget. */
+.widget-box-fade {
     position: absolute;
     inset: auto 0 0;
-    display: flex;
-    align-items: flex-end;
-    justify-content: center;
-    min-height: 4rem;
-    padding: var(--space-sm);
+    height: 3.5rem;
     background: linear-gradient(to bottom, transparent, var(--bg-secondary));
     pointer-events: none;
 }
 
-.inline-widget-fade .action-btn {
-    pointer-events: auto;
+.widget-box.is-transparent .widget-box-fade {
+    background: none;
 }
 
-.inline-widget-gone {
+/* --- An inline widget: its bar over its widget box ---
+   The card is the box's width (--widget-box-width, set from the size). The
+   bar and the box carry the surface between them, so the box keeps a tile's
+   border and the widget gets a tile's room to the pixel. On a phone the box
+   matches the phone dashboard's, which can be a hair wider than the turn: it
+   then centres on the turn rather than spilling to one side. */
+.inline-widget {
+    width: var(--widget-box-width);
+    max-width: none;
+    margin: var(--space-sm) 0 var(--space-sm) min(0px, (100% - var(--widget-box-width)) / 2);
+    border: none;
+    background: none;
+    overflow: visible;
+}
+
+.inline-widget > .widget-bar {
+    border: 1px solid var(--border-color);
+    border-bottom: none;
+    border-radius: var(--radius-surface) var(--radius-surface) 0 0;
+    background: var(--bg-secondary);
+}
+
+.inline-widget > .widget-box {
+    height: var(--widget-box-height);
+    border-radius: 0 0 var(--radius-surface) var(--radius-surface);
+}
+
+.inline-widget.inline-widget-gone {
+    width: auto;
+    margin: var(--space-sm) 0;
+    border: 1px solid var(--border-color);
+    background: var(--bg-secondary);
     padding: var(--space-sm) var(--space-md);
     color: var(--text-muted);
     font-size: var(--font-size-sm);
@@ -180,13 +146,40 @@
     color: var(--text-primary);
 }
 
-.widget-bar-kind {
+.widget-bar-add {
     flex-shrink: 0;
-    color: var(--text-muted);
+    padding: 0.125rem 0.5rem;
+    font-size: var(--font-size-xs);
+    white-space: nowrap;
 }
 
-.widget-bar-kind::before {
-    content: '· ';
+/* The pill a card's bar and an edited tile draw. In a bar it stays compact, so
+   a small card's bar still holds its icon, the pill and the ⋯. */
+.widget-size-pill {
+    display: flex;
+    flex-shrink: 0;
+    gap: 0.125rem;
+    padding: 0.125rem;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-round);
+    background: var(--bg-primary);
+}
+
+.widget-size-pill button {
+    min-width: 1.25rem;
+    padding: 0 0.25rem;
+    border: none;
+    border-radius: var(--radius-round);
+    background: none;
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.widget-size-pill button.is-current {
+    background: var(--accent);
+    color: var(--text-on-accent);
 }
 
 .widget-bar-actions {
@@ -207,8 +200,7 @@
     height: var(--icon-size-md);
 }
 
-/* Sized to what the widget reports. Only the shelf's frame animates its
-   height, since the inline card reads the clip box's settled height. */
+/* An option frame is sized to what the widget reports. */
 .widget-frame {
     position: relative;
     display: flex;
@@ -222,23 +214,11 @@
     min-height: 0;
 }
 
-/* The inline frame takes the full reported height, so it never scrolls. The
-   cap sits far past the card's clip and stops a widget whose body tracks the
-   viewport from feeding its own height back without end. */
-.widget-frame-inline,
+/* An option frame takes its full reported height, so it never scrolls. The
+   cap stops a widget whose body tracks the viewport from feeding its own
+   height back without end. */
 .widget-frame-option {
     max-height: 300dvh;
-}
-
-/* The drop-down covers the transcript, so past the cap the frame is the only
-   scroller under a finger. */
-.widget-frame-shelf {
-    max-height: 70dvh;
-    transition: height var(--duration-fast) ease;
-}
-
-:root[data-motion="reduce"] .widget-frame-shelf {
-    transition: none;
 }
 
 .widget-menu-label {

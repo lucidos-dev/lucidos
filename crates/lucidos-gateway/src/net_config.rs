@@ -558,6 +558,31 @@ pub fn bind_plan(choice: &BindChoice, port: u16) -> BindPlan {
     }
 }
 
+/// A side listener's port: `configured` when set, else the gateway's own plus
+/// `offset`, so dev and packaged gateways coexist.
+///
+/// `None` means no listener. That is what an explicit `0` asks for, and what an
+/// unparseable value gets: a listener on a port nobody meant to open is worse
+/// than none. `var` names the setting in that log line.
+pub fn side_port(
+    var: &str,
+    configured: Option<&str>,
+    gateway_port: u16,
+    offset: u16,
+) -> Option<u16> {
+    match configured.map(str::trim) {
+        Some(raw) if !raw.is_empty() => match raw.parse::<u16>() {
+            Ok(0) => None,
+            Ok(port) => Some(port),
+            Err(_) => {
+                crate::log!("[Gateway] {var} '{raw}' is not a port, so that listener stays off");
+                None
+            }
+        },
+        _ => gateway_port.checked_add(offset),
+    }
+}
+
 /// Human-readable scope for the startup log — reports the actual address chosen.
 /// A specific address notes the retained loopback (see [`bind_socket_addrs`]).
 pub fn bind_scope_label(choice: &BindChoice) -> String {

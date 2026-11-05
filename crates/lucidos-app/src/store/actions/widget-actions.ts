@@ -1,33 +1,21 @@
-/** What the user does to a thread's widget from its inline widget, its chip
- *  and its menus (ADRs 0402, 0407). Every menu action is also an agent action
- *  and a CLI verb. */
+/** What the user does to a thread's widget from its inline widget and its
+ *  menus (ADR 0402). Every menu action is also an agent action and a CLI
+ *  verb. */
 
 import {
   getAppApi,
   makeWidgetReusableApi,
-  pinWidgetApi,
+  sizeWidgetCardsApi,
   stopReusingWidgetApi,
-  unpinWidgetApi,
   type WidgetInstanceRef,
 } from '../../api/client/widgets';
-import { widgetInstanceKey, type WidgetParams } from '../../utils/widgetParams';
-import { expandExchange, showToast, threadMap } from '../store';
-import { computeExchanges } from '../thread-events';
-import { openShelfWidget } from '../widgets';
+import type { WidgetParams } from '../../utils/widgetParams';
+import type { WidgetSize } from '../types';
+import { showToast } from '../store';
 import { errorDetail } from '../../utils/errorDetail';
 import { openApp } from './apps';
 import { appendMessagesToCompose } from './chat';
 import { focusPromptNow } from '../../components/chat/promptFocus';
-import { showEventWhereItLives } from './event-navigation';
-import { closeShelfWidget } from './widgets';
-
-/** A chip tap: drop the instance open under the title, or fold it back. */
-export function toggleShelfWidget(threadId: string, instanceKey: string): void {
-  const open = openShelfWidget.value;
-  openShelfWidget.value = open?.threadId === threadId && open.instanceKey === instanceKey
-    ? null
-    : { threadId, instanceKey };
-}
 
 /** Run a widget action, toasting a failure. */
 async function run(action: () => Promise<unknown>, failure: string): Promise<void> {
@@ -38,19 +26,10 @@ async function run(action: () => Promise<unknown>, failure: string): Promise<voi
   }
 }
 
-/** "Unpin from shelf": the chip goes, the inline widget and the files stay. */
-export async function unpinWidgetFromShelf(instance: WidgetInstanceRef, name: string): Promise<void> {
-  const open = openShelfWidget.value;
-  if (open?.threadId === instance.threadId && open.instanceKey === widgetInstanceKey(instance.appId, instance.params)) {
-    closeShelfWidget();
-  }
-  await run(() => unpinWidgetApi(instance), `Couldn't unpin widget "${name}" from the shelf`);
-}
-
-/** "Pin to shelf": the instance gets a chip. `shownEventId` is the event that
- *  draws it in the thread, where "Show in thread" lands. */
-export async function pinWidgetToShelf(instance: WidgetInstanceRef, name: string, shownEventId?: string): Promise<void> {
-  await run(() => pinWidgetApi(instance, shownEventId), `Couldn't pin widget "${name}" to the shelf`);
+/** A pill pick: this instance's cards in the thread take `size`. The card
+ *  redraws when the event arrives, so a refusal changes nothing on screen. */
+export async function sizeWidgetCards(instance: WidgetInstanceRef, name: string, size: WidgetSize): Promise<void> {
+  await run(() => sizeWidgetCardsApi(instance, size), `Couldn't resize widget "${name}"`);
 }
 
 export async function makeWidgetReusable(appId: string, name: string): Promise<void> {
@@ -79,16 +58,4 @@ export function makeAppFromWidget(threadId: string, appId: string, name: string)
     { text: `Make an app from the ${name} widget (\`${appId}\`).`, imageHashes: [] },
   ]);
   focusPromptNow();
-}
-
-/** "Show in thread": land on the inline widget, at the turn that drew it. A
- *  folded turn draws no body, so that turn unfolds first. The id is an old
- *  `WidgetShown` step, or the turn's starter, which a reply's pin records. */
-export function showWidgetInThread(threadId: string, shownEventId: string): void {
-  closeShelfWidget();
-  const thread = threadMap.value.get(threadId);
-  const turn = thread && computeExchanges(thread).find((x) => x.userEvent._eventId === shownEventId
-    || x.steps.some(({ event }) => event._eventId === shownEventId));
-  if (turn) expandExchange(threadId, turn.userSeq);
-  void showEventWhereItLives(shownEventId);
 }

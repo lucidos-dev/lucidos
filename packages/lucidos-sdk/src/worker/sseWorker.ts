@@ -11,9 +11,9 @@
  * foreground followers. A worker is not frozen that way, and it exits when its
  * last port goes.
  *
- * Frames are relayed verbatim, so a port cannot tell this apart from its own
- * `EventSource`. The one exception is `PresenceCheck`, which is relayed AND
- * aggregated; see `collectPong`.
+ * Frames are relayed verbatim. `StreamHello` is also retained for late ports
+ * so each document can check the workspace generation before consuming events.
+ * `PresenceCheck` is relayed AND aggregated; see `collectPong`.
  */
 
 import {
@@ -53,6 +53,15 @@ let pongUrl = '';
  *  while the stream is DOWN must not get one, or the document would paint
  *  connected over a dead upstream. */
 let upstreamOpen = false;
+/** Connection metadata only, never a replay cache of domain events. Late
+ *  joiners need the same generation barrier as the original subscribers. */
+let streamHello: string | null = null;
+let generation: string | null | undefined;
+
+function clearCollections(): void {
+  for (const open of collecting.values()) clearTimeout(open.timer);
+  collecting.clear();
+}
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** Post to one client.
@@ -93,6 +102,9 @@ function closeUpstream(): void {
   source?.close();
   source = null;
   upstreamOpen = false;
+  streamHello = null;
+  generation = undefined;
+  clearCollections();
 }
 
 /** Open the upstream, once, on the first port that names it. An empty URL
@@ -109,18 +121,34 @@ function ensureSource(): void {
   });
   liveness = watch;
   es.onmessage = (event: MessageEvent) => {
+    if (source !== es) return;
     watch.touch();
     const data = event.data as string;
+    if (data.includes('StreamHello')) {
+      try {
+        const frame = JSON.parse(data);
+        if (frame?.type === 'StreamHello') {
+          clearCollections();
+          const value = frame.data?.restore_generation;
+          generation = value === null || typeof value === 'string' ? value : undefined;
+          streamHello = data;
+        }
+      } catch {
+        // Preserve verbatim forwarding; the document owns malformed frames.
+      }
+    }
     maybeStartPongCollection(data);
     broadcast({ t: 'frame', data });
   };
   es.addEventListener(SSE_KEEPALIVE_EVENT, () => watch.touch());
   es.onopen = () => {
+    if (source !== es) return;
     watch.touch();
     upstreamOpen = true;
     broadcast({ t: 'open' });
   };
   es.onerror = () => {
+    if (source !== es) return;
     dropUpstream({});
     // The worker owns the retry, and its ports must not duplicate it. A port
     // that tore itself down on this error would leave the worker, and the last
@@ -169,8 +197,9 @@ function restartUpstream(): void {
 // worker asks its ponging ports, merges their answers, and POSTs exactly once.
 
 interface Collection {
-  expected: number;
-  answers: PongAnswer[];
+  expected: Set<Client>;
+  answers: Map<Client, PongAnswer>;
+  generation: string | null;
   timer: ReturnType<typeof setTimeout>;
 }
 
@@ -197,18 +226,18 @@ function maybeStartPongCollection(data: string): void {
   const id = parsed.data?.notification_id;
   if (typeof id !== 'string' || collecting.has(id)) return;
 
-  const expected = [...clients].filter((c) => c.pongs).length;
-  if (expected === 0) return;
+  const expected = new Set([...clients].filter((c) => c.pongs));
+  if (expected.size === 0 || generation === undefined) return;
 
   const timer = setTimeout(() => settle(id), PONG_COLLECT_MS);
-  collecting.set(id, { expected, answers: [], timer });
+  collecting.set(id, { expected, answers: new Map(), timer, generation });
 }
 
-function collectPong(notificationId: string, answer: PongAnswer): void {
+function collectPong(client: Client, notificationId: string, answer: PongAnswer, sourceGeneration: string | null): void {
   const open = collecting.get(notificationId);
-  if (!open) return;
-  open.answers.push(answer);
-  if (open.answers.length >= open.expected) settle(notificationId);
+  if (!open || !open.expected.has(client) || open.generation !== sourceGeneration) return;
+  open.answers.set(client, answer);
+  if (open.answers.size >= open.expected.size) settle(notificationId);
 }
 
 /** POST the one aggregated pong for this notification, and stop collecting. */
@@ -217,8 +246,8 @@ function settle(notificationId: string): void {
   if (!open) return;
   clearTimeout(open.timer);
   collecting.delete(notificationId);
-  const merged = aggregatePongAnswers(open.answers);
-  if (merged) postPong(pongUrl, notificationId, merged);
+  const merged = aggregatePongAnswers([...open.answers.values()]);
+  if (merged) postPong(pongUrl, notificationId, merged, open.generation);
 }
 
 // --- Port lifecycle -------------------------------------------------------
@@ -239,7 +268,10 @@ function attach(port: MessagePort): void {
       // A port attaching to a stream that is already open gets its `open` now.
       // It never saw the upstream's own, and without one it would sit on
       // "connecting" for good and never run its late-join reconcile.
-      if (upstreamOpen) send(client, { t: 'open', lateJoin: true });
+      if (upstreamOpen) {
+        send(client, { t: 'open', lateJoin: true });
+        if (streamHello !== null) send(client, { t: 'frame', data: streamHello });
+      }
       return;
     }
 
@@ -259,7 +291,7 @@ function attach(port: MessagePort): void {
     }
 
     if (msg.t === 'pong') {
-      collectPong(msg.notificationId, msg.answer);
+      collectPong(client, msg.notificationId, msg.answer, msg.sourceGeneration);
       return;
     }
 

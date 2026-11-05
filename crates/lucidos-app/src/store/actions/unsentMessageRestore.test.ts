@@ -1,3 +1,4 @@
+import { observeSourceGeneration } from '../../utils/restoreSourceGeneration';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 vi.mock('./thread-loading', async (importOriginal) => {
@@ -80,6 +81,7 @@ function engineRow(threadId: string, seq: number, text: string, created: string,
 }
 
 beforeEach(() => {
+  observeSourceGeneration(null);
   backend = createMemoryUnsentMessageBackend();
   _resetUnsentMessageRecordsForTesting(backend);
   _resetUnsentMessageRestoreForTesting();
@@ -94,6 +96,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  observeSourceGeneration(null);
   // A refused Retry schedules a compose write; drop it with the thread.
   for (const id of threadMap.value.keys()) forgetComposeState(id);
   _resetUndeliveredComposeDraftsForTesting();
@@ -383,4 +386,33 @@ describe('a thread-list read after the restore', () => {
 
     expect(getDraft(LIVE).text).toBe('typed on another device');
   });
+});
+
+it('retains an uncaptured historical send without settling it against restored history', async () => {
+  observeSourceGeneration('current');
+  const old = record('late-old');
+  await seed(old);
+  expect((await restoreUnsentMessages()).shown).toBe(0);
+  expect(await backend.list()).toEqual([old]);
+  expect(ensureThreadByIdInMap).not.toHaveBeenCalled();
+  expect(unsentMessages.peek().size).toBe(0);
+});
+
+it('allows a current-generation unsent message to survive an ordinary page reload', async () => {
+  observeSourceGeneration('current');
+  await seed(record('current-send', { sourceGeneration: 'current' }));
+  expect((await restoreUnsentMessages()).shown).toBe(1);
+  expect(unsentMessages.peek().has('current-send')).toBe(true);
+});
+
+it('rechecks origin before settling a lookup that crossed a restore', async () => {
+  await seed(record('lookup-race'));
+  vi.mocked(ensureThreadByIdInMap).mockImplementationOnce(async () => {
+    observeSourceGeneration('restored-during-lookup');
+    return false;
+  });
+  const outcome = await restoreUnsentMessages();
+  expect(outcome.shown + outcome.delivered + outcome.movedToDraft).toBe(0);
+  expect(await storedIds()).toEqual(['lookup-race']);
+  expect(unsentMessages.peek().size).toBe(0);
 });

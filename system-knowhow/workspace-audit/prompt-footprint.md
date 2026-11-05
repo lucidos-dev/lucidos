@@ -79,8 +79,8 @@ For each finding, capture: **location** (the section id, then the item id),
   choose. Severity: **stale**. Recommend a shorter description that keeps the
   routing words.
 - **An unused item.** An app or reusable widget whose `usage.verdict` is
-  `unused` for the whole window: nobody opened the app, and no reply embedded
-  the widget and nothing pinned it. Give its `last_used_days_ago`, or "never".
+  `unused` for the whole window: nobody opened the app, no reply embedded the
+  widget, and no dashboard holds it. Give its `last_used_days_ago`, or "never".
   Severity: **nit**.
 - **A knowhow doc not loaded by name.** `usage.verdict` is
   `not-loaded-by-name`: no `load_knowhow`, `read_file` or
@@ -89,7 +89,7 @@ For each finding, capture: **location** (the section id, then the item id),
   Severity: **nit**.
 - **`not-yet-judged` is not a finding.** The evidence does not cover the window
   yet. Report the count in one line, so nobody reads silence as "all used".
-  Deleting a thread deletes the loads, embeds and pins it held, so a
+  Deleting a thread deletes the loads and embeds it held, so a
   deletion inside the window leaves knowhow and reusable widgets not judged.
 - **A knowhow doc an intent loads counts as used.** `load_knowhow` on an
   intent reads its `knowhow:` docs, and an app intent's whole app folder, but

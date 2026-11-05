@@ -17,6 +17,9 @@
   session parked on a card is now kept warm by asking a copy of it.
 - **Amended by**: [0556](0556-lucidos-agent-keep-alive-prefill-beats.md). Lucidos
   Agent threads are kept warm too, by a prefill beat.
+- **Amended by**: [0619](0619-idle-owner-covers-its-polled-tasks.md). A polled
+  task is the owner's job only while its turn runs. If the turn ends first, the
+  engine re-opens the thread when the task finishes.
 
 ## Context
 

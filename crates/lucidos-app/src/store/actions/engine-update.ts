@@ -1,10 +1,16 @@
-import { showToast, dismissToast, removeToast, toasts, engineVersionReady, engineVersionPending, engineRebuildWedged, engineBuilding, engineBuildDetail, frontendRefreshDetail, enginePendingCommits, engineRestarting, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
+import { showToast, dismissToast, removeToast, toasts, engineVersionReady, engineVersionPending, engineBuilding, engineBuildDetail, frontendRefreshDetail, enginePendingCommits, engineRestarting, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
 import { preferencesSettled } from './preferences';
 import { engineVersionStatus, rebuildEngine } from '../../api/client';
 import type { EngineVersionStatus, PendingCommits } from '../../api/client';
 import { confirmAndRestartEngine } from './chat-changes';
 import { noteAnnouncedEngineVersion, wasEngineVersionDismissed } from '../../hooks/sw-update';
+import { engineBuildLogOpen, engineBuildLogVersion } from '../engineBuildLog';
 import { errorDetail } from '../../utils/errorDetail';
+
+/** Open the workspace-scoped build output on phones and desktops alike. */
+export function showEngineBuildLog(): void {
+  engineBuildLogOpen.value = true;
+}
 
 /** Kick off the dev engine rebuild — the "Rebuild" escape hatch behind the
  *  pending / build-failed toasts. The version-status poll (and the
@@ -61,6 +67,7 @@ function setEngineBuilding(
     return;
   }
   engineBuildDetail.value = {
+    verifying: status?.build_state === 'verifying',
     elapsedMs: status?.build_elapsed_ms ?? null,
     anchoredAt: Date.now(),
     pendingCommits: commits,
@@ -95,18 +102,9 @@ function groupedCommits(pending: EngineVersionStatus['pending_commits']): Pendin
   return pending && Array.isArray(pending.groups) ? pending : null;
 }
 
-/** The ONE writer of the pending pair: the badge's third state, and whether a
- *  rebuild has been proved unable to resolve it.
- *
- *  Same argument as `setEngineBuilding` above. The poll decides "not pending" on
- *  several paths (packaged, build failed, a switchable build landed, a build in
- *  flight), and a wedged flag left standing after the state it describes has
- *  gone would tint the badge and strip the Rebuild button for a workspace that
- *  is merely building. One writer makes `pending === false` imply "not wedged"
- *  by construction. */
-function setEngineVersionPending(pending: boolean, wedged = false): void {
+/** Publish whether new source is waiting for a build. */
+function setEngineVersionPending(pending: boolean): void {
   engineVersionPending.value = pending;
-  engineRebuildWedged.value = pending && wedged;
 }
 
 /** Is the engine-version toast currently on screen?
@@ -119,33 +117,9 @@ function versionToastIsOpen(): boolean {
   return toasts.value.some((t) => t.key === NEW_VERSION_TOAST_KEY);
 }
 
-/** Which shape the engine-version announcement takes, or `null` for nothing to
- *  announce. One value rather than a pair of booleans, because `ready` and
- *  `wedged` are mutually exclusive and a two-boolean encoding makes the
- *  combination of them representable at every call site that has to avoid it. */
-type VersionAnnouncement = 'ready' | 'pending' | 'wedged';
+/** A version is ready to switch, or source is waiting for a build. */
+type VersionAnnouncement = 'ready' | 'pending';
 
-/** Draw the engine-version announcement in whichever of its three shapes fits.
- *  Keyed, so this both CREATES the toast and updates one already on screen, and
- *  re-running it on every poll neither stacks nor re-animates. The caller owns
- *  the question of whether it is entitled to create.
- *
- *  The three differ in what the user can actually do, which is the only thing
- *  worth distinguishing:
- *
- *  - **ready**: a built version is waiting, so offer the Switch, and a "Later"
- *    that defers it. The Switch opens the confirm rather than restarting on the
- *    spot, so the version can be read before it is taken. Same pattern as
- *    Settings' own Restart Engine button, and the same dialog.
- *  - **pending**: new code exists with no version behind it, so offer the
- *    Rebuild that produces one, and the same "Later".
- *  - **wedged**: the same as pending except a rebuild has already been proved
- *    futile. Offering the button anyway is the loop the user reported: it runs a
- *    few-second no-op build and puts this toast straight back. So the button
- *    goes, the tone rises to `warning`, and the copy names the one thing that
- *    does resolve it. With nothing left to do but acknowledge, it takes the
- *    `dismissable: false` + explicit OK shape the deferred-frontend hint below
- *    already uses, rather than leaving a bare X as the only affordance. */
 function renderVersionToast(shape: VersionAnnouncement): void {
   const later = {
     label: 'Later',
@@ -164,22 +138,6 @@ function renderVersionToast(shape: VersionAnnouncement): void {
     });
     return;
   }
-  if (shape === 'wedged') {
-    showToast(
-      'New engine version pending, and rebuilding cannot deliver it: a build for this commit ' +
-        'already succeeded without producing one. Relaunch the stack from your checkout.',
-      'warning',
-      {
-        key: NEW_VERSION_TOAST_KEY,
-        dismissable: false,
-        action: {
-          label: 'OK',
-          onClick: () => { dismissToast(NEW_VERSION_TOAST_KEY); },
-        },
-      },
-    );
-    return;
-  }
   showToast('New engine version pending.', 'info', {
     key: NEW_VERSION_TOAST_KEY,
     secondaryAction: later,
@@ -190,76 +148,12 @@ function renderVersionToast(shape: VersionAnnouncement): void {
   });
 }
 
-/** The repeatable failure the user has acknowledged, so the 4s poll stops
- *  redrawing it.
- *
- *  Without this the OK button is a lie. `showToast` re-creates a keyed toast
- *  the moment it is gone, so an acknowledged toast came straight back on the
- *  next poll, forever. That is tolerable for the retryable shape, which is a
- *  standing nag about something the user CAN act on here. It is not tolerable
- *  for a toast whose whole message is "there is nothing to do about this from
- *  the phone in your hand".
- *
- *  Keyed on the cause, not a boolean, so a DIFFERENT failure still surfaces.
- *  Cleared when the build state leaves `failed`, since the next failure is a
- *  new event even if it reads the same. */
-let acknowledgedBuildFailure: string | null = null;
-
-/** Draw the build-failed toast, in whichever of its two shapes the failure
- *  earns. Keyed, so a re-poll updates it in place rather than stacking.
- *
- *  Both shapes SAY WHAT BROKE. The copy this replaced said only "see the engine
- *  log". That names a file no phone can open, and the phone is where this gets
- *  read.
- *
- *  The shapes differ only in whether the user can do anything with Retry:
- *
- *  - **ordinary**: the next build could genuinely succeed, so offer Retry.
- *  - **repeatable**: a rebuild is proved futile, because the same cached
- *    artifact is replayed byte for byte. Offering the button anyway is the loop
- *    the user reported. So the button goes, the tone rises to `warning`, and
- *    the copy names the one command that does resolve it. This is exactly the
- *    `wedged` treatment above, applied to a failing build rather than a
- *    fruitless successful one, down to the `dismissable: false` + explicit OK.
- *
- *  An ABSENT failure is not a third shape. Only an older engine omits it, so
- *  the cause is unknown and Retry stays. That is the same
- *  fallible-but-worth-trying position as an ordinary error. */
+/** Every failed build keeps a manual retry, including delivery failures. */
 function renderBuildFailedToast(failure: EngineVersionStatus['build_failure']): void {
-  // A compiler error line does not end in a full stop, so it would run
-  // straight into the instruction after it.
-  const sentence = (s: string) => (/[.!?]$/.test(s.trim()) ? s.trim() : `${s.trim()}.`);
-  // "Ask a coding agent" is the honest instruction on a phone: the workspace
-  // can fix its own build, and it is the only remedy that does not require
-  // being sat at the checkout.
-  const cause = sentence(failure?.summary ?? 'the engine did not report why');
-  if (failure?.repeatable) {
-    if (acknowledgedBuildFailure === cause) return;
-    const fix = failure.remedy
-      ? `Run \`${failure.remedy}\` in your checkout, or ask a coding agent to fix it.`
-      : 'Ask a coding agent to fix it.';
-    showToast(
-      `New engine version failed to build, and retrying cannot help: ${cause} ${fix}`,
-      'warning',
-      {
-        key: BUILD_FAILED_TOAST_KEY,
-        dismissable: false,
-        action: {
-          label: 'OK',
-          onClick: () => {
-            acknowledgedBuildFailure = cause;
-            dismissToast(BUILD_FAILED_TOAST_KEY);
-          },
-        },
-      },
-    );
-    return;
-  }
-  // A retryable failure keeps nagging while it stands, which is the behavior
-  // this toast has always had: there IS something to do about it, and it
-  // clears itself the moment a build starts or succeeds.
+  const cause = failure?.summary ?? 'the engine did not report why';
   showToast(`New engine version failed to build: ${cause}`, 'error', {
     key: BUILD_FAILED_TOAST_KEY,
+    secondaryAction: { label: 'Show build log', onClick: showEngineBuildLog },
     action: { label: 'Retry build', onClick: () => { void triggerRebuild(); } },
   });
 }
@@ -290,7 +184,6 @@ let reopenedVersionId: string | undefined;
 export function resetEngineVersionToastForTest(): void {
   lastAnnouncedId = undefined;
   reopenedVersionId = undefined;
-  acknowledgedBuildFailure = null;
 }
 
 /** Re-open the pending version toast on demand (the brand badge was tapped).
@@ -308,7 +201,7 @@ export function resetEngineVersionToastForTest(): void {
 export function openEngineVersionToast(): void {
   if (!engineVersionPending.value) return;
   reopenedVersionId = lastAnnouncedId;
-  renderVersionToast(engineRebuildWedged.value ? 'wedged' : 'pending');
+  renderVersionToast('pending');
 }
 
 /** Poll the engine's version status and surface the unified "New version
@@ -372,7 +265,6 @@ async function pollEngineVersion(): Promise<void> {
   }
   // A prior failure cleared once a build starts / succeeds.
   dismissToast(BUILD_FAILED_TOAST_KEY);
-  acknowledgedBuildFailure = null;
 
   // A background rebuild of the shared binary is in flight — this engine's own
   // (build_state === 'building') OR a CO-LOCATED peer's. Co-located workspaces
@@ -403,7 +295,7 @@ async function pollEngineVersion(): Promise<void> {
   // ALONE, the persistent "switch available" affordance that survives a dismiss.
   // On ARRIVAL it appears with the Switch toast from this one check (INV-C
   // arrival); the two decouple only on dismiss.
-  const ready = status.update_available && status.build_state !== 'building';
+  const ready = status.update_available && status.build_state !== 'building' && status.build_state !== 'verifying';
 
   // A new engine version exists in source but no fresh binary is on disk yet
   // AND nothing is building it (a mixed Apply's rebuild failed / never ran, and
@@ -429,16 +321,8 @@ async function pollEngineVersion(): Promise<void> {
   const pending =
     status.source_behind_head === true &&
     !status.update_available &&
-    status.build_state !== 'building' &&
+    status.build_state !== 'building' && status.build_state !== 'verifying' &&
     !sharedBuilding;
-  // ...and the engine has PROVED that rebuilding cannot resolve it: a build for
-  // this HEAD already finished and produced nothing switchable. Never derived
-  // here from `build_state === 'ready'`, which looks like the same thing and
-  // isn't: a build that completed before newer commits landed would read as
-  // wedged when a rebuild would genuinely help, and only the engine knows which
-  // HEAD a finished build was built from.
-  const wedged = pending && status.rebuild_wedged === true;
-
   // The identity of the version being announced, whichever shape it takes: the
   // on-disk build when there is one to switch onto, the checkout's HEAD when the
   // version exists only in source. Recorded whether or not the toast is on
@@ -458,7 +342,7 @@ async function pollEngineVersion(): Promise<void> {
   const reopened =
     announcedId !== undefined && reopenedVersionId === announcedId && versionToastIsOpen();
 
-  const shape: VersionAnnouncement | null = ready ? 'ready' : pending ? (wedged ? 'wedged' : 'pending') : null;
+  const shape: VersionAnnouncement | null = ready ? 'ready' : pending ? 'pending' : null;
   if (shape !== null && (!deferred || reopened)) {
     renderVersionToast(shape);
   } else {
@@ -472,7 +356,7 @@ async function pollEngineVersion(): Promise<void> {
     removeToast(NEW_VERSION_TOAST_KEY);
   }
   engineVersionReady.value = ready;
-  setEngineVersionPending(pending, wedged);
+  setEngineVersionPending(pending);
   // A background rebuild is in flight (Apply kicked it off) but not yet ready to
   // switch onto — drives the spinning-refresh brand badge. True for THIS engine's
   // own build (build_state === 'building') OR when a co-located peer is building
@@ -482,7 +366,7 @@ async function pollEngineVersion(): Promise<void> {
   // switchable binary lands, even within a probe window, handing off to the
   // ready→Switch surface above.
   setEngineBuilding(
-    status.build_state === 'building' ||
+    status.build_state === 'building' || status.build_state === 'verifying' ||
       (sharedBuilding &&
         status.source_behind_head === true &&
         !status.update_available &&
@@ -500,9 +384,10 @@ async function pollEngineVersion(): Promise<void> {
  *
  *  It is a pure POKE: it re-runs the authoritative version-status read rather than
  *  trusting the event payload, so `engineBuilding` is still set ONLY from
- *  `build_state === 'building'`. A stale/duplicate poke therefore just triggers a
+ *  the active building/verifying states. A stale/duplicate poke triggers a
  *  harmless authoritative re-check, never a spurious spin. */
 export function handleEngineBuildStateChanged(): void {
+  engineBuildLogVersion.value++;
   void checkEngineVersion();
 }
 

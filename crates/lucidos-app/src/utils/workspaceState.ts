@@ -19,7 +19,7 @@ export type WorkspaceState = 'healthy' | 'booting' | 'stopped' | 'unhealthy';
 
 export function workspaceState(w: ListedWorkspace): WorkspaceState {
   if (w.health === 'healthy') return 'healthy';
-  if (w.health === 'booting') return 'booting';
+  if (w.health === 'booting' || w.health === 'restoring') return 'booting';
   return w.last_error === 'not started' ? 'stopped' : 'unhealthy';
 }
 
@@ -35,6 +35,7 @@ export const WORKSPACE_STATE_LABEL: Record<WorkspaceState, string> = {
  *  `aria-label`, since a tooltip is hover-only and the error would otherwise be
  *  unreachable. */
 export function workspaceStateLabel(w: ListedWorkspace): string {
+  if (w.health === 'restoring') return w.last_error || 'Restoring…';
   return w.last_error || WORKSPACE_STATE_LABEL[workspaceState(w)];
 }
 

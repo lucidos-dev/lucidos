@@ -18,6 +18,7 @@
  */
 
 import { wsDeviceId } from './_storage';
+import { captureDirectRequest, type DirectRequestGuard } from './_restoreGeneration';
 import { capabilityCarrier, splitCapability } from './frameCapability';
 import {
   callHost,
@@ -148,11 +149,12 @@ async function rawFetch(
   path: string,
   init?: RequestInit,
   timeoutMs = 10000,
+  generation = isBridged() ? null : captureDirectRequest(),
 ): Promise<Response> {
   const normalized = path.startsWith('/') ? path : `/${path}`;
   const res = isBridged()
     ? await bridgedFetch(normalized, init, timeoutMs)
-    : await directFetch(normalized, init, timeoutMs);
+    : await directFetch(normalized, init, timeoutMs, generation!);
   if (!res.ok) {
     let reason = res.statusText;
     try {
@@ -169,7 +171,11 @@ async function directFetch(
   normalized: string,
   init: RequestInit | undefined,
   timeoutMs: number,
+  generation: DirectRequestGuard,
 ): Promise<Response> {
+  generation.assertCurrent();
+  if (generation.wait) await generation.wait();
+  generation.assertCurrent();
   const headers: Record<string, string> = {};
   // Every app call says which device it came from, so a publish or a trigger
   // edit is attributed to the person who clicked it. Without it the engine has
@@ -185,12 +191,17 @@ async function directFetch(
   // dropped it), so either can abort the request.
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
   const signal = init?.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;
+  const requestHeaders = new Headers({ ...headers, ...headersToRecord(init?.headers) });
+  requestHeaders.set('x-lucidos-restore-generation', generation.header);
   try {
-    return await fetch(`${_baseUrl}${API_V1}${normalized}`, {
+    const response = await fetch(`${_baseUrl}${API_V1}${normalized}`, {
       ...init,
       signal,
-      headers: { ...headers, ...headersToRecord(init?.headers) },
+      headers: Object.fromEntries(requestHeaders.entries()),
     });
+    if (generation.wait) await generation.wait();
+    generation.assertCurrent();
+    return response;
   } catch (err) {
     throw restampDeadline(err, timeoutSignal, timeoutMs, init?.signal);
   }
@@ -239,8 +250,11 @@ export async function request<T>(
   init?: RequestInit,
   timeoutMs = 10000,
 ): Promise<T> {
-  const res = await rawFetch(path, init, timeoutMs);
+  const guard = isBridged() ? null : captureDirectRequest();
+  const res = await rawFetch(path, init, timeoutMs, guard);
   const text = await res.text();
+  if (guard?.wait) await guard.wait();
+  guard?.assertCurrent();
   if (!text) return null as T;
   return JSON.parse(text);
 }
@@ -250,8 +264,12 @@ export async function requestText(
   init?: RequestInit,
   timeoutMs = 10000,
 ): Promise<string> {
-  const res = await rawFetch(path, init, timeoutMs);
-  return res.text();
+  const guard = isBridged() ? null : captureDirectRequest();
+  const res = await rawFetch(path, init, timeoutMs, guard);
+  const text = await res.text();
+  if (guard?.wait) await guard.wait();
+  guard?.assertCurrent();
+  return text;
 }
 
 export async function requestBlob(
@@ -259,8 +277,12 @@ export async function requestBlob(
   init?: RequestInit,
   timeoutMs = 10000,
 ): Promise<Blob> {
-  const res = await rawFetch(path, init, timeoutMs);
-  return res.blob();
+  const guard = isBridged() ? null : captureDirectRequest();
+  const res = await rawFetch(path, init, timeoutMs, guard);
+  const blob = await res.blob();
+  if (guard?.wait) await guard.wait();
+  guard?.assertCurrent();
+  return blob;
 }
 
 export async function requestVoid(

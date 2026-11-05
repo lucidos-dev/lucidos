@@ -355,6 +355,7 @@ impl LucidosEngine {
             wait.wait_id,
             matched_index,
         );
+        self.note_delivered_completion(wait.thread_id, event_type, payload);
         match emit_delivery(
             &self.event_bus,
             wait,

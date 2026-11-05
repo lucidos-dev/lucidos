@@ -156,10 +156,10 @@ Exception: the engine sets `LUCIDOS_WORKSPACE` and `LUCIDOS_DATABASE_URL` in eve
 - **A script that reads `os.environ["CRED_GITHUB"]` works as is.** `python data/triggers/watch/fetch.py` gets what `fetch.py` names, with no edit to the command. The `.py` / `.sh` files beside it count too, so a `run.sh` calling `python3 fetch.py` works. A module imported from another directory does not: name its variables in the header comment below.
 - **One mention sets the whole credential.** Naming `CRED_MAIL_USERNAME` also sets `CRED_MAIL_PASSWORD`.
 - **A custom alias needs naming too.** A tool that reads `GITHUB_TOKEN` by itself, like `gh`, gets it from `gh pr list  # GITHUB_TOKEN`.
-- **A name built at run time** needs a header comment: `# lucidos-credentials: CRED_A CRED_B`.
+- **A name built at run time** needs a header comment: `# lucidos-credentials: CRED_A CRED_B`, or `//` in JavaScript. Its names inject like any other mention.
 - **`OAUTH_<PROVIDER>_ACCESS_TOKEN`** follows the same rule. Only a named account is refreshed.
 - **To see the names**, run `lucidos credentials list`. `env | grep CRED_` finds nothing, because a bare `CRED_` names no credential. The result carries a note listing the names instead.
-- **An unknown name still runs.** The result carries the same note, with names only, never values.
+- **An unknown name still runs.** When the text looks it up, the result carries the same note, with names only, never values. A lookup is a header comment, `$CRED_X`, `process.env.CRED_X`, `printenv CRED_X`, or `"CRED_X"` in quotes. A header comment counts only when the line starts with it. A name in prose, a header quoted in prose, or a prefix that builds a name (`CRED_<NAME>`, `f"OAUTH_{p}"`) gets no note. A scheduled script's note goes to the engine log, not to its notification.
 
 Every subprocess output is masked: an injected value, a token in the engine's own environment, and well-known token shapes such as `ghp_…` come back as `[REDACTED]`. Output read back later, through `bash_output`, `events(action="query")` or `lucidos events query`, is masked again against the credentials stored now. A token in the shell that started the engine never reaches a chat tool's environment. To use one there, store it as a credential.
 

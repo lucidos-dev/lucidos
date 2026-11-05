@@ -26,7 +26,7 @@ async fn tier_1_strips_build_artifacts_after_24h_idle() {
     let rx = bus.subscribe();
     // Soft pressure opens the retention gate for this non-archived thread.
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    worker.free_soft_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
@@ -71,7 +71,7 @@ async fn tier_2_removes_worktree_after_30_days_clean_unsaved() {
     let rx = bus.subscribe();
     // Full removal is disk-gated now — drive it via soft pressure.
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    worker.free_soft_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
@@ -104,7 +104,7 @@ async fn saved_threads_are_exempt_from_tier_2() {
     // Under soft pressure so the saved-thread exemption — not ample disk — is
     // the operative reason the worktree survives.
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    worker.free_soft_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
@@ -143,7 +143,7 @@ async fn dirty_threads_are_exempt_from_tier_2_auto() {
     // Under soft pressure so the dirty-worktree exemption — not ample disk — is
     // the operative reason the worktree survives.
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    worker.free_soft_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
@@ -182,8 +182,8 @@ async fn hard_pressure_strips_the_target_of_a_thread_idle_minutes() {
     insert_old_event(&pool, thread_id, 5 * 60).await;
 
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    worker.free_hard_bytes = u64::MAX;
-    worker.free_soft_bytes = u64::MAX;
+    worker.hard_cap_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
 
     let rx = bus.subscribe();
     worker.run_once().await;
@@ -230,8 +230,8 @@ async fn hard_pressure_keeps_the_tree_of_a_live_thread() {
         root.clone(),
         active_threads(&[thread_id]),
     );
-    worker.free_hard_bytes = u64::MAX;
-    worker.free_soft_bytes = u64::MAX;
+    worker.hard_cap_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
 
     let rx = bus.subscribe();
     worker.run_once().await;
@@ -274,7 +274,7 @@ async fn tier_0_deletes_branch_if_fully_merged() {
     let rx = bus.subscribe();
     // Full removal is disk-gated — drive it via soft pressure.
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    worker.free_soft_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
@@ -327,7 +327,7 @@ async fn tier_2_preserves_branch_if_unmerged_commits_exist() {
     let rx = bus.subscribe();
     // Full removal is disk-gated — drive it via soft pressure.
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    worker.free_soft_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
@@ -378,8 +378,8 @@ async fn a_tier_2_only_reclaim_under_hard_pressure_is_announced() {
     insert_old_event(&pool, thread_id, TIER_2_AGE).await;
 
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    worker.free_hard_bytes = u64::MAX;
-    worker.free_soft_bytes = u64::MAX;
+    worker.hard_cap_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
 
     let rx = bus.subscribe();
     worker.run_once().await;
@@ -456,7 +456,7 @@ async fn recent_threads_are_exempt() {
     // Under soft pressure so recency — not ample disk — is the operative
     // exemption for this recently-active thread.
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    worker.free_soft_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
@@ -965,8 +965,8 @@ async fn tier_0_worktree_survives(
 
     let mut worker = make_worker_with_active(pool.clone(), bus, root.clone(), active);
     worker.free_disk = probe;
-    worker.free_soft_bytes = super::FREE_DISK_SOFT_BYTES;
-    worker.free_hard_bytes = super::FREE_DISK_HARD_BYTES;
+    worker.soft_cap_bytes = super::FREE_DISK_SOFT_BYTES;
+    worker.hard_cap_bytes = super::FREE_DISK_HARD_BYTES;
     worker.run_once().await;
 
     let survived = worktree.exists();
@@ -1042,7 +1042,7 @@ async fn a_session_that_starts_during_tier_2_checks_keeps_the_worktree() {
         root.clone(),
         live_after_first_check(),
     );
-    worker.free_soft_bytes = u64::MAX;
+    worker.soft_cap_bytes = u64::MAX;
     worker.run_once().await;
 
     assert!(

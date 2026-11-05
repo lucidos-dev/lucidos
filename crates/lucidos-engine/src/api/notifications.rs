@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::scheduler::notifications::{
-    default_tap, resolve_thread_tap_id, verify_event_anchors, Tap,
+    default_tap, refuse_engine_only_tap, resolve_thread_tap_id, verify_event_anchors, Tap,
 };
 use crate::scheduler::{NotificationStore, PushSubscriptionStore};
 
@@ -69,6 +69,7 @@ pub(super) async fn create_notification(
     let mut tap = body
         .tap
         .unwrap_or_else(|| default_tap(link_thread_id, link_event_id));
+    refuse_engine_only_tap(&tap).map_err(|e| ApiError::bad_request(format!("invalid tap: {e}")))?;
 
     // The one sub-field we DO enforce. The page dereferences it as a thread,
     // and reports the failure to whoever taps the banner rather than to the

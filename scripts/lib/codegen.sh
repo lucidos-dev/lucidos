@@ -36,6 +36,7 @@ CODEGEN_INPUT_ROOTS=(
     crates/lucidos-local-token
     crates/lucidos-owner-lock
     crates/lucidos-pg-url
+    crates/lucidos-secret-store
     crates/lucidos-tailscale
     crates/vendor
 )

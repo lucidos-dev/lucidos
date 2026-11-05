@@ -1,3 +1,5 @@
+import { dispatchDeepLink } from '../../store/actions/in-app-notification-toast';
+import { parseDeepLinkFromInboxRow } from '../../store/actions/notification-deeplink';
 import {
   notifications,
   notificationsHasMore,
@@ -158,6 +160,11 @@ export function NotificationDetailInline() {
         {actions.openTrigger && (
           <button class="action-btn" onClick={handleOpenTrigger}>
             Open trigger
+          </button>
+        )}
+        {detail.tap?.kind === 'restore-snapshot' && (
+          <button class="action-btn" onClick={() => dispatchDeepLink(parseDeepLinkFromInboxRow(detail))}>
+            Undo restore
           </button>
         )}
         {actions.navTap && (

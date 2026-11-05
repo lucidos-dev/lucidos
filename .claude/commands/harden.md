@@ -684,6 +684,12 @@ and says `a retry of what failed`. Its PASS still reads RERUN: the full set
 then runs once more, and only that run can pass the harden. Never delete the
 record to skip the retry.
 
+**A passing touched-spec suite carries into the next round** (ADR 0616). The
+verdict records each spec in `.lucidos/harden-carried`. A later round skips a
+spec whose record is valid, and prints `PASS carried from <commit>` when no
+spec is left. A source edit since that commit voids the carry. A retry round
+carries nothing.
+
 **A start that refused shows up as MISSING.** `start` writes to
 `.lucidos/harden-suites-start.log`, so read that log before starting again.
 
@@ -751,8 +757,10 @@ These matter when you read a verdict:
   `First-paint-growth:` trailer saying why the first frame needs it.
 - **A frontend change runs the browser specs it can break** (ADR 0502).
   `e2e-touched` runs them here on the debug engine in an e2e slot, without
-  mobile-webkit. `e2e-touched-webkit` sends the mobile-webkit ones to GitHub,
-  pinned to the start commit (ADR 0536). On FAIL, read the log the FAIL line
+  mobile-webkit. `e2e-touched-webkit` runs the mobile-webkit ones here on a
+  macOS host, on the `e2e` engine profile, after `e2e-touched` ends. A Linux
+  host sends them to GitHub, pinned to the start commit (ADR 0536, 0616). On
+  FAIL, read the log the FAIL line
   names. Either the spec follows the UI change, or the UI change was
   wrong.
 - **A busy e2e lock is a `SKIP`, and a `SKIP` passes** (ADR 0541). Every e2e

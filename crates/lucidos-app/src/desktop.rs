@@ -3247,13 +3247,12 @@ fn spawn_gateway(resources: &Path, app_data: &Path, port: u16) -> io::Result<Gat
         .env("LUCIDOS_SYSTEM_KNOWHOW_DIR", &bundle.system_knowhow)
         .env("LUCIDOS_SYSTEM_WIDGETS_DIR", &bundle.system_widgets)
         .env("FASTEMBED_CACHE_DIR", &fastembed_cache)
-        // Engines may boot before the user has configured a provider, into a
-        // clear no-provider onboarding state and NOT mock output.
+        // Compatibility with older bundled engines; current engines always
+        // boot unconfigured when no provider exists (ADR 0613).
         .env("LUCIDOS_BOOT_WITHOUT_PROVIDER", "1")
         // Tell the gateway it's a packaged build so the picker hides the dev-only
         // gateway self-reload control (packaged updates go through the app updater
-        // + a full service restart, not a gateway re-exec). Mirrors the
-        // BOOT_WITHOUT_PROVIDER "I am packaged" signal above.
+        // + a full service restart, not a gateway re-exec).
         .env("LUCIDOS_PACKAGED", "1")
         .spawn()?;
     Ok(GatewayService { gateway })

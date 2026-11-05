@@ -25,7 +25,7 @@ use crate::engine::git_ops::{git_cmd, worktrees_dir};
 use crate::engine::thread_events::ThreadEvent;
 use crate::scheduler::notifications::{NavigateTarget, Tap};
 
-use super::{ActiveThreads, DiskMonitor, FreeDiskProbe, WorktreeCleanup};
+use super::{ActiveThreads, DiskMonitor, DiskReading, FreeDiskProbe, WorktreeCleanup};
 
 /// Captured at construction — matches what production sees in one pass.
 struct StaticActiveThreads(HashSet<Uuid>);
@@ -431,8 +431,8 @@ pub(crate) fn make_worker_with_active(
         bus,
         workspace_root: workspace.clone(),
         interval: Duration::from_secs(60),
-        free_soft_bytes: 0,
-        free_hard_bytes: 0,
+        soft_cap_bytes: 0,
+        hard_cap_bytes: 0,
         force_tier1_idle: Duration::from_secs(60 * 60),
         // Default to the production grace windows; tests that drive removal of a
         // freshly-created fixture override these to ZERO (mtime-gated paths) or
@@ -440,7 +440,7 @@ pub(crate) fn make_worker_with_active(
         stranded_grace: super::STRANDED_GRACE,
         temp_worktree_grace: super::TEMP_WORKTREE_GRACE,
         size_walk: super::walk_directory_size_bytes,
-        free_disk: super::os_free_disk_probe(workspace.clone()),
+        free_disk: real_free_space_probe(workspace.clone()),
         changes,
         active_threads,
         cleanup_wake: Arc::new(Notify::new()),
@@ -449,11 +449,28 @@ pub(crate) fn make_worker_with_active(
 
 pub(crate) const GB: u64 = 1024 * 1024 * 1024;
 
+/// A reading of `free` bytes on a volume so big that only the caps bind. A
+/// test can then reason in absolute free bytes.
+pub(crate) fn on_a_huge_volume(free: u64) -> DiskReading {
+    DiskReading {
+        free_bytes: free,
+        total_bytes: u64::MAX,
+    }
+}
+
+/// The real free space of the workspace volume, on a huge total. A test that
+/// raises a cap past the free bytes then still forces pressure.
+pub(crate) fn real_free_space_probe(workspace: PathBuf) -> FreeDiskProbe {
+    let os_probe = super::os_free_disk_probe(workspace);
+    Arc::new(move || os_probe().map(|reading| on_a_huge_volume(reading.free_bytes)))
+}
+
 /// A free-disk probe the test sets between reads. `None` is a failed probe.
 pub(crate) fn settable_probe(initial: Option<u64>) -> (FreeDiskProbe, Arc<Mutex<Option<u64>>>) {
     let reading = Arc::new(Mutex::new(initial));
     let probe_reading = reading.clone();
-    let probe: FreeDiskProbe = Arc::new(move || *probe_reading.lock().unwrap());
+    let probe: FreeDiskProbe =
+        Arc::new(move || (*probe_reading.lock().unwrap()).map(on_a_huge_volume));
     (probe, reading)
 }
 
@@ -463,11 +480,12 @@ pub(crate) fn scripted_probe(readings: &[u64]) -> FreeDiskProbe {
     let queue = Mutex::new(readings.iter().copied().collect::<VecDeque<u64>>());
     Arc::new(move || {
         let mut queue = queue.lock().unwrap();
-        if queue.len() > 1 {
+        let free = if queue.len() > 1 {
             queue.pop_front()
         } else {
             queue.front().copied()
-        }
+        };
+        free.map(on_a_huge_volume)
     })
 }
 

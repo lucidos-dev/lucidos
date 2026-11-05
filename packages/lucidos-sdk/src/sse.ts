@@ -1,4 +1,5 @@
 import { apiBase } from './_fetch';
+import { directRestoreGeneration } from './_restoreGeneration';
 import {
   EVENT_STREAM_RETRY_MS,
   eventStreamTargets,
@@ -81,6 +82,10 @@ function dispatch(eventType: string, data: unknown, raw: SseEvent) {
 }
 
 function handleOpen(): void {
+  if (isBridged()) admitOpen();
+}
+
+function admitOpen(): void {
   streamOpen = true;
   openCount++;
   for (const cb of [...openListeners]) runIsolated(cb);
@@ -100,6 +105,13 @@ function handleFrame(data: string): void {
   }
   const outerType = parsed?.type;
   if (!parsed || !outerType) return;
+
+  if (outerType === 'StreamHello' && !isBridged()) {
+    directRestoreGeneration.observe(parsed.data?.restore_generation);
+    try { directRestoreGeneration.capture().assertCurrent(); }
+    catch { streamOpen = false; return; } // Old page intent stays closed.
+    if (!streamOpen) admitOpen();
+  }
 
   if (outerType === 'ThreadEvent') {
     // Thread events: { type: "ThreadEvent", data: { thread_id, event: { type, ... } } }
@@ -151,14 +163,14 @@ export const sse = {
   },
 
   /**
-   * Run `callback` each time the stream opens: the first open and every
+   * Run `callback` after generation admission: the first hello and every
    * reopen after a drop. Events that landed while the stream was down are not
    * replayed, so this is where an app re-reads its data.
    *
    * If the stream is already open, `callback` runs once on the next microtask.
    * So `lucidos.sse.onOpen(render)` alone covers first load and reconnect.
    *
-   * A method of its own rather than an `on()` type, so no event can fire it.
+   * Direct transports wait for hello; bridged frames use host admission.
    * Connects the stream. Returns an unsubscribe function.
    */
   onOpen(callback: () => void): () => void {
@@ -167,7 +179,7 @@ export const sse = {
     if (streamOpen) {
       const seenOpens = openCount;
       queueMicrotask(() => {
-        if (openCount === seenOpens && openListeners.has(callback)) runIsolated(callback);
+        if (streamOpen && openCount === seenOpens && openListeners.has(callback)) runIsolated(callback);
       });
     }
     return () => {

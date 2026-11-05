@@ -35,6 +35,7 @@ Every e2e script sends a whole suite to GitHub's runners when it can (ADRs 0382,
   - An unmet precondition: a dirty tree, no release libraries, no `lucidos` remote, no `gh`, or no named account (`GH_ACCOUNT_GITHUB_COM`). The fallback prints its reason.
 - **A busy host sends a filtered run to GitHub instead of waiting** (ADR 0584). The run is eligible when nothing pinned it here and GitHub is available. `e2e_github_handoff` records HEAD and runs the local leg as a child with `LUCIDOS_BUILD_MEMORY_WAIT_SECS`, `HOST_LOAD_MAX_WAIT_SECS` and `LUCIDOS_E2E_MEMORY_RESUMES` at 0. Exit 71, 72 or 75 (`scripts/lib/host_busy_exits.sh`) reruns the selection with `--commit <recorded HEAD>`. Any other exit is the verdict, and a failing test is never retried on GitHub.
 - **`--github` insists.** It sends a filtered run too, and fails instead of falling back.
+- **`/harden`'s touched WebKit leg runs on a macOS host** with `ENGINE_CARGO_PROFILE=e2e` (ADR 0616).
 - **A local run takes an *e2e slot*** (`acquire_e2e_slots`, `scripts/lib/e2e_lock.sh`). A Chromium-only run takes the first free of `e2e-test` and `e2e-test-2`. A WebKit run or the umbrella takes both.
 - **A GitHub run reuses a built engine** whose *engine input manifest* (`scripts/lib/engine_manifest.sh`) matches the tree. A miss builds under the `e2e` cargo profile.
 - **`LUCIDOS_E2E_LOCAL=1` keeps nested scripts local**, so a caller inside a run never pushes a second run.
@@ -77,11 +78,11 @@ Tests in `crates/lucidos-e2e/tests/api_support/` (member crate `lucidos-e2e`): H
 
 **A run must leave the workspace tree as clean as it found it.** `e2e-api.sh` fails a run that leaves an uncommitted change, even after a failed test run, and names the paths. A test that needs a fixture under `data/` uses `write_data_fixture` and `remove_data_fixtures` (`api_support/mod.rs`), which commit in the same step.
 
-`e2e-api.sh` also runs the **gateway chain test** (`crates/lucidos-gateway/src/chain_tests.rs`), the only local test that puts a real gateway router in front of a real engine. It is `#[ignore]`d because `make test` has no engine, and the script runs it BY NAME.
+`e2e-api.sh` also runs the **gateway chain test** (`crates/lucidos-gateway/src/chain_tests.rs`) and **isolated snapshot round trip** (`crates/lucidos-gateway/src/snapshot_roundtrip_tests.rs`). Both put a real gateway router in front of real engines. They are `#[ignore]`d because `make test` has no built engine, and the script runs each BY NAME. The snapshot fixture owns a private HOME and Postgres instance; never restore the shared API/browser workspace. Its optional Chromium Settings check is documented in `crates/lucidos-app/e2e/snapshot-settings-roundtrip.mjs`.
 
 The gateway BINARY refuses to boot from a coding-agent worktree, with no opt-out (ADR 0021). Do not work around that to write a gateway test.
 
-**GitHub browser shards do run the binary** (`LUCIDOS_E2E_GATEWAY=own`, ADR 0385). In every mode the e2e engine's `LUCIDOS_GATEWAY_PORT` and `LUCIDOS_WORKSPACE_ID` come from a gateway that lists it at the engine's port, never from the caller.
+**GitHub API and browser shards do run the binary** (`LUCIDOS_E2E_GATEWAY=own`, ADR 0385). In every mode the e2e engine's `LUCIDOS_GATEWAY_PORT` and `LUCIDOS_WORKSPACE_ID` come from a gateway that lists it at the engine's port, never from the caller.
 
 ## Contract Tests (Rust ↔ TypeScript)
 

@@ -12,6 +12,7 @@ use crate::error::ApiError;
 use crate::hook_socket;
 use crate::net_config;
 use crate::next_boot;
+use crate::pairing;
 use crate::pairing_qr;
 use crate::postgres::{self, PgBackend, PgHandle, ProvisionError, ProvisionErrorKind};
 use crate::proxy;
@@ -37,6 +38,13 @@ use tower::ServiceExt;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
+
+#[path = "cleanup_actions.rs"]
+pub(crate) mod cleanup_actions;
+#[path = "snapshot_restore.rs"]
+mod snapshot_restore;
+#[path = "trash_actions.rs"]
+pub(crate) mod trash_actions;
 
 /// Build id baked in by `build.rs`: git short SHA plus a hash of any
 /// uncommitted gateway-source diff. Deterministic for identical source, so a
@@ -134,22 +142,39 @@ pub struct GatewayState {
     inner: Arc<GatewayInner>,
 }
 
+/// Invalidates observations on completion, including cancellation and partial failure.
+pub(crate) struct CleanupReviewMutation(GatewayState);
+
+impl Drop for CleanupReviewMutation {
+    fn drop(&mut self) {
+        let mut cache = self.0.inner.cleanup_review.lock().unwrap();
+        cache.mutations -= 1;
+        cache.invalidate();
+    }
+}
+
 /// What a pairing attempt produced, for the handler that answers it.
 ///
-/// Three outcomes rather than an `Option`, because a throttled attempt and a
-/// wrong code deserve different statuses. Collapsing them would tell a person
-/// mid-pairing that their code was wrong, when the gateway simply declined to
-/// look at it.
+/// Not an `Option`, because each refusal deserves its own answer. Collapsing a
+/// throttled or public-channel refusal into "wrong" would send a person
+/// mid-pairing hunting a typo that is not there.
 pub enum PairingOutcome {
     /// Paired. Carries the credential the device now holds.
     Paired(String),
-    /// The code was wrong or expired.
+    /// The secret or code was wrong or expired.
     Rejected,
-    /// Too many wrong guesses lately (`auth::Redemption::Throttled`).
+    /// A short code from a public channel (`pairing::Redemption::LocalOnly`).
+    LocalOnly,
+    /// Too many wrong short codes from this source lately
+    /// (`pairing::Redemption::Throttled`).
     Throttled,
 }
 
 struct GatewayInner {
+    /// Per-state socket resolution for live tests, without changing HOME or
+    /// the isolated socket root used by ordinary unit tests.
+    #[cfg(test)]
+    engine_address_factory: fn(&std::path::Path, u16) -> EngineAddress,
     /// Base dir for relative workspace dirs, `deleted/`, and `config/`.
     app_data: PathBuf,
     registry_path: PathBuf,
@@ -186,18 +211,18 @@ struct GatewayInner {
     /// publish out of order. Separate from the data lock above precisely so the
     /// file write happens with that one released.
     paired_devices_writing: Mutex<()>,
-    /// Pairing codes minted and not yet redeemed. Never persisted: a code lives
-    /// five minutes, so surviving a restart would buy nothing.
-    pending_pairings: Mutex<auth::PendingPairings>,
-    /// The gateways this one has granted access to, and their pairing codes
+    /// Device pairings minted and not yet redeemed. Never persisted: a pairing
+    /// lives five minutes, so surviving a restart would buy nothing.
+    pending_pairings: Mutex<pairing::PendingPairings>,
+    /// The gateways this one has granted access to, and their pairing secrets
     /// (ADR 0590). Apart from the device store and its codes on purpose.
     paired_gateways: crate::gateway_protocol::PairedGatewayStore,
     /// The remote gateways this one has paired with, holding their credentials
     /// (ADR 0590).
     remote_gateways: crate::remote_gateways::RemoteGatewayStore,
-    /// The client every relayed request to a remote gateway goes out on, so
-    /// its connections are pooled across requests (ADR 0591).
-    relay_client: crate::relay::RelayClient,
+    /// The transport every outbound peer request uses, with pooled
+    /// connections and one credential boundary (ADR 0591).
+    peer_connection: crate::peer_connection::PeerConnection,
     /// Keeps [`GatewayState::log_device_refusal`] to one line a minute. An
     /// unpaired browser is refused once per asset, so an ungated line would
     /// bury the one a reader came for.
@@ -270,11 +295,18 @@ struct GatewayInner {
     /// Single-slot state of the picker's restore-from-backup flow (see
     /// [`RestoreStatus`]). Polled via the control API; never persisted.
     restore: RwLock<RestoreStatus>,
+    snapshot_restores: Mutex<HashSet<String>>,
+    #[cfg(test)]
+    snapshot_test: Mutex<Option<Arc<snapshot_restore::OrderingProbe>>>,
+    workspace_operations: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    snapshot_home: PathBuf,
     /// Configured bind addresses this process wants but does not hold yet (see
     /// [`net_config::bind_plan`]). Normally empty. Non-empty means the gateway
     /// is serving loopback while it waits for an interface to appear, a
     /// reachability degradation reported in `/~/api/v1/health`.
     pending_binds: RwLock<BTreeSet<SocketAddr>>,
+    /// The public listener's port, set only once it has bound.
+    public_port: std::sync::OnceLock<u16>,
     /// Path of the binary this process was launched from, used by the reload
     /// control to re-exec onto the rebuilt binary and to stat for the
     /// "new gateway available" check.
@@ -291,6 +323,7 @@ struct GatewayInner {
     release_check: release_check::ReleaseCheck,
     /// The machine's one slowness watch (ADRs 0274, 0283).
     slowness: slowness::Slowness,
+    cleanup_review: Mutex<crate::cleanup::ReviewCache>,
     /// The update relay to the desktop client (ADR 0338).
     update_relay: crate::update_relay::UpdateRelay,
 }
@@ -350,8 +383,22 @@ impl GatewayState {
                 .path()
                 .to_path_buf(),
         };
+        // Bare fixtures share cached files, but represent independent gateways.
+        // Give their host-wide operation lock an independent home. Tests that
+        // model peers explicitly inject the same home into both states.
+        let snapshot_home = if static_dir.is_some() {
+            scratch.join("snapshot-home")
+        } else {
+            tempfile::Builder::new()
+                .prefix("snapshot-home-")
+                .tempdir_in(&scratch)
+                .unwrap()
+                .keep()
+        };
         GatewayState {
             inner: Arc::new(GatewayInner {
+                #[cfg(test)]
+                engine_address_factory: EngineAddress::for_workspace,
                 app_data: scratch.clone(),
                 registry_path: scratch.join("workspaces.json"),
                 gateway_port: 5251,
@@ -362,7 +409,9 @@ impl GatewayState {
                 device_cookie_name: auth::device_cookie_name(&scratch),
                 paired_devices: Mutex::new(auth::PairedDevices::default()),
                 paired_devices_writing: Mutex::new(()),
-                pending_pairings: Mutex::new(auth::PendingPairings::default()),
+                pending_pairings: Mutex::new(pairing::PendingPairings::new(
+                    pairing::PairingKind::Device,
+                )),
                 paired_gateways: crate::gateway_protocol::PairedGatewayStore::load(
                     crate::gateway_protocol::paired_gateways_path(&scratch),
                 )
@@ -371,7 +420,7 @@ impl GatewayState {
                     crate::remote_gateways::remote_gateways_path(&scratch),
                 )
                 .unwrap(),
-                relay_client: crate::relay::RelayClient::new().unwrap(),
+                peer_connection: crate::peer_connection::PeerConnection::new().unwrap(),
                 refusal_log: Mutex::new(auth::LogThrottle::default()),
                 certs: Arc::default(),
                 engine_bin: scratch.join("lucidos-engine"),
@@ -389,7 +438,13 @@ impl GatewayState {
                 boot_phases: RwLock::new(HashMap::new()),
                 boot_failures: RwLock::new(HashMap::new()),
                 restore: RwLock::new(RestoreStatus::default()),
+                snapshot_restores: Mutex::new(HashSet::new()),
+                #[cfg(test)]
+                snapshot_test: Mutex::new(None),
+                workspace_operations: Mutex::new(HashMap::new()),
+                snapshot_home,
                 pending_binds: RwLock::new(BTreeSet::new()),
+                public_port: std::sync::OnceLock::new(),
                 exe_path: None,
                 binary_check: Mutex::new(GatewayBinaryCheck::default()),
                 scheduled_reload: Mutex::new(None),
@@ -403,6 +458,7 @@ impl GatewayState {
                     config_path: None,
                 }),
                 slowness: slowness::Slowness::default(),
+                cleanup_review: Mutex::new(crate::cleanup::ReviewCache::default()),
                 update_relay: crate::update_relay::UpdateRelay::default(),
             }),
         }
@@ -410,6 +466,275 @@ impl GatewayState {
 
     fn app_data(&self) -> &PathBuf {
         &self.inner.app_data
+    }
+
+    async fn record_workspace_navigation(&self, id: &str) -> Result<(), BoxError> {
+        let Some(_operation) = self.try_workspace_operation(id) else {
+            return Ok(());
+        };
+        if self.snapshot_restore_blocks(id) {
+            return Ok(());
+        }
+        self.record_workspace_open(id, chrono::Utc::now())
+    }
+
+    fn record_workspace_open(
+        &self,
+        id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), BoxError> {
+        let mut registry = self.inner.registry.lock().unwrap();
+        let Some(workspace) = registry.get(id) else {
+            return Ok(());
+        };
+        // Boot splashes reload frequently; preserve activity without writing on
+        // every reload. The durable registry remains authoritative on failure.
+        if workspace
+            .cleanup
+            .last_opened_at
+            .is_some_and(|at| now.signed_duration_since(at).num_seconds() < 60)
+        {
+            return Ok(());
+        }
+        let mut updated = registry.clone();
+        let workspace = updated
+            .workspaces
+            .iter_mut()
+            .find(|ws| ws.id == id)
+            .ok_or("workspace disappeared")?;
+        workspace.cleanup.last_opened_at = Some(now);
+        updated.save(&self.inner.registry_path)?;
+        *registry = updated;
+        Ok(())
+    }
+
+    pub(crate) async fn list_trash(&self) -> Result<Vec<crate::trash::Listing>, ApiError> {
+        let app_data = self.app_data().to_owned();
+        tokio::task::spawn_blocking(move || crate::trash::list(&app_data))
+            .await
+            .map_err(|_| ApiError::conflict("Trash listing failed"))?
+            .map_err(|e| ApiError::conflict(e.to_string()))
+    }
+
+    /// Restore only server-owned journal paths, under the same workspace lock
+    /// as deletion/provisioning. Dumps remain retained for explicit Empty Trash.
+    pub(crate) async fn restore_trash(&self, id: &str) -> Result<(), ApiError> {
+        let _review = self.cleanup_review_mutation();
+        if id.starts_with("database-") {
+            return self.restore_database_trash(id).await;
+        }
+        let backend = self.inner.pg_backend.clone();
+        let app_data = self.app_data().to_owned();
+        self.restore_trash_with(id, move |entry, dump| {
+            let operation = &entry
+                .recovery
+                .as_ref()
+                .ok_or("missing recovery identity")?
+                .operation;
+            postgres::cleanup_restore(
+                &backend,
+                &app_data,
+                &entry
+                    .workspace
+                    .as_ref()
+                    .ok_or("not a registered workspace")?
+                    .id,
+                operation,
+                dump,
+                entry.deletion_operation.as_deref(),
+            )
+        })
+        .await
+    }
+
+    async fn restore_trash_with(
+        &self,
+        id: &str,
+        restore: impl FnOnce(&crate::trash::Entry, &std::path::Path) -> Result<(), BoxError>
+            + Send
+            + 'static,
+    ) -> Result<(), ApiError> {
+        self.restore_trash_with_peers(id, &self.cleanup_peer_paths(), restore)
+            .await
+    }
+
+    async fn restore_trash_with_peers(
+        &self,
+        id: &str,
+        peers: &[PathBuf],
+        restore: impl FnOnce(&crate::trash::Entry, &std::path::Path) -> Result<(), BoxError>
+            + Send
+            + 'static,
+    ) -> Result<(), ApiError> {
+        let failure = |e: BoxError| ApiError::conflict(e.to_string());
+        let (entry, _) =
+            crate::trash::Entry::load(&self.app_data().join("deleted"), id).map_err(failure)?;
+        if entry.workspace.is_none() {
+            return self.restore_folder_trash(id, &entry.original_dir).await;
+        }
+        let workspace = entry
+            .workspace
+            .clone()
+            .ok_or_else(|| ApiError::conflict("missing registration"))?;
+        let _operation = self.workspace_operation(&workspace.id).await;
+        let _publication = self.resource_publication_lock()?;
+        {
+            let others = self
+                .inner
+                .registry
+                .lock()
+                .unwrap()
+                .workspaces
+                .iter()
+                .filter(|other| other.id != workspace.id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let resources = crate::cleanup::registered_resources(&others, self.app_data(), peers)
+                .map_err(failure)?;
+            resources
+                .require_unowned_database(&postgres::database_name(&workspace.id).map_err(failure)?)
+                .map_err(failure)?;
+            resources
+                .require_unowned_destination(&entry.original_dir)
+                .map_err(failure)?;
+        }
+        let (mut entry, root) =
+            crate::trash::Entry::load(&self.app_data().join("deleted"), id).map_err(failure)?;
+        if entry.workspace.as_ref() != Some(&workspace)
+            || workspace.resolve_dir(self.app_data()) != entry.original_dir
+        {
+            return Err(ApiError::conflict("Trash workspace identity changed"));
+        }
+        if entry.phase == crate::trash::Phase::Prepared {
+            // Before the move the database was never touched. Require the
+            // original registration and inode; no dump, database restore or
+            // provisioning is appropriate for canceling this preparation.
+            if self.inner.registry.lock().unwrap().get(&workspace.id) != Some(&workspace) {
+                return Err(ApiError::conflict(
+                    "prepared workspace registration changed",
+                ));
+            }
+            let workspace_id = workspace.id.clone();
+            tokio::task::spawn_blocking(move || entry.cancel_prepared(&root))
+                .await
+                .map_err(|e| ApiError::conflict(e.to_string()))?
+                .map_err(failure)?;
+            self.clear_runtime_state(&workspace_id);
+            self.clear_stop(&workspace_id);
+            return Ok(());
+        }
+        {
+            let registry = self.inner.registry.lock().unwrap();
+            if let Some(existing) = registry.get(&workspace.id) {
+                if !matches!(
+                    entry.phase,
+                    crate::trash::Phase::Restoring
+                        | crate::trash::Phase::DatabaseDropped
+                        | crate::trash::Phase::Moved
+                ) || existing != &workspace
+                {
+                    return Err(ApiError::conflict("workspace is already registered"));
+                }
+            }
+        }
+        let snapshots = self.snapshot_root(&workspace.id).map_err(failure)?;
+        let (mut entry, root) = tokio::task::spawn_blocking(move || -> Result<_, BoxError> {
+            let dump = root.join("database.dump");
+            if !std::fs::symlink_metadata(&dump)?.is_file() {
+                return Err("Trash has no database recovery copy".into());
+            }
+            entry.begin_recovery(&root)?;
+            restore(&entry, &dump)?;
+            entry.recover_folder(&root)?;
+            entry.recover_snapshots(&root, &snapshots)?;
+            Ok((entry, root))
+        })
+        .await
+        .map_err(|e| ApiError::conflict(e.to_string()))?
+        .map_err(failure)?;
+        {
+            let mut registry = self.inner.registry.lock().unwrap();
+            let mut updated = registry.clone();
+            if let Some(existing) = updated.get(&workspace.id) {
+                if existing != &workspace {
+                    return Err(ApiError::conflict("workspace registration changed"));
+                }
+            } else {
+                updated.add(workspace.clone()).map_err(failure)?;
+            }
+            updated.save(&self.inner.registry_path).map_err(failure)?;
+            *registry = updated;
+        }
+        entry.phase = crate::trash::Phase::Restored;
+        entry.save(&root).map_err(failure)?;
+        self.clear_runtime_state(&workspace.id);
+        self.clear_stop(&workspace.id);
+        Ok(())
+    }
+
+    pub(crate) fn cleanup_review_mutation(&self) -> CleanupReviewMutation {
+        let mut cache = self.inner.cleanup_review.lock().unwrap();
+        cache.mutations += 1;
+        cache.invalidate();
+        CleanupReviewMutation(self.clone())
+    }
+
+    /// Return the last scan immediately; expensive walks belong to a gateway job.
+    pub fn cleanup_review(&self) -> crate::cleanup::Review {
+        let mut cache = self.inner.cleanup_review.lock().unwrap();
+        let stale = cache
+            .report
+            .scanned_at
+            .is_none_or(|at| chrono::Utc::now().signed_duration_since(at).num_seconds() >= 60);
+        if stale && !cache.running && cache.mutations == 0 {
+            cache.running = true;
+            let generation = cache.generation;
+            let state = self.clone();
+            tokio::spawn(async move {
+                let own = state.inner.registry.lock().unwrap().workspaces.clone();
+                let app_data = state.app_data().clone();
+                let backend = state.inner.pg_backend.clone();
+                let peers = state.cleanup_peer_paths();
+                let result = tokio::task::spawn_blocking(move || {
+                    let mut report = crate::cleanup::scan(own.clone(), &app_data, peers);
+                    match postgres::cleanup_observations(&backend, &app_data) {
+                        Ok(databases) => crate::cleanup::merge_databases(&mut report, databases),
+                        Err(e) => report
+                            .warnings
+                            .push(format!("Database discovery unavailable: {e}")),
+                    }
+                    for row in &mut report.rows {
+                        if let Some(ws) = row
+                            .workspace
+                            .as_ref()
+                            .and_then(|w| own.iter().find(|ws| ws.id == w.id))
+                        {
+                            row.fingerprint = crate::cleanup::observed_workspace_fingerprint(
+                                ws,
+                                &row.directory,
+                                row.database.as_ref(),
+                                row.running,
+                                row.folder_bytes,
+                            );
+                        }
+                    }
+                    report
+                })
+                .await;
+                let mut cache = state.inner.cleanup_review.lock().unwrap();
+                match result {
+                    Ok(report) => cache.publish(generation, report),
+                    Err(e) => cache
+                        .report
+                        .warnings
+                        .push(format!("Cleanup scan failed: {e}")),
+                }
+                cache.running = false;
+            });
+        }
+        let mut report = cache.report.clone();
+        report.refreshing = cache.running || cache.mutations > 0;
+        report
     }
 
     /// What this request proved about itself (`crate::auth`).
@@ -484,8 +809,8 @@ impl GatewayState {
         &self.inner.remote_gateways
     }
 
-    pub fn relay_client(&self) -> &crate::relay::RelayClient {
-        &self.inner.relay_client
+    pub fn peer_connection(&self) -> &crate::peer_connection::PeerConnection {
+        &self.inner.peer_connection
     }
 
     /// The credential cookie name this gateway writes (`auth::device_cookie_name`).
@@ -521,8 +846,8 @@ impl GatewayState {
             .unwrap_or_default()
     }
 
-    /// Mint a one-time pairing code, carrying the name the minter suggested.
-    pub fn mint_pairing_code(&self, label: Option<String>) -> Result<String, String> {
+    /// Mint a one-time device pairing, carrying the name the minter suggested.
+    pub fn mint_pairing(&self, label: Option<String>) -> Result<pairing::MintedPairing, String> {
         self.inner
             .pending_pairings
             .lock()
@@ -531,15 +856,17 @@ impl GatewayState {
             .map_err(|e| format!("could not mint a pairing code: {e}"))
     }
 
-    /// Redeem `code` and enrol a device called `label`.
+    /// Redeem a secret or short code from `channel`, and enrol a device called
+    /// `label`.
     ///
-    /// A rejected or throttled attempt is a caller error rather than a failure.
-    /// The two are reported apart so the handler can answer 429 for the second.
-    /// The code is consumed before the credential is minted, so a failure to
-    /// persist cannot leave a code redeemable twice.
-    pub fn redeem_pairing_code(
+    /// A refused attempt is a caller error rather than a failure, and each kind
+    /// is reported apart so the handler can answer it plainly. The pairing is
+    /// consumed before the credential is minted, so a failure to persist cannot
+    /// leave it redeemable twice.
+    pub fn redeem_pairing(
         &self,
-        code: &str,
+        presented: &str,
+        channel: pairing::PairingChannel,
         requested_label: Option<&str>,
     ) -> Result<PairingOutcome, String> {
         // The name the device typed wins when it gave one, because that person
@@ -551,10 +878,11 @@ impl GatewayState {
                 .pending_pairings
                 .lock()
                 .map_err(|_| "pairing state is unavailable".to_string())?;
-            match pending.redeem(code) {
-                auth::Redemption::Redeemed(label) => label,
-                auth::Redemption::Rejected => return Ok(PairingOutcome::Rejected),
-                auth::Redemption::Throttled => return Ok(PairingOutcome::Throttled),
+            match pending.redeem(presented, channel) {
+                pairing::Redemption::Redeemed(label) => label,
+                pairing::Redemption::Rejected => return Ok(PairingOutcome::Rejected),
+                pairing::Redemption::LocalOnly => return Ok(PairingOutcome::LocalOnly),
+                pairing::Redemption::Throttled => return Ok(PairingOutcome::Throttled),
             }
         };
         let label = requested_label
@@ -716,7 +1044,29 @@ impl GatewayState {
 
     /// The engine socket a registry entry's engine binds.
     fn engine_address_of(&self, ws: &Workspace) -> EngineAddress {
-        EngineAddress::for_workspace(&ws.resolve_dir(self.app_data()), ws.port)
+        #[cfg(test)]
+        let address = self.inner.engine_address_factory;
+        #[cfg(not(test))]
+        let address = EngineAddress::for_workspace;
+        address(&ws.resolve_dir(self.app_data()), ws.port)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_live_engine_sockets(mut self) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("configure socket resolution before sharing test state")
+            .engine_address_factory = |workspace, port| {
+            EngineAddress::at(
+                lucidos_engine_socket::path_for(workspace).expect("live engine socket path"),
+                port,
+            )
+        };
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn adopt_running_engines_for_test(&self) {
+        self.adopt_running_engines().await;
     }
 
     /// The port this gateway is configured for.
@@ -730,6 +1080,12 @@ impl GatewayState {
     /// The interfaces this gateway listens on, as resolved at boot.
     pub fn bind_choice(&self) -> net_config::BindChoice {
         self.inner.bind_choice
+    }
+
+    /// The port the public listener holds, or `None` when it is off or failed
+    /// to bind.
+    pub fn public_port(&self) -> Option<u16> {
+        self.inner.public_port.get().copied()
     }
 
     /// The scheme the spawned engine serves on its TCP port, for the ports file
@@ -852,8 +1208,8 @@ impl GatewayState {
     }
 
     /// Record a boot failure for `id` (see [`GatewayInner::boot_failures`]).
-    /// Three producers, listed in [`crate::boot_failure`]: the `boot-failure`
-    /// control endpoint, the provisioning and spawn paths, and the
+    /// Producers are listed in [`crate::boot_failure`]: the `boot-failure`
+    /// control endpoint, provisioning and spawn, offline restore, and the
     /// supervisor's give-up.
     pub fn set_boot_failure(&self, id: &str, failure: BootFailure) {
         crate::log!(
@@ -956,6 +1312,26 @@ impl GatewayState {
             self.inner.stacks.lock().await.clone();
         let mut out = Vec::with_capacity(order.len());
         for ws in order {
+            if self.snapshot_restore_blocks(&ws.id) {
+                let cleanup_failure = self.cleanup_failure(&ws.id);
+                out.push(WorkspaceStatus {
+                    id: ws.id.clone(),
+                    name: ws.name.clone(),
+                    port: ws.port,
+                    health: if cleanup_failure.is_some() {
+                        Health::Unhealthy
+                    } else {
+                        Health::Restoring
+                    },
+                    autostart: ws.autostart,
+                    last_error: cleanup_failure
+                        .or_else(|| self.snapshot_restore_failure(&ws.id))
+                        .map(str::to_owned),
+                    unread_count: None,
+                    last_successful_backup: None,
+                });
+                continue;
+            }
             if let Some(stack) = stacks.get(&ws.id) {
                 out.push(stack.lock().await.status());
             } else {
@@ -1301,6 +1677,7 @@ impl GatewayState {
     /// still listed in the picker and starts on an explicit open
     /// ([`Self::lazy_start`]).
     async fn boot_all(&self) {
+        self.recover_snapshot_restores().await;
         // Consumed exactly once, here, before anything is brought up. Empty in
         // dev, where nothing writes the record.
         let restore: Arc<HashSet<String>> =
@@ -1342,6 +1719,10 @@ impl GatewayState {
     /// concurrent requests cannot each spawn a duplicate engine before the stack
     /// lands in `stacks`.
     async fn lazy_start(&self, id: &str) {
+        let _operation = self.workspace_operation(id).await;
+        if self.snapshot_restore_blocks(id) {
+            return;
+        }
         if self.inner.stacks.lock().await.contains_key(id) {
             return;
         }
@@ -1385,7 +1766,11 @@ impl GatewayState {
             let starting = self.inner.starting.lock().await;
             registered
                 .into_iter()
-                .filter(|ws| !stacks.contains_key(&ws.id) && !starting.contains(&ws.id))
+                .filter(|ws| {
+                    !stacks.contains_key(&ws.id)
+                        && !starting.contains(&ws.id)
+                        && !self.snapshot_restore_blocks(&ws.id)
+                })
                 .collect()
         };
         if candidates.is_empty() {
@@ -1425,6 +1810,10 @@ impl GatewayState {
     /// directory. A stack and a route for a workspace that no longer exists
     /// would point traffic at whatever is still on the port.
     async fn adopt_running_engine(&self, ws: Workspace) {
+        let _operation = self.workspace_operation(&ws.id).await;
+        if self.snapshot_restore_blocks(&ws.id) {
+            return;
+        }
         if self.inner.stacks.lock().await.contains_key(&ws.id) {
             return;
         }
@@ -1463,7 +1852,7 @@ impl GatewayState {
             last_unread: None,
             last_successful_backup: None,
         };
-        self.set_route(&ws.id, stack.engine_address());
+        self.set_route(&ws.id, self.engine_address_of(&ws));
         self.install_stack(&ws.id, stack).await;
         // Already up, so there is no boot window to narrate and nothing failed.
         self.clear_boot_phase(&ws.id);
@@ -1486,6 +1875,22 @@ impl GatewayState {
     /// Retry or delete is the escape. Either way the reason is recorded as a
     /// boot failure so the splash can explain itself. See ADR 0014.
     async fn bring_up(&self, ws: Workspace) {
+        if self.snapshot_restore_blocks(&ws.id) {
+            return;
+        }
+        self.bring_up_after_snapshot(ws).await;
+    }
+
+    async fn bring_up_after_snapshot(&self, ws: Workspace) {
+        #[cfg(test)]
+        if let Some(probe) = self.inner.snapshot_test.lock().unwrap().clone() {
+            assert_eq!(
+                self.snapshot_restore_status(&ws.id).unwrap().unwrap().phase,
+                snapshot_restore::Phase::RolledBack
+            );
+            probe.spawned.notify_one();
+            return;
+        }
         let resolved_dir = ws.resolve_dir(self.app_data());
         let created = lucidos_home::ensure_storage_root(&resolved_dir)
             .and_then(|()| std::fs::create_dir_all(resolved_dir.join("data")));
@@ -1543,7 +1948,7 @@ impl GatewayState {
             }
         };
 
-        self.set_route(&ws.id, stack.engine_address());
+        self.set_route(&ws.id, self.engine_address_of(&ws));
         self.install_stack(&ws.id, stack).await;
         crate::log!("[Gateway] workspace '{}' engine on :{}", ws.id, ws.port);
     }
@@ -1682,6 +2087,8 @@ impl GatewayState {
     /// ADDRESS may still be taken while the name is free, and that one is
     /// suffixed rather than refused.
     pub async fn create_workspace(&self, name: &str) -> Result<WorkspaceStatus, ApiError> {
+        let _review = self.cleanup_review_mutation();
+        let _publication = self.resource_publication_lock()?;
         let ws = {
             let mut reg = self.inner.registry.lock().unwrap();
             if let Some(existing) = reg.find_by_display_name(name, None) {
@@ -1750,13 +2157,17 @@ impl GatewayState {
     /// may move a stopped workspace, never a running one, and never onto a port
     /// another entry holds. That is how the launcher registers without writing
     /// `workspaces.json` behind this gateway.
-    pub async fn adopt_workspace(
+    pub async fn adopt_workspace_with_cleanup(
         &self,
         dir: &Path,
         name: Option<&str>,
         autostart: Option<bool>,
         port: Option<u16>,
-    ) -> Result<Workspace, ApiError> {
+        cleanup: &registry::CleanupRegistration,
+        device: bool,
+    ) -> Result<(Workspace, Option<String>), ApiError> {
+        let _review = self.cleanup_review_mutation();
+        let mut owner_token = None;
         if port == Some(0) {
             return Err(ApiError::bad_request(
                 "port 0 is not a port an engine can bind",
@@ -1801,6 +2212,9 @@ impl GatewayState {
                  is not a valid one"
             )));
         }
+        // Serialize origin changes with delete authorization through completion.
+        let _operation = self.workspace_operation(&id).await;
+        let _publication = self.resource_publication_lock()?;
         let name = name.map(str::trim).filter(|n| !n.is_empty());
         // Once every refusal has passed, and before the registry changes, so a
         // refused adopt leaves the directory as it found it.
@@ -1831,6 +2245,18 @@ impl GatewayState {
                 if names_match(&self.restore_reserved_name(), name) {
                     return Err(ApiError::conflict(name_being_restored_message(name)));
                 }
+            }
+            if reg.get(&id).is_some()
+                && !device
+                && (cleanup
+                    .origin
+                    .is_some_and(|o| o != registry::WorkspaceOrigin::User)
+                    || cleanup.ephemeral.is_some()
+                    || cleanup.expires_at.is_some())
+            {
+                return Err(ApiError::forbidden(
+                    "only a paired device may lower workspace protection",
+                ));
             }
             let entry = match reg.get(&id) {
                 Some(existing) => {
@@ -1865,23 +2291,68 @@ impl GatewayState {
                     if let Some(autostart) = autostart {
                         entry.autostart = autostart;
                     }
+                    if let Some(origin) = cleanup.origin {
+                        entry.cleanup.origin = origin;
+                    }
+                    if let Some(ephemeral) = cleanup.ephemeral {
+                        entry.cleanup.ephemeral = ephemeral;
+                    }
+                    if let Some(expires_at) = cleanup.expires_at {
+                        entry.cleanup.expires_at = Some(expires_at);
+                    }
+                    if matches!(
+                        entry.cleanup.origin,
+                        registry::WorkspaceOrigin::User | registry::WorkspaceOrigin::Unknown
+                    ) {
+                        entry.cleanup.ephemeral = false;
+                        entry.cleanup.expires_at = None;
+                        entry.cleanup.owner_token_digest = None;
+                    }
                     entry.clone()
                 }
                 None => {
                     refuse_an_id_postgres_would_truncate(basename, &id)?;
-                    make_storage_root()?;
                     let port = match port {
                         Some(port) => port,
                         None => reg
                             .allocate_port()
                             .map_err(|e| ApiError::internal(e.to_string()))?,
                     };
+                    let origin = cleanup.origin.unwrap_or_default();
+                    let ephemeral = cleanup.ephemeral.unwrap_or(false);
+                    if ephemeral
+                        && matches!(
+                            origin,
+                            registry::WorkspaceOrigin::User | registry::WorkspaceOrigin::Unknown
+                        )
+                    {
+                        return Err(ApiError::bad_request(
+                            "user and unknown workspaces cannot be ephemeral",
+                        ));
+                    }
+                    let owner_token_digest = if ephemeral {
+                        let token = auth::mint_credential()
+                            .map_err(|e| ApiError::internal(e.to_string()))?;
+                        let digest = auth::digest(&token);
+                        owner_token = Some(token);
+                        Some(digest)
+                    } else {
+                        None
+                    };
+                    make_storage_root()?;
                     let entry = Workspace {
                         id: id.clone(),
                         name: name.unwrap_or(basename).to_string(),
                         dir: dir_text.to_string(),
                         port,
                         database_url: None,
+                        cleanup: registry::WorkspaceCleanup {
+                            origin,
+                            ephemeral,
+                            expires_at: cleanup.expires_at,
+                            owner_token_digest,
+                            last_opened_at: None,
+                        },
                         autostart: autostart.unwrap_or(false),
                     };
                     reg.add(entry.clone())
@@ -1912,7 +2383,7 @@ impl GatewayState {
             ws.port,
             ws.autostart
         );
-        Ok(ws)
+        Ok((ws, owner_token))
     }
 
     /// Current restore-flow state, for the picker's poll.
@@ -2091,6 +2562,9 @@ impl GatewayState {
         archive_tmp: &Path,
         backup_key: &str,
     ) -> Result<Vec<String>, String> {
+        let _publication = self
+            .resource_publication_lock()
+            .map_err(|e| format!("{e:?}"))?;
         let resolved_dir = ws.resolve_dir(self.app_data());
         // Created exclusively, because every failure below deletes this tree.
         // The id is free in the registry, not on disk: a delete whose move to
@@ -2181,7 +2655,7 @@ impl GatewayState {
                     last_unread: None,
                     last_successful_backup: None,
                 };
-                self.set_route(&ws.id, stack.engine_address());
+                self.set_route(&ws.id, self.engine_address_of(&ws));
                 self.install_stack(&ws.id, stack).await;
                 crate::log!("[Gateway] restored '{}' engine on :{}", ws.id, ws.port);
             }
@@ -2355,6 +2829,10 @@ impl GatewayState {
         id: &str,
         requested_by: Option<&str>,
     ) -> Result<(), BoxError> {
+        let _operation = self.workspace_operation(id).await;
+        if self.snapshot_restore_blocks(id) {
+            return Err("workspace_restoring".into());
+        }
         let existing = self.inner.stacks.lock().await.get(id).cloned();
         match existing {
             Some(stack) => {
@@ -2383,6 +2861,7 @@ impl GatewayState {
                 if !self.inner.registry.lock().unwrap().contains(id) {
                     return Err(format!("workspace '{id}' not found").into());
                 }
+                drop(_operation);
                 self.lazy_start(id).await;
                 Ok(())
             }
@@ -2397,6 +2876,9 @@ impl GatewayState {
     ///
     /// A slug this gateway does not know is a 404, as for [`Self::stop_workspace`].
     pub fn start_workspace(&self, id: &str) -> Result<(), ApiError> {
+        if self.snapshot_restore_blocks(id) {
+            return Err(ApiError::conflict("workspace_restoring"));
+        }
         if !self.inner.registry.lock().unwrap().contains(id) {
             return Err(ApiError::not_found(format!("workspace '{id}' not found")));
         }
@@ -2422,6 +2904,18 @@ impl GatewayState {
     /// KNOWN workspace that is not running stays a 202, which keeps the call
     /// idempotent.
     pub async fn stop_workspace(
+        &self,
+        id: &str,
+        requested_by: Option<&str>,
+    ) -> Result<(), ApiError> {
+        let _operation = self.workspace_operation(id).await;
+        if self.snapshot_restore_blocks(id) {
+            return Err(ApiError::conflict("workspace_restoring"));
+        }
+        self.stop_for_snapshot(id, requested_by).await
+    }
+
+    async fn stop_for_snapshot(
         &self,
         id: &str,
         requested_by: Option<&str>,
@@ -2466,22 +2960,132 @@ impl GatewayState {
         Ok(())
     }
 
-    /// Delete-to-trash: optionally confirm the typed name, stop the stack,
-    /// unregister, then move the dir to `<app-data>/deleted/<id>-<ts>/`, where
-    /// it is recoverable until purged. Never an immediate `rm`.
-    pub async fn delete_workspace(&self, id: &str, confirm: Option<&str>) -> Result<(), BoxError> {
+    /// A harness deleting only its own ephemeral registration.
+    pub async fn delete_workspace_authorized(
+        &self,
+        id: &str,
+        confirm: Option<&str>,
+        owner_token: Option<&str>,
+    ) -> Result<(), ApiError> {
+        self.delete_workspace_authorized_with_observation(
+            id,
+            confirm,
+            owner_token,
+            |database| async move {
+                let backend = self.inner.pg_backend.clone();
+                let home = self.app_data().to_owned();
+                tokio::task::spawn_blocking(move || {
+                    postgres::cleanup_database_exists(&backend, &home, &database)
+                })
+                .await?
+            },
+        )
+        .await
+    }
+
+    async fn delete_workspace_authorized_with_observation<F, Fut>(
+        &self,
+        id: &str,
+        confirm: Option<&str>,
+        owner_token: Option<&str>,
+        mut database_exists: F,
+    ) -> Result<(), ApiError>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: std::future::Future<Output = Result<bool, BoxError>>,
+    {
+        let _review = self.cleanup_review_mutation();
+        let _operation = self.workspace_operation(id).await;
         let ws = {
             let reg = self.inner.registry.lock().unwrap();
             reg.get(id)
                 .cloned()
-                .ok_or_else(|| format!("workspace '{id}' not found"))?
+                .ok_or_else(|| ApiError::not_found("workspace not found"))?
         };
-        if let Some(c) = confirm {
-            if c.trim() != ws.name {
-                return Err("confirmation does not match the workspace name".into());
-            }
+        if !owner_token.is_some_and(|t| ws.cleanup.permits_owner(t)) {
+            return Err(ApiError::forbidden(
+                "direct workspace deletion requires its harness owner token",
+            ));
         }
+        if confirm.is_none_or(|c| c != ws.name) {
+            return Err(ApiError::bad_request(
+                "confirmation does not match the workspace name",
+            ));
+        }
+        let _publication = self.resource_publication_lock()?;
+        if let Some((mut entry, root)) =
+            crate::trash::Entry::find_workspace(&self.app_data().join("deleted"), &ws)
+                .map_err(|e| ApiError::conflict(e.to_string()))?
+        {
+            let audit = entry.audit.clone().ok_or_else(|| {
+                ApiError::conflict(
+                    "interrupted cleanup has no authorization; explicit Trash recovery required",
+                )
+            })?;
+            audit
+                .require_authorized(self.app_data(), id)
+                .map_err(|e| ApiError::conflict(e.to_string()))?;
+            self.reconcile_cleanup_entry(
+                &mut entry,
+                &root,
+                &cleanup_actions::FrozenResource::Registered { workspace: ws },
+                &mut database_exists,
+            )
+            .await
+            .map_err(|e| ApiError::conflict(e.to_string()))?;
+            return audit
+                .completed(self.app_data())
+                .map_err(|e| ApiError::conflict(e.to_string()));
+        }
+        let audit = crate::cleanup_audit::Audit::begin(
+            self.app_data(),
+            id,
+            crate::cleanup_audit::Actor::Owner {
+                workspace_id: id.into(),
+            },
+        )
+        .map_err(|e| ApiError::conflict(e.to_string()))?;
+        self.delete_confirmed_workspace(&ws, &audit)
+            .await
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        audit
+            .completed(self.app_data())
+            .map_err(|e| ApiError::conflict(e.to_string()))
+    }
 
+    async fn delete_confirmed_workspace(
+        &self,
+        ws: &Workspace,
+        audit: &crate::cleanup_audit::Audit,
+    ) -> Result<(), BoxError> {
+        self.delete_confirmed_workspace_with_peers(ws, audit, &self.cleanup_peer_paths())
+            .await
+    }
+
+    async fn delete_confirmed_workspace_with_peers(
+        &self,
+        ws: &Workspace,
+        audit: &crate::cleanup_audit::Audit,
+        peers: &[PathBuf],
+    ) -> Result<(), BoxError> {
+        let id = ws.id.as_str();
+        if self.snapshot_restore_blocks(id) {
+            return Err("workspace_restoring".into());
+        }
+        let others = self
+            .inner
+            .registry
+            .lock()
+            .unwrap()
+            .workspaces
+            .iter()
+            .filter(|other| other.id != ws.id)
+            .cloned()
+            .collect::<Vec<_>>();
+        crate::cleanup::registered_resources(&others, self.app_data(), peers)?.require_unowned(
+            &ws.resolve_dir(self.app_data()),
+            &postgres::database_name(id)?,
+        )?;
         // The database is dropped below by registry id, so a stopped workspace
         // and an unhealthy stack with no `PgHandle` are cleaned up the same
         // way. The shared Postgres cluster stays up for peers.
@@ -2493,38 +3097,69 @@ impl GatewayState {
             let mut s = stack.lock().await;
             stop_engine_process(&mut s);
         }
-        if let Err(e) = self.teardown_postgres(&ws).await {
-            crate::log!("[Gateway] '{}' database teardown failed: {}", id, e);
-        }
-        // A restore can reuse this id, and must not inherit a give-up.
-        self.clear_runtime_state(id);
-        // Nothing left to guard: the entry is about to leave the registry.
-        self.clear_stop(id);
-
-        // Unregister, then move the dir to trash.
+        let dir = ws.resolve_dir(self.app_data());
+        stack::reclaim_stale_engine(&dir);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let _owner = loop {
+            if let Some(owner) = lucidos_owner_lock::OwnerLock::try_acquire(
+                &lucidos_owner_lock::engine::lock_path(&dir),
+            )? {
+                break owner;
+            }
+            if Instant::now() >= deadline {
+                return Err("workspace stop timed out".into());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let backend = self.inner.pg_backend.clone();
+        let app_data = self.app_data().to_owned();
+        let workspace = ws.clone();
+        let (mut entry, root) = tokio::task::spawn_blocking(move || {
+            crate::trash::Entry::prepare(&app_data.join("deleted"), &workspace, dir, |path| {
+                if matches!(
+                    workspace.cleanup.origin,
+                    crate::registry::WorkspaceOrigin::User
+                        | crate::registry::WorkspaceOrigin::Unknown
+                ) {
+                    postgres::cleanup_dump(&backend, &app_data, &workspace.id, path)?;
+                }
+                Ok(())
+            })
+        })
+        .await??;
+        entry.audit = Some(audit.clone());
+        entry.save(&root)?;
+        let backend = self.inner.pg_backend.clone();
+        let app_data = self.app_data().to_owned();
+        let workspace_id = id.to_owned();
+        let deletion_operation = entry
+            .deletion_operation
+            .clone()
+            .ok_or("missing deletion identity")?;
+        tokio::task::spawn_blocking(move || {
+            postgres::cleanup_mark_original(&backend, &app_data, &workspace_id, &deletion_operation)
+        })
+        .await??;
+        entry.move_folder(&root)?;
+        self.trash_snapshots(id, &root)?;
+        // A failed drop leaves both registry and journal for explicit recovery.
+        self.teardown_postgres(ws).await?;
+        entry.phase = crate::trash::Phase::DatabaseDropped;
+        entry.save(&root)?;
+        let prune_entry = entry.clone();
+        let prune_root = root.clone();
+        tokio::task::spawn_blocking(move || prune_entry.prune_worktrees(&prune_root)).await??;
         {
             let mut reg = self.inner.registry.lock().unwrap();
-            reg.remove(id)?;
-            reg.save(&self.inner.registry_path)?;
+            let mut updated = reg.clone();
+            updated.remove(id)?;
+            updated.save(&self.inner.registry_path)?;
+            *reg = updated;
         }
-
-        let resolved_dir = ws.resolve_dir(self.app_data());
-        if resolved_dir.exists() {
-            let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-            let trash = self.app_data().join("deleted").join(format!("{id}-{ts}"));
-            if let Some(parent) = trash.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            match std::fs::rename(&resolved_dir, &trash) {
-                Ok(()) => crate::log!("[Gateway] '{}' moved to {}", id, trash.display()),
-                Err(e) => crate::log!(
-                    "[Gateway] '{}' unregistered but dir move failed ({}); left at {}",
-                    id,
-                    e,
-                    resolved_dir.display()
-                ),
-            }
-        }
+        entry.phase = crate::trash::Phase::Completed;
+        entry.save(&root)?;
+        self.clear_runtime_state(id);
+        self.clear_stop(id);
         Ok(())
     }
 
@@ -2532,6 +3167,9 @@ impl GatewayState {
     /// shared-cluster database, spawn fresh. Records the error on failure
     /// rather than panicking.
     async fn respawn_stack(&self, s: &mut StackRuntime) {
+        if self.snapshot_restore_blocks(&s.ws.id) {
+            return;
+        }
         stop_engine_process(s);
         s.last_spawn = Some(Instant::now());
         s.restart_attempts += 1;
@@ -3329,6 +3967,8 @@ pub async fn run(inherited_lock_fd: Option<String>) -> Result<RunOutcome, BoxErr
     let state =
         GatewayState {
             inner: Arc::new(GatewayInner {
+                #[cfg(test)]
+                engine_address_factory: EngineAddress::for_workspace,
                 device_cookie_name: auth::device_cookie_name(&app_data),
                 app_data,
                 registry_path,
@@ -3339,10 +3979,12 @@ pub async fn run(inherited_lock_fd: Option<String>) -> Result<RunOutcome, BoxErr
                 paired_devices_path,
                 paired_devices: Mutex::new(paired_devices),
                 paired_devices_writing: Mutex::new(()),
-                pending_pairings: Mutex::new(auth::PendingPairings::default()),
+                pending_pairings: Mutex::new(pairing::PendingPairings::new(
+                    pairing::PairingKind::Device,
+                )),
                 paired_gateways,
                 remote_gateways,
-                relay_client: crate::relay::RelayClient::new()?,
+                peer_connection: crate::peer_connection::PeerConnection::new()?,
                 refusal_log: Mutex::new(auth::LogThrottle::default()),
                 certs: Arc::default(),
                 engine_bin,
@@ -3360,7 +4002,13 @@ pub async fn run(inherited_lock_fd: Option<String>) -> Result<RunOutcome, BoxErr
                 boot_phases: RwLock::new(HashMap::new()),
                 boot_failures: RwLock::new(HashMap::new()),
                 restore: RwLock::new(RestoreStatus::default()),
+                snapshot_restores: Mutex::new(HashSet::new()),
+                #[cfg(test)]
+                snapshot_test: Mutex::new(None),
+                workspace_operations: Mutex::new(HashMap::new()),
+                snapshot_home: lucidos_home::path().ok_or("Lucidos home unavailable")?,
                 pending_binds: RwLock::new(BTreeSet::new()),
+                public_port: std::sync::OnceLock::new(),
                 exe_path: exe_path.clone(),
                 binary_check: Mutex::new(GatewayBinaryCheck::default()),
                 scheduled_reload: Mutex::new(None),
@@ -3368,6 +4016,7 @@ pub async fn run(inherited_lock_fd: Option<String>) -> Result<RunOutcome, BoxErr
                     &release_check::Deployment::from_env(packaged, exe_path, release_app_data),
                 ),
                 slowness: slowness::Slowness::default(),
+                cleanup_review: Mutex::new(crate::cleanup::ReviewCache::default()),
                 update_relay: crate::update_relay::UpdateRelay::default(),
             }),
         };
@@ -3391,6 +4040,20 @@ pub async fn run(inherited_lock_fd: Option<String>) -> Result<RunOutcome, BoxErr
         tokio::spawn(async move {
             for id in handed_over {
                 restarter.restart_handed_over(&id).await;
+            }
+        });
+    }
+
+    // Durable remote credential rotation: recover on startup, then retry hourly.
+    {
+        let rotator = state.clone();
+        tokio::spawn(async move {
+            loop {
+                rotator
+                    .remote_gateways()
+                    .rotate_due(rotator.peer_connection())
+                    .await;
+                tokio::time::sleep(Duration::from_secs(3600)).await;
             }
         });
     }
@@ -3499,6 +4162,14 @@ fn start_managed_tls(state: &GatewayState, port: u16, bind_choice: &net_config::
 pub(crate) fn gateway_router(state: GatewayState) -> Router {
     let router = Router::new()
         .route(crate::peers::GATEWAY_HEALTH_PATH, get(gateway_health))
+        .route(
+            crate::oauth_callback::HANDOFF_PATH,
+            get(crate::oauth_callback::handoff),
+        )
+        .route(
+            lucidos_gateway_constants::OAUTH_WEB_CALLBACK_PATH,
+            get(crate::oauth_callback::web_callback),
+        )
         .nest("/~/api/v1/control", crate::control::router())
         .nest("/~/api/v1/auth", crate::auth_api::router())
         .nest(
@@ -3625,6 +4296,46 @@ async fn serve(
         }
     }
 
+    // The loopback OAuth callback port (`crate::oauth_callback`). Never fatal:
+    // another install may hold it, and each address retries until it is free.
+    // Spawned, not joined, because a retrying bind never ends on shutdown.
+    for addr in crate::oauth_callback::bind_addrs() {
+        tokio::spawn(crate::oauth_callback::serve(
+            addr,
+            state.clone(),
+            handle.clone(),
+        ));
+    }
+
+    // The public listener: loopback, plain, the whole router, and every request
+    // stamped public (`crate::pairing`). A tunnel or reverse proxy points here.
+    // Not fatal, for the hook socket's reason above.
+    if let Some(public) = pairing::resolved_public_port(port) {
+        let addr = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, public));
+        match std::net::TcpListener::bind(addr) {
+            Ok(listener) => {
+                crate::log!("[Gateway] public listener on http://{addr}");
+                let _ = state.inner.public_port.set(public);
+                let public_serving = Box::pin(
+                    axum_server::from_tcp(listener)
+                        .acceptor(tls::GatewayAcceptor::public(tls::ListenerTls::Plain))
+                        .handle(handle.clone())
+                        .serve(router.clone().into_make_service()),
+                );
+                serving.push(Box::pin(async move {
+                    if let Err(e) = public_serving.await {
+                        crate::log!("[Gateway] the public listener stopped serving ({e})");
+                    }
+                    Ok(())
+                }));
+            }
+            Err(e) => crate::log!(
+                "[Gateway] could not bind the public listener on {addr} ({e}); \
+                 a tunnel on the main port is still judged by its forwarding headers"
+            ),
+        }
+    }
+
     // The optional ones, each retried in its own task until the address exists.
     // Recorded as pending first so `/~/api/v1/health` is honest from the very
     // first request, rather than only after the first failed attempt.
@@ -3664,7 +4375,7 @@ fn bind_and_log(
 
 /// Serve an already-bound listener, deciding each connection's scheme through
 /// `tls`. Boxed because the caller keeps every listener in one collection.
-fn serve_listener(
+pub(crate) fn serve_listener(
     listener: std::net::TcpListener,
     router: Router,
     handle: axum_server::Handle,
@@ -3845,8 +4556,9 @@ pub(crate) fn instance_id() -> &'static str {
 ///   * `/`, the smart root: redirect to a sole workspace, else the picker.
 ///   * `/~/…`, the picker shell and its assets, under the sigil namespace.
 ///   * `/<slug>/…`, proxied to the matching engine.
-async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request) -> Response {
+async fn fallback(State(state): State<GatewayState>, mut req: axum::extract::Request) -> Response {
     let path = req.uri().path().to_string();
+    crate::oauth_callback::stamp_locality(&mut req);
 
     if path == "/" {
         // Exactly one workspace drops the user straight in. `/` is public, so
@@ -3886,6 +4598,42 @@ pub(crate) async fn serve_workspace(
     prefix: &str,
     req: axum::extract::Request,
 ) -> Response {
+    if classify_navigation(&req) == Navigation::Document
+        && req
+            .extensions()
+            .get::<auth::AuthenticatedDevice>()
+            .is_some()
+    {
+        if let Err(error) = state.record_workspace_navigation(slug).await {
+            crate::log!("[Gateway] could not persist workspace open: {error}");
+        }
+    }
+    if state.snapshot_restore_blocks(slug) {
+        let cleanup_failure = state.cleanup_failure(slug);
+        if let Some(message) = cleanup_failure.or_else(|| state.snapshot_restore_failure(slug)) {
+            match classify_navigation(&req) {
+                Navigation::Document => return proxy::failed_page(message),
+                Navigation::Frame => return proxy::frame_failed_page(),
+                Navigation::Other => {}
+            }
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(serde_json::json!({
+                    "error": message, "reason": if cleanup_failure.is_some() {
+                        "workspace_cleanup_needs_attention"
+                    } else { "snapshot_restore_needs_attention" }
+                })),
+            )
+                .into_response();
+        }
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(
+                serde_json::json!({"error":"workspace_restoring","reason":"workspace_restoring"}),
+            ),
+        )
+            .into_response();
+    }
     let path = req.uri().path().to_string();
     let rest = path
         .trim_start_matches('/')
@@ -4190,7 +4938,7 @@ async fn serve_sigil(state: &GatewayState, rest: &str, req: axum::extract::Reque
     // shell's manifest link and out again in `start_url`, so an iOS home-screen
     // install pairs itself on first launch. Owned rather than borrowed, because
     // the asset branch below consumes `req`.
-    let pair_code = pairing_qr::pairing_code_in_query(req.uri().query()).map(str::to_string);
+    let pair_code = pairing_qr::pairing_token_in_query(req.uri().query()).map(str::to_string);
 
     // Serving the raw `dist/index.html` here would carry no base tag, so the
     // bundle would render the app rather than the picker. Mirrors the engine's
@@ -4779,6 +5527,10 @@ fn raise_fd_limit() {
 mod unauth_disclosure_tests;
 
 #[cfg(test)]
+#[path = "snapshot_roundtrip_tests.rs"]
+mod snapshot_roundtrip_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::{json, Value};
@@ -4792,6 +5544,7 @@ mod tests {
         match outcome {
             PairingOutcome::Paired(credential) => credential,
             PairingOutcome::Rejected => panic!("the code was refused"),
+            PairingOutcome::LocalOnly => panic!("the short code was refused as public"),
             PairingOutcome::Throttled => panic!("the attempt was throttled"),
         }
     }
@@ -4833,15 +5586,23 @@ mod tests {
         // once and rewrote it whole, so every write deleted the other's rows.
         let (_a_dir, _b_dir, a, b) = two_gateways();
 
-        let code = a.mint_pairing_code(Some("My iPhone".into())).unwrap();
-        let credential = paired_credential(a.redeem_pairing_code(&code, None).unwrap());
+        let code = a.mint_pairing(Some("My iPhone".into())).unwrap().secret;
+        let credential = paired_credential(
+            a.redeem_pairing(&code, crate::pairing::PairingChannel::Public, None)
+                .unwrap(),
+        );
         assert_eq!(a.paired_devices().devices.len(), 1);
         assert!(b.paired_devices().devices.is_empty());
         assert!(!b.inner.paired_devices_path.exists());
 
         // B pairing its own device must leave A's file exactly as it was.
-        let code_b = b.mint_pairing_code(None).unwrap();
-        b.redeem_pairing_code(&code_b, Some("My MacBook")).unwrap();
+        let code_b = b.mint_pairing(None).unwrap().secret;
+        b.redeem_pairing(
+            &code_b,
+            crate::pairing::PairingChannel::Public,
+            Some("My MacBook"),
+        )
+        .unwrap();
         let a_store = auth::PairedDevices::load(&a.inner.paired_devices_path).unwrap();
         assert_eq!(a_store.devices.len(), 1);
         assert_eq!(a_store.devices[0].label, "My iPhone");
@@ -4867,13 +5628,15 @@ mod tests {
         // Pinned because it is the CHOSEN behaviour, not an accident. A device
         // pairs to a gateway, so `lucidos pair` refuses to guess which one.
         let (_a_dir, _b_dir, a, b) = two_gateways();
-        let code = a.mint_pairing_code(None).unwrap();
+        let code = a.mint_pairing(None).unwrap().secret;
         assert!(matches!(
-            b.redeem_pairing_code(&code, None).unwrap(),
+            b.redeem_pairing(&code, crate::pairing::PairingChannel::Public, None)
+                .unwrap(),
             PairingOutcome::Rejected
         ));
         assert!(matches!(
-            a.redeem_pairing_code(&code, None).unwrap(),
+            a.redeem_pairing(&code, crate::pairing::PairingChannel::Public, None)
+                .unwrap(),
             PairingOutcome::Paired(_)
         ));
     }
@@ -4881,10 +5644,22 @@ mod tests {
     #[test]
     fn revoking_on_one_gateway_leaves_the_other_s_device_alone() {
         let (_a_dir, _b_dir, a, b) = two_gateways();
-        let code_a = a.mint_pairing_code(None).unwrap();
-        a.redeem_pairing_code(&code_a, Some("My iPhone")).unwrap();
-        let code_b = b.mint_pairing_code(None).unwrap();
-        let cred_b = paired_credential(b.redeem_pairing_code(&code_b, Some("My iPhone")).unwrap());
+        let code_a = a.mint_pairing(None).unwrap().secret;
+        a.redeem_pairing(
+            &code_a,
+            crate::pairing::PairingChannel::Public,
+            Some("My iPhone"),
+        )
+        .unwrap();
+        let code_b = b.mint_pairing(None).unwrap().secret;
+        let cred_b = paired_credential(
+            b.redeem_pairing(
+                &code_b,
+                crate::pairing::PairingChannel::Public,
+                Some("My iPhone"),
+            )
+            .unwrap(),
+        );
 
         let id_a = a.paired_devices().devices[0].id.clone();
         assert!(a.revoke_device(&id_a).unwrap());
@@ -5012,6 +5787,7 @@ mod tests {
                 dir: dir.to_string_lossy().into_owned(),
                 port: 5199,
                 database_url: None,
+                cleanup: Default::default(),
                 autostart: false,
             },
             resolved_dir: dir,
@@ -5516,6 +6292,7 @@ mod tests {
             dir: format!("workspaces/{id}"),
             port: 5000,
             database_url: None,
+            cleanup: Default::default(),
             autostart,
         }
     }
@@ -6278,7 +7055,7 @@ mod tests {
     /// The end-to-end grammar check: a query the caller controls, all the way
     /// to the string inside the served JSON.
     #[test]
-    fn nothing_but_eight_digits_reaches_a_stamped_start_url() {
+    fn nothing_but_a_minted_token_reaches_a_stamped_start_url() {
         for query in [
             "pair=abc",
             "pair=0123456",
@@ -6286,25 +7063,29 @@ mod tests {
             "pair=0123456\"",
             "pair=01234567\"}",
             "pair=../../etc",
+            "pair=ldp_abcdefghijklmnopqrstuvwxy\"",
             "pair=",
         ] {
-            let code = pairing_qr::pairing_code_in_query(Some(query));
+            let code = pairing_qr::pairing_token_in_query(Some(query));
             assert_eq!(code, None, "{query} was accepted");
             assert_eq!(picker_start_url(code), format!("/{SIGIL}/"));
         }
 
-        let code = pairing_qr::pairing_code_in_query(Some("pair=01234567"));
-        let out: serde_json::Value = serde_json::from_str(&gateway_manifest_json(
-            APP_MANIFEST_JSON,
-            &picker_start_url(code),
-            &format!("/{SIGIL}/"),
-        ))
-        .expect("valid JSON");
-        let start_url = out["start_url"].as_str().expect("a string start_url");
-        let tail = start_url
-            .strip_prefix(&format!("/{SIGIL}/?pair="))
-            .expect("the code sits in the query");
-        assert!(tail.bytes().all(|b| b.is_ascii_digit()), "{tail}");
+        for token in ["01234567", "ldp_abcdefghijklmnopqrstuvwxyz"] {
+            let query = format!("pair={token}");
+            let code = pairing_qr::pairing_token_in_query(Some(&query));
+            let out: serde_json::Value = serde_json::from_str(&gateway_manifest_json(
+                APP_MANIFEST_JSON,
+                &picker_start_url(code),
+                &format!("/{SIGIL}/"),
+            ))
+            .expect("valid JSON");
+            let start_url = out["start_url"].as_str().expect("a string start_url");
+            let tail = start_url
+                .strip_prefix(&format!("/{SIGIL}/?pair="))
+                .expect("the token sits in the query");
+            assert_eq!(tail, token);
+        }
     }
 
     #[test]
@@ -6994,6 +7775,657 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = GatewayState::for_tests_with_static_dir(Some(dir.path().to_path_buf()));
         (state, dir)
+    }
+
+    #[tokio::test]
+    async fn cleanup_interrupted_delete_blocks_restart_after_state_reload() {
+        let (state, root) = adopting_state();
+        let dir = a_directory(root.path(), "recoverable");
+        let (ws, _) = state
+            .adopt_workspace_with_cleanup(&dir, None, None, None, &Default::default(), false)
+            .await
+            .unwrap();
+        let (mut entry, trash) = crate::trash::Entry::prepare(
+            &state.app_data().join("deleted"),
+            &ws,
+            dir.clone(),
+            |dump| {
+                std::fs::write(dump, b"stub recovery dump")?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        entry.move_folder(&trash).unwrap();
+        assert!(state.snapshot_restore_blocks(&ws.id));
+        // No in-memory deletion marker exists. A newly constructed gateway sees
+        // the same journal and must not provision an empty replacement.
+        let reloaded = GatewayState::for_tests_with_static_dir(Some(root.path().to_owned()));
+        *reloaded.inner.registry.lock().unwrap() =
+            Registry::load(&state.inner.registry_path).unwrap();
+        assert!(reloaded.snapshot_restore_blocks(&ws.id));
+        let statuses = reloaded.list_status().await;
+        let status = statuses.iter().find(|status| status.id == ws.id).unwrap();
+        assert!(status.health == Health::Unhealthy);
+        assert!(status.last_error.as_ref().unwrap().contains("cleanup"));
+        let response = serve_workspace(
+            &reloaded,
+            &ws.id,
+            "/sample/",
+            axum::extract::Request::builder()
+                .uri("/sample/api/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["reason"],
+            "workspace_cleanup_needs_attention"
+        );
+        assert!(!dir.exists());
+        assert!(trash.join("workspace").is_dir());
+    }
+
+    #[tokio::test]
+    async fn cleanup_direct_delete_refuses_manual_callers_without_side_effects() {
+        use tower::ServiceExt as _;
+        let (state, root) = adopting_state();
+        let dir = a_directory(root.path(), "protected");
+        state
+            .adopt_workspace_with_cleanup(
+                &dir,
+                Some("Protected"),
+                None,
+                None,
+                &Default::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        std::fs::write(dir.join("keep"), "precious").unwrap();
+        for (device, origin, confirm, expected) in [
+            (false, false, Some("Protected"), StatusCode::FORBIDDEN),
+            (true, true, Some("Protected"), StatusCode::FORBIDDEN),
+            (true, false, None, StatusCode::FORBIDDEN),
+            (true, false, Some("wrong"), StatusCode::FORBIDDEN),
+            (true, false, Some("Protected"), StatusCode::FORBIDDEN),
+        ] {
+            let mut request = axum::extract::Request::builder()
+                .method("DELETE")
+                .uri("/workspaces/protected")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"confirm": confirm}).to_string(),
+                ))
+                .unwrap();
+            if device {
+                request.extensions_mut().insert(auth::AuthenticatedDevice {
+                    id: "device".into(),
+                    label: "Test".into(),
+                });
+            }
+            if origin {
+                request.headers_mut().insert(
+                    "x-lucidos-agent-origin-token",
+                    HeaderValue::from_static("subprocess"),
+                );
+            }
+            let response = crate::control::router()
+                .with_state(state.clone())
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            assert_eq!(
+                std::fs::read_to_string(dir.join("keep")).unwrap(),
+                "precious"
+            );
+            assert_eq!(registered(&state).len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn trash_recovery_cancels_prepared_without_database_work() {
+        let (state, temp) = adopting_state();
+        let dir = a_directory(temp.path(), "prepared");
+        let (workspace, _) = state
+            .adopt_workspace_with_cleanup(&dir, None, None, None, &Default::default(), false)
+            .await
+            .unwrap();
+        let registry_before = std::fs::read(&state.inner.registry_path).unwrap();
+        assert!(crate::trash::Entry::prepare(
+            &state.app_data().join("deleted"),
+            &workspace,
+            dir.clone(),
+            |dump| {
+                std::fs::write(dump, "partial dump")?;
+                Err("injected failure".into())
+            },
+        )
+        .is_err());
+        let root = std::fs::read_dir(state.app_data().join("deleted"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let id = root.file_name().unwrap().to_str().unwrap();
+        assert!(state.snapshot_restore_blocks(&workspace.id));
+        state
+            .restore_trash_with(id, |_, _| {
+                panic!("must never touch database during cancellation")
+            })
+            .await
+            .unwrap();
+        assert!(dir.exists());
+        assert!(!state.snapshot_restore_blocks(&workspace.id));
+        assert_eq!(
+            std::fs::read(&state.inner.registry_path).unwrap(),
+            registry_before
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("database.dump")).unwrap(),
+            "partial dump"
+        );
+    }
+
+    #[tokio::test]
+    async fn trash_recovery_retries_after_database_failure_and_folder_publication() {
+        trash_recovery_with_phase(crate::trash::Phase::Completed).await;
+        trash_recovery_with_phase(crate::trash::Phase::DatabaseDropped).await;
+    }
+
+    #[tokio::test]
+    async fn trash_recovery_reconciles_moved_with_original_registration() {
+        trash_recovery_with_phase(crate::trash::Phase::Moved).await;
+    }
+
+    #[tokio::test]
+    async fn owner_delete_refuses_peer_resources_before_any_effect() {
+        for same_database in [false, true] {
+            let (state, temp) = adopting_state();
+            let dir = a_directory(temp.path(), "owned");
+            let mut workspace =
+                Workspace::gateway_provisioned("owned".into(), "Owned".into(), 9100);
+            workspace.dir = dir.to_string_lossy().into_owned();
+            let mut other = Workspace::gateway_provisioned(
+                if same_database { "owned" } else { "other" }.into(),
+                "Other".into(),
+                9200,
+            );
+            other.dir = if same_database {
+                a_directory(temp.path(), "other")
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                temp.path().to_string_lossy().into_owned()
+            };
+            let peer = temp.path().join("peer/config");
+            std::fs::create_dir_all(&peer).unwrap();
+            let peer_path = peer.join("workspaces.json");
+            let mut registry = Registry::default();
+            registry.add(other).unwrap();
+            registry.save(&peer_path).unwrap();
+            let audit = crate::cleanup_audit::Audit::begin(
+                state.app_data(),
+                "owned",
+                crate::cleanup_audit::Actor::Owner {
+                    workspace_id: "owned".into(),
+                },
+            )
+            .unwrap();
+            let error = state
+                .delete_confirmed_workspace_with_peers(&workspace, &audit, &[peer_path])
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(if same_database {
+                "database is registered"
+            } else {
+                "overlaps"
+            }));
+            assert!(dir.exists());
+            assert!(!state.app_data().join("deleted").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_restore_refuses_another_registration_before_database_work() {
+        for same_database in [false, true] {
+            let (state, temp) = adopting_state();
+            let dir = a_directory(temp.path(), "recovered");
+            let mut workspace =
+                Workspace::gateway_provisioned("recovered".into(), "Recovered".into(), 9100);
+            workspace.dir = dir.to_string_lossy().into_owned();
+            let (mut entry, root) = crate::trash::Entry::prepare(
+                &state.app_data().join("deleted"),
+                &workspace,
+                dir.clone(),
+                |dump| {
+                    std::fs::write(dump, "injected database")?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            entry.move_folder(&root).unwrap();
+            entry.phase = crate::trash::Phase::Completed;
+            entry.save(&root).unwrap();
+            let mut other = Workspace::gateway_provisioned(
+                if same_database { "recovered" } else { "other" }.into(),
+                "Other".into(),
+                9200,
+            );
+            other.dir = if same_database {
+                a_directory(temp.path(), "other")
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                temp.path().to_string_lossy().into_owned()
+            };
+            // Model another install, which may independently reuse the slug.
+            let peer = temp.path().join("peer/config");
+            std::fs::create_dir_all(&peer).unwrap();
+            let peer_path = peer.join("workspaces.json");
+            let mut registry = Registry::default();
+            registry.add(other).unwrap();
+            registry.save(&peer_path).unwrap();
+            let id = root.file_name().unwrap().to_str().unwrap();
+            assert!(state
+                .restore_trash_with_peers(id, &[peer_path], |_, _| {
+                    panic!("peer registration must refuse before database restore")
+                })
+                .await
+                .is_err());
+            assert!(!dir.exists());
+        }
+    }
+
+    async fn trash_recovery_with_phase(phase: crate::trash::Phase) {
+        let (state, temp) = adopting_state();
+        let dir = a_directory(temp.path(), "recovered");
+        state
+            .adopt_workspace_with_cleanup(
+                &dir,
+                Some("Recovered"),
+                None,
+                None,
+                &Default::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let workspace = state
+            .inner
+            .registry
+            .lock()
+            .unwrap()
+            .get("recovered")
+            .unwrap()
+            .clone();
+        let (mut entry, root) = crate::trash::Entry::prepare(
+            &state.app_data().join("deleted"),
+            &workspace,
+            dir.clone(),
+            |dump| {
+                std::fs::write(dump, "injected database")?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        entry.move_folder(&root).unwrap();
+        entry.phase = phase;
+        entry.save(&root).unwrap();
+        if entry.phase == crate::trash::Phase::Completed {
+            let mut registry = state.inner.registry.lock().unwrap();
+            registry.remove("recovered").unwrap();
+            registry.save(&state.inner.registry_path).unwrap();
+        }
+        let id = root.file_name().unwrap().to_str().unwrap();
+        assert!(state
+            .restore_trash_with(id, |_, _| Err("injected restore failure".into()))
+            .await
+            .is_err());
+        assert!(!dir.exists());
+        assert!(state.snapshot_restore_blocks("recovered"));
+        let operation = crate::trash::Entry::load(&state.app_data().join("deleted"), id)
+            .unwrap()
+            .0
+            .recovery
+            .unwrap()
+            .operation;
+        let crash_root = root.clone();
+        assert!(state
+            .restore_trash_with(id, move |entry, _| {
+                entry.recover_folder(&crash_root)?;
+                Err("injected crash after folder publication".into())
+            })
+            .await
+            .is_err());
+        assert!(dir.exists());
+        state
+            .restore_trash_with(id, move |entry, dump| {
+                assert_eq!(entry.recovery.as_ref().unwrap().operation, operation);
+                assert_eq!(std::fs::read_to_string(dump)?, "injected database");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(!state.snapshot_restore_blocks("recovered"));
+        assert_eq!(
+            Registry::load(&state.inner.registry_path)
+                .unwrap()
+                .get("recovered"),
+            Some(&workspace)
+        );
+        assert!(root.join("database.dump").exists());
+        assert_eq!(
+            crate::trash::Entry::load(&state.app_data().join("deleted"), id)
+                .unwrap()
+                .0
+                .phase,
+            crate::trash::Phase::Restored
+        );
+    }
+
+    #[tokio::test]
+    async fn trash_listing_route_preserves_legacy_entries() {
+        use tower::ServiceExt as _;
+        let (state, _root) = adopting_state();
+        let legacy = state.app_data().join("deleted/legacy");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("keep"), "recovery data").unwrap();
+        let response = crate::control::router()
+            .with_state(state)
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/trash")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let rows: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows[0]["id"], "legacy");
+        assert_eq!(rows[0]["status"], "legacy");
+        assert!(rows[0]["bytes"].is_number());
+        assert_eq!(
+            std::fs::read_to_string(legacy.join("keep")).unwrap(),
+            "recovery data"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_review_mutation_clears_cached_resources_and_suppresses_scans() {
+        let (state, _) = adopting_state();
+        {
+            let mut cache = state.inner.cleanup_review.lock().unwrap();
+            cache.report.scanned_at = Some(chrono::Utc::now());
+            cache.report.warnings.push("old resource".into());
+        }
+        let first = state.cleanup_review_mutation();
+        let second = state.cleanup_review_mutation();
+        let review = state.cleanup_review();
+        assert!(review.refreshing);
+        assert!(review.scanned_at.is_none());
+        assert!(review.warnings.is_empty());
+        assert!(!state.inner.cleanup_review.lock().unwrap().running);
+        drop(first);
+        assert!(state.cleanup_review().refreshing);
+        drop(second);
+        let cache = state.inner.cleanup_review.lock().unwrap();
+        assert_eq!(cache.mutations, 0);
+        assert!(cache.report.scanned_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn cleanup_review_route_reads_the_cached_observation_without_mutating_workspace() {
+        use tower::ServiceExt as _;
+        let (state, root) = adopting_state();
+        let dir = a_directory(root.path(), "sample");
+        let (ws, _) = state
+            .adopt_workspace_with_cleanup(&dir, None, None, None, &Default::default(), false)
+            .await
+            .unwrap();
+        let before = std::fs::read(&state.inner.registry_path).unwrap();
+        let report = crate::cleanup::scan(vec![ws], state.app_data(), vec![]);
+        state.inner.cleanup_review.lock().unwrap().report = report;
+        let response = crate::control::router()
+            .with_state(state.clone())
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/cleanup")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let review: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(review["rows"][0]["workspace"]["id"], "sample");
+        assert_eq!(review["refreshing"], false);
+        assert_eq!(std::fs::read(&state.inner.registry_path).unwrap(), before);
+        assert!(dir.exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_registration_scopes_owner_and_local_cannot_downgrade() {
+        let (state, root) = adopting_state();
+        let a = a_directory(root.path(), "harness-a");
+        let b = a_directory(root.path(), "harness-b");
+        let spec = registry::CleanupRegistration {
+            origin: Some(registry::WorkspaceOrigin::Eval),
+            ephemeral: Some(true),
+            expires_at: None,
+        };
+        let (wa, token) = state
+            .adopt_workspace_with_cleanup(&a, None, None, None, &spec, false)
+            .await
+            .unwrap();
+        let token = token.unwrap();
+        let (wb, _) = state
+            .adopt_workspace_with_cleanup(&b, None, None, None, &spec, false)
+            .await
+            .unwrap();
+        // Prove the matching token passes authority without executing deletion.
+        state
+            .inner
+            .snapshot_restores
+            .lock()
+            .unwrap()
+            .insert(wa.id.clone());
+        let response = state
+            .delete_workspace_authorized(&wa.id, Some(&wa.name), Some(&token))
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap()["error"],
+            "workspace_restoring"
+        );
+        state.inner.snapshot_restores.lock().unwrap().remove(&wa.id);
+        assert!(wa.cleanup.permits_owner(&token));
+        assert!(!wb.cleanup.permits_owner(&token));
+        let before = registered(&state);
+        assert!(state
+            .adopt_workspace_with_cleanup(&a, None, None, None, &spec, false)
+            .await
+            .is_err());
+        assert_eq!(registered(&state), before);
+        let protect = registry::CleanupRegistration {
+            origin: Some(registry::WorkspaceOrigin::User),
+            ..Default::default()
+        };
+        let (raised, new_token) = state
+            .adopt_workspace_with_cleanup(&a, None, None, None, &protect, false)
+            .await
+            .unwrap();
+        assert!(new_token.is_none());
+        assert!(!raised.cleanup.permits_owner(&token));
+        assert!(!raised.cleanup.ephemeral);
+        assert!(raised.cleanup.owner_token_digest.is_none());
+        let response = state
+            .delete_workspace_authorized(&wa.id, Some(&wa.name), Some(&token))
+            .await;
+        assert_eq!(
+            response.unwrap_err().into_response().status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(a.exists());
+        assert!(b.exists());
+        assert_eq!(registered(&state).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn navigation_activity_never_waits_for_a_lifecycle_operation() {
+        let (state, _root) = adopting_state();
+        let _operation = state.workspace_operation("busy").await;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            state.record_workspace_navigation("busy"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_cleanup_navigation_preserves_registration_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = GatewayState::for_tests_with_static_dir(Some(temp.path().to_owned()));
+        let source = state.app_data().join("sample");
+        std::fs::create_dir_all(&source).unwrap();
+        let mut ws = Workspace::gateway_provisioned("sample".into(), "Sample".into(), 9100);
+        ws.dir = source.to_string_lossy().into_owned();
+        state
+            .inner
+            .registry
+            .lock()
+            .unwrap()
+            .workspaces
+            .push(ws.clone());
+        let (mut entry, root) = crate::trash::Entry::prepare(
+            &state.app_data().join("deleted"),
+            &ws,
+            source,
+            |_| Ok(()),
+        )
+        .unwrap();
+        entry.move_folder(&root).unwrap();
+        state.record_workspace_navigation("sample").await.unwrap();
+        assert_eq!(
+            state.inner.registry.lock().unwrap().get("sample"),
+            Some(&ws)
+        );
+        assert!(
+            crate::trash::Entry::find_workspace(&state.app_data().join("deleted"), &ws)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn workspace_opens_are_durable_throttled_and_never_invent_registrations() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = GatewayState::for_tests_with_static_dir(Some(temp.path().to_owned()));
+        let ws = Workspace::gateway_provisioned("sample".into(), "Sample".into(), 9100);
+        state.inner.registry.lock().unwrap().workspaces.push(ws);
+        let now = chrono::Utc::now();
+        state.record_workspace_open("sample", now).unwrap();
+        let saved = Registry::load(&state.inner.registry_path).unwrap();
+        assert_eq!(
+            saved.get("sample").unwrap().cleanup.last_opened_at,
+            Some(now)
+        );
+        state
+            .record_workspace_open("sample", now + chrono::Duration::seconds(5))
+            .unwrap();
+        assert_eq!(
+            state
+                .inner
+                .registry
+                .lock()
+                .unwrap()
+                .get("sample")
+                .unwrap()
+                .cleanup
+                .last_opened_at,
+            Some(now)
+        );
+        let later = now + chrono::Duration::minutes(2);
+        state.record_workspace_open("sample", later).unwrap();
+        assert_eq!(
+            Registry::load(&state.inner.registry_path)
+                .unwrap()
+                .get("sample")
+                .unwrap()
+                .cleanup
+                .last_opened_at,
+            Some(later)
+        );
+        state.record_workspace_open("absent", later).unwrap();
+        assert_eq!(state.inner.registry.lock().unwrap().workspaces.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_paired_document_navigation_records_a_workspace_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = GatewayState::for_tests_with_static_dir(Some(temp.path().to_owned()));
+        state
+            .inner
+            .registry
+            .lock()
+            .unwrap()
+            .workspaces
+            .push(Workspace::gateway_provisioned(
+                "sample".into(),
+                "Sample".into(),
+                9100,
+            ));
+        // The manifest route returns without starting an engine, while the
+        // navigation classifier still exercises the paired-document policy.
+        for (device, navigation) in [(false, true), (true, false), (true, true)] {
+            let mut request = axum::http::Request::builder().uri("/sample/manifest.json");
+            if navigation {
+                request = request
+                    .header("sec-fetch-dest", "document")
+                    .header("sec-fetch-mode", "navigate");
+            }
+            let mut request = request.body(Body::empty()).unwrap();
+            if device {
+                request.extensions_mut().insert(auth::AuthenticatedDevice {
+                    id: "test".into(),
+                    label: "Test device".into(),
+                });
+            }
+            let _ = serve_workspace(&state, "sample", "/sample/", request).await;
+            assert_eq!(
+                state
+                    .inner
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .get("sample")
+                    .unwrap()
+                    .cleanup
+                    .last_opened_at
+                    .is_some(),
+                device && navigation
+            );
+        }
     }
 
     /// An existing workspace directory named `name`, under `root`.

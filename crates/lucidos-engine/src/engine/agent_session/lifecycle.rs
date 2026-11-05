@@ -419,6 +419,21 @@ pub(super) fn result_auto_commits(terminal: &TerminalKind) -> bool {
     !matches!(terminal, TerminalKind::Aborted(_))
 }
 
+/// Whether the turn that just ended is the user's own, finished turn: a
+/// `Generated` terminal, outside an engine merge resolution and a cache
+/// keep-alive. A shutdown aborts the turn, so it never reads as `Generated`.
+///
+/// Only such a turn decides anything at its end: the turn-end gate's forced
+/// decisions (ADR 0417), and the wait over running background tasks. A user
+/// Stop, a redirect, a failure or an abort leaves both alone.
+pub(super) fn turn_ended_cleanly(
+    terminal: &Option<TerminalKind>,
+    is_resolution_session: bool,
+    keep_alive_turn: bool,
+) -> bool {
+    matches!(terminal, Some(TerminalKind::Generated)) && !is_resolution_session && !keep_alive_turn
+}
+
 /// Whether the session-end path may delete this thread's worktree directory.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum WorktreeRemoval {

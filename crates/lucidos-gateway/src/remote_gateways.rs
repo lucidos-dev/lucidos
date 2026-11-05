@@ -1,6 +1,6 @@
 //! Remote gateways, from the side that pairs: gateway A.
 //!
-//! A's user types B's address, a gateway pairing code B minted, and a short
+//! A's user types B's address, a gateway pairing secret B minted, and a short
 //! name. A checks B's public health, redeems the code over `https`, and keeps
 //! the gateway credential B returned. B's half is [`crate::gateway_protocol`],
 //! and ADR 0590 records the decision.
@@ -11,7 +11,6 @@
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
 
 use axum::extract::State;
 use axum::middleware;
@@ -21,28 +20,142 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth;
 use crate::error::ApiError;
-use crate::gateway_protocol::{
-    PairAnswer, GATEWAY_API_PREFIX, HEADER_GATEWAY_CREDENTIAL, PAIRING_PATH, PAIR_PATH,
-};
-use crate::peers::{GATEWAY_HEALTH_PATH, GATEWAY_ROLE};
+use crate::pairing::{self, PairingKind};
+use crate::peer_connection::PeerConnection;
+use crate::peers::GATEWAY_ROLE;
 use crate::server::GatewayState;
 use lucidos_gateway_constants::REMOTE_GATEWAY_NAME_MAX_LEN;
 
-/// How long one call to B may take, end to end. A person waits on it.
-const PEER_TIMEOUT: Duration = Duration::from_secs(10);
+/// Validated proxy headers. Debug never prints values.
+#[derive(Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct ExtraHeaders(std::collections::BTreeMap<String, String>);
+
+impl std::fmt::Debug for ExtraHeaders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.0.keys()).finish()
+    }
+}
+impl<'de> Deserialize<'de> for ExtraHeaders {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Self::new(Deserialize::deserialize(d)?).map_err(serde::de::Error::custom)
+    }
+}
+impl ExtraHeaders {
+    pub fn new(values: std::collections::BTreeMap<String, String>) -> Result<Self, String> {
+        let mut normalized = std::collections::BTreeMap::new();
+        for (name, value) in values {
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| "invalid proxy header name")?;
+            let name = name.as_str();
+            if name.starts_with("x-lucidos-")
+                || matches!(
+                    name,
+                    "host"
+                        | "connection"
+                        | "keep-alive"
+                        | "proxy-connection"
+                        | "proxy-authenticate"
+                        | "proxy-authorization"
+                        | "te"
+                        | "trailer"
+                        | "transfer-encoding"
+                        | "upgrade"
+                        | "content-length"
+                        | "content-type"
+                )
+            {
+                return Err(format!("the header {name} is reserved"));
+            }
+            reqwest::header::HeaderValue::from_str(&value)
+                .map_err(|_| "invalid proxy header value")?;
+            if normalized.insert(name.to_owned(), value).is_some() {
+                return Err(format!("duplicate proxy header {name}"));
+            }
+        }
+        Ok(Self(normalized))
+    }
+    pub(crate) fn apply(&self, mut request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        for (name, value) in &self.0 {
+            let mut value =
+                reqwest::header::HeaderValue::from_str(value).expect("validated header value");
+            value.set_sensitive(true);
+            request = request.header(name, value);
+        }
+        request
+    }
+    pub(crate) fn names(&self) -> Vec<String> {
+        self.0.keys().cloned().collect()
+    }
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+struct HeaderContext<'a>(&'a str, &'a str);
+impl lucidos_secret_store::SealingContext for HeaderContext<'_> {
+    fn name(&self) -> String {
+        format!("remote-gateway.{}.header.{}", self.0, self.1)
+    }
+    fn empty_means_none(&self) -> bool {
+        false
+    }
+}
 
 /// One remote gateway, as A persists it.
 ///
-/// The credential is in the clear because A presents it on every call. The
-/// file is owner-only, and no API ever returns this field.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Credentials are plaintext only in memory; the disk representation is sealed.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemoteGateway {
     pub name: String,
     pub address: String,
     pub pairing_id: String,
     pub credential: String,
+    #[serde(default)]
+    pub headers: ExtraHeaders,
     pub gateway_protocol: u32,
     pub added_at: String,
+    #[serde(default)]
+    pub rotation: RotationState,
+}
+
+/// Durable sender recovery. Pending credentials never leave the sealed store.
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RotationState {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending: Option<String>,
+    pub last_rotated_at: Option<String>,
+    pub error: Option<String>,
+}
+
+struct PendingContext<'a>(&'a str);
+impl lucidos_secret_store::SealingContext for PendingContext<'_> {
+    fn name(&self) -> String {
+        format!("remote-gateway.{}.pending-rotation", self.0)
+    }
+    fn empty_means_none(&self) -> bool {
+        false
+    }
+}
+
+impl std::fmt::Debug for RemoteGateway {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteGateway")
+            .field("name", &self.name)
+            .field("address", &self.address)
+            .field("credential", &"[redacted]")
+            .finish_non_exhaustive()
+    }
+}
+
+struct CredentialContext<'a>(&'a str);
+impl lucidos_secret_store::SealingContext for CredentialContext<'_> {
+    fn name(&self) -> String {
+        format!("remote-gateway.{}.credential", self.0)
+    }
+    fn empty_means_none(&self) -> bool {
+        false
+    }
 }
 
 /// A's remote-gateway file, `<data dir>/remote-gateways.json`.
@@ -50,6 +163,15 @@ pub struct RemoteGateway {
 pub struct RemoteGateways {
     #[serde(default)]
     pub gateways: Vec<RemoteGateway>,
+}
+
+/// A missing version is the legacy plaintext format, accepted only for upgrade.
+#[derive(Default, Serialize, Deserialize)]
+struct StoredRemoteGateways {
+    #[serde(default)]
+    version: Option<u32>,
+    #[serde(flatten)]
+    data: RemoteGateways,
 }
 
 /// Per gateway, beside the device store and never shared (ADR 0132).
@@ -60,18 +182,133 @@ pub fn remote_gateways_path(app_data: &Path) -> PathBuf {
 /// A's remote gateways, with the locking shape of `PairedGatewayStore`.
 pub struct RemoteGatewayStore {
     path: PathBuf,
+    key_store: Box<dyn lucidos_secret_store::key_store::KeyStore>,
+    key_name: String,
     data: Mutex<RemoteGateways>,
     writing: Mutex<()>,
+    operations: tokio::sync::Mutex<()>,
+    pub(crate) last_seen: Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl RemoteGatewayStore {
     pub fn load(path: PathBuf) -> Result<Self, crate::BoxError> {
-        let data = auth::load_store(&path)?;
-        Ok(Self {
+        #[cfg(not(test))]
+        let keys = lucidos_secret_store::key_store::resolve()?;
+        // Each test gateway owns its key directory; no test touches the user's keys.
+        #[cfg(test)]
+        let keys = Box::new(lucidos_secret_store::key_store::FileKeyStore::new(
+            path.parent()
+                .ok_or("remote store has no parent")?
+                .join("test-secret-keys"),
+        ));
+        Self::load_with_key_store(path, keys)
+    }
+
+    fn load_with_key_store(
+        path: PathBuf,
+        key_store: Box<dyn lucidos_secret_store::key_store::KeyStore>,
+    ) -> Result<Self, crate::BoxError> {
+        use lucidos_secret_store::SEALED_PREFIX;
+        use sha2::{Digest, Sha256};
+        let stored: StoredRemoteGateways = auth::load_store(&path)?;
+        if stored.version.is_some_and(|version| version != 1) {
+            return Err("unsupported remote gateway store version".into());
+        }
+        let is_sealed_format = stored.version == Some(1);
+        let mut data = stored.data;
+        let identity = std::path::absolute(&path)?;
+        let key_name = format!(
+            "gateway-remotes-{:x}",
+            Sha256::digest(identity.as_os_str().as_encoded_bytes())
+        );
+        let has_sealed = data
+            .gateways
+            .iter()
+            .any(|g| g.credential.starts_with(SEALED_PREFIX));
+        let key = key_store.get(&key_name)?;
+        if has_sealed && key.is_none() {
+            return Err("remote gateway secrets need their original sealing key; restore it before starting".into());
+        }
+        let mut migrate = false;
+        for remote in &mut data.gateways {
+            if is_sealed_format || remote.credential.starts_with(SEALED_PREFIX) {
+                remote.credential = key
+                    .as_ref()
+                    .ok_or("remote sealing key is missing")?
+                    .open(&CredentialContext(&remote.pairing_id), &remote.credential)?;
+            } else {
+                migrate = true;
+            }
+            if let Some(candidate) = &mut remote.rotation.pending {
+                *candidate = key
+                    .as_ref()
+                    .ok_or("remote sealing key is missing")?
+                    .open(&PendingContext(&remote.pairing_id), candidate)?;
+            }
+            for (name, value) in &mut remote.headers.0 {
+                *value = key
+                    .as_ref()
+                    .ok_or("remote sealing key is missing")?
+                    .open(&HeaderContext(&remote.pairing_id, name), value)?;
+            }
+            // Validate decrypted values too, before any request can use them.
+            remote.headers = ExtraHeaders::new(remote.headers.0.clone())?;
+        }
+        let store = Self {
             path,
-            data: Mutex::new(data),
+            key_store,
+            key_name,
+            data: Mutex::new(data.clone()),
             writing: Mutex::new(()),
-        })
+            operations: tokio::sync::Mutex::new(()),
+            last_seen: Mutex::new(Default::default()),
+        };
+        if migrate {
+            store.save_sealed(&data)?;
+        }
+        Ok(store)
+    }
+
+    fn save_sealed(&self, data: &RemoteGateways) -> Result<(), crate::BoxError> {
+        use lucidos_secret_store::SecretKey;
+        let key = match self.key_store.get(&self.key_name)? {
+            Some(key) => key,
+            None => {
+                // Never replace a key if the existing file needs one.
+                let disk: RemoteGateways = auth::load_store(&self.path)?;
+                if disk.gateways.iter().any(|g| {
+                    g.credential
+                        .starts_with(lucidos_secret_store::SEALED_PREFIX)
+                }) {
+                    return Err(
+                        "remote gateway sealing key is missing; restore the original key".into(),
+                    );
+                }
+                self.key_store
+                    .put_new(&self.key_name, &SecretKey::generate())?;
+                self.key_store
+                    .get(&self.key_name)?
+                    .ok_or("remote gateway sealing key could not be stored")?
+            }
+        };
+        let mut sealed = data.clone();
+        for remote in &mut sealed.gateways {
+            remote.credential =
+                key.seal(&CredentialContext(&remote.pairing_id), &remote.credential)?;
+            if let Some(candidate) = &mut remote.rotation.pending {
+                *candidate = key.seal(&PendingContext(&remote.pairing_id), candidate)?;
+            }
+            for (name, value) in &mut remote.headers.0 {
+                *value = key.seal(&HeaderContext(&remote.pairing_id, name), value)?;
+            }
+        }
+        auth::save_store(
+            &StoredRemoteGateways {
+                version: Some(1),
+                data: sealed,
+            },
+            &self.path,
+        )
     }
 
     pub fn list(&self) -> Vec<RemoteGateway> {
@@ -110,7 +347,74 @@ impl RemoteGatewayStore {
                 removed = Some(store.gateways.remove(at));
             }
         })?;
+        if let Some(gateway) = &removed {
+            self.last_seen
+                .lock()
+                .unwrap()
+                .remove(&format!("{}@{}", gateway.pairing_id, gateway.address));
+        }
         Ok(removed)
+    }
+
+    fn begin_rotation(&self, name: &str) -> Result<RemoteGateway, String> {
+        let mut result = None;
+        let candidate =
+            auth::mint_credential().map_err(|_| "could not generate rotation credential")?;
+        self.write(|data| {
+            if let Some(remote) = data.gateways.iter_mut().find(|g| g.name == name) {
+                remote.rotation.pending.get_or_insert(candidate);
+                result = Some(remote.clone());
+            }
+        })?;
+        result.ok_or_else(|| "remote gateway not found".into())
+    }
+
+    /// Hold across network I/O: header replacement and unpair use this same gate.
+    pub async fn rotate(&self, client: &PeerConnection, name: &str) -> Result<(), String> {
+        let _operation = self.operations.lock().await;
+        let remote = self.begin_rotation(name)?;
+        let candidate = remote
+            .rotation
+            .pending
+            .as_ref()
+            .ok_or("rotation intent missing")?;
+        let outcome = client.rotate(&remote, candidate).await;
+        self.write(|data| {
+            if let Some(current) = data.gateways.iter_mut().find(|g| g.name == name) {
+                match &outcome {
+                    Ok(protocol) => {
+                        current.credential = candidate.clone();
+                        current.rotation.pending = None;
+                        current.rotation.last_rotated_at = Some(chrono::Utc::now().to_rfc3339());
+                        current.rotation.error = None;
+                        current.gateway_protocol = *protocol;
+                    }
+                    Err(error) => current.rotation.error = Some(error.clone()),
+                }
+            }
+        })?;
+        outcome.map(|_| ())
+    }
+
+    pub async fn rotate_due(&self, client: &PeerConnection) {
+        for remote in self.list() {
+            let since = remote
+                .rotation
+                .last_rotated_at
+                .as_ref()
+                .unwrap_or(&remote.added_at);
+            let due = chrono::DateTime::parse_from_rfc3339(since)
+                .map(|at| chrono::Utc::now().signed_duration_since(at).num_days() >= 30)
+                .unwrap_or(true);
+            if due || remote.rotation.pending.is_some() {
+                if let Err(error) = self.rotate(client, &remote.name).await {
+                    crate::log!(
+                        "[Gateway] remote credential rotation for '{}': {error}",
+                        remote.name
+                    );
+                }
+            }
+        }
     }
 
     fn write(&self, mutate: impl FnOnce(&mut RemoteGateways)) -> Result<(), String> {
@@ -121,7 +425,7 @@ impl RemoteGatewayStore {
         // Save first, publish after: a failed save changes nothing anyone sees.
         let mut next = self.data.lock().map_err(unavailable)?.clone();
         mutate(&mut next);
-        auth::save_store(&next, &self.path)
+        self.save_sealed(&next)
             .map_err(|e| format!("could not save the remote gateway store: {e}"))?;
         *self.data.lock().map_err(unavailable)? = next;
         Ok(())
@@ -242,159 +546,53 @@ pub fn read_health(body: &serde_json::Value, own_instance: &str) -> Result<Remot
     })
 }
 
-/// A's client for B: `https` only, certificates checked, no redirects.
-pub struct PeerClient {
-    http: reqwest::Client,
-}
-
-impl PeerClient {
-    pub fn new() -> Result<Self, String> {
-        Self::build(None)
-    }
-
-    /// A client that also trusts `pem`, for a test's self-signed stand-in.
-    #[cfg(test)]
-    pub fn trusting(pem: &[u8]) -> Self {
-        Self::build(Some(reqwest::Certificate::from_pem(pem).unwrap())).unwrap()
-    }
-
-    fn build(extra_root: Option<reqwest::Certificate>) -> Result<Self, String> {
-        let mut builder = reqwest::Client::builder()
-            .https_only(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(PEER_TIMEOUT);
-        if let Some(root) = extra_root {
-            builder = builder.add_root_certificate(root);
-        }
-        let http = builder
-            .build()
-            .map_err(|e| format!("could not start the remote gateway client: {e}"))?;
-        Ok(Self { http })
-    }
-
-    /// B's public health body.
-    pub async fn health(&self, origin: &str) -> Result<serde_json::Value, String> {
-        let response = self
-            .http
-            .get(format!("{origin}{GATEWAY_HEALTH_PATH}"))
-            .send()
-            .await
-            .map_err(|e| format!("could not reach {origin}: {}", reached_error(&e)))?;
-        if !response.status().is_success() {
-            return Err(format!(
-                "{origin} answered with HTTP {}, not with Lucidos's health",
-                response.status().as_u16()
-            ));
-        }
-        read_json(response)
-            .await
-            .map_err(|_| format!("{origin} answered, but not with Lucidos's health"))
-    }
-
-    /// Redeem `code` at B.
-    pub async fn pair(&self, origin: &str, code: &str, label: &str) -> Result<PairAnswer, String> {
-        let response = self
-            .http
-            .post(format!("{origin}{GATEWAY_API_PREFIX}{PAIR_PATH}"))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(serde_json::json!({ "code": code, "label": label }).to_string())
-            .send()
-            .await
-            .map_err(|e| format!("could not reach {origin}: {}", reached_error(&e)))?;
-        if !response.status().is_success() {
-            return Err(refusal(response).await);
-        }
-        read_json(response)
-            .await
-            .map_err(|e| format!("{origin} paired, but its answer was unreadable: {e}"))
-    }
-
-    /// Ask B to forget this pairing.
-    pub async fn leave(&self, gateway: &RemoteGateway) -> Result<(), String> {
-        let mut request = self.http.delete(format!(
-            "{}{GATEWAY_API_PREFIX}{PAIRING_PATH}",
-            gateway.address
-        ));
-        if let Some(credential) = auth::sensitive_credential(&gateway.credential) {
-            request = request.header(HEADER_GATEWAY_CREDENTIAL, credential);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| format!("could not reach {}: {}", gateway.address, reached_error(&e)))?;
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(refusal(response).await)
-        }
-    }
-}
-
-/// The reason a request failed, naming a refused redirect plainly.
-fn reached_error(e: &reqwest::Error) -> String {
-    if e.is_redirect() {
-        return "it redirected elsewhere, and a gateway credential never follows a redirect"
-            .to_string();
-    }
-    crate::external_address::error_chain(e)
-}
-
-/// A JSON body, without reqwest's `json` feature.
-async fn read_json<T: serde::de::DeserializeOwned>(
-    response: reqwest::Response,
-) -> Result<T, String> {
-    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
-}
-
-/// B's own sentence for a refusal, else the status.
-async fn refusal(response: reqwest::Response) -> String {
-    let status = response.status();
-    read_json::<serde_json::Value>(response)
-        .await
-        .ok()
-        .and_then(|b| b.get("error").and_then(|e| e.as_str()).map(str::to_string))
-        .unwrap_or_else(|| format!("the other gateway answered HTTP {}", status.as_u16()))
-}
-
 /// What the user typed to add a remote gateway.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct AddRequest {
     pub address: String,
     pub code: String,
     pub name: String,
+    #[serde(default)]
+    pub headers: ExtraHeaders,
 }
 
 /// A remote gateway as the API shows it. Never the credential.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct RemoteGatewayRow {
+    pub header_names: Vec<String>,
     pub name: String,
     pub address: String,
     pub pairing_id: String,
     pub gateway_protocol: u32,
     pub added_at: String,
+    pub last_rotated_at: Option<String>,
+    pub rotation_error: Option<String>,
 }
 
 impl From<RemoteGateway> for RemoteGatewayRow {
     fn from(g: RemoteGateway) -> Self {
         Self {
+            header_names: g.headers.names(),
             name: g.name,
             address: g.address,
             pairing_id: g.pairing_id,
             gateway_protocol: g.gateway_protocol,
             added_at: g.added_at,
+            last_rotated_at: g.rotation.last_rotated_at,
+            rotation_error: g.rotation.error,
         }
     }
 }
 
 /// Pair with B and record it.
 ///
-/// The name, the address and the code's shape are checked before the code is
-/// spent, so a typo burns no code. B's external address then replaces the
-/// typed one only when A reaches this same B there.
+/// The name, the address and the secret's shape are checked before the secret
+/// is spent, so a typo burns no secret. B's external address then replaces the
+/// typed one only when A reaches this same B there and no proxy headers bind
+/// the pairing to the typed origin.
 pub async fn add(
     store: &RemoteGatewayStore,
-    client: &PeerClient,
+    client: &PeerConnection,
     own_instance: &str,
     own_label: &str,
     request: AddRequest,
@@ -404,20 +602,25 @@ pub async fn add(
         return Err(AddError::NameTaken);
     }
     let address = valid_address(&request.address).map_err(AddError::Invalid)?;
-    let code = auth::valid_pairing_code(&request.code).ok_or_else(|| {
-        AddError::Invalid(format!(
-            "a gateway pairing code is {} digits",
-            auth::PAIRING_CODE_DIGITS
-        ))
-    })?;
-    let body = client.health(&address).await.map_err(AddError::Remote)?;
+    // A short code is still taken for an older B, which mints nothing else.
+    let code = pairing::valid_pairing_secret(&request.code, PairingKind::Gateway)
+        .or_else(|| pairing::valid_pairing_code(&request.code))
+        .ok_or_else(|| {
+            AddError::Invalid(
+                "paste the gateway pairing secret the other gateway shows, starting lgp_".into(),
+            )
+        })?;
+    let body = client
+        .health_with_headers(&address, &request.headers)
+        .await
+        .map_err(AddError::Remote)?;
     let health = read_health(&body, own_instance).map_err(AddError::Invalid)?;
     let answer = client
-        .pair(&address, code, own_label)
+        .pair_with_headers(&address, code, own_label, &request.headers)
         .await
         .map_err(AddError::Remote)?;
     let address = match answer.external_address.as_deref() {
-        Some(external) if external != address => {
+        Some(external) if external != address && request.headers.is_empty() => {
             preferred_address(client, &address, external, &health.instance_id).await
         }
         _ => address,
@@ -427,8 +630,10 @@ pub async fn add(
         address,
         pairing_id: answer.pairing_id,
         credential: answer.credential,
+        headers: request.headers,
         gateway_protocol: health.gateway_protocol,
         added_at: chrono::Utc::now().to_rfc3339(),
+        rotation: RotationState::default(),
     };
     if let Err(e) = store.add(gateway.clone()) {
         // B already granted access, so give the grant back rather than leave
@@ -446,7 +651,7 @@ pub async fn add(
 
 /// B's external address when A reaches this same B there, else `typed`.
 async fn preferred_address(
-    client: &PeerClient,
+    client: &PeerConnection,
     typed: &str,
     external: &str,
     instance_id: &str,
@@ -488,7 +693,8 @@ fn own_label() -> String {
 pub fn router() -> Router<GatewayState> {
     Router::new()
         .route("/", get(list).post(add_handler))
-        .route("/:name", delete(remove_handler))
+        .route("/:name", delete(remove_handler).put(update_headers_handler))
+        .route("/:name/rotate", axum::routing::post(rotate_handler))
         .route_layer(middleware::from_fn(crate::control::control_authz))
 }
 
@@ -507,16 +713,53 @@ async fn add_handler(
     State(state): State<GatewayState>,
     Json(request): Json<AddRequest>,
 ) -> Result<Json<RemoteGatewayRow>, ApiError> {
-    let client = PeerClient::new().map_err(ApiError::internal)?;
     let row = add(
         state.remote_gateways(),
-        &client,
+        state.peer_connection(),
         crate::server::instance_id(),
         &own_label(),
         request,
     )
     .await?;
     Ok(Json(row))
+}
+
+#[derive(Deserialize)]
+struct UpdateHeadersRequest {
+    headers: ExtraHeaders,
+}
+
+async fn update_headers_handler(
+    State(state): State<GatewayState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    Json(request): Json<UpdateHeadersRequest>,
+) -> Result<Json<RemoteGatewayRow>, ApiError> {
+    let _operation = state.remote_gateways().operations.lock().await;
+    let mut updated = None;
+    state
+        .remote_gateways()
+        .write(|data| {
+            if let Some(remote) = data.gateways.iter_mut().find(|g| g.name == name) {
+                remote.headers = request.headers;
+                updated = Some(remote.clone());
+            }
+        })
+        .map_err(ApiError::internal)?;
+    updated
+        .map(|g| Json(g.into()))
+        .ok_or_else(|| ApiError::not_found("remote gateway not found"))
+}
+
+async fn rotate_handler(
+    State(state): State<GatewayState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    state
+        .remote_gateways()
+        .rotate(state.peer_connection(), &name)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 #[derive(Serialize)]
@@ -532,14 +775,22 @@ async fn remove_handler(
     State(state): State<GatewayState>,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Result<Json<Removed>, ApiError> {
+    let _operation = state.remote_gateways().operations.lock().await;
     let gateway = state
         .remote_gateways()
         .remove(&name)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("no remote gateway with that name"))?;
-    let left = match PeerClient::new() {
-        Ok(client) => client.leave(&gateway).await,
-        Err(e) => Err(e),
+    // A pending intent may already be current on B, even if A's save failed.
+    let left = if let Some(candidate) = &gateway.rotation.pending {
+        let mut proposed = gateway.clone();
+        proposed.credential = candidate.clone();
+        match state.peer_connection().leave(&proposed).await {
+            Ok(()) => Ok(()),
+            Err(_) => state.peer_connection().leave(&gateway).await,
+        }
+    } else {
+        state.peer_connection().leave(&gateway).await
     };
     Ok(Json(Removed {
         remote_forgot: left.is_ok(),

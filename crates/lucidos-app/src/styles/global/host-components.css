@@ -786,12 +786,6 @@ html[data-theme-mode="dark"] .split-button.open::before {
     flex: 1;
 }
 
-/* Shared dropdown — custom select replacement */
-.dropdown {
-    position: relative;
-    flex-shrink: 0;
-}
-
 /* A dropdown wrapped in a <LoadingFade> so it can show a skeleton while its value loads.
    The fade wrapper becomes the flex item in the parent row, so it has to carry
    the trigger's own refusal to shrink: without it the row compresses the
@@ -843,76 +837,9 @@ html[data-theme-mode="dark"] .split-button.open::before {
     overflow: hidden;
 }
 
-/* A model selection reads as a whole pair, `Opus 5 (1M) · X-High`, so its
-   trigger is far wider than an ordinary dropdown's and a long registry id would
-   push its row past the pane. `.dropdown`'s blanket `flex-shrink: 0` is right
-   for a short control and wrong for this one, so this variant shrinks and
-   ellipsizes. It carries no `.dropdown-sizer`: the field renders one label
-   rather than every option stacked, so there is nothing to size against. */
-.dropdown.model-selection-field {
-    flex-shrink: 1;
-    min-width: 0;
-}
-
-/* `min-width: 0` is what lets it ellipsize: the trigger is a flex row, and a
-   flex item defends its min-content width until told otherwise. */
-.model-selection-value {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
 /* `.dropdown-chevron` lives in `shared-components.css` now (see
    docs/plans/2026-10-03-sdk-dropdown-shares-host-css.md) — `lucidos.ui.Select`
    wears it too, flipping the same glyph instead of swapping it. */
-
-/* Default styling for `.dropdown-menu` is `position: absolute`, anchored
- * to its `.dropdown` wrapper. The shared `Dropdown` component overrides
- * to `position: fixed` inline (paired with viewport-coordinate `top`/`left`
- * from `useAnchoredPosition`) AND portals the panel to <body>, so the menu
- * escapes any `overflow: hidden` ancestor, notably `.mobile-swipe-pane` on
- * mobile, where an `absolute`-positioned menu was clipped at the pane edge
- * regardless of placement direction. Custom callers that use `.dropdown-menu`
- * directly (e.g. `ChangeSelector`) inherit the legacy absolute positioning.
- *
- * The z-index is the popover layer (--z-popover), above the floating header
- * chrome, which otherwise paints its icons over a menu that reaches up into
- * the header band.
- * That is an ordinary case for the composer's destination picker: it opens
- * upward and clamps to the top margin once the option list outgrows the space
- * above it. Being a <body> child is what makes the number reachable at all,
- * since inside a pane it is capped by that pane's stacking context. It sits
- * above `.thread-toggle-slot`, on the same footing as `.thread-overflow-menu`.
- *
- * Deliberately below --z-modal, so a modal (and the UI-blocking overlay, which
- * shares that level) still covers an open menu. So a menu opened INSIDE a
- * backdrop `<Overlay>` portals into that modal's panel, not <body>
- * (`PortalTarget` in `Overlay.tsx`). There it paints above the modal, and its
- * taps read as inside it. Never raise this number past --z-modal instead:
- * that would float every menu over the blocker.
- *
- * `max-width` caps a long option label so it clips (via the
- * `.dropdown-option-label` ellipsis) instead of growing a viewport-positioned
- * menu off a narrow screen. It bites only when the CONTENT wants more room
- * than the trigger: `min-width` is the trigger's own width (set inline by
- * `Dropdown`) and a min-width above the max-width wins, so a wide form field
- * keeps its full-width menu. */
-.dropdown-menu {
-    position: absolute;
-    top: calc(100% + 0.25rem);
-    left: 0;
-    min-width: 100%;
-    max-width: min(24rem, calc(100vw - 1rem));
-    /* `--anchor-room` is the room between the trigger and the screen edge on
-       the side the menu opens, above the keyboard and below the status bar.
-       `useAnchoredPosition` measures it. Capped to it, a tall menu scrolls
-       instead of covering its trigger or the Dynamic Island. The fallback
-       covers a menu that publishes no room, such as the nav history. */
-    max-height: min(18.75rem, var(--anchor-room, calc(var(--app-height, 100dvh) - 1rem)));
-    overflow-y: auto;
-    z-index: calc(var(--z-popover) + 1);
-}
 
 /* A dropdown used as a form field sizes its option rows to the taller control
  * the trigger is (`.form-group .dropdown-trigger`), so the menu does not read
@@ -1543,148 +1470,6 @@ html[data-theme-mode="dark"] .split-button.open::before {
     background: var(--bg-tertiary);
     padding: 0.0625rem 0.25rem;
     border-radius: calc(var(--radius-control) * 0.375);
-}
-
-/* Control-menu lists. Host chrome, shared across panes: the prompt bar's two
-   control menus render these, and so does the model-selection field in
-   Settings and the trigger form, through `ModelSelectionPicker`. The panel BOX
-   each opens in is its own host's business (`.control-dropdown` in the prompt
-   bar, `.dropdown-menu` for the field); what lives here is the list inside. */
-.control-list {
-    display: flex;
-    flex-direction: column;
-    padding: 0.25rem;
-}
-
-/* The list holds focus only so the arrow keys reach it. Its focus indicator is
-   the active row, so the container draws no outline. The browser's default one
-   showed as a stray blue edge where the panel's scroller clipped it.
-   Forced-colors strips the row's background, so the row keeps a transparent
-   outline there, inset so the scroller cannot clip it. */
-.control-list:focus {
-    outline: none;
-}
-
-.control-list:focus .control-item-active {
-    outline: 0.125rem solid transparent;
-    outline-offset: -0.125rem;
-}
-
-/* The list opens scrolled to the model in force, which on a long registry is
-   far down. A filter that scrolled away with it would be out of reach exactly
-   when it earns its place. Sticky keeps it on the panel's top edge. */
-.control-filter-bar {
-    position: sticky;
-    top: 0;
-    z-index: 1;
-    padding: 0.25rem;
-    background: var(--surface-bg);
-}
-
-.control-empty {
-    padding: 0.5rem 0.625rem;
-    font-size: var(--font-size-md);
-    color: var(--text-secondary);
-}
-
-.control-section-label {
-    padding: 0.25rem 0.625rem;
-    font-size: var(--font-size-xs);
-    font-weight: 600;
-    color: var(--text-secondary);
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-}
-
-.control-item {
-    display: block;
-    width: 100%;
-    padding: 0.375rem 0.625rem;
-    text-align: left;
-    background: none;
-    border: none;
-    border-radius: calc(var(--radius-control) * 0.5);
-    color: var(--text-primary);
-    font-size: var(--font-size-md);
-    cursor: pointer;
-}
-
-/* The active item is the keyboard cursor, seeded on open. A phone has no
-   keyboard to move it, and a tap sets it through `mouseenter`, so there it
-   would only paint a stray band. */
-@media (hover: hover) {
-    .control-item:hover,
-    .control-item-active {
-        background: var(--bg-hover);
-    }
-}
-
-/* The way back to the list this one was opened from. Muted, because it is an
-   exit rather than one of the choices on offer. */
-.control-back {
-    display: flex;
-    align-items: center;
-    gap: 0.25rem;
-    color: var(--text-secondary);
-    font-size: var(--font-size-xs);
-}
-
-.control-back-glyph {
-    font-size: var(--font-size-md);
-    line-height: 1;
-}
-
-.control-option {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-}
-
-.control-option-text {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 0.125rem;
-}
-
-.control-option-label {
-    font-weight: 500;
-    display: flex;
-    align-items: center;
-    gap: 0.25rem;
-}
-
-/* Picking this row opens another list rather than committing, so it sits at
-   the trailing edge where a disclosure belongs, centred on the whole row. */
-.control-option-more {
-    flex-shrink: 0;
-    color: var(--text-muted);
-}
-
-.control-checkmark {
-    color: var(--accent);
-    font-size: var(--font-size-sm);
-    font-weight: 700;
-}
-
-.control-current-value {
-    color: var(--text-muted);
-    font-weight: 400;
-}
-
-.control-option-current {
-    background: color-mix(in srgb, var(--accent) 8%, transparent);
-}
-
-.control-option-desc {
-    font-size: var(--font-size-xs);
-    color: var(--text-secondary);
-}
-
-.control-option-badge {
-    margin-left: var(--space-sm);
-    vertical-align: middle;
 }
 
 /* ── The System attention badge ───────────────────────────────────────────

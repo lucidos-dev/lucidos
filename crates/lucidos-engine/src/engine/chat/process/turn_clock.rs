@@ -305,15 +305,15 @@ mod tests {
 
     /// The per-turn readings, in the order `run.rs` appends them.
     struct Tail {
-        /// `(update_available, source_behind_head, rebuild_wedged)`.
-        build: (bool, bool, bool),
+        /// `(update_available, source_behind_head)`.
+        build: (bool, bool),
         origin: &'static str,
     }
 
     impl Default for Tail {
         fn default() -> Self {
             Self {
-                build: (false, false, false),
+                build: (false, false),
                 origin: "https://localhost:5173",
             }
         }
@@ -332,7 +332,7 @@ mod tests {
         anchor: DateTime<Utc>,
         tail: Tail,
     ) -> Vec<Message> {
-        let (update, behind, wedged) = tail.build;
+        let (update, behind) = tail.build;
         vec![
             Message {
                 role: "assistant".to_string(),
@@ -355,7 +355,7 @@ mod tests {
                 content: MessageContent::Text(format!(
                     "[CONVERSATION HISTORY (recent)]\n{history}\n[END HISTORY]\
                      \n\nRequest: {request}\n\n{}\n\n{}\n\n{}",
-                    engine_build_block(&version_status(update, behind, wedged)),
+                    engine_build_block(&version_status(update, behind)),
                     client_url_block(tail.origin),
                     current_time_block(anchor, TZ)
                 )),
@@ -561,7 +561,7 @@ mod tests {
             "is the change live?",
             utc(2026, 8, 17, 13, 2),
             Tail {
-                build: (false, false, false),
+                build: (false, false),
                 origin: "https://localhost:5173",
             },
         ));
@@ -572,7 +572,7 @@ mod tests {
             "is the change live?",
             utc(2026, 8, 17, 16, 2),
             Tail {
-                build: (true, false, false),
+                build: (true, false),
                 origin: "http://localhost:3000",
             },
         ));

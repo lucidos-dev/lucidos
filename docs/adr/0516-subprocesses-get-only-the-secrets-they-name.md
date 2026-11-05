@@ -49,6 +49,14 @@ note lists the names the agent can use, never a value. A bare `CRED_` or
 `OAUTH_`, as in `env | grep CRED_`, names nothing and gets the same note. Names
 are not secret: the chat prompt already lists each stored service.
 
+**Only a lookup is noted.** Any mention injects, but only a lookup can be
+reported unknown. A lookup is a name on a header line, after a read such as `$`
+or `process.env.`, or alone in a string literal. A prefix
+that builds a name (`CRED_<NAME>`, `f"OAUTH_{p}"`, `"OAUTH_" + p`) is no search.
+Docstrings and comments that explain the naming had put a warning on every run.
+A scheduled script's note goes to the engine log: no agent reads its output, and
+in its failure notification the note crowded out the script's own error.
+
 **Discovery is `lucidos credentials list`.** It shows each credential's
 variable names, computed by the function the injection uses. A list in the tool
 description would cost tokens on every turn for a lookup most turns never need.

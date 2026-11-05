@@ -1,8 +1,7 @@
 // @vitest-environment jsdom
 /**
  * A dashboard's Add lists the installed apps under the reusable widgets, and a
- * pick adds an app shortcut. A thread's Add widget lists no app, and a dashboard
- * leaves out an app it already shows.
+ * pick adds an app shortcut. A dashboard leaves out an app it already shows.
  */
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { render } from 'preact';
@@ -39,8 +38,8 @@ let host: HTMLElement;
 const run = (fn: () => void) => () => fn();
 const ids = (attr: string) => [...host.querySelectorAll<HTMLElement>(`[${attr}]`)].map((el) => el.getAttribute(attr));
 
-function mount(target: Parameters<typeof WidgetPickerItems>[0]['target']): void {
-  act(() => { render(<WidgetPickerItems run={run} target={target} />, host); });
+function mount(dashboard: Parameters<typeof WidgetPickerItems>[0]['dashboard']): void {
+  act(() => { render(<WidgetPickerItems run={run} dashboard={dashboard} />, host); });
 }
 
 function holding(appIds: string[]): void {
@@ -69,14 +68,14 @@ afterEach(() => {
 
 describe('the dashboard picker', () => {
   it('lists the widgets, then the apps under an Apps note', () => {
-    mount({ dashboard: 'desktop' });
+    mount('desktop');
     expect(ids('data-add-widget')).toEqual(['clock']);
     expect(ids('data-add-app')).toEqual(['habit-tracker', 'notes']);
     expect(host.textContent).toContain('Apps');
   });
 
   it('adds an app as a shortcut, carrying no params', async () => {
-    mount({ dashboard: 'desktop' });
+    mount('desktop');
     act(() => { host.querySelector<HTMLElement>('[data-add-app="habit-tracker"]')!.click(); });
     await vi.waitFor(() => expect(api.added).toHaveLength(1));
     expect(api.added).toEqual([{ dashboard: 'desktop', tile: { appId: 'habit-tracker' } }]);
@@ -85,20 +84,20 @@ describe('the dashboard picker', () => {
 
   it('leaves out an app the dashboard already shows', () => {
     holding(['notes']);
-    mount({ dashboard: 'desktop' });
+    mount('desktop');
     expect(ids('data-add-app')).toEqual(['habit-tracker']);
   });
 
   it('draws no Apps note once every app is on the dashboard', () => {
     holding(['habit-tracker', 'notes']);
-    mount({ dashboard: 'desktop' });
+    mount('desktop');
     expect(ids('data-add-app')).toEqual([]);
     expect(host.textContent).not.toContain('Apps');
   });
 
   it('names an app, not a widget, when adding it fails', async () => {
     api.failWith = 'engine down';
-    mount({ dashboard: 'desktop' });
+    mount('desktop');
     act(() => { host.querySelector<HTMLElement>('[data-add-app="notes"]')!.click(); });
     await vi.waitFor(() => expect(toasts).toHaveLength(1));
     expect(toasts[0]).toBe('Couldn\'t add app "Notes" to the desktop dashboard: engine down');
@@ -106,26 +105,18 @@ describe('the dashboard picker', () => {
 
   it('says so when the apps list could not be read', () => {
     appsList.value = { status: 'failed', error: 'engine down' };
-    mount({ dashboard: 'desktop' });
+    mount('desktop');
     expect(host.querySelector('[role="alert"]')?.textContent).toBe('Couldn\'t list apps: engine down');
   });
 });
 
 describe('a picker row description', () => {
   it('shows as a tooltip, not as text in the row', () => {
-    mount({ dashboard: 'desktop' });
+    mount('desktop');
     const row = (selector: string) => host.querySelector<HTMLElement>(selector)!;
     expect(row('[data-add-widget="clock"]').getAttribute('data-tooltip')).toBe('The time');
     expect(row('[data-add-app="habit-tracker"]').getAttribute('data-tooltip')).toBe('Track habits');
     expect(row('[data-add-app="notes"]').hasAttribute('data-tooltip')).toBe(false);
     expect(host.textContent).not.toContain('Track habits');
-  });
-});
-
-describe('a thread picker', () => {
-  it('lists no app', () => {
-    mount({ threadId: 't' });
-    expect(ids('data-add-widget')).toEqual(['clock']);
-    expect(ids('data-add-app')).toEqual([]);
   });
 });

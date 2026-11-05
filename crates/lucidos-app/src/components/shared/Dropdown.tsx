@@ -1,7 +1,8 @@
+import { DropdownChevron, dropdownPanelStyle } from './dropdownPresentation';
+export { DropdownChevron, dropdownPanelStyle } from './dropdownPresentation';
 import { useState, useEffect, useRef } from 'preact/hooks';
-import type { JSX } from 'preact';
 import { keepFocusOnPress } from '../../utils/dom';
-import { useAnchoredPosition, type AnchorPosition } from '../../hooks/useAnchoredPopover';
+import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from './Overlay';
 import { SearchField } from './SearchField';
@@ -97,46 +98,6 @@ export function openMenuFocusTarget(opts: {
 export function dropdownMenuClass(trigger: { closest(selector: string): unknown } | null): string {
   const base = trigger?.closest('.form-group') ? 'surface-box dropdown-menu dropdown-menu-field' : 'surface-box dropdown-menu';
   return base + protectedClassFrom(trigger);
-}
-
-/** Inline style for the menu panel, given the trigger's width and the computed
- *  position (`null` until `useAnchoredPosition` has measured the panel).
- *
- *  `minWidth` is present from the FIRST render, before `pos` exists, and that
- *  is load-bearing rather than tidy: the hook measures THIS panel to compute
- *  the position, and the panel is portaled to `<body>`, where the stylesheet's
- *  `min-width: 100%` resolves against the initial containing block. Left to
- *  the stylesheet, the measurement pass would report a viewport-wide menu, and
- *  `computeAnchorPosition` would strand `left` at the viewport margin instead
- *  of under the trigger, jumping into place a frame or two later once the
- *  ResizeObserver re-measured the narrowed panel. (`.thread-overflow-menu`
- *  hit the same trap from the other direction and fixed it with
- *  `width: max-content`; a min-width would have beaten that, so this one is
- *  answered where it is set.) `fixed` plus the zeroed offsets keep the hidden
- *  measurement box inside the viewport rather than 100vh down the document,
- *  so it measures at exactly the geometry it will be shown at. `--anchor-room`
- *  is the room on the side the menu opens, which `.dropdown-menu` folds into
- *  its height cap. It is absent while measuring, so the first measurement sees
- *  the menu's natural height. */
-export function dropdownPanelStyle(
-  anchorWidth: number | null,
-  pos: Pick<AnchorPosition, 'top' | 'left' | 'maxHeight'> | null,
-): JSX.CSSProperties {
-  if (anchorWidth === null) return { visibility: 'hidden' };
-  return {
-    position: 'fixed',
-    minWidth: `${anchorWidth}px`,
-    ...(pos
-      ? { top: `${pos.top}px`, left: `${pos.left}px`, '--anchor-room': `${pos.maxHeight}px` }
-      : { top: '0px', left: '0px', visibility: 'hidden' }),
-  };
-}
-
-/** The trigger's chevron. It draws one glyph in both states, and `.open` turns
- *  it over. Never swap in an up glyph: it can differ in width and resize the
- *  trigger. */
-export function DropdownChevron({ open, onClick }: { open: boolean; onClick?: () => void }) {
-  return <span class={`dropdown-chevron${open ? ' open' : ''}`} onClick={onClick}>▾</span>;
 }
 
 /** Walk `options` from `start` in direction `step` (±1), skipping any

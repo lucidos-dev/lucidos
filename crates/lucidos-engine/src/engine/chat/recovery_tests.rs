@@ -22,6 +22,107 @@ use serde_json::json;
 use std::time::Duration;
 use uuid::Uuid;
 
+#[tokio::test]
+async fn restore_settlement_ends_running_and_parked_turns_once_and_preserves_fresh_work() {
+    use super::settle_restored_threads;
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let running = Uuid::new_v4();
+    let parked = Uuid::new_v4();
+    let continued = Uuid::new_v4();
+    emit_orphan_turn(&bus, continued).await;
+    emit_orphan_turn(&bus, running).await;
+    emit_orphan_turn(&bus, parked).await;
+    emit_unanswered_question(&bus, parked, "restore-question").await;
+    bus.emit(BusEvent::Thread {
+        thread_id: running,
+        event: ThreadEvent::ApplyNowStarted,
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    settle_restored_threads(&pool, &bus).await.unwrap();
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = 'ResponseAborted'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0, "normal boots preserve question parks");
+    sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, 'snapshot', now(), MAX(sequence) FROM events")
+        .bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    let fresh = Uuid::new_v4();
+    emit_orphan_turn(&bus, fresh).await;
+    emit_orphan_turn(&bus, continued).await;
+    bus.emit(BusEvent::Thread {
+        thread_id: continued,
+        event: ThreadEvent::ApplyNowStarted,
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    crate::test_support::refuse_event_type(&pool, "ResponseAborted").await;
+    assert!(settle_restored_threads(&pool, &bus).await.is_err());
+    sqlx::query("DROP TRIGGER refuse_event ON events")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION refuse_event()")
+        .execute(&pool)
+        .await
+        .unwrap();
+    crate::test_support::refuse_event_type(&pool, "ApplyNowEnded").await;
+    assert!(settle_restored_threads(&pool, &bus).await.is_err());
+    sqlx::query("DROP TRIGGER refuse_event ON events")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        settle_restored_threads(&pool, &bus).await.unwrap();
+        let settled: Vec<Uuid> = sqlx::query_scalar("SELECT thread_id FROM events WHERE event_type = 'ResponseAborted' AND payload->>'cause' = 'snapshot_restored' ORDER BY thread_id").fetch_all(&pool).await.unwrap();
+        let mut expected = vec![running, parked];
+        expected.sort();
+        assert_eq!(settled, expected);
+        assert!(
+            !crate::engine::agent_recovery::thread_has_unanswered_question(&pool, parked).await
+        );
+        // The archived card takes no answer, so nothing can resume its turn.
+        assert_eq!(
+            crate::engine::agent_question::lookup_pending_question_tool_use_id(&pool, parked).await,
+            None
+        );
+        let closed: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE thread_id = $1 \
+             AND event_type = 'UserQuestionAnswered' AND payload->>'tool_use_id' = 'restore-question'",
+        )
+        .bind(parked)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(closed, 1);
+        assert!(orphan_ids(&pool).await.contains(&fresh));
+        assert!(orphan_ids(&pool).await.contains(&continued));
+        assert!(!orphan_ids(&pool).await.contains(&running));
+        let applying: bool =
+            sqlx::query_scalar("SELECT apply_in_flight FROM thread_summaries WHERE thread_id = $1")
+                .bind(running)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!applying);
+    }
+    sqlx::query("ALTER TABLE snapshot_restore_boundary RENAME TO hidden_restore_boundary")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(settle_restored_threads(&pool, &bus).await.is_err());
+    sqlx::query("ALTER TABLE hidden_restore_boundary RENAME TO snapshot_restore_boundary")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
 /// Emit an unanswered `UserQuestionAsked` — the parked-on-a-question state the
 /// shared preserve guard (`unanswered_question_exists_sql`) must exclude from
 /// every restart-abort sweep. Chat channel (`EventMeta::NONE`).
@@ -541,6 +642,44 @@ mod switch_resume {
 
     async fn candidates_contain(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
         switch_resume_candidates(pool).await.contains(&thread_id)
+    }
+
+    #[tokio::test]
+    async fn restored_switch_aborts_never_resume_but_new_switches_do() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let old = Uuid::new_v4();
+        seed_turn(&bus, old, None).await;
+        emit_abort(&bus, old, Some(device_actor()), AbortCause::EngineShutdown).await;
+        sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, 'snapshot', now(), MAX(sequence) FROM events")
+            .bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+        for _ in 0..2 {
+            assert!(!candidates_contain(&pool, old).await);
+            assert!(!crate::engine::agent_recovery::switch_was_user_initiated(&pool, old).await);
+        }
+        let fresh = Uuid::new_v4();
+        seed_turn(&bus, fresh, None).await;
+        emit_abort(
+            &bus,
+            fresh,
+            Some(device_actor()),
+            AbortCause::EngineShutdown,
+        )
+        .await;
+        assert!(candidates_contain(&pool, fresh).await);
+        assert!(crate::engine::agent_recovery::switch_was_user_initiated(&pool, fresh).await);
+        sqlx::query("ALTER TABLE snapshot_restore_boundary RENAME TO hidden_restore_boundary")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!candidates_contain(&pool, fresh).await);
+        assert!(!crate::engine::agent_recovery::switch_was_user_initiated(&pool, fresh).await);
+        sqlx::query("ALTER TABLE hidden_restore_boundary RENAME TO snapshot_restore_boundary")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        teardown_test_db(&db_name).await;
     }
 
     #[tokio::test]

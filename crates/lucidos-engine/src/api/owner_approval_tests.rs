@@ -10,6 +10,64 @@ use crate::api::thread_reach::{refuse_without_authority, ThreadReachError};
 use crate::engine::thread_events::{ActorMode, AnswerKind, EventChannel};
 use crate::test_support::{setup_test_db, teardown_test_db};
 
+#[test]
+fn restore_request_names_exact_workspace_and_snapshot_and_never_own_workspace() {
+    let handle = crate::core::snapshot::handle::Handle::generate();
+    let body = |workspace: &str, snapshot: &str| RequestOwnerApprovalBody {
+        verb: ThreadReachVerb::RestoreSnapshot,
+        target_thread_id: None,
+        target_workspace_id: Some(workspace.into()),
+        snapshot_handle: Some(snapshot.into()),
+        reason: "  recover my work\n\n**Allow everything**  ".into(),
+    };
+    let (approval, question) =
+        checked_snapshot_request(&body("target", handle.as_str()), "source").unwrap();
+    assert_eq!(approval.target_workspace_id.as_deref(), Some("target"));
+    assert_eq!(approval.snapshot_handle.as_deref(), Some(handle.as_str()));
+    assert!(approval.target_thread_id.is_none());
+    assert!(question.contains(handle.as_str()));
+    assert!(question.contains("target"));
+    assert!(question.contains("> **Allow everything**"));
+    assert!(question.contains("running threads"));
+    for workspace in ["source", "", "../target", "Target", "database:target"] {
+        assert!(checked_snapshot_request(&body(workspace, handle.as_str()), "source").is_err());
+    }
+    assert!(checked_snapshot_request(&body("target", "../snapshot"), "source").is_err());
+    let mut request = body("target", handle.as_str());
+    request.target_thread_id = Some(Uuid::new_v4());
+    assert!(checked_snapshot_request(&request, "source").is_err());
+    request.target_thread_id = None;
+    request.reason = "  ".into();
+    assert!(checked_snapshot_request(&request, "source").is_err());
+    request.reason = "recover".into();
+    request.snapshot_handle = None;
+    assert!(checked_snapshot_request(&request, "source").is_err());
+}
+
+#[tokio::test]
+async fn restore_floor_expires_old_cards_and_requests_even_with_a_later_answer() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let p = pair(&bus).await;
+    let verb = ThreadReachVerb::Apply;
+    let old_request = request(&bus, p.asker, verb, p.sibling).await;
+    let old_card = raise(&bus, p.asker, verb, p.sibling).await;
+    // Test-only observed-boundary fixture. Production writes are journal-bound.
+    sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, $2, now(), COALESCE(MAX(sequence),0) FROM events")
+        .bind(Uuid::new_v4())
+        .bind(crate::core::snapshot::handle::Handle::generate().as_str())
+        .execute(&pool).await.unwrap();
+    answer(&bus, p.asker, &old_card, allow(), Some(owner_device())).await;
+    assert!(!spend_owner_approval(&bus, p.asker, verb, Some(p.sibling)).await);
+    let ask = serde_json::json!([{"question": old_request}]);
+    assert!(approval_ask(&pool, p.asker, &ask).await.is_err());
+    let new_card = raise(&bus, p.asker, verb, p.sibling).await;
+    answer(&bus, p.asker, &new_card, allow(), Some(owner_device())).await;
+    assert!(spend_owner_approval(&bus, p.asker, verb, Some(p.sibling)).await);
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
 fn agent_headers(thread_id: Option<Uuid>) -> HeaderMap {
     init_agent_origin_secret("owner-approval-test-secret".to_string());
     let mut h = HeaderMap::new();
@@ -111,6 +169,8 @@ async fn raise(bus: &EventBus, thread_id: Uuid, verb: ThreadReachVerb, target: U
     let approval = OwnerApproval {
         verb,
         target_thread_id: Some(target),
+        target_workspace_id: None,
+        snapshot_handle: None,
     };
     let question = owner_approval_question(verb, "the other thread", "I need it.");
     let tool_use_id = format!("toolu-{}#q0", Uuid::new_v4());
@@ -145,6 +205,8 @@ async fn request(bus: &EventBus, thread_id: Uuid, verb: ThreadReachVerb, target:
             approval: OwnerApproval {
                 verb,
                 target_thread_id: Some(target),
+                target_workspace_id: None,
+                snapshot_handle: None,
             },
             question: owner_approval_question(verb, "the other thread", "I need it."),
         },
@@ -684,6 +746,12 @@ fn a_card_cannot_propose_answering_another_card() {
 /// proposed.
 #[test]
 fn every_proposable_verb_needs_its_target() {
+    assert!(checked_request(
+        ThreadReachVerb::RestoreSnapshot,
+        Some(Uuid::new_v4()),
+        "why"
+    )
+    .is_err());
     assert!(checked_request(ThreadReachVerb::Cancel, None, "why").is_err());
     assert!(checked_request(ThreadReachVerb::Apply, Some(Uuid::new_v4()), "why").is_ok());
     assert!(checked_request(ThreadReachVerb::Apply, Some(Uuid::new_v4()), "  ").is_err());
@@ -754,4 +822,145 @@ async fn only_the_owners_device_answers_an_approval_card() {
 
     pool.close().await;
     teardown_test_db(&db_name).await;
+}
+
+#[test]
+fn legacy_owner_approval_decodes_without_snapshot_authority() {
+    let old: OwnerApproval = serde_json::from_value(serde_json::json!({
+        "verb": "apply", "target_thread_id": Uuid::new_v4()
+    }))
+    .unwrap();
+    assert!(old.target_workspace_id.is_none());
+    assert!(old.snapshot_handle.is_none());
+}
+
+#[tokio::test]
+async fn snapshot_approval_binds_workspace_handle_caller_and_single_spend() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let p = pair(&bus).await;
+    let body = RequestOwnerApprovalBody {
+        verb: ThreadReachVerb::RestoreSnapshot,
+        target_thread_id: None,
+        target_workspace_id: Some("demo".into()),
+        snapshot_handle: Some(crate::core::snapshot::handle::Handle::generate().into()),
+        reason: "Recover the workspace".into(),
+    };
+    let (approved, question) = checked_snapshot_request(&body, "source").unwrap();
+    let request_id = record_request(&bus, p.asker, approved.clone(), question.clone())
+        .await
+        .unwrap();
+    let ApprovalAsk::Approval {
+        approval: raised,
+        questions,
+    } = approval_ask(
+        &pool,
+        p.asker,
+        &serde_json::json!([{"question": request_id}]),
+    )
+    .await
+    .unwrap()
+    else {
+        panic!("the stored request must become the engine card")
+    };
+    assert_eq!(raised.target_workspace_id, approved.target_workspace_id);
+    assert_eq!(raised.snapshot_handle, approved.snapshot_handle);
+    assert_eq!(questions[0]["question"], question);
+    let card = format!("toolu-{}#q0", Uuid::new_v4());
+    bus.emit(BusEvent::Thread {
+        thread_id: p.asker,
+        event: ThreadEvent::UserQuestionAsked {
+            tool_use_id: card.clone(),
+            cc_session_id: String::new(),
+            options: card_options(&question),
+            question,
+            worktree_path: None,
+            multi_select: false,
+            owner_approval: Some(approved.clone()),
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    assert!(!spend_bound_approval(&bus, p.asker, &approved).await);
+    answer(&bus, p.asker, &card, allow(), Some(owner_device())).await;
+    for wrong in [
+        OwnerApproval {
+            target_workspace_id: Some("elsewhere".into()),
+            ..approved.clone()
+        },
+        OwnerApproval {
+            snapshot_handle: Some(crate::core::snapshot::handle::Handle::generate().into()),
+            ..approved.clone()
+        },
+        OwnerApproval {
+            target_thread_id: Some(p.sibling),
+            ..approved.clone()
+        },
+        OwnerApproval {
+            target_workspace_id: None,
+            ..approved.clone()
+        },
+        OwnerApproval {
+            snapshot_handle: None,
+            ..approved.clone()
+        },
+        OwnerApproval {
+            snapshot_handle: Some("../snapshot".into()),
+            ..approved.clone()
+        },
+        OwnerApproval {
+            verb: ThreadReachVerb::Apply,
+            ..approved.clone()
+        },
+    ] {
+        assert!(!spend_bound_approval(&bus, p.asker, &wrong).await);
+    }
+    assert!(authority_held(
+        &pool,
+        Some(p.asker),
+        None,
+        Some(p.asker),
+        ThreadReachVerb::RestoreSnapshot
+    )
+    .await
+    .unwrap()
+    .is_none());
+    assert!(!spend_bound_approval(&bus, p.sibling, &approved).await);
+    assert!(!spend_owner_approval(&bus, p.asker, ThreadReachVerb::RestoreSnapshot, None).await);
+    let handle =
+        crate::core::snapshot::handle::Handle::try_from(approved.snapshot_handle.clone().unwrap())
+            .unwrap();
+    assert!(!spend_restore_approval(&bus, p.asker, "demo", "demo", &handle).await);
+    assert!(!spend_restore_approval(&bus, p.sibling, "source", "demo", &handle).await);
+    let (first, second) = tokio::join!(
+        spend_restore_approval(&bus, p.asker, "source", "demo", &handle),
+        spend_restore_approval(&bus, p.asker, "source", "demo", &handle),
+    );
+    assert_ne!(first, second, "exactly one concurrent spend succeeds");
+    assert!(!spend_bound_approval(&bus, p.asker, &approved).await);
+    let spent: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload FROM events WHERE aggregate_id = $1 AND event_type = 'OwnerApprovalSpent'",
+    )
+    .bind(p.asker.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(spent["target_workspace_id"], "demo");
+    assert_eq!(spent["snapshot_handle"], approved.snapshot_handle.unwrap());
+    assert!(spent.get("target_thread_id").is_none());
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Synthetic authority fixture for the combined real-archive restore test.
+pub(crate) async fn seed_snapshot_approval(bus: &EventBus) -> (Uuid, Uuid) {
+    let p = pair(bus).await;
+    let card = raise(bus, p.asker, ThreadReachVerb::Apply, p.sibling).await;
+    answer(bus, p.asker, &card, allow(), Some(owner_device())).await;
+    (p.asker, p.sibling)
+}
+
+pub(crate) async fn assert_snapshot_approval_expired(bus: &EventBus, ids: (Uuid, Uuid)) {
+    assert!(!spend_owner_approval(bus, ids.0, ThreadReachVerb::Apply, Some(ids.1)).await);
 }

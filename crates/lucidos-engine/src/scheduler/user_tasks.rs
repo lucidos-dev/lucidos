@@ -199,6 +199,31 @@ fn failure_notification_message(body: &str) -> String {
     clamp_result_summary(body)
 }
 
+/// The body of a script-failure notification. When the error is too long it
+/// keeps the first line, which names the runtime, and the END of the rest:
+/// a traceback or a log ends with the error. A first line that would take
+/// half the cap gives way, and only the end is kept.
+fn script_failure_message(trigger_id: &str, reason: &str) -> String {
+    const ELISION: &str = "…\n";
+    let message = format!("[trigger: {trigger_id}] {reason}");
+    if message.chars().count() <= RESULT_SUMMARY_MAX_CHARS {
+        return message;
+    }
+    let (first, rest) = message.split_once('\n').unwrap_or((&message, ""));
+    let head = format!("{first}\n{ELISION}");
+    if head.chars().count() > RESULT_SUMMARY_MAX_CHARS / 2 {
+        let room = RESULT_SUMMARY_MAX_CHARS - ELISION.chars().count();
+        return format!("{ELISION}{}", last_chars(&message, room));
+    }
+    let room = RESULT_SUMMARY_MAX_CHARS - head.chars().count();
+    format!("{head}{}", last_chars(rest, room))
+}
+
+fn last_chars(s: &str, n: usize) -> &str {
+    let skip = s.chars().count().saturating_sub(n);
+    s.char_indices().nth(skip).map_or("", |(i, _)| &s[i..])
+}
+
 /// The body of a temporary-failure notification. It states what really
 /// happens next, read off the trigger's own schedule at `now`. Nothing retries
 /// a failed run, so only a future cron fire may be named as the next run.
@@ -433,7 +458,7 @@ async fn execute_script_task(
             // if the reason were empty, but normalize the reason for parity with
             // the intent path).
             let reason = crate::triggers::ensure_non_empty_error(&e.to_string(), &config.name);
-            let message = format!("[trigger: {}] {}", config.id, reason);
+            let message = script_failure_message(&config.id, &reason);
             emit_failure_notification(&engine, config, title, message).await;
             Err(e)
         }
@@ -802,6 +827,39 @@ mod tests {
             "the trigger is still named: {message}"
         );
         assert!(message.ends_with("..."), "the cut is visible");
+    }
+
+    /// A long script error keeps its runtime line and its end, where the
+    /// exception or the logged failure is, and fits the notification cap.
+    #[test]
+    fn a_long_script_failure_keeps_its_end() {
+        let reason = format!(
+            "Python error:\n{}\nRuntimeError: OpenRouter returned HTTP 500",
+            "  File \"x.py\", line 1\n".repeat(200)
+        );
+        let message = script_failure_message("digest", &reason);
+        assert!(
+            message.starts_with("[trigger: digest] Python error:\n…\n"),
+            "{message}"
+        );
+        assert!(message.ends_with("HTTP 500"), "{message}");
+        assert!(message.chars().count() <= RESULT_SUMMARY_MAX_CHARS);
+        assert_eq!(failure_notification_message(&message), message);
+
+        let short = script_failure_message("digest", "Python error:\nboom");
+        assert_eq!(short, "[trigger: digest] Python error:\nboom");
+    }
+
+    /// One long error line has no runtime line to keep, so the message keeps
+    /// its end and still fits the cap.
+    #[test]
+    fn a_single_long_failure_line_keeps_its_end_within_the_cap() {
+        let reason = format!("{} HTTP 500", "x".repeat(RESULT_SUMMARY_MAX_CHARS));
+        let message = script_failure_message("digest", &reason);
+        assert!(message.starts_with("…\n"), "{message}");
+        assert!(message.ends_with("HTTP 500"), "{message}");
+        assert_eq!(message.chars().count(), RESULT_SUMMARY_MAX_CHARS);
+        assert_eq!(failure_notification_message(&message), message);
     }
 
     /// Clamping counts characters, not bytes, so a multi-byte error is never

@@ -115,12 +115,10 @@ a build-cache command.
   ADR 0022's transition did NOT have this problem, and the difference is instructive: the
   path it orphaned was cargo's own uplift path, which cargo keeps rewriting, so the pinned
   binary stayed live. This one orphans a path nothing will ever write again.
-  **The window is now legible rather than merely predicted.** The engine reports the
-  give-up as `rebuild_wedged` on `version-status` instead of only logging it, so the toast
-  drops the *Rebuild* button that cannot resolve it and names the relaunch, the brand mark
-  carries a dot for the whole window, and the toast can be dismissed and re-opened from
-  that dot. See *pending engine version* / *wedged rebuild* in `docs/glossary.md`, and
-  `docs/plans/2026-08-13-pending-engine-version-is-a-first-class-surface.md`.
+  **The transition was later exposed as a retired wedged rebuild verdict.**
+  [ADR 0617](0617-engine-build-delivery-proof.md) replaces it with verified
+  delivery and a fresh retry. See *pending engine version* and *verified engine
+  build* in `docs/glossary.md`.
 - **During that window co-located workspaces do not share a build lock.** The lock path is
   resolved by the *engine binary*, so a pre-change engine flocks
   `target/.lucidos-engine-build.lock` while a post-change peer flocks

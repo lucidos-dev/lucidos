@@ -2811,6 +2811,7 @@ export const backupProgress = gapClearedProgress<{ phase: string; progress: numb
  *  BackupFailed). BackupSection re-fetches `/backup/status` when this changes
  *  so the health card reflects the new last-run outcome. */
 export const backupStatusVersion = gapRefreshedVersion();
+export const snapshotsVersion = gapRefreshedVersion();
 
 /** Bumped on `BackupRecipientSet`: a backup key setup finished, or the user
  *  set their own age public key. BackupSection re-reads `/backup/recipient`. */
@@ -2955,14 +2956,6 @@ export const engineVersionReady = signal(false);
 // "there is new code, and it has not become a version yet". Offering a Switch
 // here would respawn the same engine.
 export const engineVersionPending = signal(false);
-
-// --- ...and rebuilding has been proved unable to deliver it ---
-// The engine's verdict (`rebuild_wedged`), never derived here. Only the engine
-// knows which HEAD a completed build was built from, and a build that finished
-// before newer commits landed says nothing about a rebuild now. Meaningful
-// only while `engineVersionPending`. It tints the badge and swaps the toast's
-// Rebuild button for the operator fix.
-export const engineRebuildWedged = signal(false);
 
 // --- New engine version currently building (dev background rebuild) ---
 // Set by the version-status poll (store/actions/engine-update.ts) when the

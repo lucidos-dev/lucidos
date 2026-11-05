@@ -1,3 +1,4 @@
+import { observeSourceGeneration } from '../utils/restoreSourceGeneration';
 import { describe, it, expect, beforeEach } from 'vitest';
 
 import {
@@ -14,6 +15,7 @@ import {
   pendingUploadStorageFailureMessage,
   persistPendingUpload,
   readPendingUploadStore,
+  livePendingUploadRecords,
   _resetPendingUploadRecordsForTesting,
   type PendingUploadBackend,
   type PendingUploadRecord,
@@ -35,6 +37,7 @@ function record(localId: string, overrides: Partial<PendingUploadRecord> = {}): 
 }
 
 beforeEach(() => {
+  observeSourceGeneration(null);
   _resetPendingUploadRecordsForTesting();
   toasts.value = [];
 });
@@ -48,6 +51,25 @@ describe('pendingUploadDbName', () => {
 });
 
 describe('persistPendingUpload', () => {
+  it('retains landed live bytes excluded by the durable cap until explicitly released', async () => {
+    notePendingUploadsOwnedElsewhere(Array.from({ length: PENDING_UPLOAD_MAX_RECORDS }, (_, i) => record(`other-${i}`)));
+    expect(persist('over-cap')).toBe(false);
+    markPendingUploadLanded('over-cap', 'confirmed-hash');
+    expect((await readPendingUploadStore()).uploads).toEqual([]);
+    expect(livePendingUploadRecords()).toEqual([expect.objectContaining({ localId: 'over-cap', landedHash: 'confirmed-hash', bytes: bytes(3) })]);
+    expect(ownedPendingUploadRecords()).toEqual([expect.objectContaining({ localId: 'over-cap', landedHash: 'confirmed-hash' })]);
+    forgetPendingUploadRecord('over-cap');
+    expect(livePendingUploadRecords()).toEqual([]);
+  });
+
+  it('retains live bytes when IndexedDB rejects the write', async () => {
+    _resetPendingUploadRecordsForTesting({ ...createMemoryPendingUploadBackend(), putUpload: async () => { throw new Error('quota'); } });
+    persist('failed-write');
+    await readPendingUploadStore();
+    markPendingUploadLanded('failed-write', 'confirmed-hash');
+    expect(livePendingUploadRecords()[0]).toMatchObject({ localId: 'failed-write', landedHash: 'confirmed-hash', bytes: bytes(3) });
+  });
+
   it('stores the bytes and metadata, owned by this page', async () => {
     expect(persist('u-1')).toBe(true);
     const { uploads } = await readPendingUploadStore();
@@ -126,5 +148,74 @@ describe('adoptPendingUploadRecord', () => {
     expect(after.ownerId).toBe(pageOwnerId);
     expect(after.landedHash).toBeUndefined();
     expect(ownedPendingUploadRecords().map((r) => r.localId)).toEqual(['u-1']);
+  });
+});
+
+it('stamps uploads and queued sends synchronously, retaining origin through adoption', async () => {
+  const { persistQueuedUploadSend, adoptQueuedUploadSendRecord } = await import('./pendingUploadRecords');
+  observeSourceGeneration('old');
+  persist('tagged');
+  persistQueuedUploadSend('t-1', { useCodingAgent: false, context: null }, { localIds: ['tagged'], text: 'before' });
+  observeSourceGeneration('current');
+  const stored = await readPendingUploadStore();
+  expect(stored.uploads[0].sourceGeneration).toBe('old');
+  expect(stored.queuedUploadSendRecords[0].sourceGeneration).toBe('old');
+  adoptPendingUploadRecord(stored.uploads[0]);
+  adoptQueuedUploadSendRecord(stored.queuedUploadSendRecords[0]);
+  const adopted = await readPendingUploadStore();
+  expect(adopted.uploads[0].sourceGeneration).toBe('old');
+  expect(adopted.queuedUploadSendRecords[0].sourceGeneration).toBe('old');
+});
+
+
+describe('queued source isolation', () => {
+  it('keeps owners and generations on the same thread and drops settled history', async () => {
+    const backend = createMemoryPendingUploadBackend();
+    const old = { threadId: 'same', ownerId: 'old-page', sourceGeneration: 'before',
+      localIds: ['image'], text: 'old', intent: { useCodingAgent: false, context: null } };
+    const current = { ...old, ownerId: 'current-page', sourceGeneration: 'after', text: 'current' };
+    await Promise.all([backend.putQueuedUploadSend(old), backend.putQueuedUploadSend(current)]);
+    expect(await backend.listQueuedUploadSends()).toEqual([old, current]);
+    await backend.deleteQueuedUploadSend(old);
+    expect(await backend.listQueuedUploadSends()).toEqual([current]);
+    expect(await backend.listQueuedUploadHistory()).toEqual([current]);
+  });
+
+  it('refuses stale settlement of a newer intent, keeping only the live revision', async () => {
+    const backend = createMemoryPendingUploadBackend();
+    const first = { threadId: 'same', ownerId: 'page', sourceGeneration: 'current',
+      localIds: ['image'], text: 'first', intent: { useCodingAgent: false, context: null } };
+    const next = { ...first, text: 'edited' };
+    await backend.putQueuedUploadSend(first);
+    await backend.putQueuedUploadSend(next);
+    expect(await backend.listQueuedUploadHistory()).toEqual([next]);
+    await backend.deleteQueuedUploadSend(first);
+    expect(await backend.listQueuedUploadSends()).toEqual([next]);
+    expect(await backend.listQueuedUploadHistory()).toEqual([next]);
+    await backend.deleteQueuedUploadSend(next);
+    expect(await backend.listQueuedUploadSends()).toEqual([]);
+    expect(await backend.listQueuedUploadHistory()).toEqual([]);
+  });
+});
+
+
+describe('retained attachment sources', () => {
+  // History holds intent a restore could strand. A deleted upload was delivered
+  // or dropped, so keeping its bytes would only grow device storage forever.
+  it('keeps bytes and owner lineage after patch and overwrite, and drops them on deletion', async () => {
+    const backend = createMemoryPendingUploadBackend();
+    _resetPendingUploadRecordsForTesting(backend);
+    const old = record('image', { sourceGeneration: 'before' });
+    await backend.putUpload(old);
+    await backend.patchUpload('image', { ownerId: 'adopter', landedHash: 'landed' });
+    const current = record('image', { ownerId: 'current', sourceGeneration: 'after', bytes: bytes(5), size: 5 });
+    await backend.putUpload(current);
+    expect((await readPendingUploadStore(true)).uploads).toEqual([
+      old, { ...old, ownerId: 'adopter', landedHash: 'landed' }, current,
+    ]);
+    await backend.putUpload(record('other'));
+    await backend.deleteUpload('image');
+    expect((await readPendingUploadStore()).uploads.map((u) => u.localId)).toEqual(['other']);
+    expect((await readPendingUploadStore(true)).uploads.map((u) => u.localId)).toEqual(['other']);
   });
 });

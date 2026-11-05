@@ -6,7 +6,7 @@
  * handleThreadEvent or handleGlobalEvent.
  */
 import { removeWindowItem } from '../../utils/windowStorage';
-import { refreshThreadWidgetsNaming } from './widgets';
+import { refreshReusableWidgets } from './widgets';
 import { onDashboardEvent, refreshDashboardsNaming } from './dashboards';
 import type { Dashboard } from '../../generated/thread-event-wire';
 import { forgetAppById } from './appsById';
@@ -240,10 +240,8 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
       if (appId && name) patchRecentsMetadata(appId, 'apps', name);
       void loadApps();
       // A widget's name or reusable flag may have changed (ADR 0402).
-      if (appId) {
-        refreshThreadWidgetsNaming(appId);
-        refreshDashboardsNaming(appId);
-      }
+      refreshReusableWidgets();
+      if (appId) refreshDashboardsNaming(appId);
       promptFootprintVersion.value++;
       break;
     }
@@ -258,11 +256,9 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
         forgetAppLabels(appId);
       }
       void loadApps();
-      // Delete (a thread) removes its widgets: re-read every thread that showed one.
-      if (appId) {
-        refreshThreadWidgetsNaming(appId);
-        refreshDashboardsNaming(appId);
-      }
+      // Delete (a thread) removes its widgets.
+      refreshReusableWidgets();
+      if (appId) refreshDashboardsNaming(appId);
       promptFootprintVersion.value++;
       break;
     }

@@ -346,6 +346,15 @@ async fn fan_out_os_surface(
     // Every surface below shows text verbatim, so none of them gets markdown.
     let body = &plain_text_body(body);
     let pool = engine.pool();
+    // Capture before presence waits and payload serialization. An unreadable
+    // boundary cannot authorize sending work from an unknown era.
+    let source_generation = match crate::core::snapshot::boundary::read(pool).await {
+        Ok(boundary) => boundary.map(|b| b.restore_id),
+        Err(error) => {
+            log!("[Push] Cannot read source generation: {}", error);
+            return;
+        }
+    };
     // MAY be empty: a desktop-only workspace never creates one, because the
     // embedded WKWebView cannot subscribe to Web Push. Do NOT bail on empty
     // here. A connected client still needs the toast or the native banner, and
@@ -451,6 +460,7 @@ async fn fan_out_os_surface(
         .into_iter()
         .map(|sub| {
             let payload_bytes = build_push_payload_fitted(
+                source_generation,
                 title,
                 body,
                 notification_id,
@@ -481,7 +491,13 @@ async fn fan_out_os_surface(
     // persisted notification to build the wake payload, so a wake without an
     // id has nothing to mirror.
     if let Some(nid) = notification_id {
-        schedule_mac_chromium_wakes(engine.clone(), wake_targets, nid, MAC_CHROMIUM_WAKE_DELAY);
+        schedule_mac_chromium_wakes(
+            engine.clone(),
+            source_generation,
+            wake_targets,
+            nid,
+            MAC_CHROMIUM_WAKE_DELAY,
+        );
     }
 }
 
@@ -505,6 +521,7 @@ const MAC_CHROMIUM_WAKE_DELAY: std::time::Duration = std::time::Duration::from_s
 /// anyway.
 fn schedule_mac_chromium_wakes(
     engine: SharedEngine,
+    source_generation: Option<uuid::Uuid>,
     device_ids: Vec<String>,
     notification_id: uuid::Uuid,
     delay: std::time::Duration,
@@ -513,7 +530,9 @@ fn schedule_mac_chromium_wakes(
         let engine = engine.clone();
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            match send_wake_push_to_device(&engine, &device_id, notification_id).await {
+            match send_wake_push_to_device(&engine, source_generation, &device_id, notification_id)
+                .await
+            {
                 Ok(0) => log!(
                     "[Push] Layer-3 wake-push for {} on {}: nothing sent \
                      (notification read during the delay window, or device \
@@ -743,12 +762,15 @@ fn wake_still_needed(notification: &crate::scheduler::notifications::Notificatio
 /// push as visible (§4.5). Sending a push is the canonical way to wake an
 /// inactive service worker: any push event resurrects the worker thread and
 /// drains queued `notificationclick` events as a side effect.
-pub(crate) async fn send_wake_push_to_device(
+async fn send_wake_push_to_device(
     engine: &crate::engine::LucidosEngine,
+    source_generation: Option<uuid::Uuid>,
     device_id: &str,
     notification_id: uuid::Uuid,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let pool = engine.pool();
+    // This provenance was captured before scheduling the timer, never adopted
+    // from the current workspace after its delay.
     let notification =
         match crate::scheduler::NotificationStore::get_by_id(pool, notification_id).await? {
             Some(n) => n,
@@ -772,6 +794,7 @@ pub(crate) async fn send_wake_push_to_device(
         .into_iter()
         .map(|sub| {
             let payload_bytes = build_wake_payload(
+                source_generation,
                 &notification,
                 sub.scope_url.as_deref(),
                 app_badge_for(
@@ -960,6 +983,7 @@ fn fit_payload_body(
 /// The `tap` JSON is emitted only for non-modal kinds. Modal-kind URLs stay
 /// short, and the page demotes a missing `tap` param to the modal default.
 fn build_navigate_params(
+    source_generation: Option<uuid::Uuid>,
     notification_id: Option<uuid::Uuid>,
     link_thread_id: Option<uuid::Uuid>,
     link_event_id: Option<uuid::Uuid>,
@@ -981,6 +1005,10 @@ fn build_navigate_params(
     if !matches!(tap, crate::scheduler::notifications::Tap::Modal) {
         let tap_json = serde_json::to_string(tap).expect("Tap serializes infallibly");
         parts.push(format!("tap={}", urlencoding::encode(&tap_json)));
+    }
+    if !parts.is_empty() {
+        let generation = source_generation.map_or_else(|| "none".to_string(), |id| id.to_string());
+        parts.push(format!("restore_generation={generation}"));
     }
     parts.join("&")
 }
@@ -1224,6 +1252,7 @@ fn parse_unread_total(body: &str) -> Option<i64> {
 /// the wake larger than the push it mirrors. A body that just squeezed into
 /// the original send would otherwise blow the wake up.
 fn build_wake_payload(
+    source_generation: Option<uuid::Uuid>,
     notification: &crate::scheduler::notifications::Notification,
     ios_scope_url: Option<&str>,
     app_badge: Option<i64>,
@@ -1233,6 +1262,7 @@ fn build_wake_payload(
         "wake",
         |candidate_body| {
             let mut payload = build_push_payload(
+                source_generation,
                 &notification.title,
                 candidate_body,
                 Some(notification.id),
@@ -1256,6 +1286,7 @@ fn build_wake_payload(
 /// guard in the way. It is also what [`fit_payload_body`] re-renders.
 #[allow(clippy::too_many_arguments)]
 fn build_push_payload_fitted(
+    source_generation: Option<uuid::Uuid>,
     title: &str,
     body: &str,
     notification_id: Option<uuid::Uuid>,
@@ -1268,6 +1299,7 @@ fn build_push_payload_fitted(
 ) -> serde_json::Value {
     fit_payload_body(body, "notification", |candidate_body| {
         build_push_payload(
+            source_generation,
             title,
             candidate_body,
             notification_id,
@@ -1297,6 +1329,7 @@ fn build_push_payload_fitted(
 /// keep it short, and the page demotes a missing `tap` to modal.
 #[allow(clippy::too_many_arguments)]
 fn build_push_payload(
+    source_generation: Option<uuid::Uuid>,
     title: &str,
     body: &str,
     notification_id: Option<uuid::Uuid>,
@@ -1307,7 +1340,13 @@ fn build_push_payload(
     ios_scope_url: Option<&str>,
     app_badge: Option<i64>,
 ) -> serde_json::Value {
-    let params = build_navigate_params(notification_id, link_thread_id, link_event_id, tap);
+    let params = build_navigate_params(
+        source_generation,
+        notification_id,
+        link_thread_id,
+        link_event_id,
+        tap,
+    );
     let navigate_ios = navigate_url_ios(&params, ios_scope_url);
     let navigate_sw = navigate_url_sw(&params);
     let tag = notification_id
@@ -1315,6 +1354,10 @@ fn build_push_payload(
         .unwrap_or_else(|| DEFAULT_NOTIFICATION_TAG.to_string());
 
     let mut data = serde_json::Map::new();
+    data.insert(
+        "restore_generation".into(),
+        serde_json::json!(source_generation),
+    );
     if let Some(id) = notification_id {
         data.insert(
             "notification_id".into(),

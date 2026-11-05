@@ -11,6 +11,14 @@ import {
   reloadGateway,
   openWorkspace,
   parseWorkspaceNameFromArchive,
+  getCleanupReview,
+  freezeCleanup,
+  confirmCleanup,
+  listTrash,
+  restoreTrash,
+  abandonTrashStaging,
+  freezeEmptyTrash,
+  confirmEmptyTrash,
 } from './control';
 import { slugifyWorkspaceName } from '../../utils/slug';
 import { DEVICE_ID_KEY } from '../../utils/deviceIdHeader';
@@ -39,6 +47,50 @@ function headersOf(mock: ReturnType<typeof vi.fn>, call = 0): Record<string, str
 }
 
 describe('control client', () => {
+  it('reads cleanup and Trash projections without masking errors', async () => {
+    const mock = withFetch(() => Promise.resolve(new Response('{"error":"peer inventory unavailable"}', { status: 503 })));
+    await expect(getCleanupReview()).rejects.toThrow('peer inventory unavailable');
+    await expect(listTrash()).rejects.toThrow('peer inventory unavailable');
+    expect(mock.mock.calls.map((call) => call[0])).toEqual([
+      '/~/api/v1/control/cleanup', '/~/api/v1/control/trash',
+    ]);
+  });
+
+  it('freezes exact fingerprints and confirms the server phrase with the device identity', async () => {
+    localStorage.setItem(DEVICE_ID_KEY, 'paired-device');
+    const batch = { id: 'batch-test', phrase: 'Delete 1 workspaces', members: [], results: [] };
+    const mock = withFetch(() => Promise.resolve(Response.json(batch)));
+    expect(await freezeCleanup([{ id: 'sample', fingerprint: 'observed' }])).toEqual(batch);
+    expect(await confirmCleanup(batch.id, batch.phrase)).toEqual(batch);
+    expect(JSON.parse(mock.mock.calls[0][1].body)).toEqual({ members: [{ id: 'sample', fingerprint: 'observed' }] });
+    expect(JSON.parse(mock.mock.calls[1][1].body)).toEqual({ confirm: batch.phrase });
+    expect(mock.mock.calls[1][0]).toBe('/~/api/v1/control/cleanup/batches/batch-test/confirm');
+    for (let i = 0; i < 2; i++) {
+      expect(mock.mock.calls[i][1].method).toBe('POST');
+      expect(headersOf(mock, i)['x-lucidos-device-id']).toBe('paired-device');
+    }
+  });
+
+  it('uses paired-device POSTs for Trash actions and escapes resource identities', async () => {
+    localStorage.setItem(DEVICE_ID_KEY, 'paired-device');
+    const mock = withFetch(() => Promise.resolve(new Response(null, { status: 204 })));
+    await restoreTrash('workspace:example');
+    await abandonTrashStaging('workspace:example');
+    await freezeEmptyTrash();
+    await confirmEmptyTrash('batch-test', 'Empty Trash');
+    expect(mock.mock.calls.map((call) => call[0])).toEqual([
+      '/~/api/v1/control/trash/workspace%3Aexample/restore',
+      '/~/api/v1/control/trash/workspace%3Aexample/abandon-staging',
+      '/~/api/v1/control/trash/empty-batches',
+      '/~/api/v1/control/trash/empty-batches/batch-test/confirm',
+    ]);
+    for (let i = 0; i < 4; i++) {
+      expect(mock.mock.calls[i][1].method).toBe('POST');
+      expect(headersOf(mock, i)['x-lucidos-device-id']).toBe('paired-device');
+    }
+    expect(JSON.parse(mock.mock.calls[3][1].body)).toEqual({ confirm: 'Empty Trash' });
+  });
+
   it('lists workspaces from the sigil control route', async () => {
     const mock = withFetch(() =>
       Promise.resolve(new Response('{"workspaces":[]}', { status: 200 })),

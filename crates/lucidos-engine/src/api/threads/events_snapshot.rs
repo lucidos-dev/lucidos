@@ -77,6 +77,10 @@ pub struct ThreadEventsSnapshot {
     /// read carries every event, so it sends none.
     #[serde(rename = "pairStamps", skip_serializing_if = "Option::is_none")]
     pub pair_stamps: Option<Vec<crate::core::PairStamp>>,
+    /// The thread's card sizes, sent only for a PAGE, for the same reason: the
+    /// pick that sized a widget instance's cards may sit behind the page.
+    #[serde(rename = "cardSizes", skip_serializing_if = "Option::is_none")]
+    pub card_sizes: Option<Vec<crate::engine::widgets::CardSize>>,
 }
 
 /// GET /api/v1/threads/:thread_id/events — snapshot of persisted thread events,
@@ -120,12 +124,20 @@ pub(in crate::api) async fn get_thread_events_snapshot(
 
     // Independent fetches against the same pool — run in parallel.
     let pool = state.engine.pool();
-    let (events_res, aggregate_res, pair_stamps_res) = tokio::join!(
+    let (events_res, aggregate_res, pair_stamps_res, card_sizes_res) = tokio::join!(
         read_events(&state, thread_uuid, &query, before),
         crate::core::store::fetch_thread_aggregate(pool, thread_uuid),
         async {
             match query.limit {
                 Some(_) => crate::core::PreferenceStore::thread_pair_stamps(pool, thread_uuid)
+                    .await
+                    .map(Some),
+                None => Ok(None),
+            }
+        },
+        async {
+            match query.limit {
+                Some(_) => crate::engine::widgets::thread_card_sizes(pool, thread_uuid)
                     .await
                     .map(Some),
                 None => Ok(None),
@@ -148,6 +160,11 @@ pub(in crate::api) async fn get_thread_events_snapshot(
             thread_uuid,
             e
         );
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+    // Missing sizes would silently draw a later card at the widget's default.
+    let card_sizes = card_sizes_res.map_err(|e| {
+        log!("[API] Failed to read card sizes for {}: {}", thread_uuid, e);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
 
@@ -191,6 +208,7 @@ pub(in crate::api) async fn get_thread_events_snapshot(
         has_more,
         max_sequence,
         pair_stamps,
+        card_sizes,
     }))
 }
 

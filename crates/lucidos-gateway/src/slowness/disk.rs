@@ -10,9 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
-/// Below this much free space, the disk is the reason Lucidos is slow. Far
-/// under the engine's cleanup floor, because this claims the disk is the
-/// cause, not that it needs tidying.
+/// Below this much free space, the disk is the reason Lucidos is slow. A
+/// fixed amount, apart from the engine's cleanup thresholds, because this
+/// claims the disk is the cause, not that it needs tidying.
 const CRITICAL_FREE_BYTES: u64 = 2_000_000_000;
 
 /// How long a sample waits for a reading.

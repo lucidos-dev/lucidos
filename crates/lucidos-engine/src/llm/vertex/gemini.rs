@@ -243,6 +243,15 @@ fn gemini_generation_config(
     })
 }
 
+pub(crate) fn sdk_request_defaults(model: &str, effort: Option<&str>) -> serde_json::Value {
+    let mut body = serde_json::json!({});
+    if let Some(config) = gemini_generation_config(model, effort) {
+        body["generationConfig"] =
+            serde_json::to_value(config).expect("generation config serializes");
+    }
+    serde_json::json!({ "body": body, "headers": {} })
+}
+
 /// Map the unified `reasoning_effort` to a Gemini 3.x `thinkingLevel`, clamped to
 /// the levels the specific model accepts: Gemini 3 Flash supports
 /// `minimal`/`low`/`medium`/`high`; Gemini 3 Pro supports only `low`/`high`

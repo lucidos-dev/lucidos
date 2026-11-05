@@ -1,6 +1,6 @@
 # 0432: Home is one place with two faces; board widgets take one of three sizes
 
-- **Status**: Accepted
+- **Status**: Accepted. Amended by [ADR 0621](0621-widgets-one-box-no-pin.md): the size contract applies to the thread card too, and the user picks a card's size
 - **Date**: 2026-10-11
 
 Amends [ADR 0407](0407-inline-widget-cards-and-an-opt-in-shelf.md) (Home's

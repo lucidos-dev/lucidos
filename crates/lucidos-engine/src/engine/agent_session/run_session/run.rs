@@ -10,6 +10,7 @@ use crate::engine::agent_session::text_buffer::CodingAgentTextBuffer;
 use crate::engine::agentic_loop::should_flush;
 use crate::engine::change_ops::{now_epoch_millis, ProposeOutcome};
 use crate::engine::claude_code::STALE_RESUME_ERROR;
+use crate::engine::event_wait::OwnerTurn;
 use crate::engine::git_ops::{
     auto_commit_preserving_marker, branch_head_sha, default_local_branch, describe_branch_changes,
     files_require_restart, has_full_harden_marker, is_external_repo_path, main_worktree,
@@ -36,10 +37,10 @@ use crate::engine::agent_session::lifecycle::{
     classify_result, idle_action, idle_change_write, is_definitive_session_not_found,
     is_resume_settle_result, is_stale_resume_signal, require_agent_input, reset_per_turn_flags,
     result_auto_commits, should_auto_commit_on_cleanup, starts_turn_after_terminal,
-    terminal_clears_user_hit_stop, terminate_decision, turn_has_terminal, watchdog_gate,
-    IdleAction, IdleChangeWrite, IdleSession, StaleResumeInputs, TerminalKind, TerminateDecision,
-    TurnTerminal, WatchdogGate, WATCHDOG_DIAG_LOG_THRESHOLD_MS, WATCHDOG_HUNG_TOOL_CEILING_MS,
-    WATCHDOG_INACTIVITY_LIMIT_MS, WATCHDOG_TICK_INTERVAL_SECS,
+    terminal_clears_user_hit_stop, terminate_decision, turn_ended_cleanly, turn_has_terminal,
+    watchdog_gate, IdleAction, IdleChangeWrite, IdleSession, StaleResumeInputs, TerminalKind,
+    TerminateDecision, TurnTerminal, WatchdogGate, WATCHDOG_DIAG_LOG_THRESHOLD_MS,
+    WATCHDOG_HUNG_TOOL_CEILING_MS, WATCHDOG_INACTIVITY_LIMIT_MS, WATCHDOG_TICK_INTERVAL_SECS,
 };
 use crate::engine::agent_session::prompts::standing_instruction_section;
 use crate::engine::agent_session::resume::{
@@ -2611,6 +2612,15 @@ impl LucidosEngine {
                                         // pending row to reconcile, which would otherwise
                                         // keep claiming files the branch no longer has.
                                         let mut held_proposal = None;
+                                        // An idle agent polls nothing, so a clean turn end
+                                        // covers its running tasks, polled ones included.
+                                        // Before `holds_live_wait`: the wait holds the
+                                        // proposal, and keeps a waiting child unfinished.
+                                        // Pinned by `the_idle_arm_covers_polled_tasks_before_it_idles`.
+                                        let ended_cleanly = turn_ended_cleanly(&last_terminal_kind, is_resolution_session, keep_alive_turn);
+                                        if ended_cleanly {
+                                            self.arm_wait_for_running_background_tasks(thread_id, OwnerTurn::Ended).await;
+                                        }
                                         let holds_live_wait = !self.live_waits.for_thread(thread_id).await.is_empty();
                                         let idle_write = idle_change_write(
                                             IdleSession {
@@ -2707,10 +2717,12 @@ impl LucidosEngine {
                                         }
 
                                         // Recorded on the `CodingAgentIdled` payload for
-                                        // the event history. It gates nothing: a running
-                                        // background task re-opens the thread through its
-                                        // event wait. A task the thread already stopped
-                                        // re-opens nothing, so it does not count.
+                                        // the event history. It gates nothing: after a clean
+                                        // turn end, the wait armed above re-opens the thread
+                                        // when a running task finishes. A Stop arms nothing
+                                        // at this turn end, but a wait armed earlier still
+                                        // stands. A task the thread already stopped re-opens
+                                        // nothing, so it does not count.
                                         let bg_bash_running = self
                                             .bash_background
                                             .running_for_thread(thread_id)
@@ -2725,10 +2737,7 @@ impl LucidosEngine {
                                             // the idle records the turn's end (ADR 0417). An
                                             // engine-run merge resolution is not the user's
                                             // turn, and an unfinished turn decides nothing.
-                                            if !is_resolution_session
-                                                && !keep_alive_turn
-                                                && matches!(last_terminal_kind, Some(TerminalKind::Generated))
-                                            {
+                                            if ended_cleanly {
                                                 self.gate_coding_agent_turn_end(thread_id, wt_has_changes).await;
                                             }
                                             self.emit_coding_agent_idled(

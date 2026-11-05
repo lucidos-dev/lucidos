@@ -66,6 +66,8 @@ explains the ones a reader would not guess.
   that name a string literal the diff removed, and specs the main check's coverage
   map ties to a changed file.
   A backend-only diff selects none, and the fast tier drops the row.
+  A macOS host runs the mobile-webkit ones locally, and a passing suite carries
+  into the next round (ADR 0616).
 
 ## Why `make lint` and not `cargo check`
 

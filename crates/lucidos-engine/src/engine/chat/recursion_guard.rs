@@ -22,19 +22,40 @@ pub(crate) static LIVE_CHILD_SQL: std::sync::LazyLock<String> = std::sync::LazyL
     )
 });
 
-/// How many live children `$1` has, each counted once. Three sources:
+/// The ids of the live children `$1` is still owed a result by, from two
+/// sources:
 /// - children on the edge;
-/// - children moved to top level, each `ChildThreadDetached` on the parent
-///   joined to the child's row, so a move frees no live slot (ADR 0278);
-/// - spawns still waiting in the Thread Queue, which have no row yet.
+/// - spawns the Thread Queue holds: admitted with no row yet, or queued while
+///   any row they have is still on the edge.
 ///
-/// One branch per source, so each reads an index: an `OR` across the first
-/// two would scan every row.
+/// A child moved to top level is on neither: its result never reaches the
+/// former parent (ADR 0278). Its queue entry keeps the old parent in its
+/// request, so the row decides.
+pub(crate) static OWED_CHILDREN_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "SELECT thread_id FROM thread_summaries \
+             WHERE parent_thread_id = $1 AND {live} \
+             UNION \
+             SELECT q.thread_id FROM thread_queue q \
+             LEFT JOIN thread_summaries s ON s.thread_id = q.thread_id \
+             WHERE q.thread_id IS NOT NULL \
+               AND q.request->>'parent_thread_id' = $1::text \
+               AND (s.thread_id IS NULL \
+                    OR (q.status = 'queued' AND s.parent_thread_id = $1))",
+        live = *LIVE_CHILD_SQL,
+    )
+});
+
+/// How many live children `$1` has, each counted once: the children it is
+/// owed a result by, plus the live ones it moved to top level. A move frees
+/// no live slot (ADR 0278).
+///
+/// One branch per source, so each reads an index: an `OR` across the edge and
+/// the detached children would scan every row.
 static LIVE_CHILD_COUNT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         "SELECT COUNT(*) FROM ( \
-             SELECT thread_id FROM thread_summaries \
-             WHERE parent_thread_id = $1 AND {live} \
+             {owed} \
              UNION \
              SELECT thread_id FROM thread_summaries \
              WHERE thread_id = ANY(ARRAY( \
@@ -42,11 +63,8 @@ static LIVE_CHILD_COUNT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::
                  WHERE aggregate = 'thread' AND aggregate_id = $1::text \
                    AND event_type = 'ChildThreadDetached')) \
                AND {live} \
-             UNION \
-             SELECT thread_id FROM thread_queue \
-             WHERE status = 'queued' AND thread_id IS NOT NULL \
-               AND request->>'parent_thread_id' = $1::text \
          ) live_children",
+        owed = *OWED_CHILDREN_SQL,
         live = *LIVE_CHILD_SQL,
     )
 });

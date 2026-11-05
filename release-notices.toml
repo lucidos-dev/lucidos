@@ -311,3 +311,18 @@ call now fails with a hint. The button finds each place and rewrites it.
 """
 action_label = "Fix old intent calls"
 action_prompt = "Run only the retired-tools audit check on my workspace, and fix what it finds."
+
+[[notice]]
+id = "widgets-pin-to-thread-removed"
+since = "0.55.2"
+title = "Pinned widgets are gone: add them to a dashboard"
+body = """
+A widget no longer pins to a thread, and the chips under a thread's title are \
+gone. To keep a widget in view, tap **+ Dashboard** on its card. It joins the \
+dashboard of the screen you tap it on, at the card's size.
+
+A widget in a thread now shows exactly as its dashboard tile does, at small, \
+medium or large. The pill on its card picks the size. A widget built to grow \
+with its content may now cut off in its card, as it already did on a \
+dashboard. Ask Lucidos to redraw it for each size.
+"""

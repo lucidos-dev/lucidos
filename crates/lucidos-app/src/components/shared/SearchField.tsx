@@ -1,5 +1,5 @@
 import type { ComponentChildren, JSX, Ref } from 'preact';
-import { SearchIcon } from './icons';
+import { SearchIcon } from './SearchIcon';
 
 /** The one search box in the host: a soft pill with a search glyph.
  *

@@ -547,6 +547,9 @@
        welcome lines up with the composer directly below it, scroll gutter
        included: `overflow: visible` here means the base rule's
        `scrollbar-gutter: stable` reserves nothing, so add it explicitly.
+       The gutter is a right margin, not padding. WebKit lays the welcome out
+       again only when this box's width changes, and the gutter is republished
+       after the welcome can already be on screen.
        The bottom is much the larger of the two, on purpose. Nothing docks above
        this surface (the space over it is the pane's own, and on mobile the wrap
        centres the surface in it), so the top only has to stop the greeting
@@ -556,9 +559,10 @@
        as a breath between two surfaces rather than as inner padding. */
     padding:
         0.5rem
-        calc(var(--thread-pane-gutter) + var(--scrollbar-gutter-width))
+        var(--thread-pane-gutter)
         3.5rem
         var(--thread-pane-gutter);
+    margin-right: var(--scrollbar-gutter-width);
 }
 
 .compose-empty .prompt-area {
@@ -2126,6 +2130,9 @@
    column on its right edge. */
 .brand-badge {
     --badge-height: var(--header-mark-count-size);
+    /* The spinner's and the hourglass's design size. styles/badges.css snaps
+       it so the icon's inset is a whole pixel on each side. */
+    --badge-icon-size: 0.5625rem;
 }
 
 .brand-badge-dot {
@@ -2135,15 +2142,6 @@
        applies to an empty box, and both would stretch the dot out of round. */
     padding: 0;
     line-height: 0;
-}
-
-/* Rebuilding has been proved unable to deliver the pending version, so this one
-   will not clear on its own the way an ordinary pending badge does. Amber for
-   the same reason the toast turns `warning`: it is the accent's "waiting"
-   sibling rather than an error, and the situation is recoverable, just not from
-   inside the app. */
-.brand-badge-dot.brand-badge-wedged {
-    background: var(--accent-yellow);
 }
 
 /* Inherits the badge's ink via currentColor. */
@@ -2159,8 +2157,8 @@
 .brand-badge-spinner svg,
 .brand-badge-queued svg {
     display: block;
-    width: 0.5625rem;
-    height: 0.5625rem;
+    width: var(--badge-icon-size);
+    height: var(--badge-icon-size);
 }
 
 /* The still glyph a queued build shows in the spinner's place. */

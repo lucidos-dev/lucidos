@@ -65,8 +65,12 @@ fn the_start_response_tells_the_agent_what_to_do_next() {
     });
     assert_eq!(polled["status"], "polled");
     let msg = polled["message"].as_str().unwrap();
-    assert!(msg.contains("keep your turn"), "{msg}");
+    assert!(msg.contains("Keep your turn"), "{msg}");
     assert!(msg.contains("lucidos background-task wait t4"), "{msg}");
+    assert!(
+        msg.contains("If your turn ends first, the engine re-opens this thread"),
+        "{msg}"
+    );
 
     let finished = start_response(BackgroundTaskStart::Finished {
         task_id: "t3".into(),

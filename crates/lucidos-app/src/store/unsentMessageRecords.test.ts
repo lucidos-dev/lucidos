@@ -1,3 +1,4 @@
+import { observeSourceGeneration } from '../utils/restoreSourceGeneration';
 import { describe, it, expect, beforeEach } from 'vitest';
 
 import {
@@ -7,6 +8,7 @@ import {
   markUnsentMessageRecordUnsent,
   persistSendingMessage,
   readUnsentMessageStore,
+  liveUnsentMessageRecords,
   unsentMessageDbName,
   unsentMessageStorageFailureMessage,
   _resetUnsentMessageRecordsForTesting,
@@ -27,6 +29,7 @@ function sending(eventId: string): Omit<UnsentMessageRecord, 'ownerId' | 'phase'
 }
 
 beforeEach(() => {
+  observeSourceGeneration(null);
   _resetUnsentMessageRecordsForTesting();
   toasts.value = [];
 });
@@ -43,7 +46,7 @@ describe('the unsent message store', () => {
   it('keeps a send from the moment it starts, owned by this page', async () => {
     persistSendingMessage(sending('e-1'));
     const records = await readUnsentMessageStore();
-    expect(records).toEqual([{ ...sending('e-1'), phase: 'sending', failedRetries: 0, ownerId: pageOwnerId }]);
+    expect(records).toEqual([{ ...sending('e-1'), phase: 'sending', failedRetries: 0, ownerId: pageOwnerId, sourceGeneration: null }]);
   });
 
   it('marks a send that got no answer as unsent, with its retry count', async () => {
@@ -87,7 +90,22 @@ describe('the unsent message store', () => {
       persistSendingMessage(sending('e-2'));
     }).not.toThrow();
     await readUnsentMessageStore();
+    expect(liveUnsentMessageRecords().map((r) => r.eventId)).toEqual(['e-1', 'e-2']);
+    markUnsentMessageRecordUnsent('e-1', 1);
+    expect(liveUnsentMessageRecords()[0]).toMatchObject({ phase: 'unsent', failedRetries: 1 });
+    forgetUnsentMessageRecord('e-1');
+    expect(liveUnsentMessageRecords().map((r) => r.eventId)).toEqual(['e-2']);
     const warnings = toasts.value.filter((t) => t.type === 'warning').map((t) => t.message);
     expect(warnings).toEqual([unsentMessageStorageFailureMessage(new Error('QuotaExceededError'))]);
   });
+});
+
+it('stamps the page generation before asynchronous persistence and preserves it on adoption', async () => {
+  observeSourceGeneration('old');
+  persistSendingMessage(sending('tagged'));
+  observeSourceGeneration('current');
+  const [record] = await readUnsentMessageStore();
+  expect(record.sourceGeneration).toBe('old');
+  adoptUnsentMessageRecord(record);
+  expect((await readUnsentMessageStore())[0].sourceGeneration).toBe('old');
 });

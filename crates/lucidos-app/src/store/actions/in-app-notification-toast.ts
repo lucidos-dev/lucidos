@@ -12,6 +12,7 @@
 // lives exactly as long as its row is unread on this page. That is what
 // `installNotificationToastLifetime` at the foot of this file enforces.
 
+import { confirmSnapshotRestore } from './restore-snapshot';
 import { effect, untracked } from '@preact/signals';
 import type { PresenceOutcome } from '@lucidos/event-stream';
 import type { Loadable, Notification } from '../types';
@@ -129,8 +130,12 @@ export function dispatchDeepLink(target: DeepLinkTarget): boolean {
   });
   switch (action.type) {
     case 'navigate':
-      if (action.notification) markReadOptimistic(action.notification);
+      if (action.notification) markReadOptimistic(action.notification, target.restoreGeneration);
       handleNavigationRequest(action.to);
+      return dispatched();
+    case 'restore-snapshot':
+      if (action.notification) markReadOptimistic(action.notification, target.restoreGeneration);
+      void confirmSnapshotRestore(action.tap);
       return dispatched();
     case 'view-notification':
       // viewNotification opens the detail in the content pane AND marks the row
@@ -138,7 +143,7 @@ export function dispatchDeepLink(target: DeepLinkTarget): boolean {
       // best-effort from the dispatcher's POV: `viewNotification` owns its own
       // failure toast on the GET, so `void` here keeps the discriminated return
       // synchronous without dropping the error path.
-      void viewNotification(action.id);
+      void viewNotification(action.id, target.restoreGeneration);
       return dispatched();
     case 'noop':
       return false;
@@ -216,9 +221,10 @@ export function presentInAppNotification({ title, body, target }: InAppNotificat
   const safeTitle = title.length > 0 ? title : 'Lucidos';
   const toastKey = notifId ? notificationToastKey(notifId) : undefined;
 
-  // A `modal` or `navigate` notification opens on a tap anywhere on the card,
+  // A notification action opens on a tap anywhere on the card,
   // beside the toast's built-in X. The tap runs the deep link (the detail in the
-  // content pane for `modal`, the destination for `navigate`) and marks the
+  // content pane for `modal`, the destination for `navigate`, or confirmation
+  // for `restore-snapshot`) and marks the
   // notification read. The X dismisses WITHOUT marking read, leaving the row on
   // the bell badge and in the panel. There is deliberately no "OK" button:
   // marking read without opening would bury an unanswered question.
@@ -226,7 +232,7 @@ export function presentInAppNotification({ title, body, target }: InAppNotificat
   // quick double-tap must not re-run a non-idempotent open or navigate.
   // Dismiss first, then act.
   let onClick: (() => void) | undefined;
-  if (resolved.type === 'view-notification' || resolved.type === 'navigate') {
+  if (resolved.type !== 'noop') {
     let acted = false;
     onClick = () => {
       if (acted) return;

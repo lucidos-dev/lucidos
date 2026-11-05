@@ -204,7 +204,7 @@ describe('PresenceCheck (active page) → in-app toast', () => {
     toasts.value[0].onClick!();
 
     expect(focusThreadOrBootstrap).toHaveBeenCalledWith('t-9', { targetEventId: 'e-7' });
-    expect(markReadOptimistic).toHaveBeenCalledWith('notif-q');
+    expect(markReadOptimistic).toHaveBeenCalledWith('notif-q', undefined);
   });
 
   it('defers a navigate notification via the X (dismissable, keeps it unread), with no OK button', () => {

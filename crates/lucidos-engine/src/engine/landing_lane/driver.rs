@@ -370,7 +370,10 @@ impl LucidosEngine {
         self.notify_landing_lane(LaneMsg::Restored(Box::new(restore)));
     }
 
-    async fn read_lane_restore(&self) -> Result<LaneRestore, sqlx::Error> {
+    async fn read_lane_restore(
+        &self,
+    ) -> Result<LaneRestore, Box<dyn std::error::Error + Send + Sync>> {
+        settle_restored_lane(self.pool(), &self.event_bus).await?;
         let records = load_lane_records(self.pool()).await?;
         if records.is_empty() {
             return Ok(LaneRestore::default());
@@ -1756,17 +1759,72 @@ pub(super) async fn forward_lane_thread_closures(
     true
 }
 
+/// Announce cancellation before admitting any recovered lane work. The floor
+/// also excludes historical worktree ownership on every later boot. Emitting
+/// through the bus (rather than deleting rows) makes a crash retry observable.
+pub(crate) async fn settle_restored_lane(
+    pool: &sqlx::PgPool,
+    bus: &crate::engine::event_bus::EventBus,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(boundary) = crate::core::snapshot::boundary::read(pool).await? else {
+        return Ok(());
+    };
+    let batches: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT (payload->'data'->>'batch_id')::uuid FROM events start \
+         WHERE event_type = 'LaneBatchStarted' AND sequence <= $1 \
+         AND NOT EXISTS (SELECT 1 FROM events ended WHERE ended.event_type IN ('LaneBatchFailed', 'LaneBatchLanded') \
+           AND ended.payload->'data'->>'batch_id' = start.payload->'data'->>'batch_id')")
+        .bind(boundary.event_sequence).fetch_all(pool).await?;
+    for batch_id in batches {
+        bus.emit(BusEvent::System(SystemEvent::LaneBatchFailed {
+            batch_id,
+            reason: "Workspace restored from snapshot; apply these changes again.".into(),
+            actor: None,
+        }))
+        .await?;
+    }
+    // Latest queue authority matters: a fresh Apply after restoration must
+    // survive, including one for a change that appeared in the archive.
+    let queued: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT thread_id, payload->>'change_id' FROM events queued \
+         WHERE event_type = 'ChangeQueued' AND sequence <= $1 \
+         AND NOT EXISTS (SELECT 1 FROM events later WHERE later.sequence > queued.sequence \
+           AND later.event_type IN ('ChangeQueued', 'ChangeUnqueued', 'ChangeApplied') \
+           AND later.payload->>'change_id' = queued.payload->>'change_id') \
+         ORDER BY sequence",
+    )
+    .bind(boundary.event_sequence)
+    .fetch_all(pool)
+    .await?;
+    for (thread_id, change_id) in queued {
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::ChangeUnqueued {
+                change_id,
+                reason: UnqueueReason::Removed,
+            },
+            meta: EventMeta::NONE,
+        })
+        .await?;
+    }
+    Ok(())
+}
+
 /// Every event the lane's state depends on, oldest first.
 pub(super) async fn load_lane_records(pool: &sqlx::PgPool) -> Result<Vec<LaneRecord>, sqlx::Error> {
+    let floor = crate::core::snapshot::boundary::read(pool)
+        .await?
+        .map_or(0, |b| b.event_sequence);
     let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
         "SELECT event_type, payload FROM events \
-         WHERE event_type IN ('ChangeQueued', 'ChangeUnqueued', 'LaneBatchStarted', \
+         WHERE sequence > $1 AND (event_type IN ('ChangeQueued', 'ChangeUnqueued', 'LaneBatchStarted', \
                               'LaneBatchLanded', 'LaneBatchFailed') \
             OR (event_type = 'ChangeApplied' \
                 AND payload->>'change_id' IN \
-                    (SELECT payload->>'change_id' FROM events WHERE event_type = 'ChangeQueued')) \
+                    (SELECT payload->>'change_id' FROM events WHERE event_type = 'ChangeQueued'))) \
          ORDER BY sequence",
     )
+    .bind(floor)
     .fetch_all(pool)
     .await?;
     Ok(rows

@@ -15,8 +15,14 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// Tables an agent may read but never write. An agent that could write the
 /// backup recipient could seal every later backup to a key of its own. One
 /// that could write a mailbox's hosts could send its password to a server of
-/// its own at the next login.
-const READ_ONLY_TABLES: &[&str] = &["_sqlx_migrations", "backup_recipient", "email_accounts"];
+/// its own at the next login. One that could clear the restore boundary could
+/// spend an owner approval the restore expired (ADR 0612).
+const READ_ONLY_TABLES: &[&str] = &[
+    "_sqlx_migrations",
+    "backup_recipient",
+    "email_accounts",
+    "snapshot_restore_boundary",
+];
 
 /// A role, database, table or column name, quoted for SQL. Postgres cannot
 /// bind an identifier. A workspace database name holds a hyphen, so quoting,
@@ -64,6 +70,7 @@ pub async fn provision(pool: &PgPool, database_url: &str) -> Result<String, BoxE
         sqlx::query(&statement).execute(pool).await?;
     }
     grant_tables(pool, &role_ident).await?;
+    guard_human_only_preferences(pool, &role).await?;
 
     url.user = Some(role);
     url.password = Some(password);
@@ -165,6 +172,50 @@ async fn grant_tables(pool: &PgPool, role: &str) -> Result<(), BoxError> {
         };
         sqlx::query(&grant).execute(&mut *tx).await?;
     }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Refuse an agent-role write to a preference the catalog keeps from agents.
+///
+/// `set_preference` and the HTTP route refuse these keys already, but the
+/// handed database credential reached them directly. One of them,
+/// `snapshot_restore_by_agents`, lets agents restore without a card.
+/// The trigger is rebuilt on every boot, so the key list follows the catalog.
+/// It names the agent role exactly: a superuser counts as a member of every
+/// group, so a membership test would refuse the engine itself.
+async fn guard_human_only_preferences(pool: &PgPool, role: &str) -> Result<(), BoxError> {
+    let literal = |text: &str| format!("'{}'", text.replace('\'', "''"));
+    let migrated: bool = sqlx::query_scalar("SELECT to_regclass('public.preferences') IS NOT NULL")
+        .fetch_one(pool)
+        .await?;
+    if !migrated {
+        return Ok(());
+    }
+    let keys = crate::core::prefs::internal_specs()
+        .map(|spec| literal(spec.key))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let role = literal(role);
+    let mut tx = pool.begin().await?;
+    sqlx::raw_sql(&format!(
+        "CREATE OR REPLACE FUNCTION public.lucidos_refuse_agent_preference_write() \
+         RETURNS trigger LANGUAGE plpgsql AS $guard$ BEGIN \
+           IF current_user = {role} \
+              AND (OLD.key = ANY (ARRAY[{keys}]) OR NEW.key = ANY (ARRAY[{keys}])) THEN \
+             RAISE EXCEPTION 'permission denied: only the owner can change this preference' \
+               USING ERRCODE = 'insufficient_privilege'; \
+           END IF; \
+           IF TG_OP = 'DELETE' THEN RETURN OLD; END IF; \
+           RETURN NEW; \
+         END $guard$; \
+         DROP TRIGGER IF EXISTS lucidos_refuse_agent_preference_write ON public.preferences; \
+         CREATE TRIGGER lucidos_refuse_agent_preference_write \
+           BEFORE INSERT OR UPDATE OR DELETE ON public.preferences \
+           FOR EACH ROW EXECUTE FUNCTION public.lucidos_refuse_agent_preference_write();"
+    ))
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(())
 }

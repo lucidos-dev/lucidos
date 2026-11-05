@@ -17,7 +17,7 @@ use crate::api::{ApiError, AppState};
 use crate::core::blobs::write_blob_from_base64;
 use crate::core::store::{ComposeReport, ComposeReportRow, COMPOSE_REPORT_COLS};
 use crate::engine::event_bus::BusEvent;
-use crate::engine::thread_events::{EventMeta, ThreadEvent};
+use crate::engine::thread_events::{EventMeta, RecoveredCompose, ThreadEvent};
 use crate::engine::thread_state::ThreadState;
 
 /// Cap on `compose_text` size. Compose updates fan out to every connected
@@ -48,6 +48,63 @@ pub(in crate::api) const DISCARD_DRAFT_VERB: ThreadReachVerb = ThreadReachVerb::
 pub(super) struct PostThreadBody {
     pub id: Uuid,
     pub mode: String,
+    #[serde(default)]
+    pub recovered_compose: Option<RecoveredCompose>,
+    /// Request-only bytes: never copied into ThreadStarted or SSE.
+    #[serde(default)]
+    pub recovered_images: Vec<RecoveredImage>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct RecoveredImage {
+    pub hash: String,
+    pub base64: String,
+}
+
+/// Validate the whole batch before writing anything. The HTTP router also caps
+/// the body at 100 MiB; this leaves headroom for text and JSON framing.
+fn restore_compose_images(
+    workspace: &std::path::Path,
+    hashes: &[String],
+    images: Vec<RecoveredImage>,
+) -> Result<(), ApiError> {
+    use crate::core::blobs::{compute_hash, sniff_image_mime, write_blob};
+    use base64::Engine as _;
+    if images.len() > MAX_COMPOSE_IMAGES {
+        return Err(too_many_compose_images());
+    }
+    if images.iter().map(|image| image.base64.len()).sum::<usize>() > 96 * 1024 * 1024 {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "recovered images exceed size cap",
+        ));
+    }
+    let mut decoded = Vec::with_capacity(images.len());
+    let mut seen = std::collections::HashSet::new();
+    for image in images {
+        if !hashes.contains(&image.hash) || !seen.insert(image.hash.clone()) {
+            return Err(ApiError::bad_request(
+                "recovered image must name one unique compose hash",
+            ));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&image.base64)
+            .map_err(|_| ApiError::bad_request("invalid recovered image base64"))?;
+        if compute_hash(&bytes) != image.hash {
+            return Err(ApiError::bad_request("recovered image hash mismatch"));
+        }
+        if sniff_image_mime(&bytes).is_none() {
+            return Err(ApiError::new(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported recovered image",
+            ));
+        }
+        decoded.push(bytes);
+    }
+    for bytes in decoded {
+        write_blob(workspace, &bytes).map_err(|e| ApiError::internal(e.to_string()))?;
+    }
+    Ok(())
 }
 
 /// Legacy compose-image payload (`[{base64, mime_type}, ...]`). Mime is
@@ -202,13 +259,58 @@ fn compose_error(state: Option<ThreadState>) -> Option<ApiError> {
 /// Idempotent on `id`: re-POSTing the same `{id, mode}` returns 200; a
 /// different `mode` returns 409 (the user's first device wins, drift would
 /// reopen the bug class this redesign closed). Both successes answer with the
-/// draft's *compose report*.
+/// draft's *compose report*. Recovery supplies initial content in the same
+/// event-backed insert. Its generation must match; retries acknowledge an
+/// existing destination in any state without changing its content or mode.
 pub(super) async fn post_thread(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<PostThreadBody>,
 ) -> Result<(StatusCode, Json<ComposeReport>), ApiError> {
     let mode = canonical_mode(&body.mode)?;
+    if body.recovered_compose.is_none() && !body.recovered_images.is_empty() {
+        return Err(ApiError::bad_request(
+            "recovered images require recovered compose",
+        ));
+    }
+    if let Some(recovered) = &body.recovered_compose {
+        refuse_without_authority(
+            &state.engine.event_bus,
+            &headers,
+            Some(body.id),
+            COMPOSE_VERB,
+        )
+        .await?;
+        let boundary = crate::core::snapshot::boundary::read(state.engine.pool())
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        if boundary.map(|b| b.restore_id) != Some(recovered.generation) {
+            return Err(ApiError::new(
+                StatusCode::PRECONDITION_FAILED,
+                "snapshot_restore_generation_mismatch",
+            ));
+        }
+        if recovered.text.len() > MAX_COMPOSE_TEXT_BYTES {
+            return Err(ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "compose_text exceeds 64 KiB cap",
+            ));
+        }
+        if let Some(rejection) = reject_compose_images(&recovered.image_hashes) {
+            return Err(rejection);
+        }
+        if recovered
+            .selection
+            .as_ref()
+            .is_some_and(|s| s.to_string().len() > MAX_COMPOSE_SELECTION_BYTES)
+        {
+            return Err(ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "compose_selection exceeds size cap",
+            ));
+        }
+    }
+    let recovering = body.recovered_compose.is_some();
 
     let row: Option<PostThreadRow> = sqlx::query_as(&format!(
         "SELECT state, archive_state, {COMPOSE_REPORT_COLS} FROM thread_summaries WHERE thread_id = $1"
@@ -230,6 +332,17 @@ pub(super) async fn post_thread(
     )) = row
     {
         let existing = ComposeReport::from((version, epoch, text, images, stored_mode, selection));
+        // A recovery retry observes the destination without restoring its old
+        // payload over subsequent user edits, sends, mode changes or discards.
+        if recovering {
+            state
+                .engine
+                .event_bus
+                .emit(existing.clone().broadcast(body.id, None))
+                .await
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+            return Ok((StatusCode::OK, Json(existing)));
+        }
         let existing_state =
             ThreadState::from_db_str(&state_str).map_err(|e| ApiError::internal(e.to_string()))?;
         // Each arm fully handles its state — no spatial-ordering dependency
@@ -261,10 +374,28 @@ pub(super) async fn post_thread(
         };
     }
 
+    if let Some(recovered) = &body.recovered_compose {
+        let workspace = state.engine.workspace_path().to_path_buf();
+        let hashes = recovered.image_hashes.clone();
+        tokio::task::spawn_blocking(move || {
+            restore_compose_images(&workspace, &hashes, body.recovered_images)
+        })
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))??;
+        for hash in &recovered.image_hashes {
+            if crate::core::blobs::resolve_blob(state.engine.workspace_path(), hash).is_none() {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "recovered compose image is unavailable",
+                ));
+            }
+        }
+    }
     let actor = user_actor(&headers, None);
     let event = BusEvent::Thread {
         thread_id: body.id,
         event: ThreadEvent::ThreadStarted {
+            recovered_compose: body.recovered_compose,
             mode: mode.to_string(),
             actor: actor.clone(),
         },
@@ -273,12 +404,13 @@ pub(super) async fn post_thread(
             ..Default::default()
         },
     };
-    state
+    let created = state
         .engine
         .event_bus
         .emit(event)
         .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .is_some();
     // `ThreadStarted` inserts with `ON CONFLICT DO NOTHING`, so a racing POST
     // from another device may own the row. Read it back: the report is then
     // whatever the row holds, in one consistent statement.
@@ -290,13 +422,28 @@ pub(super) async fn post_thread(
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
     let report = ComposeReport::from(row);
-    if report.mode.as_deref() != Some(mode) {
+    if !recovering && report.mode.as_deref() != Some(mode) {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "thread already exists with a different mode",
         ));
     }
-    Ok((StatusCode::CREATED, Json(report)))
+    if recovering {
+        state
+            .engine
+            .event_bus
+            .emit(report.clone().broadcast(body.id, None))
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+    }
+    Ok((
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(report),
+    ))
 }
 
 /// `post_thread`'s lookup: the lifecycle columns, then [`COMPOSE_REPORT_COLS`].
@@ -451,7 +598,7 @@ pub(super) async fn put_compose(
     // dropdown change sends the full object.
     //
     // `compose_updated_at` dates the draft for the `threads` tool's `drafts`
-    // action. This UPDATE is the only writer of non-empty draft text.
+    // action. Recovered drafts also initialize these fields in their creation event.
     //
     // `compose_epoch = $6` is the write fence. It costs nothing on the
     // keystroke path because the epoch counts SUBMISSIONS, not writes: every
@@ -670,6 +817,52 @@ mod tests {
         ];
         bytes.push(seed);
         base64::engine::general_purpose::STANDARD.encode(&bytes)
+    }
+
+    #[test]
+    fn recovered_images_verify_entire_batch_before_landing_bytes() {
+        use base64::Engine as _;
+        let workspace = tempfile::tempdir().unwrap();
+        let encoded = distinct_png_base64(1);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&encoded)
+            .unwrap();
+        let hash = crate::core::blobs::compute_hash(&bytes);
+        let image = || RecoveredImage {
+            hash: hash.clone(),
+            base64: encoded.clone(),
+        };
+        let invalid = RecoveredImage {
+            hash: "a".repeat(64),
+            base64: encoded.clone(),
+        };
+        assert!(restore_compose_images(
+            workspace.path(),
+            &[hash.clone(), invalid.hash.clone()],
+            vec![image(), invalid]
+        )
+        .is_err());
+        assert!(crate::core::blobs::resolve_blob(workspace.path(), &hash).is_none());
+        assert!(restore_compose_images(workspace.path(), &[], vec![image()]).is_err());
+        assert!(restore_compose_images(
+            workspace.path(),
+            std::slice::from_ref(&hash),
+            vec![image(), image()]
+        )
+        .is_err());
+        restore_compose_images(workspace.path(), std::slice::from_ref(&hash), vec![image()])
+            .unwrap();
+        assert_eq!(
+            std::fs::read(
+                crate::core::blobs::resolve_blob(workspace.path(), &hash)
+                    .unwrap()
+                    .path
+            )
+            .unwrap(),
+            bytes
+        );
+        restore_compose_images(workspace.path(), std::slice::from_ref(&hash), vec![image()])
+            .unwrap();
     }
 
     fn legacy_batch(count: u8) -> Vec<LegacyComposeImage> {

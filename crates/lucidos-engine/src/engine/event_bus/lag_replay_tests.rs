@@ -718,3 +718,31 @@ fn a_partial_replay_covers_only_what_it_offered() {
     assert!(!replay.is_covered(Some(16)));
     assert_eq!(replay.floor, Some(15));
 }
+
+/// A fresh bus has no append tickets for archived history. Restore's durable
+/// floor still bounds both read shapes, including after another process crash.
+#[tokio::test]
+async fn restore_floor_bounds_workspace_and_thread_lag_replay() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = seed_chat_thread(&bus, "archived").await;
+    let floor = seq_of_last_row(&pool).await;
+    sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) VALUES ($1, $2, now(), $3)")
+        .bind(Uuid::new_v4())
+        .bind(crate::core::snapshot::handle::Handle::generate().as_str())
+        .bind(floor).execute(&pool).await.unwrap();
+    seed_thread_event(&bus, thread, message_received("new work")).await;
+    let new = seq_of_last_row(&pool).await;
+    for scope in [ReplayScope::Workspace, ReplayScope::Thread(thread)] {
+        let mut replay = at_floor(0);
+        replay.scope = scope;
+        assert_eq!(seqs(&replay.missed(&pool).await), vec![new]);
+        assert!(
+            !replay.first_sight(floor),
+            "a late archived frame stays excluded"
+        );
+        assert!(replay.missed(&pool).await.is_empty());
+    }
+    pool.close().await;
+    teardown_test_db(&db).await;
+}

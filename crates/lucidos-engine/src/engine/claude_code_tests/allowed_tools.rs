@@ -198,14 +198,14 @@ fn derive_allow_pattern_reads_through_a_nested_shell_and_never_stores_one() {
 fn cc_allowed_tools_drops_a_line_that_names_a_shell_or_an_exec_wrapper() {
     let dir = tempfile::tempdir().unwrap();
     let file = GrantFile::CodingAgentTools;
-    let lines = "Bash\nBash(git:*)\nBash(bash:*)\nBash(zsh:*)\nBash(timeout:*)\nRead\n\
+    let lines = "Bash\nBash(git:*)\nBash(rm:*)\nBash(find:*)\nBash(python3:*)\nBash(bash:*)\nBash(zsh:*)\nBash(timeout:*)\nRead\n\
                  Bash(/bin/bash:*)\nBash(\\bash:*)\nBash(sudo rm:*)\nBash(eval:*)\nBash(env)\n";
     std::fs::write(dir.path().join(file.file_name()), lines).unwrap();
 
     let result = cc_allowed_tools(dir.path());
 
     let mut want = ENGINE_ALLOWED_TOOLS.to_vec();
-    want.extend(["Bash", "Bash(git:*)", "Read"]);
+    want.push("Read");
     assert_eq!(result, want.join(","));
 }
 
@@ -219,8 +219,7 @@ fn cc_allowed_tools_drops_a_path_line() {
                  Bash(check.sh:*)\nBash(git:*)\n";
     std::fs::write(dir.path().join(file.file_name()), lines).unwrap();
 
-    let mut want = ENGINE_ALLOWED_TOOLS.to_vec();
-    want.extend(["Bash(check.sh:*)", "Bash(git:*)"]);
+    let want = ENGINE_ALLOWED_TOOLS.to_vec();
     assert_eq!(cc_allowed_tools(dir.path()), want.join(","));
 }
 
@@ -645,7 +644,7 @@ fn cc_allowed_tools_parses_user_file_strips_comments_and_blanks() {
     assert_eq!(
         cc_allowed_tools(dir.path()),
         format!(
-            "{},Bash,Read,Edit,Skill(superpowers:*)",
+            "{},Read,Edit,Skill(superpowers:*)",
             ENGINE_ALLOWED_TOOLS.join(",")
         ),
     );

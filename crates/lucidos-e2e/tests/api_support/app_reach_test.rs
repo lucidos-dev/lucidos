@@ -69,6 +69,34 @@ async fn a_stamped_call_is_refused_per_method() {
         .await
         .expect("request to /api/v1/models failed");
     assert_eq!(read.status(), 200, "an app may read the model registry");
+    let registry: serde_json::Value = read.json().await.expect("model registry JSON");
+    let models = registry["models"].as_array().expect("models array");
+    assert!(
+        !models.is_empty(),
+        "seeded registry must exercise route metadata"
+    );
+    for model in models {
+        for route in model["routes"].as_array().expect("routes array") {
+            let configured = route.get("configured").expect("configured is explicit");
+            assert!(configured.is_null() || configured.is_boolean());
+            let proxy = route.get("proxy").expect("proxy capability is explicit");
+            if !proxy.is_null() {
+                let fields = proxy.as_object().expect("proxy capability object");
+                assert_eq!(fields.len(), 3, "only public proxy metadata is served");
+                assert!(proxy["name"].is_string());
+                assert!(proxy["protocol"].is_string());
+                let defaults = proxy["request_defaults"]
+                    .as_object()
+                    .expect("wire defaults");
+                assert!(defaults.contains_key(""), "provider default is explicit");
+                for template in defaults.values() {
+                    assert!(template["body"].is_object());
+                    assert!(template["headers"].is_object());
+                    assert_eq!(template.as_object().unwrap().len(), 2);
+                }
+            }
+        }
+    }
 
     let write = client
         .delete(format!("{}/api/v1/models?id=whatever", base_url()))

@@ -146,7 +146,9 @@ Five things here surprise people:
 ### Public only behind a front door you own
 
 Authentication raises the floor. It does not make a bare public origin a good
-idea: pairing is then the only gate, and wrong guesses are only rate limited.
+idea: pairing is then the only gate. A typed *pairing code* is refused from a
+public address, and the long *pairing secret* in the QR is the only way in
+(ADR 0615).
 
 - Use `tailscale serve` (tailnet-private), **never `tailscale funnel`** on the
   gateway's own port.
@@ -154,6 +156,9 @@ idea: pairing is then the only gate, and wrong guesses are only rate limited.
 - A public address needs an outer gate you own: an identity proxy, proxy auth
   or mTLS, in front of a reverse proxy. Pairing stays the inner gate. Set that
   address as the external address (§ Any other VPN).
+- Point a tunnel or reverse proxy on this machine at the *public listener*
+  (5282 packaged, 5281 dev), not the main port. Every request there counts as
+  public, whatever headers it carries.
 - A tailnet or a private VPN is the simpler outer boundary.
 
 ### The one exception: a webhook's own socket
@@ -667,13 +672,16 @@ on arrival.
 **A live code shows as three cards**, one per way to use it: scan the QR (the
 big card), type the digits, or open the address. The cards are alternatives, so
 each after the first says "Or". The digits are always there, large enough to
-read across a desk, so a failed scan is never a dead end. The two fallbacks
+read across a desk. On your own network or tailnet, typing them works when a
+scan fails. Through a tunnel, open the address instead. The two fallbacks
 carry a Copy button, hidden where the browser has no clipboard (a plain-HTTP
 LAN address is not a secure context). The address card is text, never a link:
 following it here would spend a single-use code on a device already paired.
 
-**The QR encodes `<reachable-origin>/~/?pair=<code>`.** Scanning it opens the
-picker, whose pairing screen reads the parameter and fills in the code. It then
+**The QR encodes `<reachable-origin>/~/?pair=<secret>`.** It carries the long
+*pairing secret*, never the digits, so it works through a tunnel or proxy too.
+Scanning it opens the picker, whose pairing screen reads the parameter and
+pairs at once. It then
 strips the code from the address bar, so a reload, bookmark or shared link
 cannot keep it. On a phone the scan lands somewhere else: see § A phone
 installs before it pairs.
@@ -793,13 +801,13 @@ carry it, right under **Pair a device**:
 
 | Section | On which gateway | What it does |
 |---|---|---|
-| **Pair a gateway** | B, the one being opened | Mints a *gateway pairing code* and shows the `https` address to use with it. Lists the gateways that may open this one, with **Unpair**. |
-| **Remote gateways** | A, the one opening | Takes B's address, the code and a short name, then pairs. Lists the remote gateways, with **Remove**. |
+| **Pair a gateway** | B, the one being opened | Mints a *gateway pairing secret* and shows the `https` address to use with it. Lists the gateways that may open this one, with **Unpair**. |
+| **Remote gateways** | A, the one opening | Takes B's address, the pasted secret and a short name, then pairs. Lists the remote gateways, with **Remove**. |
 
-`lucidos pair --gateway` on B mints the same code from a terminal. The
+`lucidos pair --gateway` on B mints the same secret from a terminal. The
 Workspaces picker also has **Add a remote gateway**, with the same form.
 
-Five rules hold, whatever the network:
+These rules hold, whatever the network:
 
 - **Add only a gateway you run.** B's pages open on A's own address, so they
   can do anything A's devices can do on A. A paired gateway is trusted like
@@ -809,13 +817,42 @@ Five rules hold, whatever the network:
   Route B below, or an *external address*.
 - **B must be new enough.** A reads `gateway_protocol` from B's health and
   refuses a gateway too old to pair. Update B, then try again.
-- **A prefers B's external address**, but only when A reaches the same B
-  there. Otherwise it keeps the address you typed.
-- **Codes never cross over.** A device *pairing code* never pairs a gateway,
-  and a *gateway pairing code* never pairs a device.
+- **A must be new enough too.** An A older than the *gateway pairing secret*
+  wants 8 digits, and refuses the secret before it contacts B. Update A first.
+- **A prefers B's external address** when no extra headers are configured,
+  and only when A reaches the same B there. With extra headers it always keeps
+  the address you typed, and sends headers only to that origin.
+- **Secrets never cross over.** A device *pairing secret* or code never pairs
+  a gateway, and a *gateway pairing secret* never pairs a device.
 
 **Unpair** on B refuses A's very next request. **Remove** on A also asks B to
 forget the pairing. When B does not answer, A says so, and you unpair on B.
+
+**A remote behind an access proxy.** Prefer a tailnet address when both
+machines have one. Otherwise enter the remote's HTTPS address and add its
+required header names and values under **Extra headers** before pairing.
+For example, a Cloudflare Access service token uses `CF-Access-Client-Id`
+and `CF-Access-Client-Secret`; obtain both from the proxy administrator.
+Lucidos's transport is provider-independent. A sign-in page means the proxy
+has not admitted the request: supply its headers or use the tailnet address.
+
+In **Settings → Access → Remote gateways**, **Edit headers** replaces the
+whole header set without pairing again. Re-enter every value you want to keep;
+emptying the set clears it. Values are write-only: the list shows names and
+“set”. The packaged macOS app seals values with Keychain; other installs use
+an owner-only key file. Keep the original sealing key with a backup. Anyone
+who can read both key and ciphertext can decrypt file-backed values.
+
+Gateway credentials rotate automatically every 30 days. **Rotate credential**
+starts one immediately or retries a pending attempt. Errors and unsupported
+peers appear on the remote row; update an older remote to enable rotation.
+The pairing stays usable while retries run hourly. A durable sealed candidate
+allows recovery after restarts and lost responses.
+
+B accepts the old key for
+up to ten minutes, ending the overlap when the candidate is first used.
+**Pair a gateway** also shows when each paired gateway last used its grant.
+Unpair remains immediate revocation; device credentials are unchanged.
 
 **A remote workspace has no voice.** A relays pages and requests, but no
 call, so the call toggle is absent there. Settings → Models → Voice says why.
@@ -1109,6 +1146,36 @@ and `tls`, so a stranger on the network learns no release or address. `loopback`
 their single address is required, and failing to bind it is a hard error
 (the port is held, not an interface missing).
 
+## Connecting accounts from another device
+
+Connecting an OAuth account (Google, Microsoft, Dropbox and so on) sends the
+browser to a redirect URI after consent. Where that browser runs decides which
+URI works. The rules live in `oauth-providers.md` § Web redirect URI.
+
+- **A browser on a computer running Lucidos** needs no setup, even for a remote
+  workspace opened through that computer's gateway. The local gateway catches
+  the loopback redirect and passes it to the remote gateway.
+- **A phone, an iPad, or a laptop opening a remote address** needs two things.
+  The gateway address must be https (one of the routes above). The credential
+  needs a registered **web redirect URI** on a Web client, with its secret.
+  Without them, Connect refuses at once and names the fix.
+- **An SSH port-forward to a remote gateway is unsupported.** The browser looks
+  local to the remote gateway, which then offers a loopback redirect that lands
+  on the wrong computer. Open the remote workspace through this computer's own
+  Lucidos instead.
+
+### Claude Code's MCP login is a different flow
+
+A Claude Code session that logs in to an MCP server runs the `claude` CLI's own
+OAuth flow. That flow binds a random loopback port on the computer running
+Claude Code, and Lucidos never sees it. So a browser on another computer cannot
+finish it. Two ways out:
+
+1. Run the MCP login in a browser on the computer that runs Claude Code.
+2. Or SSH-forward that random port from the browser's computer, then open the
+   login link there: `ssh -L <port>:127.0.0.1:<port> <host>`. The port is in
+   the redirect URL the login link carries.
+
 ## Operational notes
 
 - **The host must be awake.** A sleeping Mac serves nothing. Lucidos holds it
@@ -1153,3 +1220,4 @@ their single address is required, and failing to bind it is a hard error
 | Apps load blank behind a reverse proxy | A path prefix was added. Serve Lucidos at the origin root, on its own port. |
 | `tailscale serve status` says "No serve config" but the URL works | Route C is in play. Not a problem. Probe the port. |
 | Anything needing a live socket fails, while pages load | A hop is dropping the WebSocket upgrade. Probe `/<slug>/api/v1/ws-echo`, which upgrades and echoes what you send it. A `101` means every hop carried it. |
+| Account Connect refuses on a phone, asking for https or a web redirect URI | The browser is not on a computer running Lucidos. See § Connecting accounts from another device. |

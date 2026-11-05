@@ -179,6 +179,19 @@ pub async fn lookup_pending_question_tool_use_id(
     unwrap_tool_use_id_row(result, thread_id)
 }
 
+/// [`lookup_pending_question_tool_use_id`] for a caller that must not read a
+/// failed lookup as "no open card".
+pub(crate) async fn try_lookup_pending_question_tool_use_id(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Result<Option<String>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (String,)>(PENDING_QUESTION_SQL)
+        .bind(thread_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|(t,)| t).filter(|t| !t.is_empty()))
+}
+
 /// Same as `lookup_pending_question_tool_use_id`, but also excludes questions
 /// the agent has already moved past (terminal events, progression events, or
 /// a replacement question — see `ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES`)

@@ -64,6 +64,8 @@ export interface NavigateUi {
  *  historical `{kind:'none'}` payloads are coerced to `modal`. */
 export type Tap =
   | { kind: 'modal' }
+  /** Requests normal restore admission and confirmation; never auto-restores. */
+  | { kind: 'restore-snapshot'; workspace_id: string; handle: string }
   | { kind: 'navigate'; to: NavigateUi };
 
 export interface Notification {

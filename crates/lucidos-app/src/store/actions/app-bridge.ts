@@ -24,6 +24,8 @@ import {
   type AppStorageSpace,
 } from '@lucidos/sdk';
 import { API } from '../../api/client';
+import { requestGenerationGuard, type RequestGenerationGuard } from '../../api/client/_core';
+import { restoreAdmissionReady, waitForRestoreAdmission } from '../../utils/restoreAdmission';
 import { postClientLog } from '../../utils/clientLog';
 import { deviceIdHeader, readDeviceId } from '../../utils/deviceIdHeader';
 import { registrationToAwait } from '../../utils/deviceRegistration';
@@ -175,25 +177,36 @@ async function sendBridgedFetch(
   path: string,
   appId: string | null,
   timeoutMs: number,
+  checkGeneration: RequestGenerationGuard,
 ): Promise<unknown> {
+  checkGeneration();
+  if (!restoreAdmissionReady()) await waitForRestoreAdmission();
   const method = wire.method || 'GET';
   const registration = registrationToAwait(`${API}${path}`, method);
   if (registration) await registration;
+  if (!restoreAdmissionReady()) await waitForRestoreAdmission();
+  checkGeneration();
   const res = await fetch(`${API}${path}`, {
     method,
     headers: {
       ...sanitizeHeaders(wire.headers),
       ...deviceIdHeader(),
+      ...checkGeneration.headers,
       ...(appId ? { [APP_ID_HEADER]: appId } : {}),
     },
     body: fromWireBody(wire.body),
     signal: AbortSignal.timeout(timeoutMs),
   });
+  if (!restoreAdmissionReady()) await waitForRestoreAdmission();
+  checkGeneration();
+  const body = await res.arrayBuffer();
+  if (!restoreAdmissionReady()) await waitForRestoreAdmission();
+  checkGeneration();
   return {
     status: res.status,
     statusText: res.statusText,
     headers: headersToRecord(res.headers),
-    body: await res.arrayBuffer(),
+    body,
   };
 }
 
@@ -211,10 +224,11 @@ function bridgedFetch(
   frame: HTMLIFrameElement,
 ): Promise<unknown> {
   const path = admittedPath(wire, appId);
+  const checkGeneration = requestGenerationGuard(`${API}${path}`);
   const timeoutMs = wire.timeoutMs || DEFAULT_FETCH_TIMEOUT_MS;
-  if (path.startsWith(USER_INTENT_PREFIX)) return sendBridgedFetch(wire, path, appId, timeoutMs);
+  if (path.startsWith(USER_INTENT_PREFIX)) return sendBridgedFetch(wire, path, appId, timeoutMs, checkGeneration);
   return fetchLanes.enqueue(frame, Date.now() + timeoutMs, (remainingMs) =>
-    sendBridgedFetch(wire, path, appId, remainingMs),
+    sendBridgedFetch(wire, path, appId, remainingMs, checkGeneration),
   );
 }
 

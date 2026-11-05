@@ -12,9 +12,10 @@ import { LoadableError } from '../shared/LoadableError';
 import { LoadingFade } from '../shared/LoadingFade';
 import { OverflowMenu } from '../shared/OverflowMenu';
 import { WidgetPickerItems } from '../widgets/WidgetPickerItems';
+import { useWidgetCell } from '../widgets/useWidgetCell';
 import { SkeletonProvider } from '../shared/Skeleton';
 import { useEscapeStep } from '../../hooks/useEscapeStep';
-import { DASHBOARD_CELL_REM, DASHBOARD_GAP_REM, DASHBOARD_MIN_COLUMNS, DASHBOARD_STEPS_PER_CELL, dashboardColumns, dashboardContentWidth } from '../../utils/dashboardGeometry';
+import { DASHBOARD_MIN_COLUMNS, DASHBOARD_STEPS_PER_CELL, dashboardColumns, dashboardContentWidth } from '../../utils/dashboardGeometry';
 import { inOrder, withTile } from './dashboardArrangement';
 import { DashboardTile, TileSkeleton } from './DashboardTile';
 import { useDashboardDrag } from './useDashboardDrag';
@@ -41,7 +42,7 @@ function AddWidget({ dashboard }: { dashboard: DashboardName }) {
       ariaLabel="Add a widget or an app to the dashboard"
       face={{ class: 'action-btn action-btn-secondary dashboard-add', children: '+ Add' }}
       onOpen={() => void loadReusableWidgets()}
-      items={({ run }) => <WidgetPickerItems run={run} target={{ dashboard }} />}
+      items={({ run }) => <WidgetPickerItems run={run} dashboard={dashboard} />}
     />
   );
 }
@@ -105,6 +106,7 @@ export function Dashboard({ dashboard, hidden = false }: {
     observer.observe(root);
     return () => observer.disconnect();
   }, [root]);
+  useWidgetCell(root);
 
   if (view.status === 'failed') return <LoadableError noun={`the ${dashboard} dashboard`} error={view.error} />;
 
@@ -114,11 +116,10 @@ export function Dashboard({ dashboard, hidden = false }: {
   const skeletonSizes = view.status === 'loaded'
     ? drag.shown.flatMap((key) => byKey.get(key)?.size ?? [])
     : SKELETON_SIZES;
-  // On the dashboard, since its head lines up with the grid too.
+  // On the dashboard, since its head lines up with the grid too. The cell
+  // edge and gap come from `useWidgetCell`, which a thread pane shares.
   const geometry = {
     '--dashboard-columns': String(columns),
-    '--dashboard-cell': `${DASHBOARD_CELL_REM}rem`,
-    '--dashboard-gap': `${DASHBOARD_GAP_REM}rem`,
     '--dashboard-steps-per-cell': String(DASHBOARD_STEPS_PER_CELL),
     '--dashboard-steps': String(columns * DASHBOARD_STEPS_PER_CELL),
   };

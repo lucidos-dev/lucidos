@@ -48,6 +48,16 @@ const DISPATCHER_FILES = DISPATCHERS.map((d) => d.file).join(' or ');
  *  make this test pass WITHOUT an arm, and it should be harder to justify than
  *  writing the arm. */
 const NO_UI_STATE: Record<string, string> = {
+  WorkspaceRestored:
+    'a restricted-boot audit record emitted before serving SSE; StreamHello owns generation '
+    + 'admission and cache reconstruction, and NotificationCreated populates the inbox',
+  SnapshotProgress:
+    'capture/check jobs are currently exposed through CLI and agent status polling; '
+    + 'the shell holds no snapshot progress state',
+  SnapshotRestoreRequested:
+    'the external restore journal and gateway own admission; the shell reconnects after restore',
+  SnapshotChecked:
+    'verification is read from the durable job; no shell view holds a check result',
   TreeBackfillStarted:
     'the record of a backfill\'s estimate and cap. The TreeBackfillProgressed frame '
     + 'the seed announces carries what the Memory page shows',
@@ -65,6 +75,9 @@ const NO_UI_STATE: Record<string, string> = {
   TriggerCompleted:
     'the narrative summary of a threadless run. The row that shows an outcome '
     + 'moves on `TriggerExecuted`, which carries the ok/failed status',
+  TriggerSlotsSkipped:
+    'the dedup record for a skipped-slot report. The user sees the paired '
+    + 'inbox notice, which moves on `NotificationCreated`',
   ChangeDiscarded:
     'a name shared with a ThreadEvent variant; nothing emits the SystemEvent '
     + 'form. The changes list moves on `ChangesUpdated`',

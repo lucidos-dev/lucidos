@@ -24,9 +24,15 @@ scan retired-tools "execute_intent" $all
 
 ## Checks
 
+- **Cleanup authority.** Workspace review is read-only. Refuse recipes that use local tokens for manual deletion or infer ownership from workspace names.
+
+- **Restore authority inferred from a caller-provided workspace.** Review snapshot recipes against `system-knowhow/backups/workspace-snapshots.md` and `system-knowhow/lucidos-cli.md`.
+  Flag self-restore instructions or retries after unknown delivery as **broken**.
+
 For each finding, capture: **location**, **what's wrong**, **which reference owns the rule** (link, don't quote), **suggested fix**.
 
-- **A credential written into workspace code.** One rule over four surfaces, so it lives here, not in the `apps`, `knowhow` and `scripts` sections. Where the workspace calls an external API the engine holds a credential for, the credential belongs in the credential store and the backend in `data/config/apis.json`. Flag:
+- **A credential written into workspace code.** One rule over four surfaces, so it lives here, not in the `apps`, `knowhow` and `scripts` sections. Where the workspace calls an external API the engine holds a credential for, use its builtin proxy or configure a credential-backed entry in `data/config/apis.json`.
+  Builtin sign-ins stay inside the engine; see `system-knowhow/js-sdk.md` § `lucidos.proxy`. Flag:
 
   - An inline auth header. `curl -H "Authorization: Bearer $CRED_<NAME>"`, a pasted literal token, an `Authorization` / `X-API-Key` / `Bearer` header built in JS, or `requests.get(url, headers={"Authorization": ...})` and its equivalents.
   - Prose telling a future session to "set `$CRED_X`", or to read the credential out of the environment.
@@ -36,6 +42,8 @@ For each finding, capture: **location**, **what's wrong**, **which reference own
   The fix differs only by caller: `lucidos.proxy(name).fetch(...)` in an app, `lucidos proxy <name>` in a script, `proxy_request` for the LLM. Severity: **drift**, since the call still works. Give a pasted literal token its own line in the report: the file is git-tracked, so the credential needs rotating, not just rerouting. Owns the rule: `system-knowhow/js-sdk.md` § `lucidos.proxy` and `system-knowhow/lucidos-cli.md` § `lucidos proxy`.
 
 - Broken references: missing `knowhow:` ID, missing script path, manifest pointing at a deleted asset.
+- Model request recipes use `lucidos.modelRequest` and `lucidos.proxy` without
+  reading credentials. See `system-knowhow/js-sdk.md` for the selection contract.
 - Duplicated content: same knowhow text in two files, same script copied between apps.
 - Patterns the source-of-truth files explicitly mark deprecated. Grep for the old form and point at the doc that flags it.
 - **Removed CLI flags and tool args still passed by workspace code.** These were

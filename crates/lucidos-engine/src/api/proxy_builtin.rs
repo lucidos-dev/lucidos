@@ -7,10 +7,10 @@
 //! engine synthesizes the upstream target here: the provider's API base URL
 //! plus a server-side auth layer sourced from the engine's OWN provider auth, resolved
 //! exactly as the LLM providers resolve it (a stored credential first, then the
-//! provider's env fallback), so a workspace never has to duplicate a provider
+//! provider's env fallback, or the gateway's issuer-bound sign-in), so a workspace never has to duplicate a provider
 //! credential into `apis.json`.
 //!
-//! **A builtin name is not always a model-registry row.** Six are
+//! **A builtin name is not always a model-registry row.** Seven are
 //! `ProviderKind`s and `typesafe` is not. Jev answers typed questions rather
 //! than holding a conversation, so it never enters the model picker
 //! (ADR 0220). Nothing here needs a `ProviderKind`: a resolver reads a
@@ -23,8 +23,9 @@
 //!
 //! **What is injected.** Only the credential/token the iframe must never see —
 //! `Authorization: Bearer …` (openai / openrouter / xai / local / vertex /
-//! anthropic-OAuth) or `x-api-key: …` (anthropic API key). Content-Type,
-//! `anthropic-version`, and attribution headers stay app-owned.
+//! anthropic-OAuth / claude-gateway) or `x-api-key: …` (anthropic API key).
+//! Content-Type and `anthropic-version` stay app-owned. Gateway requests identify
+//! Lucidos and resolve the requested model against the account's managed policy.
 //!
 //! **Vertex** is the one dynamic case: the base URL is the engine-owned prefix
 //! `https://<host>/v1/projects/<project>/locations/<region>` (project + region
@@ -32,6 +33,8 @@
 //! `/publishers/<publisher>/models/<model>:<method>` suffix; the access token is
 //! minted/refreshed server-side per request via the shared token cache. Any
 //! other suffix is a 400, refused before a token exists.
+
+mod gateway;
 
 use crate::api::proxy_auth_layer::{AuthLayer, AuthMutation, LayerInput, RetryHint, ScopeBinding};
 use crate::api::proxy_static_layers::StaticHeaderLayer;
@@ -58,6 +61,7 @@ type BuiltinTarget = (String, Vec<Arc<dyn AuthLayer>>);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Resolver {
     Anthropic,
+    ClaudeGateway,
     Local,
     OpenAi,
     OpenRouter,
@@ -74,20 +78,25 @@ pub(crate) struct BuiltinProxy {
     /// Other spellings of the same service, compared after
     /// [`normalized_service_name`]. `request_credential` reads them.
     pub aliases: &'static [&'static str],
-    /// The base an unconfigured row shows. `None` for `vertex`, whose base
-    /// comes from the engine's project and region.
+    /// The base an unconfigured row shows. Dynamic bases use `None`.
     pub default_base_url: Option<&'static str>,
     resolver: Resolver,
 }
 
 /// Every builtin provider proxy, in the order the agent's context lists them.
 /// The order is fixed so the rendered block is byte-stable across turns.
-pub(crate) const BUILTIN_PROXIES: [BuiltinProxy; 7] = [
+pub(crate) const BUILTIN_PROXIES: [BuiltinProxy; 8] = [
     BuiltinProxy {
         name: "anthropic",
         aliases: &["claude"],
         default_base_url: Some(ANTHROPIC_API_BASE_URL),
         resolver: Resolver::Anthropic,
+    },
+    BuiltinProxy {
+        name: "claude-gateway",
+        aliases: &[],
+        default_base_url: None,
+        resolver: Resolver::ClaudeGateway,
     },
     BuiltinProxy {
         name: "local",
@@ -132,18 +141,11 @@ pub(crate) const BUILTIN_PROXIES: [BuiltinProxy; 7] = [
 /// lists, so a new provider cannot be forgotten.
 ///
 /// `opencode-free` is out by ADR 0104: nothing may build on an anonymous
-/// endpoint that can vanish without notice. `claude-gateway` is out because
-/// its sign-in is the user's own, granted for chat, and no app may spend it.
-pub(crate) const PROVIDERS_WITHOUT_PROXY: [(&str, &str); 2] = [
-    (
-        "opencode-free",
-        "the keyless free tier serves chat only (ADR 0104)",
-    ),
-    (
-        "claude-gateway",
-        "the Claude gateway sign-in serves chat only",
-    ),
-];
+/// endpoint that can vanish without notice.
+pub(crate) const PROVIDERS_WITHOUT_PROXY: [(&str, &str); 1] = [(
+    "opencode-free",
+    "the keyless free tier serves chat only (ADR 0104)",
+)];
 
 /// A service name with case and separators removed, so `Open-AI`, `open_ai`
 /// and `openai` compare equal.
@@ -164,6 +166,61 @@ pub(crate) fn builtin_proxy_for_service(service_name: &str) -> Option<&'static B
         std::iter::once(proxy.name)
             .chain(proxy.aliases.iter().copied())
             .any(|spelling| normalized_service_name(spelling) == wanted)
+    })
+}
+
+/// Public model-route capability without resolving credentials, refreshing a
+/// token or revealing the configured upstream. The catalog remains the gate:
+/// a protocol alone never grants a provider a proxy.
+pub(crate) fn model_proxy_info(provider: &str, wire_id: &str) -> Option<super::ModelProxyInfo> {
+    use super::ModelProxyProtocol;
+    use crate::llm::ProviderKind;
+
+    let kind = ProviderKind::from_name(provider)?;
+    let proxy = builtin_proxy_for_service(kind.as_str())?;
+    let protocol = match kind {
+        ProviderKind::Anthropic | ProviderKind::ClaudeGateway => {
+            ModelProxyProtocol::AnthropicMessages
+        }
+        ProviderKind::OpenAi if crate::llm::openai::uses_responses_api(wire_id) => {
+            ModelProxyProtocol::OpenaiResponses
+        }
+        ProviderKind::OpenAi
+        | ProviderKind::OpenRouter
+        | ProviderKind::XAi
+        | ProviderKind::Local => ModelProxyProtocol::OpenaiChatCompletions,
+        ProviderKind::Vertex if crate::llm::VertexProvider::is_claude_model(wire_id) => {
+            ModelProxyProtocol::VertexAnthropic
+        }
+        ProviderKind::Vertex => ModelProxyProtocol::VertexGoogle,
+        ProviderKind::OpenCodeFree => return None,
+    };
+    Some(super::ModelProxyInfo {
+        name: proxy.name.to_string(),
+        protocol,
+        request_defaults: std::iter::once(None)
+            .chain(
+                crate::llm::reasoning::supported_efforts(kind, wire_id)
+                    .iter()
+                    .map(|effort| Some(*effort)),
+            )
+            .map(|effort| {
+                let defaults = match protocol {
+                    ModelProxyProtocol::AnthropicMessages | ModelProxyProtocol::VertexAnthropic => {
+                        crate::llm::anthropic_wire::sdk_request_defaults(
+                            wire_id,
+                            effort,
+                            protocol == ModelProxyProtocol::VertexAnthropic,
+                        )
+                    }
+                    ModelProxyProtocol::VertexGoogle => {
+                        crate::llm::vertex::sdk_request_defaults(wire_id, effort)
+                    }
+                    _ => serde_json::json!({ "body": {}, "headers": {} }),
+                };
+                (effort.unwrap_or("").to_string(), defaults)
+            })
+            .collect(),
     })
 }
 
@@ -193,6 +250,7 @@ async fn resolve_entry(
 ) -> Result<BuiltinTarget, (StatusCode, String)> {
     match proxy.resolver {
         Resolver::Anthropic => resolve_anthropic(engine.pool()).await,
+        Resolver::ClaudeGateway => gateway::resolve(engine).await,
         Resolver::Local => resolve_local(engine.pool()).await,
         Resolver::OpenAi => resolve_openai(engine.pool()).await,
         Resolver::OpenRouter => resolve_openrouter(engine.pool()).await,
@@ -242,7 +300,7 @@ pub(crate) async fn builtin_proxy_state(
 }
 
 /// Every builtin with its state, in catalog order. The checks are independent,
-/// so they run concurrently: the chat turn waits for one, not seven.
+/// so they run concurrently: the chat turn waits for one, not the sum of all checks.
 pub(crate) async fn builtin_proxy_states(
     engine: &Arc<crate::engine::LucidosEngine>,
 ) -> Vec<(&'static BuiltinProxy, BuiltinProxyState)> {
@@ -284,6 +342,9 @@ pub(crate) fn render_builtin_proxies_block(
         let base_part = match base {
             Some(url) if base_includes_v1(url) => format!("{url} (base includes /v1)"),
             Some(url) => format!("{url} (base has no /v1)"),
+            None if proxy.resolver == Resolver::ClaudeGateway => {
+                "base set by the configured Claude gateway".to_string()
+            }
             None => "base set by the engine's Vertex project and region".to_string(),
         };
         let configured = match state {

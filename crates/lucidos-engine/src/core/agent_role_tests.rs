@@ -93,6 +93,65 @@ async fn the_agent_role_writes_ordinary_tables_only_inside_read_write() {
     drop_role(&pool, &db_name).await;
 }
 
+/// The restore policy and the restore boundary grant or fence authority, so the
+/// handed credential must not write them (ADR 0612 decisions 8 and 9).
+#[tokio::test]
+async fn the_agent_role_cannot_write_restore_authority_or_human_only_preferences() {
+    let (pool, db_name) = setup_test_db().await;
+    let url = provision(&pool, &test_db_url(&db_name)).await.unwrap();
+    let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+    let policy = crate::core::prefs::SNAPSHOT_RESTORE_BY_AGENTS.key();
+    let other = crate::core::prefs::internal_specs()
+        .find(|spec| spec.key != policy)
+        .expect("the catalog keeps another key from agents")
+        .key;
+    sqlx::query(
+        "INSERT INTO preferences (key, value) VALUES ($1, 'ask'), ($2, 'x'), ('probe', '1')",
+    )
+    .bind(policy)
+    .bind(other)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    for statement in [
+        format!("INSERT INTO preferences (key, value, device_id) VALUES ('{policy}', 'allow', 'd')"),
+        format!("UPDATE preferences SET value = 'allow' WHERE key = '{policy}'"),
+        format!("DELETE FROM preferences WHERE key = '{other}'"),
+        format!("UPDATE preferences SET key = '{policy}' WHERE key = 'probe'"),
+        "INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) \
+         VALUES (gen_random_uuid(), 'snap', now(), 0)"
+            .into(),
+        "DELETE FROM snapshot_restore_boundary".into(),
+    ] {
+        let result =
+            sqlx::raw_sql(&format!("BEGIN READ WRITE; {statement}; COMMIT;")).execute(&mut conn).await;
+        assert!(denied(result), "the agent role ran: {statement}");
+        sqlx::raw_sql("ROLLBACK").execute(&mut conn).await.unwrap();
+    }
+    let value: String = sqlx::query_scalar("SELECT value FROM preferences WHERE key = $1")
+        .bind(policy)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(value, "ask");
+
+    // An ordinary preference stays writable, and the engine role is not fenced.
+    sqlx::raw_sql(
+        "BEGIN READ WRITE; UPDATE preferences SET value = '2' WHERE key = 'probe'; COMMIT;",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE preferences SET value = 'allow' WHERE key = $1")
+        .bind(policy)
+        .execute(&pool)
+        .await
+        .unwrap();
+    conn.close().await.unwrap();
+    drop_role(&pool, &db_name).await;
+}
+
 #[tokio::test]
 async fn the_agent_role_reaches_no_other_database() {
     let (pool, db_name) = setup_test_db().await;

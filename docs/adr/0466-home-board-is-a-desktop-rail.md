@@ -1,6 +1,6 @@
 # 0466: The Home board is a desktop rail; widget windows, the dock and the Home long press are gone; one inline widget
 
-- **Status**: Accepted
+- **Status**: Accepted. Point 5 amended by [ADR 0621](0621-widgets-one-box-no-pin.md): the thread's Add widget is gone
 - **Date**: 2026-10-13
 
 Supersedes [ADR 0419](0419-widget-windows-stay-open.md). Amends

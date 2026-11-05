@@ -24,7 +24,7 @@ pub(crate) use events::IMAGE_DESCRIPTION_PROMPT;
 pub(crate) use held_messages::answer_releases_held_messages;
 pub(crate) use images::{current_image_handles, handles_note};
 pub(crate) use process::PreEmittedOrigin;
-pub(crate) use recursion_guard::LIVE_CHILD_SQL;
+pub(crate) use recursion_guard::{LIVE_CHILD_SQL, OWED_CHILDREN_SQL};
 pub(crate) use title::{emit_generated_title, generate_thread_title, spawn_naming, title_call};
 
 // event_bus_tests reaches this via chat::*. Gated to test builds, since

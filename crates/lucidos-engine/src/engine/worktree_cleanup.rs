@@ -15,8 +15,8 @@
 //! is instant, while reclaiming it forces a cold ~15 GB rebuild and (if it races
 //! a resume) can strand the tree so the next session lands in the workspace data
 //! repo. So all reclamation tiers are **gated**. A worktree is removed only
-//! once its thread is **archived** or free disk drops below
-//! [`FREE_DISK_SOFT_BYTES`]. Archiving is the explicit "I'm done" signal, from
+//! once its thread is **archived** or free disk drops below the soft
+//! threshold ([`DiskThresholds`]). Archiving is the explicit "I'm done" signal, from
 //! the user or the thread's agent (ADR 0310).
 //!
 //! **Archived removal (ADR 0458).** An archived thread's worktree goes once
@@ -80,9 +80,12 @@
 //! - **Free-disk pressure.** The worker reads free space on the volume hosting
 //!   the worktrees dir at each decision, never once per cycle: a cycle can
 //!   wait minutes on the database while free space changes by hundreds of GB.
-//!   Below [`FREE_DISK_SOFT_BYTES`] (20 GB) the retention gate opens and the
+//!   The levels scale with the volume ([`DiskThresholds::for_volume`]): the
+//!   soft level is a quarter of it, capped at [`FREE_DISK_SOFT_BYTES`]
+//!   (20 GB), and the hard level a tenth, capped at [`FREE_DISK_HARD_BYTES`]
+//!   (5 GB). Below the soft level the retention gate opens and the
 //!   Tier 1 idle window shrinks from 24 h to [`FORCE_TIER_1_IDLE`] (1 h).
-//!   Below [`FREE_DISK_HARD_BYTES`] (5 GB) the Tier 0 grace and the Tier 1
+//!   Below the hard level the Tier 0 grace and the Tier 1
 //!   window drop to zero. Each cycle that frees space then emits "Lucidos
 //!   reclaimed disk space". The
 //!   disk monitor wakes the worker when pressure worsens, so a cycle starts
@@ -207,13 +210,15 @@ pub const TIER_1_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Idle threshold for Tier 2 (full worktree removal). 30 days.
 pub const TIER_2_IDLE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-/// Soft free-disk threshold. Below it the disk monitor sends one low-disk
+/// Cap on the soft free-disk threshold, which is a quarter of the volume on a
+/// volume under 80 GiB. Below the threshold the disk monitor sends one low-disk
 /// notification per pressure episode. The worker opens the retention gate for
 /// non-archived threads and shrinks the Tier 1 idle window to
 /// [`FORCE_TIER_1_IDLE`].
 pub const FREE_DISK_SOFT_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
-/// Hard free-disk threshold. Below it the Tier 0 grace and the Tier 1 idle
+/// Cap on the hard free-disk threshold, which is a tenth of the volume on a
+/// volume under 50 GiB. Below the threshold the Tier 0 grace and the Tier 1 idle
 /// window drop to zero, and the worker tells the user what it reclaimed.
 /// Active worktrees stay untouched.
 pub const FREE_DISK_HARD_BYTES: u64 = 5 * 1024 * 1024 * 1024;
@@ -230,7 +235,7 @@ pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// removal). Long enough that the user can apply a change, read the diff,
 /// and send a follow-up message that reuses the worktree before deletion;
 /// short enough that the Disk Usage panel stays accurate. Drops to 0 under
-/// hard disk pressure (`free_bytes < FREE_DISK_HARD_BYTES`).
+/// hard disk pressure (free bytes below the hard threshold).
 pub const TIER_0_GRACE: Duration = Duration::from_secs(60 * 60);
 
 /// Idle time after which a thread with nothing pending releases its build
@@ -312,8 +317,8 @@ pub struct WorktreeCleanup {
     bus: Arc<EventBus>,
     workspace_root: PathBuf,
     interval: Duration,
-    free_soft_bytes: u64,
-    free_hard_bytes: u64,
+    soft_cap_bytes: u64,
+    hard_cap_bytes: u64,
     force_tier1_idle: Duration,
     /// Grace before a stranded worktree is removed. Defaults to
     /// [`STRANDED_GRACE`]; a struct field (like `force_tier1_idle`) so tests
@@ -336,7 +341,7 @@ pub struct WorktreeCleanup {
 }
 
 impl WorktreeCleanup {
-    /// Build a worker with production defaults (15-minute cycle, 20 GB soft / 5 GB hard free-disk thresholds).
+    /// Build a worker with production defaults (15-minute cycle, 20 GB soft / 5 GB hard free-disk caps).
     pub fn new(
         pool: PgPool,
         bus: Arc<EventBus>,
@@ -351,8 +356,8 @@ impl WorktreeCleanup {
             free_disk: os_free_disk_probe(workspace_root.clone()),
             workspace_root,
             interval: CLEANUP_INTERVAL,
-            free_soft_bytes: FREE_DISK_SOFT_BYTES,
-            free_hard_bytes: FREE_DISK_HARD_BYTES,
+            soft_cap_bytes: FREE_DISK_SOFT_BYTES,
+            hard_cap_bytes: FREE_DISK_HARD_BYTES,
             force_tier1_idle: FORCE_TIER_1_IDLE,
             stranded_grace: STRANDED_GRACE,
             temp_worktree_grace: TEMP_WORKTREE_GRACE,
@@ -383,12 +388,12 @@ impl WorktreeCleanup {
     /// is kept, and starts the next pass as soon as this one returns.
     async fn run_loop(self) {
         log!(
-            "[WorktreeCleanup] starting (interval={:?}, tier1_idle={:?}, tier2_idle={:?}, free_soft={} bytes, free_hard={} bytes)",
+            "[WorktreeCleanup] starting (interval={:?}, tier1_idle={:?}, tier2_idle={:?}, soft_cap={} bytes, hard_cap={} bytes)",
             self.interval,
             TIER_1_IDLE,
             TIER_2_IDLE,
-            self.free_soft_bytes,
-            self.free_hard_bytes,
+            self.soft_cap_bytes,
+            self.hard_cap_bytes,
         );
         loop {
             self.run_once().await;
@@ -403,6 +408,27 @@ impl WorktreeCleanup {
     /// tests can drive cleanup deterministically without waiting an hour.
     /// See module-level docs for the free-disk tiering semantics.
     pub async fn run_once(&self) {
+        // Read before every cleanup path, including reclaiming and temporary
+        // trees. A broken external registry must never authorize deletion.
+        let options = self.pool.connect_options();
+        let exemptions = options
+            .get_database()
+            .ok_or("database unavailable")
+            .map_err(|_| ())
+            .and_then(|database| {
+                crate::core::snapshot::store::Store::database_root(database).map_err(|_| ())
+            })
+            .and_then(|root| {
+                crate::core::snapshot::worktree_exemptions::read(&root, &self.workspace_root)
+                    .map_err(|_| ())
+            });
+        let exemptions = match exemptions {
+            Ok(paths) => paths,
+            Err(()) => {
+                log!("[WorktreeCleanup] cannot verify restore exemptions; skipping cleanup");
+                return;
+            }
+        };
         let dir = worktrees_dir(&self.workspace_root);
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
@@ -423,6 +449,14 @@ impl WorktreeCleanup {
 
         for entry in entries.flatten() {
             let path = entry.path();
+            // Registry paths use the canonical workspace binding; entry paths
+            // may come from a relative or symlinked workspace argument.
+            if exemptions
+                .iter()
+                .any(|saved| saved.file_name() == path.file_name())
+            {
+                continue;
+            }
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
@@ -547,13 +581,9 @@ impl WorktreeCleanup {
         }
     }
 
-    /// Free disk right now, classified against this worker's thresholds.
+    /// Free disk right now, classified against the thresholds of this volume.
     fn disk_pressure(&self) -> DiskPressure {
-        DiskPressure::classify(
-            (self.free_disk)(),
-            self.free_soft_bytes,
-            self.free_hard_bytes,
-        )
+        DiskPressure::classify((self.free_disk)(), self.soft_cap_bytes, self.hard_cap_bytes)
     }
 
     /// The retention gate: `Some(pressure)` when this thread's worktree may be
@@ -1205,6 +1235,9 @@ pub use disk_monitor::{DiskMonitor, LARGE_FOOTPRINT_BYTES};
 #[path = "worktree_cleanup_ops.rs"]
 mod ops;
 pub(crate) use ops::*;
+
+#[path = "worktree_cleanup_zfs.rs"]
+mod zfs;
 
 #[path = "worktree_cleanup_recommended.rs"]
 mod recommended;

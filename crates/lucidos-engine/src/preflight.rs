@@ -235,7 +235,21 @@ async fn run_pg_tool(
         cmd.env("PGDATABASE", database);
     }
     configure(&mut cmd);
-    let output = tokio::process::Command::from(cmd).output().await?;
+    let output = tokio::process::Command::from(cmd)
+        .output()
+        .await
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                format!(
+                    "Could not start {name}: {error}. Install PostgreSQL client tools \
+                     (postgresql-client-18 on Debian/Ubuntu, or brew install libpq on macOS) \
+                     and put {name} on PATH. Use a client major version at least as new as \
+                     the PostgreSQL server."
+                )
+            } else {
+                format!("Could not start {name}: {error}")
+            }
+        })?;
     if output.status.success() {
         return Ok(());
     }

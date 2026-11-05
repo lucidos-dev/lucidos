@@ -49,7 +49,6 @@ resolve_workspace
 allocate_ports "$WORKSPACE"
 detect_tls
 setup_postgres
-kill_stale_processes
 build_or_find_engine
 # build_or_find_engine builds the window once this checkout has one, so only
 # the first launch builds it here.
@@ -63,6 +62,7 @@ DEV_WINDOW_LAUNCH_DIR="$(cd "$DEV_WINDOW_LAUNCH_DIR" && pwd -P)"
 DEV_WINDOW_BIN="$(dev_window_bin "$DEV_WINDOW_LAUNCH_DIR")"
 # Before the stack starts, so /api/v1/sdk.js is ready immediately.
 generate_build_outputs
+kill_stale_processes
 swap_ports
 
 # Gateway model by default (ADR 0014), matching web-dev.sh.

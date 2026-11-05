@@ -1,4 +1,5 @@
 import { pruneClosedWindows, readWindowItem } from '../utils/windowStorage';
+import { installRestoreRuntime } from './restoreRuntime';
 import { checkConnection, handleResume, bounceToPickerIfStranded } from './actions/connection';
 import { loadArtifacts } from './actions/artifacts';
 import {
@@ -128,6 +129,7 @@ function visibleOnlyInterval(tick: () => void, everyMs: number): { start: () => 
  *  is evaluated, so the network work runs while the UI loads (ADR 0288).
  *  Returns the teardown. */
 export function startClient(): () => void {
+  installRestoreRuntime();
   // Diagnostic-only: classify this load (cold / bg_resume / reload_clean /
   // nav_clean / likely_crash) against the prior heartbeat. POSTs one log
   // line then starts the heartbeat ticker. See utils/liveness.ts.

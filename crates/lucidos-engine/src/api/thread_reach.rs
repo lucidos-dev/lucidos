@@ -79,6 +79,8 @@ pub enum ThreadReachVerb {
     /// cancel (`POST /api/v1/changes/apply-all/cancel`), and the workspace-wide
     /// disarm (`DELETE /api/v1/standing-applies`).
     Apply,
+    /// Restoring one snapshot of a named workspace. Never a thread target.
+    RestoreSnapshot,
     Discard,
     SetAside,
     BringBack,
@@ -117,6 +119,7 @@ impl ThreadReachVerb {
             Self::AskSideQuestion => "ask a side question of",
             Self::DismissSideQuestion => "dismiss a side question on",
             Self::Apply => "apply a change from",
+            Self::RestoreSnapshot => "restore a snapshot of",
             Self::Discard => "discard a change from",
             Self::SetAside => "set aside a change from",
             Self::BringBack => "bring back a change from",
@@ -142,6 +145,7 @@ impl ThreadReachVerb {
             Self::AskSideQuestion => "asking a side question",
             Self::DismissSideQuestion => "dismissing a side question",
             Self::Apply => "applying a change",
+            Self::RestoreSnapshot => "restoring a workspace snapshot",
             Self::Discard => "discarding a change",
             Self::SetAside => "setting a change aside",
             Self::BringBack => "bringing a change back",
@@ -549,6 +553,11 @@ pub(crate) async fn authority_held(
     target: Option<Uuid>,
     verb: ThreadReachVerb,
 ) -> Result<Option<HeldAuthority>, ThreadReachError> {
+    // A snapshot is workspace-scoped. Thread reach and a turn's standing
+    // instruction cannot stand in for the restore policy or its bound card.
+    if verb == ThreadReachVerb::RestoreSnapshot {
+        return Ok(None);
+    }
     if !verb.needs_authority() {
         return Ok(Some(HeldAuthority::NoneNeeded));
     }

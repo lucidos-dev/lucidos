@@ -15,6 +15,7 @@ members = [
     "crates/lucidos-frame-capability",
     "crates/lucidos-gateway-constants",
     "crates/lucidos-home",
+    "crates/lucidos-secret-store",
     "crates/lucidos-installs",
     "crates/lucidos-local-token",
     "crates/lucidos-owner-lock",

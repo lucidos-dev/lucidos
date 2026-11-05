@@ -14,26 +14,41 @@ export const pageOwnerId = generateUuid();
  *  still running that build then counts as live here too. */
 export const PAGE_OWNER_LOCK_PREFIX = `${deviceDatabaseName('lucidos-pending-uploads', WORKSPACE_ID)}:owner:`;
 
-let held = false;
+let lockState: 'unrequested' | 'requested' | 'held' | 'unavailable' = 'unrequested';
 
 /** Hold this page's lock. Idempotent, so every store's restore may call it. */
 export function holdPageOwnerLock(): void {
-  if (held || typeof navigator === 'undefined' || !navigator.locks) return;
-  held = true;
-  navigator.locks.request(PAGE_OWNER_LOCK_PREFIX + pageOwnerId, () => new Promise<never>(() => {})).catch((err) => {
-    // Runs without user intent. Without the lock another tab may adopt this
-    // page's records too. A pending image then uploads twice, which the blob
-    // store absorbs. An unsent message shows in both tabs, and the engine's
-    // repeat-event-id guard runs it once.
+  if (lockState !== 'unrequested' || typeof navigator === 'undefined' || !navigator.locks) return;
+  lockState = 'requested';
+  const unavailable = (err: unknown) => {
+    lockState = 'unavailable';
+    // Startup capability probe, not user intent. Restore recovery treats owners
+    // as unknown and retains originals for explicit review instead of adopting.
     console.warn('page owner: could not hold the owner lock', err);
-  });
+  };
+  try {
+    void navigator.locks.request(PAGE_OWNER_LOCK_PREFIX + pageOwnerId, () => {
+      lockState = 'held';
+      return new Promise<never>(() => {});
+    }).then(() => unavailable(new Error('owner lock released')), unavailable);
+  } catch (err) { unavailable(err); }
 }
 
 /** The owners another open tab still holds, or null when this browser cannot
- *  tell. Null means every record is free to adopt. */
+ *  tell. Ordinary replay-safe adoption may proceed on null; restore composer
+ *  reconstruction must retain unknown owners until explicit review. */
 export async function liveOwnerIds(): Promise<ReadonlySet<string> | null> {
   if (typeof navigator === 'undefined' || !navigator.locks) return null;
-  const { held: locks = [] } = await navigator.locks.query();
+  holdPageOwnerLock();
+  let snapshot: LockManagerSnapshot;
+  try { snapshot = await navigator.locks.query(); }
+  catch { return null; }
+  // Inspection can succeed where request is refused. Absence from that
+  // snapshot proves no orphanhood until this page can participate itself.
+  if (lockState !== 'held') return null;
+  // A just-started page may be queued to acquire its lifetime lock. It is
+  // already alive; treating that window as an orphan can freeze stale content.
+  const locks = [...(snapshot.held ?? []), ...(snapshot.pending ?? [])];
   const owners = new Set<string>();
   for (const lock of locks) {
     if (lock.name?.startsWith(PAGE_OWNER_LOCK_PREFIX)) owners.add(lock.name.slice(PAGE_OWNER_LOCK_PREFIX.length));

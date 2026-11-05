@@ -259,12 +259,14 @@ jobs:
         if: always()
         with:
           name: e2e-out-${{ matrix.id }}
+          overwrite: true
           path: e2e-out/${{ matrix.id }}
           retention-days: 1
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         if: failure()
         with:
           name: e2e-traces-${{ matrix.id }}
+          overwrite: true
           path: |
             crates/lucidos-app/test-results
             ~/workspaces/e2e-test/.lucidos/engine.log
@@ -330,12 +332,14 @@ jobs:
         if: always()
         with:
           name: e2e-out-${{ matrix.id }}
+          overwrite: true
           path: e2e-out/${{ matrix.id }}
           retention-days: 1
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         if: failure()
         with:
           name: e2e-traces-${{ matrix.id }}
+          overwrite: true
           path: |
             crates/lucidos-app/test-results
             ~/workspaces/e2e-test/.lucidos/engine.log
@@ -383,6 +387,7 @@ jobs:
         if: always()
         with:
           name: e2e-out-engine
+          overwrite: true
           path: e2e-out/engine
           retention-days: 1
 

@@ -1628,6 +1628,118 @@ test_locate_prefers_published_and_falls_back() {
     esac
 }
 
+test_background_publish_failure_is_fatal() (
+    local before="$FAIL" broken out rc
+    for broken in lucidos-engine lucidos-gateway lucidos; do
+        publish_launch_binary() { [ "${1##*/}" != "$broken" ]; }
+        rc=0
+        out="$(publish_all_launch_binaries "$SANDBOX/src" "$SANDBOX/dst" "" 2>&1)" || rc=$?
+        if [ "$broken" = lucidos ]; then
+            if [ "$rc" -eq 0 ]; then pass "CLI publish remains nonfatal"; else fail "CLI publish failed build"; fi
+        else
+            if [ "$rc" -ne 0 ]; then pass "$broken publish fails build"; else fail "$broken publish swallowed failure"; fi
+            case "$out" in
+                *"ERROR: could not publish $broken"*) pass "publish names $broken" ;;
+                *) fail "publish has no named error: $out" ;;
+            esac
+        fi
+    done
+    [ "$FAIL" -eq "$before" ]
+)
+
+test_delivery_contract() (
+    local before="$FAIL" rc out
+    SCRIPT_NAME="test"
+    parse_dev_args -w test --engine-build --publish-to "$PROJECT_DIR/.launch/release/plain" --fresh
+    if [ "$(engine_build_profile)" = release ]; then pass "target selects release"; else fail "wrong profile"; fi
+    if [ -n "$ENGINE_BUILD_FRESH" ]; then pass "fresh requested"; else fail "fresh lost"; fi
+    parse_dev_args -w test --engine-only --publish-to "$PROJECT_DIR/.launch/release/plain" || fail "standalone switch target rejected"
+    if [ "$(engine_build_profile)" = release ]; then pass "standalone switch preserves release"; else fail "standalone switch lost profile"; fi
+    if parse_dev_args -w test --engine-only --fresh >/dev/null 2>&1; then
+        fail "standalone switch accepted fresh clean"
+    else
+        pass "fresh remains build-only"
+    fi
+    configure_publish_target "$PROJECT_DIR/.launch/debug/e2e-test-hooks_real-embedder-tests" || fail "known variant rejected"
+    if [ "$ENGINE_BUILD_FEATURES" = 'e2e-test-hooks real-embedder-tests' ]; then pass "variant decoded"; else fail "wrong features"; fi
+    for out in "$PROJECT_DIR/.launch/debug/unknown" "$PROJECT_DIR/.launch/debug/../plain" /tmp/.launch/debug/plain; do
+        rc=0
+        configure_publish_target "$out" >/dev/null 2>&1 || rc=$?
+        if [ "$rc" -ne 0 ]; then pass "invalid target rejected"; else fail "invalid target accepted"; fi
+    done
+    local PROJECT_DIR="$SANDBOX/symlink-checkout"
+    mkdir -p "$PROJECT_DIR" "$SANDBOX/elsewhere"
+    ln -s "$SANDBOX/elsewhere" "$PROJECT_DIR/.launch"
+    if configure_publish_target "$PROJECT_DIR/.launch/debug/plain" >/dev/null 2>&1; then
+        fail "symlink publish target accepted"
+    else
+        pass "symlink publish target rejected"
+    fi
+    local src="$SANDBOX/sign-src" dst="$SANDBOX/sign-dst"
+    echo new > "$src"
+    echo old > "$dst"
+    sign_engine_binary() { return 1; }
+    rc=0
+    publish_launch_binary "$src" "$dst" sign || rc=$?
+    if [ "$rc" -ne 0 ] && [ "$(cat "$dst")" = old ]; then pass "sign failure preserves binary"; else fail "sign failure published"; fi
+    [ "$FAIL" -eq "$before" ]
+)
+test_delivery_contract || FAIL=$((FAIL+1))
+
+test_stale_publish_fails_after_one_retry() (
+    local before="$FAIL" count=0 rc=0 out
+    BUILD=1
+    run_launch_cargo_builds() { count=$((count+1)); }
+    prune_stale_debug_objects() { :; }
+    publish_after_preflight() { :; }
+    published_build_state() { echo stale; }
+    build_or_find_engine > "$SANDBOX/stale-output" 2>&1 || rc=$?
+    out="$(cat "$SANDBOX/stale-output")"
+    if [ "$rc" -eq 75 ]; then pass "head-moved exit is distinct"; else fail "stale result returned $rc"; fi
+    if [ "$count" -eq 2 ]; then pass "stale retry is bounded"; else fail "stale build count $count"; fi
+    case "$out" in
+        *"ERROR: head-moved:"*) pass "stale publish names reason" ;;
+        *) fail "stale publish omitted reason" ;;
+    esac
+    [ "$FAIL" -eq "$before" ]
+)
+test_stale_publish_fails_after_one_retry || FAIL=$((FAIL+1))
+
+test_fresh_clean_uses_profile_and_slot() (
+    local before="$FAIL" PROJECT_DIR="$SANDBOX/fresh-checkout" ENGINE_BUILD_FRESH=1
+    ENGINE_CARGO_PROFILE=release
+    mkdir -p "$PROJECT_DIR/scripts"
+    cat > "$PROJECT_DIR/scripts/with-build-slot.sh" <<'SLOT'
+#!/bin/bash
+printf '%s\n' "$@" > "$0.args"
+SLOT
+    chmod +x "$PROJECT_DIR/scripts/with-build-slot.sh"
+    run_engine_cargo_build() { echo build >> "$PROJECT_DIR/builds"; }
+    run_launch_cargo_builds "" || fail "fresh build failed"
+    local args
+    args="$(cat "$PROJECT_DIR/scripts/with-build-slot.sh.args")"
+    case "$args" in
+        *"cargo
+clean
+--profile
+release
+-p
+lucidos-engine
+-p
+lucidos-gateway
+-p
+lucidos-cli"*) pass "clean is scoped inside slot" ;;
+        *) fail "wrong fresh command: $args" ;;
+    esac
+    if [ -z "$ENGINE_BUILD_FRESH" ]; then pass "fresh clean consumed once"; else fail "fresh still armed"; fi
+    if [ "$(cat "$PROJECT_DIR/builds")" = build ]; then pass "build followed clean"; else fail "build missing"; fi
+    [ "$FAIL" -eq "$before" ]
+)
+test_fresh_clean_uses_profile_and_slot || FAIL=$((FAIL+1))
+
+
+test_background_publish_failure_is_fatal || FAIL=$((FAIL+1))
+
 test_launch_bin_dir_is_per_profile_and_variant
 test_launch_dir_is_outside_cargo_target
 test_worktree_refusal_still_sees_a_worktree_launch_dir

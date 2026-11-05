@@ -15,8 +15,11 @@
  * It orders each by its *compose revision* and lays this device's pending
  * edits over it (ADR 0437).
  */
+import { restoreAdmissionReady } from '../../utils/restoreAdmission';
+import { requestGenerationGuard } from '../../api/client/_core';
 
 import { effect } from '@preact/signals';
+import { retainSendingImageHashes } from '../pendingUploadRecords';
 import { threadMap, focusedThreadId, inputMode, showToast, removeToast, setFocusedThread, selectedScope, repositories, type Scope } from '../store';
 import { loadedOr } from '../types';
 import { generateUuid } from '../../utils/uuid';
@@ -401,6 +404,7 @@ function dropUndeliveredComposeDraft(threadId: string): void {
  *  in-flight bookkeeping (and the re-park on another failure) stays in one
  *  place. A draft that fails again simply stays parked for the next resume. */
 export function flushUndeliveredComposeDrafts(): void {
+  if (!restoreAdmissionReady()) return;
   if (undeliveredComposeDrafts.size === 0) return;
   // Snapshot first: `schedulePush` and its settle path mutate the set.
   for (const threadId of [...undeliveredComposeDrafts]) {
@@ -477,6 +481,7 @@ function schedulePush(threadId: string): void {
  *  keystroke writes from landing backwards. */
 function runComposePushes(threadId: string): void {
   owedComposePushes.add(threadId);
+  if (!restoreAdmissionReady()) { undeliveredComposeDrafts.add(threadId); return; }
   if (runningComposePushes.has(threadId)) return;
   runningComposePushes.add(threadId);
   void (async () => {
@@ -1243,6 +1248,7 @@ export async function sendCompose(
   const ccReasoningEffortOverride = resolveCcReasoningEffort(threadId);
   // Must run before the draft clear — see `markHashesAsSent`.
   if (wireHashes.length > 0) markHashesAsSent(wireHashes);
+  const releaseImages = retainSendingImageHashes(wireHashes);
   // The clear stays a pending edit until the write the send owes is answered.
   // So no report from before the send can put the sent text back.
   noteLocalComposeEdit(threadId);
@@ -1290,6 +1296,8 @@ export async function sendCompose(
   } catch (err) {
     rollBack();
     throw err;
+  } finally {
+    releaseImages();
   }
 }
 
@@ -1306,18 +1314,23 @@ export async function sendFollowup(
 ): Promise<void> {
   // Must run before the draft clear — see `markHashesAsSent`.
   if (imageHashes?.length) markHashesAsSent(imageHashes);
-  // Clears the draft locally AND schedules the write the send owes the engine.
-  // `updateCompose` is the entry point that does both, so this path reaches
-  // `pushClearedComposeAfterSend`'s guarantee through it rather than by
-  // scheduling a second write.
-  updateCompose(threadId, { text: '', image_hashes: [] });
-  const outcome = await sendMessage(text, imageHashes, {
-    ...opts,
-    threadId,
-    focus: opts?.focus ?? true,
-  });
-  // The refused send's row is gone, so the draft is all that can hold the text.
-  if (outcome === 'dropped') appendMessagesToCompose(threadId, [{ text, imageHashes: imageHashes ?? [] }]);
+  const releaseImages = retainSendingImageHashes(imageHashes);
+  try {
+    // Clears the draft locally AND schedules the write the send owes the engine.
+    // `updateCompose` is the entry point that does both, so this path reaches
+    // `pushClearedComposeAfterSend`'s guarantee through it rather than by
+    // scheduling a second write.
+    updateCompose(threadId, { text: '', image_hashes: [] });
+    const outcome = await sendMessage(text, imageHashes, {
+      ...opts,
+      threadId,
+      focus: opts?.focus ?? true,
+    });
+    // The refused send's row is gone, so the draft is all that can hold the text.
+    if (outcome === 'dropped') appendMessagesToCompose(threadId, [{ text, imageHashes: imageHashes ?? [] }]);
+  } finally {
+    releaseImages();
+  }
 }
 
 /** Tab-close-safe flush. Each pending PUT goes out with `keepalive: true`, so
@@ -1326,7 +1339,10 @@ export async function sendFollowup(
  *  The device-id header names the caller, which every mutating route needs:
  *  the request carries no other credential here. */
 function flushAllPending(): void {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json', ...deviceIdHeader() };
+  // No admission gate: a tab closing mid-reconnect would lose its text, and the
+  // engine already refuses a write stamped with a stale generation.
+  const headers: Record<string, string> = { 'Content-Type': 'application/json', ...deviceIdHeader(),
+    ...requestGenerationGuard().headers };
 
   // Every thread holding an intent the engine has not seen. **Two states
   // qualify, not one**: a debounce still counting down (`pendingTimers`), and

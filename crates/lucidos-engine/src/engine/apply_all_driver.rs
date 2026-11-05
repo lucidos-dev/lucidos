@@ -65,6 +65,81 @@ fn batch_member_skip_reason(
     }
 }
 
+type PersistedBatch = (Uuid, Vec<Uuid>, Option<serde_json::Value>);
+
+/// End archived Apply All ownership before boot subscribers or archive
+/// recovery can dispatch. Eligible fresh rows remain for normal reconstruction.
+pub(crate) async fn settle_restored_batches(
+    pool: &sqlx::PgPool,
+    bus: &crate::engine::event_bus::EventBus,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if crate::core::snapshot::boundary::read(pool).await?.is_some() {
+        recoverable_batches(pool, bus).await?;
+    }
+    Ok(())
+}
+
+/// Read the durable admission set before reconstructing any batch owners.
+/// An archived press is a canceled request, not permission to apply restored
+/// changes. Announce before removing its row; failed writes refuse admission
+/// and retain the row for the next boot. A crash after emit retries only removal.
+async fn recoverable_batches(
+    pool: &sqlx::PgPool,
+    bus: &crate::engine::event_bus::EventBus,
+) -> Result<Vec<PersistedBatch>, Box<dyn std::error::Error + Send + Sync>> {
+    let boundary = crate::core::snapshot::boundary::read(pool).await?;
+    let rows: Vec<PersistedBatch> = sqlx::query_as(
+        "SELECT batch_id, change_ids, actor FROM apply_all_batches ORDER BY created_at",
+    )
+    .fetch_all(pool)
+    .await?;
+    let Some(boundary) = boundary else {
+        return Ok(rows);
+    };
+    let mut eligible = Vec::new();
+    for row in rows {
+        // A later duplicate start cannot renew the original owner's press.
+        let first: Option<i64> = sqlx::query_scalar(
+            "SELECT MIN(sequence) FROM events WHERE event_type = 'ApplyAllBatchStarted' AND aggregate_id = $1")
+            .bind(row.0.to_string()).fetch_one(pool).await?;
+        if first.is_some_and(|seq| seq > boundary.event_sequence) {
+            eligible.push(row);
+            continue;
+        }
+        let completed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE event_type = 'ApplyAllBatchCompleted' AND aggregate_id = $1)")
+            .bind(row.0.to_string()).fetch_one(pool).await?;
+        if !completed {
+            let applied: Vec<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM changes WHERE id = ANY($1) AND status = 'applied'",
+            )
+            .bind(&row.1)
+            .fetch_all(pool)
+            .await?;
+            let failed = row
+                .1
+                .iter()
+                .filter(|id| !applied.contains(id))
+                .map(|id| ApplyFailure {
+                    change_id: *id,
+                    error: "Workspace restored from snapshot; apply this change again.".into(),
+                })
+                .collect();
+            bus.emit(BusEvent::System(SystemEvent::ApplyAllBatchCompleted {
+                batch_id: row.0,
+                applied,
+                failed,
+            }))
+            .await?;
+        }
+        sqlx::query("DELETE FROM apply_all_batches WHERE batch_id = $1")
+            .bind(row.0)
+            .execute(pool)
+            .await?;
+    }
+    Ok(eligible)
+}
+
 /// How recovery should treat a batch member, derived from its `changes.status`.
 /// `Terminal` covers a set-aside, discarded or reverted member and a missing row. All
 /// must become a terminal `Failed` so the batch can complete; leaving such a
@@ -575,12 +650,7 @@ impl LucidosEngine {
     /// MUST run after agent recovery queues its switch resumes, and before
     /// `resume_pending_switches` drains that queue.
     pub async fn recover_apply_all_batches(self: &std::sync::Arc<Self>) {
-        let rows: Vec<(Uuid, Vec<Uuid>, Option<serde_json::Value>)> = match sqlx::query_as(
-            "SELECT batch_id, change_ids, actor FROM apply_all_batches ORDER BY created_at",
-        )
-        .fetch_all(self.pool())
-        .await
-        {
+        let rows = match recoverable_batches(self.pool(), &self.event_bus).await {
             Ok(r) => r,
             Err(e) => {
                 log!("[ApplyAll] recovery query failed: {}", e);
@@ -1052,5 +1122,127 @@ mod tests {
             ..pending_member()
         };
         assert_eq!(batch_member_skip_reason(&applied, true), None);
+    }
+    #[tokio::test]
+    async fn restored_apply_all_settles_old_batches_and_keeps_fresh_batches() {
+        use crate::engine::event_bus::EventBus;
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let old = Uuid::new_v4();
+        let fresh = Uuid::new_v4();
+        let member = Uuid::new_v4();
+        let applied = Uuid::new_v4();
+        sqlx::query("INSERT INTO changes (id, request_id, branch_name, repo_root, description, file_count, files, requires_restart, status) VALUES ($1, $2, 'applied-branch', '/repo', 'change', 1, ARRAY['a.rs'], false, 'applied')")
+            .bind(applied).bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+        for id in [old, fresh] {
+            let members = if id == old {
+                vec![member, applied]
+            } else {
+                vec![member]
+            };
+            bus.emit(BusEvent::System(SystemEvent::ApplyAllBatchStarted {
+                batch_id: id,
+                change_ids: members.clone(),
+                actor: None,
+            }))
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO apply_all_batches (batch_id, change_ids) VALUES ($1, $2)")
+                .bind(id)
+                .bind(members)
+                .execute(&pool)
+                .await
+                .unwrap();
+            if id == old {
+                sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, $2, now(), MAX(sequence) FROM events")
+                    .bind(Uuid::new_v4()).bind("20261031T120000Z-0123456789abcdef")
+                    .execute(&pool).await.unwrap();
+            }
+        }
+        bus.emit(BusEvent::System(SystemEvent::ApplyAllBatchStarted {
+            batch_id: old,
+            change_ids: vec![member],
+            actor: None,
+        }))
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            settle_restored_batches(&pool, &bus).await.unwrap();
+            let rows = recoverable_batches(&pool, &bus).await.unwrap();
+            assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), vec![fresh]);
+        }
+        let completed: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT payload FROM events WHERE event_type = 'ApplyAllBatchCompleted' AND aggregate_id = $1")
+            .bind(old.to_string()).fetch_all(&pool).await.unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0]["data"]["applied"],
+            serde_json::json!([applied])
+        );
+        assert_eq!(
+            completed[0]["data"]["failed"][0]["change_id"],
+            member.to_string()
+        );
+        assert_eq!(
+            completed[0]["data"]["failed"][0]["error"],
+            "Workspace restored from snapshot; apply this change again."
+        );
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn restored_apply_all_refuses_missing_provenance_and_failed_settlement() {
+        use crate::engine::event_bus::EventBus;
+        use crate::test_support::{refuse_event_type, setup_test_db, teardown_test_db};
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO apply_all_batches (batch_id, change_ids) VALUES ($1, $2)")
+            .bind(id)
+            .bind(vec![Uuid::new_v4()])
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) VALUES ($1, $2, now(), 0)")
+            .bind(Uuid::new_v4()).bind("20261031T120000Z-0123456789abcdef")
+            .execute(&pool).await.unwrap();
+        refuse_event_type(&pool, "ApplyAllBatchCompleted").await;
+        for _ in 0..2 {
+            assert!(settle_restored_batches(&pool, &bus).await.is_err());
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM apply_all_batches")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+        sqlx::query("DROP TRIGGER refuse_event ON events")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(recoverable_batches(&pool, &bus).await.unwrap().is_empty());
+        // Simulate a crash after announcement but before row removal.
+        sqlx::query("INSERT INTO apply_all_batches (batch_id, change_ids) VALUES ($1, $2)")
+            .bind(id)
+            .bind(vec![Uuid::new_v4()])
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(recoverable_batches(&pool, &bus).await.unwrap().is_empty());
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE event_type = 'ApplyAllBatchCompleted'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+        sqlx::query("ALTER TABLE snapshot_restore_boundary RENAME TO unavailable_restore_boundary")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(settle_restored_batches(&pool, &bus).await.is_err());
+        pool.close().await;
+        teardown_test_db(&db).await;
     }
 }

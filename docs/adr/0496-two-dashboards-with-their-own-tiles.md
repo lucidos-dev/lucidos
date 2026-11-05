@@ -1,6 +1,6 @@
 # 0496: Phone and desktop get their own dashboard, with their own tiles; Home's board face is the phone dashboard
 
-- **Status**: Accepted
+- **Status**: Accepted. Amended by [ADR 0621](0621-widgets-one-box-no-pin.md): no pin exists to refuse in Home
 - **Date**: 2026-10-16
 
 Amends [ADR 0432](0432-home-board-two-faces-three-sizes.md) (the tiles are

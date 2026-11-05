@@ -520,6 +520,7 @@ keep = ("name", "status", "conclusion", "created_at", "started_at", "completed_a
 print(json.dumps({
     "status": run.get("status"),
     "conclusion": run.get("conclusion"),
+    "run_attempt": run.get("run_attempt"),
     "updated_at": run.get("updated_at"),
     "jobs": [{k: j.get(k) for k in keep} for j in jobs.get("jobs") or []],
     "rate_remaining": min(remaining) if remaining else None,
@@ -595,6 +596,78 @@ e2e_github_wait() {
 # e2e_github_conclusion <run-state>: the run's conclusion, or nothing.
 e2e_github_conclusion() {
     printf '%s' "$1" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("conclusion") or "")'
+}
+
+# e2e_github_run_attempt <run-state>: the run's attempt number, 1 when unknown.
+e2e_github_run_attempt() {
+    printf '%s' "$1" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("run_attempt") or 1)'
+}
+
+# e2e_github_rerun_failed <run-id> <attempt>: rerun the run's failed jobs, then
+# wait until a later attempt than <attempt> is on the run. Until then the run
+# still reads as completed, and the driver would take the old verdict again.
+# Returns 1 when gh refused the rerun, and 2 when the rerun may have started
+# but no later attempt showed within E2E_GITHUB_RERUN_START_SECS (default 120).
+e2e_github_rerun_failed() {
+    local run_id="$1" attempt="$2" limit="${E2E_GITHUB_RERUN_START_SECS:-120}" deadline state
+    e2e_github_gh run rerun "$run_id" --failed --repo "$E2E_GITHUB_REPO" >/dev/null || return 1
+    deadline=$(($(e2e_github_now) + limit))
+    while :; do
+        if state="$(e2e_github_run_state "$run_id" 2>/dev/null)" \
+            && [ "$(e2e_github_run_attempt "$state")" -gt "$attempt" ]; then
+            return 0
+        fi
+        [ "$(e2e_github_now)" -lt "$deadline" ] || return 2
+        sleep 5
+    done
+}
+
+# e2e_github_settle_run <run-id> <out-dir>: wait for the run, download its
+# output and report it. A run that ends with no verdict gets one rerun of its
+# failed jobs: the report is then read again over both attempts' shards, since
+# the run keeps the artifacts of the first. The report puts any real failure
+# ahead of no verdict, so no verdict means no shard reported a failed test, and
+# a failed test is never rerun (ADR 0584). Leaves the last run state in
+# E2E_GITHUB_RUN_STATE, the report's exit code in E2E_GITHUB_SETTLE_RC, and
+# E2E_GITHUB_SETTLE_DOWNLOADED as 1 once the output came down.
+# Returns the no-verdict exit alone when the run may still be going: the wait
+# gave up, or a rerun was asked for and never showed. The caller cancels it.
+# shellcheck disable=SC2034 # the globals are read by scripts/e2e-github.sh
+e2e_github_settle_run() {
+    local run_id="$1" dir="$2" attempt report rc rerun_rc reran=""
+    E2E_GITHUB_RUN_STATE=""
+    E2E_GITHUB_SETTLE_RC="$E2E_GITHUB_NO_VERDICT_EXIT"
+    while :; do
+        E2E_GITHUB_SETTLE_DOWNLOADED=""
+        # Under pipefail a wait that gave up fails the pipeline, though tail ends 0.
+        E2E_GITHUB_RUN_STATE="$(e2e_github_wait "$run_id" | tail -1)" || return "$E2E_GITHUB_NO_VERDICT_EXIT"
+        attempt="$(e2e_github_run_attempt "$E2E_GITHUB_RUN_STATE")"
+        echo "[e2e-github] run concluded: $(e2e_github_conclusion "$E2E_GITHUB_RUN_STATE")"
+        if ! e2e_github_download "$run_id" "$dir"; then
+            echo "ERROR: could not download the run's output." >&2
+            return 0
+        fi
+        E2E_GITHUB_SETTLE_DOWNLOADED=1
+        report="$(e2e_github_report "$dir" 2>&1)"
+        rc=$?
+        if [ "$rc" -eq "$E2E_GITHUB_NO_VERDICT_EXIT" ] && [ -z "$reran" ]; then
+            rerun_rc=0
+            e2e_github_rerun_failed "$run_id" "$attempt" || rerun_rc=$?
+            if [ "$rerun_rc" -eq 0 ]; then
+                reran=1
+                echo "[e2e-github] attempt $attempt ended with no verdict; rerunning its failed jobs once" >&2
+                continue
+            fi
+            if [ "$rerun_rc" -eq 2 ]; then
+                printf '%s\n' "$report"
+                echo "ERROR: the rerun of run $run_id did not show within ${E2E_GITHUB_RERUN_START_SECS:-120}s." >&2
+                return "$E2E_GITHUB_NO_VERDICT_EXIT"
+            fi
+        fi
+        printf '%s\n' "$report"
+        E2E_GITHUB_SETTLE_RC="$rc"
+        return 0
+    done
 }
 
 # e2e_github_timings_log: the one log every run appends its timing record to,

@@ -1,11 +1,12 @@
-//! `lucidos pair`: mint a one-time code that enrols a device.
+//! `lucidos pair`: mint a one-time pairing that enrols a device.
 //!
 //! The gateway authenticates every network caller. A browser cannot read the
 //! machine-local token file, so even a browser on this machine has to pair.
 //! This command is the bootstrap: run it in a terminal, then type the code into
-//! whichever device you want to let in.
+//! whichever device you want to let in. The typed code works only from another
+//! device on the LAN or the tailnet; the long secret and the link work anywhere.
 //!
-//! `--qr` draws the code instead, so a phone scans it. That needs an address
+//! `--qr` draws the pairing link instead, so a phone scans it. That needs an address
 //! the phone can reach, which is the hard part of the whole feature: this
 //! command talks to `127.0.0.1`, and a QR aimed there helps nobody. The
 //! address comes from `--host`, else the gateway's external address, else the
@@ -17,6 +18,7 @@
 
 use crate::gateway;
 use crate::workspace::BoxError;
+use lucidos_gateway_constants::{PAIR_PARAM, SIGIL};
 
 /// Where the gateway's own surface lives, behind the reserved sigil namespace.
 const PAIRING_CODE_PATH: &str = "/~/api/v1/auth/pairing-code";
@@ -88,6 +90,7 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
         body,
     } = mint(request)?;
     let pair_url = body.get("pair_url").and_then(|u| u.as_str());
+    let secret = body.get("secret").and_then(|s| s.as_str());
 
     // User-facing CLI output that a person reads off the screen and types into
     // a phone, so bare `println!` rather than the timestamped `log!`.
@@ -97,7 +100,7 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
             Some(url) => match terminal_qr(url) {
                 Some(qr) => {
                     print!("{qr}");
-                    println!("  Scan this, or enter the code below.");
+                    println!("  Scan this from anywhere, or enter the code below.");
                     println!();
                 }
                 None => println!("  That address does not fit in a QR code."),
@@ -112,25 +115,32 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
         }
     }
     println!("  Pairing code: {code}");
-    println!();
-    match pair_url {
-        Some(url) => println!("  Open {url} on the device you want to pair,"),
-        None => println!("  Open {base}/ on the device you want to pair,"),
+    if let Some(secret) = secret {
+        println!("  Pairing secret: {secret}");
     }
+    println!();
+    // With no reachable origin, a browser on this machine is the one device
+    // left, and the gateway refuses it a typed code. So it gets a loopback link.
+    let link = pair_url
+        .map(str::to_owned)
+        .or_else(|| secret.map(|s| format!("{base}/{SIGIL}/?{PAIR_PARAM}={s}")));
+    match link {
+        Some(link) => println!("  Open {link} on the device you want to pair."),
+        None => println!("  Open {base}/ on the device you want to pair, and enter the code."),
+    }
+    println!("  Or type the code on its pairing screen, from another device on your");
+    println!("  network or tailnet. Through a tunnel or proxy, paste the secret instead.");
     if let Some(label) = args.label {
         // The pairing screen offers the device a name of its own, and what the
         // person there types wins. So this is what it falls back to.
-        println!("  and enter this code. Unless that device names itself,");
-        println!("  it will be listed as \"{label}\".");
-    } else {
-        println!("  and enter this code.");
+        println!("  Unless that device names itself, it will be listed as \"{label}\".");
     }
     println!("  It works once and expires in {minutes} minutes.");
     println!();
     Ok(())
 }
 
-/// `lucidos pair --gateway`: mint a code that lets another gateway relay this
+/// `lucidos pair --gateway`: mint a secret that lets another gateway relay this
 /// one's workspaces (ADR 0590).
 ///
 /// It prints the `https` address the other gateway should use, found the way a
@@ -141,7 +151,7 @@ pub fn cmd_pair_gateway(port: Option<u16>, label: Option<&str>) -> Result<(), Bo
     let base = gateway::the_gateway(
         &client,
         port,
-        "A gateway pairing code only works on the gateway that minted it, so pass --port to \
+        "A gateway pairing secret only works on the gateway that minted it, so pass --port to \
          name the one the other gateway will reach",
     )?;
     let token = local_token()?;
@@ -161,17 +171,17 @@ pub fn cmd_pair_gateway(port: Option<u16>, label: Option<&str>) -> Result<(), Bo
     let Minted { code, minutes, .. } = mint(request)?;
 
     println!();
-    println!("  Gateway pairing code: {code}");
+    println!("  Gateway pairing secret: {code}");
     println!();
     println!("  On the other gateway, open Settings -> Access -> Add a remote gateway,");
     match &address {
         Some(address) => {
-            println!("  and enter this address and code:");
+            println!("  and paste this address and secret:");
             println!();
             println!("    {address}");
         }
         None => {
-            println!("  and enter this code with an https address for this gateway.");
+            println!("  and paste this secret with an https address for this gateway.");
             println!();
             println!("  This gateway has no https address another gateway can reach yet.");
             println!("  Gateways pair over https only. Set up `tailscale serve`, or set one");
@@ -184,7 +194,7 @@ pub fn cmd_pair_gateway(port: Option<u16>, label: Option<&str>) -> Result<(), Bo
     Ok(())
 }
 
-/// Where the gateway mints a gateway pairing code, apart from device codes.
+/// Where the gateway mints a gateway pairing secret, apart from device pairings.
 const GATEWAY_PAIRING_CODE_PATH: &str = "/~/api/v1/auth/gateway-pairing-code";
 
 /// The machine-local token, which only a process on the gateway's machine can

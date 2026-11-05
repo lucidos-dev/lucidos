@@ -11,9 +11,9 @@
 //! `docs/plans/2026-09-20-the-agent-can-read-its-own-todo-list.md`.
 //!
 //! Also hosts [`settle_open_todos`], the engine-side hook that runs whenever a
-//! thread stops working the list: at response termination, and at the one
-//! unpark no response follows (`todo_consumer` has both triggers and says which
-//! is which). The agent's contract is "either keep working
+//! thread stops working the list: at response termination, and at each unpark
+//! no response follows (`todo_consumer` has the triggers and says which is
+//! which). The agent's contract is "either keep working
 //! the list until every item is `completed`, or call `todo_write` with `[]` to
 //! drop it explicitly." If the agent terminates a response with any OPEN item
 //! still on the list, the engine emits a new `TodoListWritten` with those items
@@ -27,15 +27,19 @@
 //! `await_event` does not hold the turn, so a subscribed thread ends its
 //! response like any other and then sleeps until the event arrives. Its open
 //! items settle to `Waiting`, which is the same reading the thread's own status
-//! dot already gives that fact. Everything else settles to `Abandoned`.
+//! dot already gives that fact. A thread that a live direct child still owes a
+//! report parked the same way. Everything else settles to `Abandoned`.
 //!
 //! See `docs/plans/2026-05-18-todo-list-design.md` for the original design,
 //! `docs/plans/2026-08-09-a-subscribed-threads-todo-list-reads-as-waiting.md`
-//! for the waiting split, and
+//! for the waiting split,
 //! `docs/plans/2026-08-11-a-canceled-subscription-settles-the-todo-list.md` for
-//! the second trigger that keeps `Waiting` from stranding.
+//! the second trigger that keeps `Waiting` from stranding, and
+//! `docs/plans/2026-11-02-a-thread-parked-on-its-children-reads-as-waiting.md`
+//! for live children.
 
 use super::ToolOutcome;
+use crate::engine::chat::OWED_CHILDREN_SQL;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventMeta, ThreadEvent, TodoItem, TodoStatus};
 use crate::engine::LucidosEngine;
@@ -376,6 +380,66 @@ async fn thread_held_event_wait(
     .await
 }
 
+/// The cards on a parent that resolve a child and start no turn behind them.
+/// `todo_consumer` settles on each one.
+pub(crate) const CHILD_UNPARK_EVENT_TYPES: [&str; 3] = [
+    "ChildReportFiled",
+    "ChildThreadStopped",
+    "ChildThreadDetached",
+];
+
+/// The card on a parent that resolves a child AND wakes the parent. The woken
+/// turn's terminator settles the list, so the consumer leaves this one alone.
+const CHILD_WAKE_EVENT_TYPE: &str = "ChildThreadCompleted";
+
+/// Was this thread owed a result by a live direct child as of `as_of_seq`?
+///
+/// No event records when a child became owed: a queued spawn has no events at
+/// all, and a child's start lives on the child's own thread. So the answer is
+/// a current read plus a correction. A child live now was live then, and so
+/// was any child whose card landed on this thread after `as_of_seq`.
+///
+/// Every error this makes points at `Waiting`, never at terminal `Abandoned`.
+/// A child spawned or revived after `as_of_seq` reads as live, and each of
+/// those brings its own later settle. See
+/// `docs/plans/2026-11-02-a-thread-parked-on-its-children-reads-as-waiting.md`.
+///
+/// `Err` means the question could not be answered, never "no", exactly as for
+/// [`thread_held_event_wait`].
+async fn thread_held_live_child(
+    pool: &PgPool,
+    thread_id: Uuid,
+    as_of_seq: i64,
+) -> Result<bool, sqlx::Error> {
+    let resolutions: Vec<&str> = CHILD_UNPARK_EVENT_TYPES
+        .into_iter()
+        .chain([CHILD_WAKE_EVENT_TYPE])
+        .collect();
+    sqlx::query_scalar(&format!(
+        "SELECT EXISTS ({owed}) \
+             OR EXISTS ( \
+               SELECT 1 FROM events \
+               WHERE thread_id = $1 AND sequence > $2 AND event_type = ANY($3))",
+        owed = *OWED_CHILDREN_SQL,
+    ))
+    .bind(thread_id)
+    .bind(as_of_seq)
+    .bind(resolutions)
+    .fetch_one(pool)
+    .await
+}
+
+/// Is this thread owed a result by a live direct child right now?
+///
+/// The *wake check*'s reader. It runs inside the turn, where no terminator
+/// exists to be as-of, so the current state is the answer.
+async fn holds_live_child(pool: &PgPool, thread_id: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(&format!("SELECT EXISTS ({})", *OWED_CHILDREN_SQL))
+        .bind(thread_id)
+        .fetch_one(pool)
+        .await
+}
+
 /// The thread's newest todo list: its items, its *todo notes*, and the sequence
 /// it was written at.
 ///
@@ -483,16 +547,17 @@ impl LucidosEngine {
     /// than zero. `Some(0)` means the list genuinely holds nothing open.
     /// `should_nudge_unwatched_turn` combines them with the per-turn bound.
     ///
-    /// **The probe order is the cost control.** Both coverage reads are
+    /// **The probe order is the cost control.** Both registry reads are
     /// in-memory, and either one true settles the answer. So they run FIRST and
-    /// skip the query, which keeps a parked thread free. The query itself is a
-    /// second copy of the one `settle_open_todos` runs per terminator.
+    /// skip the queries, which keeps a parked thread free. The open count runs
+    /// next, and the live-child query only when items are open, so an ordinary
+    /// turn with no list pays one query.
     ///
-    /// **The registry is read, not the settle's anti-join.** This runs inside
-    /// the turn, before any terminator exists. There is no sequence to be
-    /// as-of, so the registry is the current truth. The settle is an async
-    /// consumer and must answer as of its terminator, which is why it cannot
-    /// share this reader.
+    /// **Current state is read, not the settle's as-of answers.** This runs
+    /// inside the turn, before any terminator exists. There is no sequence to
+    /// be as-of, so the registries and the child rows are the current truth.
+    /// The settle is an async consumer and must answer as of its terminator,
+    /// which is why it cannot share these readers.
     pub(crate) async fn wake_check_facts(&self, thread_id: Uuid) -> (Option<usize>, bool) {
         let covered = !self.live_waits.for_thread(thread_id).await.is_empty()
             || self.bash_background.has_running_for_thread(thread_id).await;
@@ -500,8 +565,9 @@ impl LucidosEngine {
             return (None, true);
         }
 
-        match open_todo_count(&self.pool, thread_id).await {
-            Ok(open) => (Some(open), false),
+        let open = match open_todo_count(&self.pool, thread_id).await {
+            Ok(0) => return (Some(0), false),
+            Ok(open) => open,
             Err(e) => {
                 log!(
                     "[Todo] Could not read the todo list for thread {}: {}. \
@@ -509,9 +575,33 @@ impl LucidosEngine {
                     thread_id,
                     e
                 );
-                (None, false)
+                return (None, false);
             }
+        };
+        let child_probe = holds_live_child(&self.pool, thread_id).await;
+        if let Err(e) = &child_probe {
+            log!(
+                "[Todo] Could not read the live children of thread {}: {}. \
+                 Not asking whether this turn leaves work unwatched.",
+                thread_id,
+                e
+            );
         }
+        wake_facts_given_child_probe(open, child_probe)
+    }
+}
+
+/// The wake check's facts once the list holds `open` open items and the
+/// live-child probe has run. A live child reports back on its own, so it
+/// covers the thread. A probe that could not run is UNKNOWN, reported as an
+/// unknown count so it never nudges.
+fn wake_facts_given_child_probe(
+    open: usize,
+    holds_live_child: Result<bool, sqlx::Error>,
+) -> (Option<usize>, bool) {
+    match holds_live_child {
+        Ok(covered) => (Some(open), covered),
+        Err(_) => (None, false),
     }
 }
 
@@ -521,7 +611,8 @@ impl LucidosEngine {
 /// completed.
 ///
 /// Open items settle to **`Waiting`** when the thread still holds a live event
-/// wait at the terminator, and to **`Abandoned`** otherwise. A subscribed
+/// wait or a live direct child at the terminator, and to **`Abandoned`**
+/// otherwise. A subscribed
 /// thread parked on purpose (ADR 0049: `await_event` does not hold the turn, so
 /// the response terminates normally and the thread sleeps), and calling that
 /// abandoned within milliseconds of the agent saying it would keep watching is
@@ -534,8 +625,8 @@ impl LucidosEngine {
 ///
 /// Called from `todo_consumer` on every chat-thread terminator
 /// (`ResponseGenerated` / `ResponseCanceled` / `ResponseAborted` /
-/// `ResponseFailed`), and on the one unpark no terminator follows, an
-/// `EventWaitCanceled`. The agent's contract: either finish the list (every
+/// `ResponseFailed`), and on each unpark no terminator follows: an
+/// `EventWaitCanceled`, or a child card that wakes nothing. The agent's contract: either finish the list (every
 /// item `completed`) or call `todo_write` with `[]` to drop it. Already-settled
 /// lists short-circuit, so a second call with the same answer re-emits
 /// nothing. That short-circuit is also what keeps the archive cascade to one
@@ -547,8 +638,8 @@ impl LucidosEngine {
 /// `sequence <= terminator_seq`, AND skip the settle if a NEWER
 /// TodoListWritten exists (a fresh turn started before our async consumer
 /// caught up, and that turn owns its list: the consumer will see its own
-/// terminator and handle it then). The wait question is scoped to the same
-/// sequence for the same reason.
+/// terminator and handle it then). The wait and child questions are scoped to
+/// the same sequence for the same reason.
 ///
 /// Coding-agent threads never emit `TodoListWritten` (CC has its own
 /// `TodoWrite`), so the SELECT short-circuits to `None` for them and no extra
@@ -609,12 +700,12 @@ pub async fn settle_open_todos(
 
     // Only asked once there is something to settle, so an all-completed list
     // (the common case) never pays for it.
-    let settled_status = match thread_held_event_wait(pool, thread_id, terminator_seq).await {
+    let settled_status = match thread_was_parked(pool, thread_id, terminator_seq).await {
         Ok(true) => TodoStatus::Waiting,
         Ok(false) => TodoStatus::Abandoned,
         Err(e) => {
             log!(
-                "[Todo] settle_open_todos could not resolve the event-wait state for thread {}: {} \
+                "[Todo] settle_open_todos could not resolve whether thread {} was parked: {} \
                  (leaving the list untouched; the next terminator retries)",
                 thread_id,
                 e
@@ -626,11 +717,27 @@ pub async fn settle_open_todos(
     settle_to(event_bus, thread_id, items, notes, settled_status).await;
 }
 
+/// Will something re-open this thread, as of `as_of_seq`: a live event wait,
+/// or a live direct child that still owes it a result?
+///
+/// The wait is asked first because it is the cheaper query and the commoner
+/// park.
+async fn thread_was_parked(
+    pool: &PgPool,
+    thread_id: Uuid,
+    as_of_seq: i64,
+) -> Result<bool, sqlx::Error> {
+    if thread_held_event_wait(pool, thread_id, as_of_seq).await? {
+        return Ok(true);
+    }
+    thread_held_live_child(pool, thread_id, as_of_seq).await
+}
+
 /// Rewrite every OPEN item to `settled_status` and re-emit the list.
 ///
-/// Extracted so the two ways a thread can be parked reach one writer: an
-/// unresolved *event wait* at the terminator, and unfinished background work
-/// the tail is about to subscribe to.
+/// Extracted so every way a thread can be parked reaches one writer: an
+/// unresolved *event wait* or live child at the terminator, and unfinished
+/// background work the tail is about to subscribe to.
 ///
 /// `notes` rides through untouched. Replace-whole-list means this re-emit IS
 /// the list from here on. Dropping them would have the engine erase what the
@@ -1009,6 +1116,19 @@ mod tests {
             notes: None,
             sequence: 1,
         }
+    }
+
+    /// A live child reports back on its own, so it re-opens the thread as
+    /// surely as a subscription does. A probe that could not run is UNKNOWN,
+    /// and unknown never nudges.
+    #[test]
+    fn the_wake_check_counts_a_live_child_as_covered() {
+        assert_eq!(wake_facts_given_child_probe(2, Ok(true)), (Some(2), true));
+        assert_eq!(wake_facts_given_child_probe(2, Ok(false)), (Some(2), false));
+        assert_eq!(
+            wake_facts_given_child_probe(2, Err(sqlx::Error::PoolClosed)),
+            (None, false)
+        );
     }
 
     /// A turn on a thread with nothing to reconcile pays nothing. Three shapes

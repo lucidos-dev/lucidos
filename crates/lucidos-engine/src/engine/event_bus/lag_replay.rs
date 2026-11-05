@@ -98,6 +98,8 @@ impl ReplayWindow {
 /// every type. The position itself records every live frame, of any type.
 pub(crate) struct LagReplay {
     scope: ReplayScope,
+    /// Archived history is never owed, even by an in-flight append ticket.
+    restore_floor: i64,
     event_types: Option<Vec<&'static str>>,
     unbroadcast: UnbroadcastRows,
     tickets: AppendTickets,
@@ -153,6 +155,7 @@ impl LagReplay {
     ) -> Self {
         Self {
             scope,
+            restore_floor: 0,
             event_types,
             unbroadcast,
             tickets,
@@ -269,6 +272,18 @@ impl LagReplay {
     /// `None` when there is nothing to replay. A failed horizon read moves
     /// nothing, so the next lag's window covers this one too.
     pub(crate) async fn window(&mut self, pool: &PgPool) -> Option<ReplayWindow> {
+        // Refuse the entire window on an unknown restore boundary. No position
+        // advances, so a later successful read can recover new work.
+        self.restore_floor = match crate::core::snapshot::boundary::read(pool).await {
+            Ok(boundary) => boundary.map_or(0, |b| b.event_sequence),
+            Err(error) => {
+                log!(
+                    "[LagReplay] Restore boundary unavailable; refusing replay: {}",
+                    error
+                );
+                return None;
+            }
+        };
         let top = match horizon(pool, self.scope).await {
             Ok(top) => top,
             Err(e) => {
@@ -300,7 +315,12 @@ impl LagReplay {
                 self.first_floor(committed)?
             }
         };
-        let owed = self.owed();
+        let floor = floor.max(self.restore_floor);
+        let owed: Vec<i64> = self
+            .owed()
+            .into_iter()
+            .filter(|seq| *seq > self.restore_floor)
+            .collect();
         if top <= floor && owed.is_empty() {
             return None;
         }
@@ -406,7 +426,8 @@ impl LagReplay {
     /// that no replay owed was never replayed, so it is not covered.
     fn is_covered(&self, seq: Option<i64>) -> bool {
         seq.is_some_and(|seq| {
-            self.seen_below.contains(&seq)
+            seq <= self.restore_floor
+                || self.seen_below.contains(&seq)
                 || self
                     .replayed
                     .as_ref()

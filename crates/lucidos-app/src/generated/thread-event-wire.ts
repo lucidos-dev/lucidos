@@ -24,6 +24,7 @@ export type AbortCause =
   | 'process_killed'
   | 'stale_settle'
   | 'session_dropped'
+  | 'snapshot_restored'
   | 'unknown';
 
 /** Who semantically drove this request:
@@ -602,6 +603,7 @@ export type EventWaitCancelCause =
   | 'thread_archived'
   | 'thread_discarded'
   | 'thread_canceled'
+  | 'snapshot_restored'
   | 'unknown';
 
 /** How an event wait ended, as the re-entry it caused reports it. */
@@ -826,9 +828,11 @@ export interface ModalityUsage {
  *  Full reasoning is on the Rust variant. */
 export interface OwnerApproval {
   verb: ThreadReachVerb;
-  /** The thread the act aims at. `None` only on a card asked for a
-   *  top-thread before that needed no approval (ADR 0475). */
+  /** The thread the act aims at. Workspace-scoped snapshot approvals use
+   *  explicit workspace and snapshot fields instead. */
   target_thread_id?: string;
+  target_workspace_id?: string;
+  snapshot_handle?: string;
 }
 
 /** The expected wake a keep-alive run plans from, as its status shows it. */
@@ -901,6 +905,15 @@ export interface RecalledMemory {
   /** When the source content was created, which is the date the model saw. */
   src_created_at: string;
   source: MemorySource;
+}
+
+/** Initial restored composer, inserted only when its fresh destination is absent.
+ *  The generation fences requests delayed across another workspace restore. */
+export interface RecoveredCompose {
+  generation: string;
+  text: string;
+  image_hashes: string[];
+  selection: unknown;
 }
 
 /** Provenance and admission deadline for a fresh fire retrying an interrupted thread. */
@@ -982,6 +995,7 @@ export type ThreadReachVerb =
   | 'ask-side-question'
   | 'dismiss-side-question'
   | 'apply'
+  | 'restore-snapshot'
   | 'discard'
   | 'set-aside'
   | 'bring-back'
@@ -2190,6 +2204,7 @@ export type ThreadEvent =
    *  be addressed by id immediately after this event lands. */
   | {
       type: 'ThreadStarted';
+      recovered_compose?: RecoveredCompose;
       /** Initial mode the user opened compose with. Mutable while the
        *  thread is `Composing`; locked on first `MessageReceived`. */
       mode: string;
@@ -2822,6 +2837,8 @@ export type ThreadEvent =
       tool_use_id: string;
       verb: ThreadReachVerb;
       target_thread_id?: string;
+      target_workspace_id?: string;
+      snapshot_handle?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -3466,7 +3483,7 @@ export type ThreadEvent =
       app_id: string;
       /** The instance's *widget params*. Absent means none. */
       params?: Record<string, unknown>;
-      /** The instance's chip label. Absent means the widget's name. */
+      /** The instance's card label. Absent means the widget's name. */
       label?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -3475,16 +3492,16 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The user or the agent pinned a widget instance: its chip is now on this
-   *  thread's widget shelf. A pin alone adds the instance, as from an
-   *  embed. No file changes. */
+  /** Legacy: a widget instance was pinned to the thread's shelf, which is
+   *  gone. Nothing writes it any more. Only the dashboard seed reads it, for
+   *  Home's old pins (ADR 0496). */
   | {
       type: 'WidgetPinned';
       app_id: string;
       params?: Record<string, unknown>;
       label?: string;
-      /** The event whose reply draws the widget, so "Show in thread" can
-       *  land there. Absent when the pin came from nowhere in the thread. */
+      /** The event whose reply drew the widget. Absent when the pin came
+       *  from nowhere in the thread. */
       shown_event_id?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -3493,13 +3510,29 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A widget instance was unpinned: its chip left this thread's widget
-   *  shelf. The inline widget stays, and no file changes. */
+  /** Legacy: a widget instance was unpinned from the thread's shelf, which
+   *  is gone. Nothing writes it any more. Only the dashboard seed reads it,
+   *  for Home's old pins (ADR 0496). */
   | {
       type: 'WidgetUnpinned';
       app_id: string;
       params?: Record<string, unknown>;
       label?: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The user or the agent picked the size of a widget instance's cards in
+   *  this thread. The newest one wins, and a card with none starts at the
+   *  widget's default size. No file changes. */
+  | {
+      type: 'InlineWidgetSized';
+      app_id: string;
+      params?: Record<string, unknown>;
+      size: WidgetSize;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -3848,6 +3881,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   WidgetShown: true,
   WidgetPinned: true,
   WidgetUnpinned: true,
+  InlineWidgetSized: true,
   ThreadMcpServerEnabled: true,
   ThreadMcpServerDisabled: true,
   HomeBoardArranged: true,

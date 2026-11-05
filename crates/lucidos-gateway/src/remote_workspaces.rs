@@ -13,10 +13,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
 
-use crate::auth;
-use crate::gateway_protocol::{
-    ListedWorkspace, GATEWAY_API_PREFIX, HEADER_GATEWAY_CREDENTIAL, WORKSPACES_PATH,
-};
+use crate::gateway_protocol::{ListedWorkspace, GATEWAY_API_PREFIX, WORKSPACES_PATH};
 use crate::remote_gateways::RemoteGateway;
 use crate::server::GatewayState;
 
@@ -30,6 +27,9 @@ pub struct RemoteGatewayListing {
     /// The short name A's user gave the gateway, the `<name>` in
     /// `/<slug>@<name>/`.
     pub gateway: String,
+    pub host: String,
+    pub pairing_id: String,
+    pub last_seen_at: Option<String>,
     #[serde(flatten)]
     pub listing: Listing,
 }
@@ -37,8 +37,35 @@ pub struct RemoteGatewayListing {
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "lowercase")]
 pub enum Listing {
-    Reachable { workspaces: Vec<ListedWorkspace> },
-    Unreachable { reason: String },
+    Reachable {
+        workspaces: Vec<ListedWorkspace>,
+    },
+    Unreachable {
+        reason: String,
+        reason_kind: ReasonKind,
+    },
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasonKind {
+    Timeout,
+    Refused,
+    Tls,
+    Revoked,
+    Incompatible,
+}
+
+pub fn transport_reason(error: &reqwest::Error) -> ReasonKind {
+    if error.is_timeout() {
+        return ReasonKind::Timeout;
+    }
+    let chain = crate::external_address::error_chain(error).to_lowercase();
+    if chain.contains("certificate") || chain.contains("tls") {
+        ReasonKind::Tls
+    } else {
+        ReasonKind::Refused
+    }
 }
 
 /// A's routes, nested at `/~/api/v1/remote-workspaces`, device-gated by
@@ -50,20 +77,44 @@ pub fn router() -> Router<GatewayState> {
 }
 
 async fn list(State(state): State<GatewayState>) -> Json<Vec<RemoteGatewayListing>> {
-    let client = state.relay_client().client();
+    let client = state.peer_connection().client();
     let listings = state.remote_gateways().list().into_iter().map(|gateway| {
         let client = client.clone();
+        let state = state.clone();
         async move {
             let listing = match client {
                 Some(client) => match fetch(&client, &gateway).await {
-                    Ok(workspaces) => Listing::Reachable { workspaces },
-                    Err(reason) => Listing::Unreachable { reason },
+                    Ok(workspaces) => {
+                        state.remote_gateways().last_seen.lock().unwrap().insert(
+                            format!("{}@{}", gateway.pairing_id, gateway.address),
+                            chrono::Utc::now().to_rfc3339(),
+                        );
+                        Listing::Reachable { workspaces }
+                    }
+                    Err((reason_kind, reason)) => Listing::Unreachable {
+                        reason,
+                        reason_kind,
+                    },
                 },
                 None => Listing::Unreachable {
                     reason: "the relay client is unavailable".to_string(),
+                    reason_kind: ReasonKind::Refused,
                 },
             };
+            let last_seen_at = state
+                .remote_gateways()
+                .last_seen
+                .lock()
+                .unwrap()
+                .get(&format!("{}@{}", gateway.pairing_id, gateway.address))
+                .cloned();
             RemoteGatewayListing {
+                host: reqwest::Url::parse(&gateway.address)
+                    .ok()
+                    .and_then(|u| u.host_str().map(str::to_owned))
+                    .unwrap_or_default(),
+                last_seen_at,
+                pairing_id: gateway.pairing_id,
                 gateway: gateway.name,
                 listing,
             }
@@ -74,39 +125,56 @@ async fn list(State(state): State<GatewayState>) -> Json<Vec<RemoteGatewayListin
 
 /// `gateway`'s workspaces, or a sentence saying why not.
 async fn fetch(
-    client: &reqwest::Client,
+    client: &crate::peer_connection::PeerConnection,
     gateway: &RemoteGateway,
-) -> Result<Vec<ListedWorkspace>, String> {
-    let mut request = client
-        .get(format!(
-            "{}{GATEWAY_API_PREFIX}{WORKSPACES_PATH}",
-            gateway.address
-        ))
-        .timeout(LIST_TIMEOUT);
-    if let Some(credential) = auth::sensitive_credential(&gateway.credential) {
-        request = request.header(HEADER_GATEWAY_CREDENTIAL, credential);
+) -> Result<Vec<ListedWorkspace>, (ReasonKind, String)> {
+    if gateway.gateway_protocol < 1 {
+        return Err((
+            ReasonKind::Incompatible,
+            "Update the remote gateway to a compatible Lucidos version".into(),
+        ));
     }
+    let request = client
+        .request(
+            gateway,
+            reqwest::Method::GET,
+            &format!("{GATEWAY_API_PREFIX}{WORKSPACES_PATH}"),
+        )
+        .map_err(|e| (ReasonKind::Refused, e))?
+        .timeout(LIST_TIMEOUT);
     let response = request.send().await.map_err(|e| {
-        format!(
-            "could not reach {}: {}",
-            gateway.address,
-            crate::external_address::error_chain(&e)
+        (
+            transport_reason(&e),
+            format!(
+                "could not reach {}: {}",
+                gateway.address,
+                crate::external_address::error_chain(&e)
+            ),
         )
     })?;
     match response.status() {
         status if status.is_success() => {
-            let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-            serde_json::from_slice(&bytes)
-                .map_err(|_| format!("{} answered with an unreadable list", gateway.address))
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|e| (transport_reason(&e), e.to_string()))?;
+            serde_json::from_slice(&bytes).map_err(|_| {
+                (
+                    ReasonKind::Incompatible,
+                    format!("{} answered with an unreadable list", gateway.address),
+                )
+            })
         }
-        reqwest::StatusCode::UNAUTHORIZED => Err(format!(
-            "{} no longer grants this gateway access. Remove it here and pair again",
-            gateway.address
+        reqwest::StatusCode::UNAUTHORIZED => Err((
+            ReasonKind::Revoked,
+            format!(
+                "{} no longer grants this gateway access. Remove it here and pair again",
+                gateway.address
+            ),
         )),
-        status => Err(format!(
-            "{} answered HTTP {}",
-            gateway.address,
-            status.as_u16()
+        status => Err((
+            ReasonKind::Refused,
+            format!("{} answered HTTP {}", gateway.address, status.as_u16()),
         )),
     }
 }

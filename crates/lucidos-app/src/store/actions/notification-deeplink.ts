@@ -1,4 +1,5 @@
 import type { Tap, NavigateUi } from '@lucidos/sdk';
+import { isWorkspaceSlug } from '../../utils/basePath';
 import type { Notification } from '../types';
 import { hasDangerousScheme } from '../../utils/dangerousUrlScheme';
 
@@ -8,11 +9,14 @@ export type DeepLinkAction =
    *  source notification id so the dispatcher can mark it read in parallel
    *  with the navigation. */
   | { type: 'navigate'; to: NavigateUi; notification: string | null }
+  | { type: 'restore-snapshot'; tap: Extract<Tap, { kind: 'restore-snapshot' }>; notification: string | null }
   | { type: 'view-notification'; id: string }
   | { type: 'noop' };
 
 export interface DeepLinkTarget {
   notification?: string | null;
+  /** Push origin; absent only for page-local inbox/toast intent. */
+  restoreGeneration?: string;
   // CONTEXT — source-of-event for the §4 in-app matrix. `thread` + `event`
   // identify where the notification was raised; they drive Row 1's
   // "user already saw it, auto-mark-read" check. Distinct from
@@ -36,18 +40,22 @@ export interface DeepLinkTarget {
  *  panel (the `modal` tap kind is the wire name, not a UI modal). */
 export function resolveDeepLink(target: DeepLinkTarget): DeepLinkAction {
   const tap: Tap = target.tap ?? { kind: 'modal' };
-  // Only `navigate` deep-links; everything else opens the inbox detail. That
-  // "everything else" defensively covers the retired `none` kind (and any
+  // Recognized actions share one dispatcher; unknown kinds open the detail.
+  // This defensively covers the retired `none` kind (and any
   // unknown future kind) arriving via untyped runtime data (an old SW message,
   // a stale URL param, a historical row) — every notification is openable.
   if (tap.kind === 'navigate') {
     return { type: 'navigate', to: tap.to, notification: target.notification ?? null };
   }
+  const restoreTap = validateTap(tap);
+  if (restoreTap?.kind === 'restore-snapshot') {
+    return { type: 'restore-snapshot', tap: restoreTap, notification: target.notification ?? null };
+  }
   if (target.notification) return { type: 'view-notification', id: target.notification };
   return { type: 'noop' };
 }
 
-const DEEP_LINK_KEYS = ['notification', 'thread', 'event', 'tap'] as const;
+const DEEP_LINK_KEYS = ['notification', 'thread', 'event', 'tap', 'restore_generation'] as const;
 
 /** Read deep-link params from a URL/Location, preferring hash over query.
  *
@@ -70,6 +78,7 @@ export function parseDeepLinkFromUrl(loc: URL | Location): DeepLinkTarget {
   const get = (k: string) => hashParams.get(k) ?? queryParams.get(k);
   return {
     notification: get('notification'),
+    restoreGeneration: get('restore_generation') ?? 'unknown',
     thread: get('thread'),
     event: get('event'),
     tap: parseTapFromUrlParam(get('tap')),
@@ -108,6 +117,10 @@ function validateTap(raw: unknown): Tap | null {
   if (!raw || typeof raw !== 'object') return null;
   const obj = raw as Record<string, unknown>;
   switch (obj.kind) {
+    case 'restore-snapshot':
+      if (typeof obj.workspace_id !== 'string' || !isWorkspaceSlug(obj.workspace_id)
+        || typeof obj.handle !== 'string' || !/^snap_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(obj.handle)) return null;
+      return { kind: 'restore-snapshot', workspace_id: obj.workspace_id, handle: obj.handle };
     case 'modal':
       return { kind: 'modal' };
     // The retired `none` kind is intentionally NOT accepted — a `{kind:'none'}`
@@ -150,6 +163,8 @@ export function parseDeepLinkFromSwMessage(raw: unknown): DeepLinkTarget | null 
   if (!raw || typeof raw !== 'object') return null;
   const obj = raw as Record<string, unknown>;
   return {
+    restoreGeneration: obj.restore_generation === null ? 'none'
+      : typeof obj.restore_generation === 'string' ? obj.restore_generation : 'unknown',
     notification: typeof obj.notification_id === 'string' ? obj.notification_id : null,
     thread: typeof obj.thread_id === 'string' ? obj.thread_id : null,
     event: typeof obj.event_id === 'string' ? obj.event_id : null,

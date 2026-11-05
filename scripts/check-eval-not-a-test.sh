@@ -48,7 +48,7 @@ SPENDING_ENTRYPOINTS=(
     drive_task
     boot_engine
     migrate_by_booting
-    recreate_database
+    create_database
     install_fixture_tree
     apply_seed_sql
     judge_call

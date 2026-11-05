@@ -17,12 +17,16 @@ pub(crate) fn cmd_ask(
     ws: &Workspace,
     verb: &str,
     thread: Option<&str>,
+    target_workspace: Option<&str>,
+    snapshot: Option<&str>,
     reason: &str,
 ) -> Result<(), BoxError> {
     let url = format!("{}/api/v1/owner-approvals", ws.base_url());
     let body = json!({
         "verb": verb,
         "target_thread_id": thread,
+        "target_workspace_id": target_workspace,
+        "snapshot_handle": snapshot,
         "reason": reason,
     });
     let resp = send_expect_json("POST", &url, http_client()?.post(&url).json(&body))?;

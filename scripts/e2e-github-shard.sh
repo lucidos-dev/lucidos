@@ -128,6 +128,26 @@ ensure_main_branch() {
         || git -C "$repo" branch main HEAD
 }
 
+# prepare_coding_agent_host: what a suite that spawns a coding-agent thread needs
+# on a runner. The API gateway chain test spawns a child like the browser specs.
+prepare_coding_agent_host() {
+    install_fake_claude_code || return 1
+    ensure_main_branch
+}
+
+# run_setup_step <out-dir> <id> <cmd...>: a step before the suite. On failure its
+# stderr and exit code land where the report reads the suite's verdict.
+run_setup_step() {
+    local out="$1" id="$2" rc
+    shift 2
+    "$@" 2>>"$out/$id.log" || {
+        rc=$?
+        cat "$out/$id.log" >&2
+        echo "$rc" >"$out/$id.rc"
+        return "$rc"
+    }
+}
+
 cmd_plan() {
     # shellcheck source=scripts/lib/e2e.sh
     source "$SCRIPT_DIR/lib/e2e.sh"
@@ -609,16 +629,12 @@ cmd_run() {
     local id="$1" suite="$2" project="${3:-}" shard="${4:-}" total="${5:-}"
     local out="$OUT_ROOT/$id" rc
     mkdir -p "$out"
+    : >"$out/$id.log"
     # e2e-browser.sh waits for the system packages and the browser itself,
     # after the engine has booted. gcloud's first call must end before it.
     local -a waits=()
     [ "$suite" != browser ] || waits=(npm gcloud)
-    e2e_warm_wait ${waits[@]+"${waits[@]}"} 2>"$out/$id.log" || {
-        rc=$?
-        cat "$out/$id.log" >&2
-        echo "$rc" >"$out/$id.rc"
-        return "$rc"
-    }
+    run_setup_step "$out" "$id" e2e_warm_wait ${waits[@]+"${waits[@]}"} || return
     # Every suite must see what the build job saw: dist/ holds sourcemaps exactly
     # when coverage was requested, and a mismatch makes the suite rebuild dist/
     # on a runner that never installed node_modules.
@@ -639,6 +655,10 @@ cmd_run() {
             cmd=("$SCRIPT_DIR/test-engine.sh")
             ;;
         api)
+            # The gateway chain test's child proves its workspace id, which an
+            # engine learns only from a gateway that lists it.
+            export LUCIDOS_E2E_GATEWAY=own
+            run_setup_step "$out" "$id" prepare_coding_agent_host || return
             cmd=("$SCRIPT_DIR/e2e-api.sh")
             while IFS= read -r a; do [ -z "$a" ] || cmd+=("$a"); done <<EOF
 $(request_field 'r["api_args"]')
@@ -654,8 +674,7 @@ EOF
             export LUCIDOS_E2E_GATEWAY=own
             # The fixture records only on Chromium, into the uploaded output.
             [ -z "${LUCIDOS_E2E_COVERAGE:-}" ] || export LUCIDOS_E2E_COVERAGE_DIR="$out/coverage"
-            install_fake_claude_code || return 1
-            ensure_main_branch || return 1
+            run_setup_step "$out" "$id" prepare_coding_agent_host || return
             cmd=("$SCRIPT_DIR/e2e-browser.sh")
             [ "$project" = mobile-webkit ] || cmd+=(--no-webkit)
             cmd+=(-- "--project=$project" "--shard=$shard/$total")

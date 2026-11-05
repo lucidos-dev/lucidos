@@ -11,7 +11,6 @@ import {
   restartRequired,
   engineVersionReady,
   engineVersionPending,
-  engineRebuildWedged,
   engineBuilding,
   engineBuildDetail,
   enginePackaged,
@@ -52,7 +51,6 @@ describe('brandBadgeState / brandBadgeLabel', () => {
     restartRequired.value = false;
     engineVersionReady.value = false;
     engineVersionPending.value = false;
-    engineRebuildWedged.value = false;
     engineBuilding.value = false;
     enginePackaged.value = false;
     updateAvailable.value = false;
@@ -114,12 +112,6 @@ describe('brandBadgeState / brandBadgeLabel', () => {
     expect(brandBadgeLabel([])).toBe('New code pending');
   });
 
-  it('a wedged rebuild says so', () => {
-    engineVersionPending.value = true;
-    engineRebuildWedged.value = true;
-    expect(brandBadgeState(0)).toBe('pending');
-    expect(brandBadgeLabel([])).toBe('New code pending · no rebuild can deliver it');
-  });
 
   it('ready wins over pending: something you can take now beats something unbuilt', () => {
     engineVersionReady.value = true;
@@ -212,7 +204,6 @@ describe('BrandBadge', () => {
     engineBuilding.value = false;
     engineVersionReady.value = false;
     engineVersionPending.value = false;
-    engineRebuildWedged.value = false;
     updateAvailable.value = false;
     enginePackaged.value = false;
     restartRequired.value = false;
@@ -265,11 +256,6 @@ describe('BrandBadge', () => {
     expect(findByClass(BrandBadge(), 'brand-badge-spinner')).toHaveLength(0);
   });
 
-  it('tints the dot when rebuilding is wedged', () => {
-    engineVersionPending.value = true;
-    engineRebuildWedged.value = true;
-    expect(findByClass(BrandBadge(), 'brand-badge-wedged')).toHaveLength(1);
-  });
 
   /** The reported bug: on iOS the spinner froze after a swipe to the Threads
    *  pane. Each mobile header carries its own badge, and the hidden ones are

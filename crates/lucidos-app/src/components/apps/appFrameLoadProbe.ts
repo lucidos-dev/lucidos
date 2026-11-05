@@ -22,7 +22,7 @@ const CATEGORY = 'app-frame';
 /** Which frame this is, in the words the log is read in. */
 export interface FrameLabel {
   app: string;
-  /** `canvas`, or a widget's place: `dashboard`, `inline`, `shelf`, `option`. */
+  /** `canvas`, or a widget's place: `dashboard`, `inline`, `option`. */
   place: string;
 }
 

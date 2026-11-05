@@ -1,3 +1,4 @@
+import { bindSourceGeneration, sourceGeneration } from '../../utils/restoreSourceGeneration';
 import { effect } from '@preact/signals';
 import { engineRestarting } from '../../store/store';
 import { BASE_PATH } from '../../utils/basePath';
@@ -8,6 +9,7 @@ import { deviceIdHeader } from '../../utils/deviceIdHeader';
 import { registrationToAwait } from '../../utils/deviceRegistration';
 import { clampText } from '../../utils/clampText';
 import { trackRequest } from './requestsInFlight';
+import { isRestoreBootstrapRequest, restoreAdmissionReady, waitForRestoreAdmission } from '../../utils/restoreAdmission';
 
 // Base-path aware (ADR 0014): behind the workspace gateway the bundle is served
 // under `/<slug>/`, so every API URL must carry that prefix. `BASE_PATH` is
@@ -76,19 +78,52 @@ function isHealthProbe(url: string): boolean {
   return url.endsWith('/health');
 }
 
+/** Bind intent before any wait. A reconnect may release the gate, but a restore
+ * cannot relabel an old invocation as new intent. Bootstrap has no domain intent. */
+export interface RequestGenerationGuard {
+  (): void;
+  readonly headers: Readonly<Record<string, string>>;
+}
+
+export function requestGenerationGuard(url = ''): RequestGenerationGuard {
+  const generation = bindSourceGeneration();
+  const bootstrap = isRestoreBootstrapRequest(url);
+  const check = () => {
+    if (!bootstrap && sourceGeneration() !== generation()) {
+      throw new ApiError(409, 'Workspace restored; review retained work before trying again');
+    }
+  };
+  // Explicit null distinguishes original-generation intent from an old client
+  // that carries no protocol header. Never stamp the latest value after a wait.
+  return Object.defineProperty(check, 'headers', {
+    get: () => Object.freeze({ 'x-lucidos-restore-generation': generation() ?? 'none' }),
+  }) as RequestGenerationGuard;
+}
+
 /** `fetch` wrapped to always send `x-lucidos-device-id` so the engine can
  *  attribute the call to this device. Use when you need the raw `Response`
  *  (custom `AbortSignal`, non-JSON body, status-specific handling like 409).
  *  Pair with `throwIfNotOk(res)` so error responses surface the engine's
  *  `{error}` body. JSON-response endpoints should use `json()`, which adds
  *  the header and parses for you. */
-export async function mutatingFetch(url: string, init?: RequestInit): Promise<Response> {
+export async function mutatingFetch(url: string, init?: RequestInit, restoreRecovery = false): Promise<Response> {
+  return fetchMutation(url, init, restoreRecovery, requestGenerationGuard(url));
+}
+
+async function fetchMutation(url: string, init: RequestInit | undefined, restoreRecovery: boolean, checkGeneration: RequestGenerationGuard): Promise<Response> {
+  checkGeneration();
+  if (!restoreRecovery && !isRestoreBootstrapRequest(url) && !restoreAdmissionReady()) await waitForRestoreAdmission();
   const registration = registrationToAwait(url, init?.method);
   if (registration) await registration;
-  const headers = { ...deviceIdHeader(), ...(init?.headers as Record<string, string> | undefined) };
+  if (!restoreRecovery && !isRestoreBootstrapRequest(url) && !restoreAdmissionReady()) await waitForRestoreAdmission();
+  checkGeneration();
+  const headers = { ...deviceIdHeader(), ...Object.fromEntries(new Headers(init?.headers).entries()), ...checkGeneration.headers };
   const done = trackRequest(url);
   try {
-    return await fetch(url, { ...init, headers });
+    const response = await fetch(url, { ...init, headers });
+    if (!restoreRecovery && !isRestoreBootstrapRequest(url) && !restoreAdmissionReady()) await waitForRestoreAdmission();
+    checkGeneration();
+    return response;
   } finally {
     done();
   }
@@ -138,11 +173,17 @@ export function isTransientFetchError(err: unknown): boolean {
  *  Only for requests with no caller-supplied `AbortSignal` — a deliberate cancel
  *  would be retried with the same, already-aborted signal. */
 export async function retryTransient<T>(request: () => Promise<T>): Promise<T> {
+  const checkGeneration = requestGenerationGuard();
   try {
-    return await request();
+    const result = await request();
+    checkGeneration();
+    return result;
   } catch (err) {
     if (!isTransientFetchError(err)) throw err;
-    return request();
+    checkGeneration();
+    const result = await request();
+    checkGeneration();
+    return result;
   }
 }
 
@@ -154,10 +195,11 @@ export async function retryTransient<T>(request: () => Promise<T>): Promise<T> {
  *  sw.js); POSTs bypass the SW because iOS WebKit can't reliably clone
  *  request bodies, so the retry has to live here. */
 export async function mutatingFetchIdempotent(url: string, init?: RequestInit): Promise<Response> {
+  const checkGeneration = requestGenerationGuard(url);
   try {
-    return await mutatingFetch(url, init);
+    return await fetchMutation(url, init, false, checkGeneration);
   } catch (err) {
-    if (isTransportError(err)) return mutatingFetch(url, init);
+    if (isTransportError(err)) return fetchMutation(url, init, false, checkGeneration);
     throw err;
   }
 }
@@ -281,17 +323,23 @@ export function throwIfRefused<T extends { success: boolean; error?: string }>(
  *  purpose: the SDK bundles standalone for app iframes and cannot import from
  *  the host, and only this half gates on `awaitEngineReady`. Change one, change
  *  the other. */
-async function fetchWithDefaults(url: string, init: RequestInit | undefined, timeoutMs: number): Promise<Response> {
+async function fetchWithDefaults(url: string, init: RequestInit | undefined, timeoutMs: number, checkGeneration: RequestGenerationGuard): Promise<Response> {
+  if (!isRestoreBootstrapRequest(url) && !restoreAdmissionReady()) await waitForRestoreAdmission();
   const method = (init?.method ?? 'GET').toUpperCase();
   if (method === 'GET' && !isHealthProbe(url)) await awaitEngineReady();
   const registration = registrationToAwait(url, method);
   if (registration) await registration;
-  const headers = { ...deviceIdHeader(), ...(init?.headers as Record<string, string> | undefined) };
+  if (!isRestoreBootstrapRequest(url) && !restoreAdmissionReady()) await waitForRestoreAdmission();
+  checkGeneration();
+  const headers = { ...deviceIdHeader(), ...Object.fromEntries(new Headers(init?.headers).entries()), ...checkGeneration.headers };
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
   const signal = init?.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;
   const done = trackRequest(url);
   try {
-    return await fetch(url, { ...init, headers, signal });
+    const response = await fetch(url, { ...init, headers, signal });
+    if (!isRestoreBootstrapRequest(url) && !restoreAdmissionReady()) await waitForRestoreAdmission();
+    checkGeneration();
+    return response;
   } catch (err) {
     // WebKit rejects an aborted fetch with its own `AbortError: Fetch is
     // aborted` rather than the signal's `reason`, so on iOS Safari and in the
@@ -312,10 +360,14 @@ async function fetchWithDefaults(url: string, init: RequestInit | undefined, tim
 }
 
 export async function json<T>(url: string, init?: RequestInit, timeoutMs = 10000): Promise<T> {
-  const res = await fetchWithDefaults(url, init, timeoutMs);
+  const checkGeneration = requestGenerationGuard(url);
+  const res = await fetchWithDefaults(url, init, timeoutMs, checkGeneration);
   await throwIfNotOk(res);
   try {
-    return await res.json() as T;
+    const body = await res.json() as T;
+    if (!isRestoreBootstrapRequest(url) && !restoreAdmissionReady()) await waitForRestoreAdmission();
+    checkGeneration();
+    return body;
   } catch (err) {
     // A PARSE failure only. Reading the body can also fail for reasons that say
     // nothing about its content. The deadline stays armed while the stream
@@ -336,7 +388,11 @@ export async function json<T>(url: string, init?: RequestInit, timeoutMs = 10000
 /** Like `json<T>` but for endpoints that return plain text (file contents,
  *  raw markdown, etc.). Same error / timeout / signal handling. */
 export async function text(url: string, init?: RequestInit, timeoutMs = 10000): Promise<string> {
-  const res = await fetchWithDefaults(url, init, timeoutMs);
+  const checkGeneration = requestGenerationGuard(url);
+  const res = await fetchWithDefaults(url, init, timeoutMs, checkGeneration);
   await throwIfNotOk(res);
-  return res.text();
+  const body = await res.text();
+  if (!isRestoreBootstrapRequest(url) && !restoreAdmissionReady()) await waitForRestoreAdmission();
+  checkGeneration();
+  return body;
 }

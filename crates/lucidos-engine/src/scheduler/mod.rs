@@ -17,6 +17,7 @@ pub(crate) mod plugin_updates;
 pub mod push;
 #[cfg(feature = "e2e-test-hooks")]
 pub mod push_test_log;
+mod skipped_slots;
 #[cfg(test)]
 mod tasks;
 pub mod user_tasks;
@@ -835,9 +836,16 @@ impl SchedulerManager {
 
     /// Load backup schedule from preferences on startup. Delegates to the shared
     /// reload path so startup, a timezone change, and an agent/HTTP pref write
-    /// all arm the loop identically (in the user's timezone).
+    /// all arm the loop identically (in the user's timezone). Only this arm may
+    /// catch up a slot missed while the engine was down.
     async fn load_backup_schedule(&mut self) {
-        reload_backup_schedule(&self.backup_runner, &self.engine, &self.pool).await;
+        reload_backup_schedule(
+            &self.backup_runner,
+            &self.engine,
+            &self.pool,
+            BackupArm::EngineStart,
+        )
+        .await;
     }
 
     /// Set or clear the automatic backup schedule.
@@ -870,7 +878,14 @@ impl SchedulerManager {
                 PreferenceStore::set(&self.pool, bus, schedule_key, expr, actor.clone()).await?;
                 PreferenceStore::set(&self.pool, bus, provider_key, provider, actor).await?;
 
-                arm_backup_runner(&self.backup_runner, &self.engine, expr, provider).await?;
+                arm_backup_runner(
+                    &self.backup_runner,
+                    &self.engine,
+                    expr,
+                    provider,
+                    BackupArm::Reload,
+                )
+                .await?;
             }
             None => {
                 // Disable schedule. The PROVIDER is still written: it is the
@@ -1004,21 +1019,84 @@ fn next_backup_fire(
     .map(|t| t.with_timezone(&chrono::Utc))
 }
 
+/// Why the backup loop is armed. Only engine start may catch up a slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackupArm {
+    /// The engine just started, so a slot may have passed while it was down.
+    EngineStart,
+    /// The schedule, provider or timezone changed while the engine ran.
+    Reload,
+}
+
+impl BackupArm {
+    fn catches_up(self) -> bool {
+        matches!(self, Self::EngineStart)
+    }
+}
+
+/// Whether engine start owes one backup for slots that passed while it was down.
+///
+/// A due slot after the floor means one backup, however many slots passed.
+/// With no floor there is nothing to measure from. A restore bounds it, so the
+/// rewound history never uploads the restored state over a newer backup.
+fn backup_catch_up_due(
+    schedule: &cron::Schedule,
+    tz: chrono_tz::Tz,
+    floor: backup::BackupCatchUpFloor,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(floor) = floor.floor() else {
+        return false;
+    };
+    next_backup_fire(schedule, tz, floor).is_some_and(|slot| slot <= now)
+}
+
+/// Run one backup now when engine start owes one. A floor that cannot be read
+/// runs nothing: a missed backup is better than a guessed one.
+async fn catch_up_missed_backup(
+    engine: &SharedEngine,
+    schedule: &cron::Schedule,
+    tz: chrono_tz::Tz,
+    provider_id: &str,
+    cancel: &CancellationToken,
+) {
+    let floor = match backup::load_backup_catch_up_floor(engine.pool()).await {
+        Ok(floor) => floor,
+        Err(e) => {
+            log!(
+                "[Scheduler] Could not read the backup catch-up floor: {}",
+                e
+            );
+            return;
+        }
+    };
+    if !backup_catch_up_due(schedule, tz, floor, chrono::Utc::now()) {
+        return;
+    }
+    log!("[Scheduler] A scheduled backup passed while Lucidos was not running, running it now");
+    run_scheduled_backup(engine.clone(), provider_id.to_string(), cancel).await;
+}
+
 /// Run the scheduled backup on `cron_expr`, resolving each fire through `tz` at
 /// the moment it is computed.
 ///
 /// The idiom is `task_runner::run_task_loop`'s, deliberately: short polls rather
 /// than one long sleep, because a monotonic timer does not advance across macOS
 /// system sleep. Exits once engine shutdown begins or on `cancel`, whichever
-/// comes first.
+/// comes first. An engine-start `arm` first runs one backup for any slot missed
+/// while the engine was down.
 async fn run_backup_loop(
     engine: SharedEngine,
     schedule: cron::Schedule,
     tz: chrono_tz::Tz,
     provider_id: String,
     cancel: CancellationToken,
+    arm: BackupArm,
 ) {
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+    if arm.catches_up() {
+        catch_up_missed_backup(&engine, &schedule, tz, &provider_id, &cancel).await;
+    }
     loop {
         if engine.is_shutting_down() || cancel.is_cancelled() {
             return;
@@ -1043,7 +1121,7 @@ async fn run_backup_loop(
                 _ = cancel.cancelled() => return,
             }
         }
-        run_scheduled_backup(engine.clone(), provider_id.clone()).await;
+        run_scheduled_backup(engine.clone(), provider_id.clone(), &cancel).await;
     }
 }
 
@@ -1060,6 +1138,7 @@ async fn arm_backup_runner(
     engine: &SharedEngine,
     cron_expr: &str,
     provider_id: &str,
+    arm: BackupArm,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let schedule = crate::engine::tools::scheduler::parse_standard_cron(cron_expr)?;
     let tz = backup_timezone(engine).await;
@@ -1084,6 +1163,7 @@ async fn arm_backup_runner(
         tz,
         provider_id.to_string(),
         cancel,
+        arm,
     ));
     log!(
         "[Scheduler] Armed backup runner: {} (provider: {}, tz: {})",
@@ -1110,11 +1190,12 @@ fn stop_backup_runner(backup_runner: &BackupRunner) {
 /// (`load_backup_schedule`) and the EventBus subscriber (which calls it on a
 /// `TimezoneSet` or a `backup_schedule` / `backup_provider` `PreferencesChanged`,
 /// so an agent write, an HTTP write or a timezone change takes effect with no
-/// engine restart).
+/// engine restart). `arm` says which of the two is calling.
 pub(crate) async fn reload_backup_schedule(
     backup_runner: &BackupRunner,
     engine: &SharedEngine,
     pool: &PgPool,
+    arm: BackupArm,
 ) {
     use crate::core::backup::is_schedule_active;
 
@@ -1156,13 +1237,15 @@ pub(crate) async fn reload_backup_schedule(
             return;
         }
     };
-    if let Err(e) = arm_backup_runner(backup_runner, engine, &cron, &provider).await {
+    if let Err(e) = arm_backup_runner(backup_runner, engine, &cron, &provider, arm).await {
         log!("[Scheduler] Failed to reload backup schedule: {}", e);
     }
 }
 
 mod bus_subscriber;
 mod task_runner;
+#[cfg(test)]
+pub(crate) use task_runner::assert_snapshot_catch_up_excluded;
 use task_runner::{check_task_health_and_restart, register_and_track, TrackedTask};
 
 /// Apply a trigger-group lifecycle event to the in-memory registry. Groups
@@ -1680,6 +1763,101 @@ mod tests {
             trigger_dispatch(&frame),
             None,
             "a transient frame writes no row, so neither matcher may see it"
+        );
+    }
+
+    fn catch_up_due(last_completed_start: Option<&str>, schedule_written: Option<&str>) -> bool {
+        catch_up_due_after_restore(last_completed_start, schedule_written, None)
+    }
+
+    fn catch_up_due_after_restore(
+        last_completed_start: Option<&str>,
+        schedule_written: Option<&str>,
+        restored_at: Option<&str>,
+    ) -> bool {
+        let schedule = crate::engine::tools::scheduler::parse_standard_cron("0 0 3 * * *")
+            .expect("the Daily (03:00) preset parses");
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("a literal timestamp")
+                .with_timezone(&chrono::Utc)
+        };
+        // 03:00 Oslo is 02:00 UTC in November. The Mac is opened at 09:00.
+        backup_catch_up_due(
+            &schedule,
+            chrono_tz::Europe::Oslo,
+            backup::BackupCatchUpFloor {
+                last_completed_start: last_completed_start.map(at),
+                schedule_written: schedule_written.map(at),
+                restored_at: restored_at.map(at),
+            },
+            at("2026-11-03T08:00:00Z"),
+        )
+    }
+
+    const WRITTEN_LONG_AGO: Option<&str> = Some("2026-09-01T10:00:00Z");
+
+    #[test]
+    fn a_night_the_engine_was_down_owes_one_backup() {
+        assert!(catch_up_due(Some("2026-11-02T02:00:01Z"), WRITTEN_LONG_AGO));
+        // Three missed nights still owe one, which the caller runs once.
+        assert!(catch_up_due(Some("2026-10-31T02:00:01Z"), WRITTEN_LONG_AGO));
+    }
+
+    #[test]
+    fn a_backup_after_the_slot_owes_nothing() {
+        assert!(!catch_up_due(
+            Some("2026-11-03T02:00:00Z"),
+            WRITTEN_LONG_AGO
+        ));
+        assert!(!catch_up_due(
+            Some("2026-11-03T07:30:00Z"),
+            WRITTEN_LONG_AGO
+        ));
+    }
+
+    #[test]
+    fn a_schedule_set_after_the_slot_owes_nothing() {
+        assert!(!catch_up_due(
+            Some("2026-10-20T02:00:01Z"),
+            Some("2026-11-03T07:00:00Z")
+        ));
+    }
+
+    #[test]
+    fn a_restore_after_the_slot_owes_nothing() {
+        assert!(!catch_up_due_after_restore(
+            Some("2026-11-01T02:00:01Z"),
+            WRITTEN_LONG_AGO,
+            Some("2026-11-03T07:00:00Z")
+        ));
+        assert!(catch_up_due_after_restore(
+            Some("2026-11-01T02:00:01Z"),
+            WRITTEN_LONG_AGO,
+            Some("2026-11-02T07:00:00Z")
+        ));
+    }
+
+    #[test]
+    fn a_workspace_that_never_backed_up_counts_from_the_schedule_write() {
+        assert!(catch_up_due(None, WRITTEN_LONG_AGO));
+        assert!(!catch_up_due(None, Some("2026-11-03T07:00:00Z")));
+        assert!(!catch_up_due(None, None), "nothing to measure from");
+    }
+
+    #[test]
+    fn only_engine_start_arms_a_catch_up() {
+        let source = include_str!("mod.rs");
+        let production = &source[..source.find("\nmod tests {").expect("the test module")];
+        let callers: Vec<&str> = production
+            .match_indices("BackupArm::EngineStart")
+            .map(|(at, _)| &production[..at])
+            .collect();
+        assert_eq!(callers.len(), 1, "exactly one caller arms at engine start");
+        let opener = callers[0].rfind("fn ").expect("the caller is a function");
+        assert!(
+            callers[0][opener..].starts_with("fn load_backup_schedule("),
+            "only `load_backup_schedule` arms with a catch-up"
         );
     }
 

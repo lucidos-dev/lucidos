@@ -34,6 +34,7 @@ use crate::codegen::REGENERATE;
 /// A payload field naming a new supporting type therefore fails the generator,
 /// with that type's name in the message.
 const TYPE_SOURCES: &[(&str, &str)] = &[
+    ("RecoveredCompose", "engine/thread_events/event.rs"),
     ("ActorMode", "engine/thread_events/actor.rs"),
     ("AgentParticipant", "engine/thread_events/actor.rs"),
     ("CodingAgentExit", "engine/thread_events/agent_exit.rs"),

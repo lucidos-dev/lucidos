@@ -78,6 +78,14 @@ e2e_gateway_env() {
         "LUCIDOS_STATIC_DIR=$static_dir"
 }
 
+# Only actual E2E adoption supplies provenance. Generic dev launches and auto
+# mode keep existing registration protection and never mint harness authority.
+e2e_adopt_into_gateway() {
+    # shellcheck disable=SC2153 # ENGINE_PORT is set by workspace.sh before adoption
+    python3 "$_E2E_LIB_DIR/e2e_adopt.py" "$1" "$WORKSPACE" \
+        "$(workspace_slug)" "$ENGINE_PORT" "$(lucidos_home_dir)/local-token"
+}
+
 # Start the harness's own gateway, or reuse the one this session started.
 # Sets E2E_GATEWAY_PORT. It only ever adopts the engine the harness starts: the
 # workspace is registered at the engine's port with autostart off, and nothing
@@ -121,8 +129,8 @@ EOF
         if curl -sf --max-time 1 "http://127.0.0.1:$port/~/api/v1/health" >/dev/null 2>&1; then
             echo "e2e gateway: started its own on :$port (PID $pid, log $dir/gateway.log)"
             # A subshell, so the dev launcher's GATEWAY_WS_ID never leaks here.
-            # A refusal is printed by adopt_into_gateway itself.
-            if ( adopt_into_gateway "http://127.0.0.1:$port" >/dev/null ); then
+            # A refusal is printed without its secret response body.
+            if ( e2e_adopt_into_gateway "http://127.0.0.1:$port" >/dev/null ); then
                 E2E_GATEWAY_PORT="$port"
                 return 0
             fi

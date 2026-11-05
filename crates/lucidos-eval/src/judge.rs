@@ -249,10 +249,11 @@ impl<'a> Judge<'a> {
         let pinned = provider_override(std::env::var(JUDGE_PROVIDER_VAR).ok().as_deref())?;
         let registry = judge_registry(&config.model, pinned)?;
         let context = judge_context(&config.model, &registry);
-        let provider = match build_active_provider(None, &context).await? {
-            ProviderBuildOutcome::Install { llm, .. } => llm,
-            ProviderBuildOutcome::FailFast => return Err(no_provider_message().into()),
-        };
+        let ProviderBuildOutcome { llm: provider, .. } =
+            build_active_provider(None, &context).await?;
+        if !provider.is_configured() {
+            return Err(no_provider_message().into());
+        }
         let configured = provider.configured_providers().unwrap_or_default();
         let resolved = resolve_provider(&registry, &config.model, pinned, &configured)?;
         let judge = Self { provider, config };
@@ -357,7 +358,6 @@ pub(crate) fn judge_context(model: &str, registry: &ModelRegistry) -> ProviderBu
         vertex_token_cache: token_cache,
         model_registry: registry.clone(),
         not_served: Default::default(),
-        boot_without_provider: false,
         claude_gateway_access: None,
     }
 }

@@ -36,7 +36,7 @@ function pointInViewport(frame: HTMLIFrameElement, at: unknown): ViewportPoint |
 }
 
 /** One menu at a time: a frame behind an open overlay opens none. A frame
- *  inside the top panel, as the open shelf widget is, still may. */
+ *  inside the top panel still may. */
 function inTopPanel(frame: HTMLIFrameElement): boolean {
   const top = topPanelOverlay();
   return !top || frame.closest('[data-overlay-panel]')?.getAttribute('data-overlay-panel') === top.id;

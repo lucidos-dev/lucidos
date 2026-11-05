@@ -8,6 +8,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { SPEECH_GATE_DEFAULTS } from './speechGate';
+import { observeSourceGeneration } from '../utils/restoreSourceGeneration';
 import { CAPTURE_FRAME_MS, PREROLL_FRAMES_MAX, type CallRunner, createCallRunner } from './call';
 import {
   BARGE_IN_QUIET_MS,
@@ -291,6 +292,33 @@ async function liveCall(): Promise<Harness> {
 }
 
 describe('placing a call', () => {
+  afterEach(() => observeSourceGeneration(null));
+
+  it('does not mint a current ticket for a press held across restore by microphone permission', async () => {
+    const h = harness();
+    h.armSlowAudio();
+    h.runner.press(THREAD);
+    observeSourceGeneration('11111111-1111-4111-8111-111111111111');
+    await h.releaseAudio();
+    expect(h.minted).toEqual([]);
+    expect(h.sockets).toEqual([]);
+    expect(h.device().closes).toBe(1);
+    expect(h.last().note).toContain('Workspace restored');
+  });
+
+  it('does not dial a ticket whose mint finished after restore', async () => {
+    const h = harness();
+    h.armSlowMint();
+    h.runner.press(THREAD);
+    await Promise.resolve();
+    await Promise.resolve();
+    observeSourceGeneration('11111111-1111-4111-8111-111111111111');
+    await h.releaseMint();
+    expect(h.sockets).toEqual([]);
+    expect(h.device().closes).toBe(1);
+    expect(h.last().note).toContain('Workspace restored');
+  });
+
   it('opens the microphone before the socket', async () => {
     const h = harness();
     h.runner.press(THREAD);

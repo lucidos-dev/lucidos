@@ -4,6 +4,9 @@
   "icon": "assets/icon.svg",
   "kind": "widget",
   "reusable": true,
+  "sizes": [
+    "medium"
+  ],
   "params": {
     "clip": {
       "description": "The clip to play: a workspace path such as artifacts/voices/marin.mp3, or an https URL",

@@ -1053,7 +1053,7 @@
    apart without a modifier class. */
 @media (hover: hover) {
     button.brand-menu-ws-row:hover,
-    a.brand-menu-ws-row:hover {
+    a.brand-menu-ws-row:not([aria-disabled="true"]):hover {
         background: var(--bg-hover);
         color: var(--text-primary);
     }
@@ -1146,9 +1146,6 @@ div.brand-menu-ws-row {
     background: var(--accent);
 }
 
-.brand-menu-activity-row.is-wedged .brand-menu-activity-dot {
-    background: var(--accent-yellow);
-}
 
 /* One line while folded: a long thread title ellipsizes rather than wrapping
    the row, which is the "one line per job" the group promises. Unfolded, the
@@ -1487,3 +1484,9 @@ div.brand-menu-ws-row {
         background: color-mix(in srgb, var(--accent-action) 80%, #fff);
     }
 }
+
+.remote-workspace-gateway { color: var(--accent); }
+.brand-menu-remote-workspaces { padding: var(--space-sm); }
+.brand-menu-ws-heading { color: var(--text-muted); font-size: var(--font-size-sm); }
+.brand-menu-remote-workspaces small { display: block; color: var(--text-muted); font-size: var(--font-size-xs); }
+.brand-menu-remote-workspaces [aria-disabled="true"] { opacity: 0.6; cursor: default; }

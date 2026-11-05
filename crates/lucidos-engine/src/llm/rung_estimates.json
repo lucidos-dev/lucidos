@@ -1,7 +1,7 @@
 {
   "_note": "The rung estimates: bands for every estimated (model, effort) pair, and each ladder surface's shipped pairs, ranked on its profile, with whether each is on (runtime/intelligence_ladder.rs). Bands only, never a third-party figure (ADR 0500, ADR 0525). estimate_rungs.py in the update-lucidos-models skill writes it, so never edit it by hand.",
   "source": "Lucidos estimate, weighted toward Artificial Analysis (artificialanalysis.ai): its Intelligence Index and Coding Agent Index, with the Epoch AI Capabilities Index, list prices and OpenRouter speed. Bands only: see estimate_rungs.py in the update-lucidos-models skill.",
-  "estimated": "2026-10-20",
+  "estimated": "2026-11-02",
   "pairs": [
     { "model": "gemini-3.1-flash-lite", "effort": "low", "general_band": 7, "coding_band": 7, "coding_estimated": true, "token_band": -4, "time_band": -6 },
     { "model": "gpt-6-luna", "effort": "none", "general_band": 9, "coding_band": 10, "coding_estimated": true, "token_band": -11, "time_band": -7 },
@@ -90,7 +90,7 @@
       { "model": "gpt-6.1-sol", "effort": "medium", "on": true },
       { "model": "gpt-6-astra", "effort": "medium", "on": false },
       { "model": "gpt-6.1-sol", "effort": "high", "on": true },
-      { "model": "claude-opus-5-5", "effort": "medium", "on": false },
+      { "model": "claude-opus-5-5", "effort": "medium", "on": true },
       { "model": "gpt-6.1-sol", "effort": "xhigh", "on": true },
       { "model": "gpt-6-astra", "effort": "high", "on": false },
       { "model": "claude-sonnet-5-5", "effort": "xhigh", "on": false },

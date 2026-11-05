@@ -36,13 +36,22 @@ scan state-as-action "classList[[:space:]]*\.[[:space:]]*(toggle|remove|replace)
 
 ## Checks
 
+- **Capture fallback.** Screenshot failure still returns a DOM snapshot. Do not require a nonempty screenshot to accept capture.
+
+- **Calls retained across a workspace restore.** Check custom request wrappers and SSE handlers against `system-knowhow/js-sdk.md` restore-generation rules.
+  Flag replay of stale mutations as **broken**. Check that refused calls reach the app's error UI.
+
 For each finding, capture: **location**, **what's wrong**, **which reference owns the rule** (link, don't quote), **suggested fix**.
 
 Per `system-knowhow/js-sdk.md`:
 
+- Model, effort and provider controls use `lucidos.ui.ModelPicker`, rather than
+  copying the host's lists. For model calls, use `callableOnly` and
+  `lucidos.modelRequest` before sending through `lucidos.proxy`.
+  Check that apps await readiness, surface load failures and destroy removed fields.
 - `index.html` matches the current boilerplate (script order, which pieces are required vs optional).
 - Every `lucidos.*` call used in app code appears in the SDK reference. Calls not listed are either deprecated or invented.
-- **External-API calls from the iframe: USE `lucidos.proxy(name).fetch(path, init)`.** The engine forwards the request server-side, strips this side's headers, and injects the configured auth header from the credential store. The credential never reaches the iframe. Configure the backend once in `data/config/apis.json`. Reference: `system-knowhow/js-sdk.md` § `lucidos.proxy`, which owns the strip list.
+- **External-API calls from the iframe: USE `lucidos.proxy(name).fetch(path, init)`.** The engine forwards the request server-side, strips this side's headers, and injects the configured auth header from the credential store. The credential never reaches the iframe. Use a builtin provider when available; otherwise configure the backend in `data/config/apis.json`. Reference: `system-knowhow/js-sdk.md` § `lucidos.proxy`, which owns the strip list.
 
   **DO NOT USE** either of the following. Flag each occurrence and recommend the SDK helper:
 
@@ -215,11 +224,14 @@ Per `system-knowhow/building-an-app.md` § App icon:
 Per `system-knowhow/building-an-app.md` § Widgets:
 
 - **A widget's origin.** A manifest with `"kind": "widget"` must carry exactly one owner. That is an `origin_thread_id` naming a thread in this workspace (`lucidos threads list`, or `thread_summaries`), or an `origin_plugin_id` naming an installed plugin (`plugins.md` § Shipping widgets). A `reusable` thread widget is exempt from the thread check, since no thread owns it, but still needs the field.
-  - **broken**: no owner, or an `origin_thread_id` that is not a uuid. The widget shows on no shelf it can find its way back to, and no Delete (a thread) will ever remove it.
-  - **broken**: both `origin_thread_id` and `origin_plugin_id`. Lucidos refuses to read the folder, so the widget is gone from every shelf. Keep the one that owns it.
+  - **broken**: no owner, or an `origin_thread_id` that is not a uuid. No thread owns the widget, so no Delete (a thread) will ever remove it.
+  - **broken**: both `origin_thread_id` and `origin_plugin_id`. Lucidos refuses to read the folder, so the widget is gone from every thread and dashboard. Keep the one that owns it.
   - **broken**: an `origin_plugin_id` widget that is not `reusable`, or names a plugin that is not installed. No uninstall will remove it. Suggest reinstalling the plugin or removing the folder.
   - **stale**: it names a thread that no longer exists, and the widget is not `reusable`. Nothing shows it or removes it. Suggest making it reusable or removing the folder.
   - **broken**: `kind` holds a value other than `app` or `widget`. The folder lists as an app, which is not what the author meant.
+- **A widget drawn for its content height.** A widget draws into a *widget box* in its thread card and on a dashboard ("The widget box"). Read its HTML, CSS and JS.
+  - **drift**: no `data-widget-size` rule and no `lucidos.widget.size()` read, so it draws one layout for every size and clips in its card. Suggest a layout per declared size.
+  - **drift**: text sized in `px`, or shrunk to fit a size. The UI scale cannot reach px type. Suggest the `--font-size-*` tokens, and showing less at a smaller size.
 
 Per `system-knowhow/best-practices.md`:
 

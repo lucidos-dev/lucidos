@@ -405,16 +405,15 @@ type ResponseEventKind =
       removes: number;
     }
   | {
-      /** A widget shown at this point (`WidgetShown`, ADR 0407). Draws its
-       *  card: the bar over the widget's frame. Unpinning it from the shelf
-       *  leaves the card as it is. */
+      /** A widget shown at this point (`WidgetShown`, ADR 0466). Draws its
+       *  card: the bar over the widget's box. */
       type: 'widget';
       app_id: string;
       /** The instance's *widget params* (ADR 0415). Absent means none. */
       params?: Record<string, unknown>;
       /** The instance's label. Absent means the widget's name. */
       label?: string;
-      /** The `WidgetShown` event's id, where "Show in thread" lands. */
+      /** The `WidgetShown` event's id, which a deep link lands on. */
       event_id?: string;
     }
   | {
@@ -858,8 +857,8 @@ export interface App {
    *  usable image. Draw it through `AppIcon`. */
   icon?: string;
   reveal: AppReveal;
-  /** `widget` for a small answer on a thread's widget shelf (ADR 0402). The
-   *  apps list never holds one. */
+  /** `widget` for a small answer in a thread or on a dashboard (ADR 0402).
+   *  The apps list never holds one. */
   kind: AppKind;
   /** The thread a widget was made in. Absent for an app, and for a widget a
    *  plugin ships. */

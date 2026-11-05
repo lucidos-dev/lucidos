@@ -18,6 +18,14 @@ await writePreviewBundles();
 await build({
   entryPoints: ['src/browser.ts'],
   bundle: true,
+  jsx: 'automatic',
+  jsxImportSource: 'preact',
+  alias: {
+    '@lucidos/motion': './src/motion.ts',
+    '@lucidos/appearance': './src/appearance.ts',
+    '@lucidos/tap-press': './src/tapPress.ts',
+    '@lucidos/geometry': './src/geometry.ts',
+  },
   format: 'iife',
   globalName: '__lucidosSDK',
   outfile: 'dist/sdk.js',

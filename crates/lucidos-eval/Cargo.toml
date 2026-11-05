@@ -43,9 +43,9 @@ chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 regex = "1"
 fastembed = { version = "4", optional = true }
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 # The engine's tests enable this, and cargo then builds tokio with it for any
 # test build that includes the engine. Naming it here makes `cargo test -p
 # lucidos-eval` resolve every shared crate as the engine's tests do, so the two

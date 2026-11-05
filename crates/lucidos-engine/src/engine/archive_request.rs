@@ -105,15 +105,22 @@ pub(crate) fn request_verdict(facts: &RequestFacts) -> RequestVerdict {
     }
 }
 
-/// Is the thread's newest request still open?
+/// Is the thread's newest request still open? A restore expires archived
+/// requests even when a later settlement would otherwise make them runnable.
 async fn request_is_open(pool: &sqlx::PgPool, thread_id: Uuid) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(&format!(
-        "SELECT EXISTS ( \
+        concat!(
+            "SELECT EXISTS ( \
            SELECT 1 FROM events r \
             WHERE r.thread_id = $1 AND r.event_type = 'ThreadArchiveRequested' \
+              AND r.sequence > ",
+            crate::core::snapshot::boundary::restore_floor_sql!(),
+            " \
               AND r.sequence > COALESCE(( \
                 SELECT MAX(c.sequence) FROM events c \
                  WHERE c.thread_id = $1 AND c.event_type IN {CLOSING_EVENTS_SQL}), 0))"
+        ),
+        CLOSING_EVENTS_SQL = CLOSING_EVENTS_SQL
     ))
     .bind(thread_id)
     .fetch_one(pool)
@@ -123,11 +130,17 @@ async fn request_is_open(pool: &sqlx::PgPool, thread_id: Uuid) -> Result<bool, s
 /// Every thread holding an open request.
 async fn threads_with_open_requests(pool: &sqlx::PgPool) -> Result<HashSet<Uuid>, sqlx::Error> {
     let rows: Vec<(Uuid,)> = sqlx::query_as(&format!(
-        "SELECT DISTINCT r.thread_id FROM events r \
+        concat!(
+            "SELECT DISTINCT r.thread_id FROM events r \
           WHERE r.event_type = 'ThreadArchiveRequested' \
+            AND r.sequence > ",
+            crate::core::snapshot::boundary::restore_floor_sql!(),
+            " \
             AND r.sequence > COALESCE(( \
               SELECT MAX(c.sequence) FROM events c \
                WHERE c.thread_id = r.thread_id AND c.event_type IN {CLOSING_EVENTS_SQL}), 0)"
+        ),
+        CLOSING_EVENTS_SQL = CLOSING_EVENTS_SQL
     ))
     .fetch_all(pool)
     .await?;

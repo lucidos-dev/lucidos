@@ -1447,6 +1447,41 @@ pub const BACKUP_RETENTION: Pref<Number> = Pref::number(PrefSpec {
     side_effect: PrefSideEffect::None,
 });
 
+pub const SNAPSHOT_RESTORE_BY_AGENTS: Pref<Text> = Pref::text(PrefSpec {
+    key: "snapshot_restore_by_agents",
+    label: "Agent snapshot restores",
+    access: PrefAccess::Human {
+        hint: "only a registered owner device can change the snapshot restore policy",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::Enum(&["ask", "allow"]),
+    default: PrefDefault::Value("ask"),
+    description: "Whether agents restoring this workspace need a single-use owner approval. 'ask' requires approval; 'allow' permits verified agents from other workspaces. An agent can never restore its own workspace.",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const SNAPSHOT_RETENTION: Pref<Number> = Pref::number(PrefSpec {
+    key: "snapshot_retention",
+    label: "Snapshot retention",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::Number { min: 1.0, max: 1000.0 },
+    default: PrefDefault::Value("5"),
+    description: "Number of unkept manual workspace snapshots retained after a successful capture. Kept snapshots and snapshots referenced by an open restore are protected.",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const SNAPSHOT_RECOVERY_RETENTION: Pref<Number> = Pref::number(PrefSpec {
+    key: "snapshot_recovery_retention",
+    label: "Recovery snapshot retention",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::Number { min: 1.0, max: 1000.0 },
+    default: PrefDefault::Value("3"),
+    description: "Number of recovery snapshots retained after a successful capture. The newest recovery snapshot and snapshots referenced by an open restore are protected.",
+    side_effect: PrefSideEffect::None,
+});
+
 pub const BACKUP_REMINDER_DISMISSED: Pref<Optional> = Pref::optional(PrefSpec {
     key: "backup_reminder_dismissed",
     label: "Backup reminder dismissed",
@@ -2083,6 +2118,9 @@ pub const CATALOG: &[&PrefSpec] = &[
     &BACKUP_SCHEDULE.spec,
     &BACKUP_PROVIDER.spec,
     &BACKUP_RETENTION.spec,
+    &SNAPSHOT_RESTORE_BY_AGENTS.spec,
+    &SNAPSHOT_RETENTION.spec,
+    &SNAPSHOT_RECOVERY_RETENTION.spec,
     &BACKUP_REMINDER_DISMISSED.spec,
     &COMMAND_GUARD.spec,
     &COMMAND_GUARD_JUDGE.spec,
@@ -2461,6 +2499,16 @@ pub fn allowed_values_hint(spec: &PrefSpec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_policy_defaults_to_approval_and_is_human_only() {
+        assert_eq!(SNAPSHOT_RESTORE_BY_AGENTS.default_text(), "ask");
+        assert!(internal_hint(SNAPSHOT_RESTORE_BY_AGENTS.key()).is_some());
+        assert!(matches!(
+            SNAPSHOT_RESTORE_BY_AGENTS.spec.value,
+            PrefValue::Enum(["ask", "allow"])
+        ));
+    }
 
     #[test]
     fn an_intelligence_ladder_is_ordered_rungs_with_no_repeat() {

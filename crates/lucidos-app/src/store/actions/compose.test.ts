@@ -1712,6 +1712,25 @@ describe('compose writes for a thread are serialized', () => {
       .filter(([, init]) => (init as RequestInit | undefined)?.keepalive)
       .map(([, init]) => JSON.parse(String((init as RequestInit).body)).text as string);
     expect(flushed).toEqual(['hello world']);
+    const keepalive = mockFetch.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.keepalive);
+    expect(new Headers((keepalive?.[1] as RequestInit).headers).get('x-lucidos-restore-generation')).toBe('none');
+  });
+
+  // Every stream drop closes admission until the next hello. A tab closed in
+  // that gap must still flush: the engine fences a stale generation itself.
+  it('the tab-close flush still goes out while restore admission is closed', async () => {
+    const { installRestoreAdmission } = await import('../../utils/restoreAdmission');
+    installRestoreAdmission({ ready: () => false, wait: () => new Promise(() => {}) });
+    try {
+      updateCompose('t-1', { text: 'typed during a reconnect' });
+      window.dispatchEvent(new Event('pagehide'));
+      const flushed = mockFetch.mock.calls
+        .filter(([, init]) => (init as RequestInit | undefined)?.keepalive)
+        .map(([, init]) => JSON.parse(String((init as RequestInit).body)).text as string);
+      expect(flushed).toEqual(['typed during a reconnect']);
+    } finally {
+      installRestoreAdmission({ ready: () => true, wait: async () => {} });
+    }
   });
 
   it('a failed write still parks the thread, and the queued one still goes out', async () => {

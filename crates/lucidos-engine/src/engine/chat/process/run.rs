@@ -10,6 +10,7 @@ use crate::engine::agentic_loop::{
     cancel_cause_for_turn, meta_with_cancel_actor, terminal_result, until_canceled,
 };
 use crate::engine::context::{agent_context_char_budget, trim_history_from_oldest};
+use crate::engine::event_wait::OwnerTurn;
 use crate::engine::thread_events::{ActorMode, EventChannel, MessageOrigin};
 use crate::engine::types::*;
 use crate::engine::{InjectedPrompt, LucidosEngine, ThreadGuard};
@@ -2189,7 +2190,8 @@ impl LucidosEngine {
         // and in the second the next turn runs its own tail in a moment. An
         // errored turn is not a state to schedule a wake from either.
         if result.is_ok() && !cancel_token.is_cancelled() {
-            self.arm_wait_for_running_background_tasks(thread_id).await;
+            self.arm_wait_for_running_background_tasks(thread_id, OwnerTurn::Ended)
+                .await;
         }
 
         let orphans = self

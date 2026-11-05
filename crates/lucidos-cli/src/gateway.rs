@@ -79,27 +79,39 @@ pub(crate) struct FoundGateway {
 
 /// Every gateway that answers, in probe order.
 ///
-/// Both schemes are tried per port. The dev gateway serves TLS and the packaged
-/// one serves plain HTTP, and the caller cannot know which it faces. All of
+/// The other scheme is tried only after a transport failure. An HTTP refusal
+/// proves a server answered and must not be bypassed. The dev gateway serves
+/// TLS and the packaged one serves plain HTTP. All of
 /// them rather than the first, so a caller that must refuse ambiguity sees the
 /// second one.
 pub(crate) fn find_gateways(
     client: &reqwest::blocking::Client,
     ports: &[u16],
 ) -> Vec<FoundGateway> {
+    find_gateways_with(ports, |base| {
+        client
+            .get(format!("{base}{HEALTH_PATH}"))
+            .send()
+            .map(|response| response.status().is_success())
+            .map_err(|_| ())
+    })
+}
+
+fn find_gateways_with(
+    ports: &[u16],
+    mut probe: impl FnMut(&str) -> Result<bool, ()>,
+) -> Vec<FoundGateway> {
     let mut found = Vec::new();
     for &port in ports {
         for scheme in ["https", "http"] {
             let base = format!("{scheme}://127.0.0.1:{port}");
-            if client
-                .get(format!("{base}{HEALTH_PATH}"))
-                .send()
-                .is_ok_and(|r| r.status().is_success())
-            {
-                found.push(FoundGateway { port, base });
-                // One gateway per port. The other scheme is the same process
-                // refusing a handshake, never a second gateway.
-                break;
+            match probe(&base) {
+                Ok(true) => {
+                    found.push(FoundGateway { port, base });
+                    break;
+                }
+                Ok(false) => break,
+                Err(()) => continue,
             }
         }
     }
@@ -179,6 +191,47 @@ mod tests {
     use lucidos_installs::{DEFAULT_DEV_GATEWAY_PORT as DEV, DEFAULT_GATEWAY_PORT as PACKAGED};
 
     const WHY: &str = "Pass --port to name one.";
+
+    #[test]
+    fn a_health_refusal_stops_scheme_fallback_but_not_other_ports() {
+        for status in [301, 401, 403, 404, 500, 502, 503, 504] {
+            let mut attempts = Vec::new();
+            let gateways = find_gateways_with(&[5998, 5999], |base| {
+                attempts.push(base.to_owned());
+                Ok(reqwest::StatusCode::from_u16(if base.ends_with(":5998") {
+                    status
+                } else {
+                    200
+                })
+                .unwrap()
+                .is_success())
+            });
+            assert_eq!(
+                attempts,
+                ["https://127.0.0.1:5998", "https://127.0.0.1:5999"]
+            );
+            assert_eq!(gateways.len(), 1);
+            assert_eq!(gateways[0].port, 5999);
+        }
+    }
+
+    #[test]
+    fn only_a_transport_failure_tries_the_other_scheme() {
+        let mut attempts = Vec::new();
+        let gateways = find_gateways_with(&[5999], |base| {
+            attempts.push(base.to_owned());
+            if base.starts_with("https:") {
+                Err(())
+            } else {
+                Ok(true)
+            }
+        });
+        assert_eq!(
+            attempts,
+            ["https://127.0.0.1:5999", "http://127.0.0.1:5999"]
+        );
+        assert_eq!(gateways[0].base, "http://127.0.0.1:5999");
+    }
 
     fn found(ports: &[u16]) -> Vec<FoundGateway> {
         ports

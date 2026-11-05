@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+// Picker integration has its own tests and SDK-specific bundler aliases.
+vi.mock('./modelPicker', () => ({ ModelPicker: {} }));
 // The theme-precedence cases this file used to carry now live beside the rule
 // itself, in `appearance.test.ts`. `resolveThemeModePreference` moved into the
 // shared appearance contract when the four hand-copied versions of it were

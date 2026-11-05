@@ -31,7 +31,6 @@ const APP_SURFACES = [
   '../../dashboard/DashboardTile.tsx',
   '../../plugins/pluginCard.tsx',
   '../../layout/Drawer.tsx',
-  '../../widgets/WidgetShelf.tsx',
   '../../widgets/InlineWidget.tsx',
   '../../widgets/WidgetPickerItems.tsx',
   '../../search/SearchEverywhere.tsx',
@@ -56,7 +55,7 @@ describe('every app surface draws its picture through AppIcon (I3)', () => {
     });
 
     it(`${rel} draws no generic glyph for an app or widget`, () => {
-      expect(src).not.toMatch(/<(WidgetIcon|AppsIcon)\b/);
+      expect(src).not.toMatch(/<AppsIcon\b/);
     });
 
     it(`${rel} reads an icon field only to hand it to AppIcon`, () => {

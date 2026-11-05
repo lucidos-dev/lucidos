@@ -369,13 +369,15 @@ impl Driver {
     pub(crate) async fn restore(&mut self) {
         self.unavailable =
             unavailable_reason(&self.setup.repo_root, &self.setup.command.program).await;
+        if let Err(error) = settle_restored_checks(&self.setup.pool, &self.setup.bus).await {
+            log!("[MainCheck] restored check settlement failed: {}", error);
+            self.restore_failed = true;
+            return;
+        }
         let records = match load_records(&self.setup.pool).await {
             Ok(records) => records,
-            Err(e) => {
-                log!(
-                    "[MainCheck] recovery query failed, the next message retries it: {}",
-                    e
-                );
+            Err(error) => {
+                log!("[MainCheck] recovery query failed: {}", error);
                 self.restore_failed = true;
                 return;
             }
@@ -445,10 +447,28 @@ impl Driver {
         self.run_link = Some(link);
     }
 
+    /// The archived check remains visible, but its unsent prompt is authority
+    /// from before the restore. A later duplicate start never renews it.
+    async fn restored_fix_may_prompt(&self, check_id: Uuid) -> bool {
+        match permits_fix_recovery(&self.setup.pool, check_id).await {
+            Ok(allowed) => allowed,
+            Err(error) => {
+                log!(
+                    "[MainCheck] restore boundary unavailable; fix prompt held: {}",
+                    error
+                );
+                false
+            }
+        }
+    }
+
     async fn restore_red_fix_thread(&self) {
         let Some(red) = self.check.red().cloned() else {
             return;
         };
+        if !self.restored_fix_may_prompt(red.range.check_id).await {
+            return;
+        }
         match fix_thread_trace(&self.setup.pool, red.fix_thread_id).await {
             Ok(FixThreadTrace::Unprompted) => self.open_red_fix_thread(&red).await,
             Ok(FixThreadTrace::Prompted | FixThreadTrace::Archived) => {}
@@ -471,6 +491,9 @@ impl Driver {
         let Some(flaky) = self.check.flaky_fix().cloned() else {
             return;
         };
+        if !self.restored_fix_may_prompt(flaky.range.check_id).await {
+            return;
+        }
         match fix_thread_trace(&self.setup.pool, flaky.fix_thread_id).await {
             Ok(FixThreadTrace::Unprompted) => self.open_flaky_fix_thread(&flaky).await,
             Ok(FixThreadTrace::Prompted) => {}
@@ -700,10 +723,54 @@ async fn own_fix_thread_trace(
     })
 }
 
-/// Every event the main check's state depends on, oldest first.
+/// Only a check begun in the current generation retains automation authority.
+async fn permits_fix_recovery(pool: &sqlx::PgPool, check_id: Uuid) -> Result<bool, sqlx::Error> {
+    let Some(boundary) = crate::core::snapshot::boundary::read(pool).await? else {
+        return Ok(true);
+    };
+    let first: Option<i64> = sqlx::query_scalar(
+        "SELECT MIN(sequence) FROM events WHERE event_type = 'MainCheckStarted' AND payload->'data'->>'check_id' = $1")
+        .bind(check_id.to_string()).fetch_one(pool).await?;
+    Ok(first.is_some_and(|sequence| sequence > boundary.event_sequence))
+}
+
+/// Settle archived checks before any boot subscriber can dispatch. Keeping
+/// this independent of Driver construction lets first boot fail closed.
+pub(crate) async fn settle_restored_checks(
+    pool: &sqlx::PgPool,
+    bus: &crate::engine::event_bus::EventBus,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if crate::core::snapshot::boundary::read(pool).await?.is_none() {
+        return Ok(());
+    }
+    let recovered = fold(&load_records(pool).await?);
+    let active = recovered
+        .reattach
+        .as_ref()
+        .map(|(range, _)| range)
+        .or(recovered.interrupted.as_ref());
+    if let Some(range) = active {
+        if !permits_fix_recovery(pool, range.check_id).await? {
+            bus.emit(BusEvent::System(SystemEvent::MainCheckAbandoned {
+                check_id: range.check_id,
+                reason: "Workspace restored from snapshot; check abandoned.".into(),
+                run_url: recovered
+                    .reattach
+                    .as_ref()
+                    .map(|(_, link)| link.run_url.clone()),
+            }))
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Every event the main check's state depends on, oldest first, with a
+/// synthetic observation at the durable restore floor to expire owed work.
 pub(super) async fn load_records(pool: &sqlx::PgPool) -> Result<Vec<MainCheckRecord>, sqlx::Error> {
-    let rows: Vec<(String, serde_json::Value, Option<Uuid>)> = sqlx::query_as(
-        "SELECT event_type, payload, thread_id FROM events \
+    let mut boundary = crate::core::snapshot::boundary::read(pool).await?;
+    let rows: Vec<(String, serde_json::Value, Option<Uuid>, i64)> = sqlx::query_as(
+        "SELECT event_type, payload, thread_id, sequence FROM events \
          WHERE event_type IN ('MainCheckStarted', 'MainCheckRunLinked', 'MainCheckPassed', \
                               'MainCheckFailed', 'MainCheckAbandoned', 'MainCheckRedClosed') \
             OR (event_type = 'ChangeApplied' AND payload->>'landing_merge_sha' IS NOT NULL) \
@@ -712,7 +779,14 @@ pub(super) async fn load_records(pool: &sqlx::PgPool) -> Result<Vec<MainCheckRec
     .fetch_all(pool)
     .await?;
     let mut records = Vec::with_capacity(rows.len());
-    for (event_type, payload, thread_id) in &rows {
+    for (event_type, payload, thread_id, sequence) in &rows {
+        if boundary
+            .as_ref()
+            .is_some_and(|b| *sequence > b.event_sequence)
+        {
+            records.push(MainCheckRecord::RestoreBoundary);
+            boundary = None;
+        }
         let Some(mut rec) = record(event_type, payload, *thread_id) else {
             continue;
         };
@@ -724,6 +798,9 @@ pub(super) async fn load_records(pool: &sqlx::PgPool) -> Result<Vec<MainCheckRec
             *landing = landing_thread(pool, *landing).await;
         }
         records.push(rec);
+    }
+    if boundary.is_some() {
+        records.push(MainCheckRecord::RestoreBoundary);
     }
     Ok(records)
 }

@@ -205,7 +205,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   const apps = loadedOr(appsList.value, NO_APPS);
 
   const userMessage = exchangeUserMessage(exchange);
-  // A reply's inline widget records it on a pin, so "Show in thread" lands here.
+  // A reply's inline widgets name their turn by it.
   const starterId = exchangeStarterId(exchange);
   const userImageHashes = exchangeUserImageHashes(exchange);
   const timestamp = exchangeTimestamp(exchange);

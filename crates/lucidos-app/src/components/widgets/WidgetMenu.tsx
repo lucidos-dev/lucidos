@@ -1,16 +1,13 @@
 import type { OverflowMenuContext } from '../shared/OverflowMenu';
-import { AppsIcon, ChevronDownIcon, OpenInCanvasIcon, PinIcon, ReuseIcon } from '../shared/icons';
+import { AppsIcon, OpenInCanvasIcon, PinIcon, ReuseIcon } from '../shared/icons';
 import {
   makeAppFromWidget,
   makeWidgetReusable,
   openWidgetInCanvas,
-  pinWidgetToShelf,
-  showWidgetInThread,
   stopReusingWidget,
-  unpinWidgetFromShelf,
 } from '../../store/actions/widget-actions';
 import { removeFromDashboard } from '../../store/actions/dashboards';
-import { homeThreadId, isHomeThread } from '../../store/actions/homeThread';
+import { homeThreadId } from '../../store/actions/homeThread';
 import type { Dashboard } from '../../generated/thread-event-wire';
 import { DashboardItem, Item, tileRef, type Run, type WidgetInstance } from './DashboardItem';
 
@@ -22,12 +19,6 @@ export interface WidgetMenuTarget extends WidgetInstance {
   originPluginId?: string;
   /** A built-in widget ships with Lucidos and is always reusable. */
   builtIn: boolean;
-  pinned: boolean;
-  /** Where "Show in thread" lands. Absent on the inline widget, which is there. */
-  shownEventId?: string;
-  /** The event that draws this inline widget. A pin records it, so "Show in
-   *  thread" lands back on it. */
-  drawnByEventId?: string;
 }
 
 /** A tile on one dashboard, as its menu acts on it. */
@@ -57,11 +48,10 @@ function MakeAppItem({ widget: w, threadId, run }: { widget: WidgetInstance; thr
   );
 }
 
-/** The widget menu's items in a thread: the chip's right-click or long press,
- *  and the ⋯ in a widget's bar. Each item is also an agent action and a CLI
- *  verb. Home draws no shelf, so it offers no shelf pin. */
+/** The widget menu's items in a thread: the ⋯ in a widget's bar, or a
+ *  right-click or long press on its card. Each item is also an agent action
+ *  and a CLI verb. */
 export function widgetMenuItems({ run }: OverflowMenuContext, w: WidgetMenuTarget) {
-  const instance = { appId: w.appId, threadId: w.threadId, params: w.params, label: w.label };
   return (
     <>
       <OpenInCanvasItem widget={w} run={run} />
@@ -74,35 +64,15 @@ export function widgetMenuItems({ run }: OverflowMenuContext, w: WidgetMenuTarge
         />
       )}
       <MakeAppItem widget={w} threadId={w.threadId} run={run} />
-      {w.shownEventId && (
-        <Item
-          icon={<ChevronDownIcon size="1rem" />}
-          label="Show in thread"
-          onClick={run(() => showWidgetInThread(w.threadId, w.shownEventId!))}
-        />
-      )}
       <div class="thread-overflow-divider" role="separator" />
-      {!isHomeThread(w.threadId) && (w.pinned ? (
-        <Item
-          icon={<PinIcon filled />}
-          label="Unpin from shelf"
-          onClick={run(() => void unpinWidgetFromShelf(instance, w.name))}
-        />
-      ) : (
-        <Item
-          icon={<PinIcon />}
-          label="Pin to shelf"
-          onClick={run(() => void pinWidgetToShelf(instance, w.name, w.drawnByEventId))}
-        />
-      ))}
       <DashboardItem tile={w} noun="widget" run={run} />
     </>
   );
 }
 
 /** The widget items on a dashboard tile's menu. A tile names a reusable widget
- *  that no thread holds, so it offers no reuse change, no shelf pin and no
- *  Show in thread. Make app drafts its prompt in the Home chat. */
+ *  that no thread holds, so it offers no reuse change. Make app drafts its
+ *  prompt in the Home chat. */
 export function dashboardTileMenuItems({ run }: OverflowMenuContext, t: DashboardTileTarget) {
   const home = homeThreadId.value;
   return (

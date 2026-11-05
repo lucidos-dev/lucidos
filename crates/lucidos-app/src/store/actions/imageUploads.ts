@@ -23,7 +23,7 @@ import { addAttachedImageHash, rememberSessionBlobUrl } from '../../components/c
 import { errorDetail } from '../../utils/errorDetail';
 import { sha256Hex } from '../../utils/sha256Hex';
 import { generateUuid } from '../../utils/uuid';
-import { composeDrafts, getDraft } from '../composeDrafts';
+import { composeDrafts } from '../composeDrafts';
 import { landedImages } from '../landedImages';
 import {
   addPendingUpload,
@@ -42,12 +42,13 @@ import {
   markPendingUploadLanded,
   ownedPendingUploadRecords,
   persistPendingUpload,
+  sendingImageHashes,
   type OwnedRecord,
 } from '../pendingUploadRecords';
 import { isConnected, showToast, threadMap } from '../store';
 import type { ThreadState } from '../thread-events';
 import { awaitThreadStarted, isThreadStartPending } from './compose';
-import { serverComposeOf, serverComposeVersion } from '../composeSync';
+import { unsentMessages } from '../unsentMessages';
 
 /** Backoff before each automatic retry of a transient failure. Its length is
  *  the retry budget: once spent, the entry fails and offers a manual Retry. */
@@ -227,8 +228,7 @@ function promote(entry: PendingUpload, hash: string): void {
   batch(() => {
     rememberSessionBlobUrl(hash, previewUrl);
     attached = addAttachedImageHash(threadId, hash);
-    // Before the detach, so the record outlives the entry until the engine's
-    // draft holds the hash (`recordStillNeeded`).
+    // Before detach, so attached bytes outlive the pending entry.
     markPendingUploadLanded(localId, hash);
     detachPendingUpload(threadId, localId);
   });
@@ -300,28 +300,26 @@ effect(() => {
 
 /** Whether this page still needs a record's bytes to survive a reload:
  *  - while its entry is pending, yes;
- *  - once it landed, until the engine's draft holds the hash, or the local
- *    draft no longer does (sent, removed, discarded);
+ *  - once it landed, while a local draft or unresolved send references it;
  *  - an entry that ended without landing, no. Pure, for testing. */
 export function recordStillNeeded(
   record: OwnedRecord,
   entryPending: boolean,
   localHashes: readonly string[],
-  serverHashes: readonly string[] | undefined,
+  unresolvedHashes: readonly string[] = [],
 ): boolean {
   if (entryPending) return true;
   const hash = record.landedHash;
   if (hash === undefined) return false;
-  return localHashes.includes(hash) && !(serverHashes ?? []).includes(hash);
+  return localHashes.includes(hash) || unresolvedHashes.includes(hash);
 }
 
-// Every way an entry ends shows up here as a change to one of three signals:
-// the entry map, a local draft, or the engine's draft. So no removal path can
-// forget its record, and no run outlives its entry.
+// Reconcile owned records when pending entries, drafts or unresolved sends change.
 effect(() => {
   const entries = pendingUploads.value;
-  void composeDrafts.value;
-  void serverComposeVersion.value;
+  const attached = [...composeDrafts.value.values()].flatMap((draft) => draft.image_hashes);
+  const unresolved = [...unsentMessages.value.values()];
+  const sending = sendingImageHashes.value;
   const pending = new Set<string>();
   for (const list of entries.values()) for (const entry of list) pending.add(entry.localId);
   for (const [localId, controller] of runs) {
@@ -334,8 +332,8 @@ effect(() => {
     const needed = recordStillNeeded(
       record,
       pending.has(record.localId),
-      getDraft(record.threadId).image_hashes,
-      serverComposeOf(record.threadId)?.imageHashes,
+      attached,
+      [...sending, ...unresolved.flatMap((send) => send.body.image_hashes ?? [])],
     );
     if (!needed) forgetPendingUploadRecord(record.localId);
   }

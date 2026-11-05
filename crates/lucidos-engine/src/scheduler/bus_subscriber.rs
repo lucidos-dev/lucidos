@@ -24,7 +24,9 @@ use uuid::Uuid;
 use super::task_runner::{
     fire_matching_triggers, handle_trigger_event, rearm_after_lag, TrackedTask,
 };
-use super::{handle_trigger_group_event, reload_backup_schedule, trigger_dispatch, BackupRunner};
+use super::{
+    handle_trigger_group_event, reload_backup_schedule, trigger_dispatch, BackupArm, BackupRunner,
+};
 use super::{load_trigger_groups, stored_trigger_dispatch, StoredTriggerCarrier};
 use super::{TriggerDispatch, TriggerGroup};
 use crate::api::SharedEngine;
@@ -101,7 +103,13 @@ impl SchedulerEffects for EngineEffects {
     }
 
     async fn reload_backup_schedule(&self) {
-        reload_backup_schedule(&self.backup_runner, &self.engine, &self.pool).await;
+        reload_backup_schedule(
+            &self.backup_runner,
+            &self.engine,
+            &self.pool,
+            BackupArm::Reload,
+        )
+        .await;
     }
 
     async fn dispatch_trigger(

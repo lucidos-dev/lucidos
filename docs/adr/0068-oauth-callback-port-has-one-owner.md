@@ -1,6 +1,6 @@
 # 0068: The OAuth loopback callback port has one process-level owner, and starting an authorization supersedes the abandoned one
 
-- **Status**: Accepted
+- **Status**: Superseded by ADR 0622 (under a gateway; the slot still governs `LUCIDOS_NO_GATEWAY` engines)
 - **Date**: 2026-08-13
 
 ## Context

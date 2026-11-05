@@ -205,8 +205,12 @@ parse_dev_args() {
     # separately, via the /restart control call). See
     # docs/plans/2026-07-01-new-engine-version-switch-flow.md.
     ENGINE_BUILD_ONLY=""
+    ENGINE_BUILD_FRESH=""
+    ENGINE_PUBLISH_TO=""
     # shellcheck disable=SC2034 # read by scripts/web-dev.sh after it calls this parser
     FOLLOW_LOG=""
+    # shellcheck disable=SC2034 # read by scripts/web-dev.sh
+    EXIT_AFTER_READY=""
     while [[ $# -gt 0 ]]; do
         # A directive cannot sit on an individual case branch, so it goes here:
         # FOLLOW_LOG is set below and read by scripts/web-dev.sh after this parser
@@ -217,9 +221,14 @@ parse_dev_args() {
             -b|--build) BUILD="1"; shift ;;
             -r|--release) RELEASE="1"; shift ;;
             -f|--follow) FOLLOW_LOG="1"; shift ;;
+            --exit-after-ready) EXIT_AFTER_READY="1"; shift ;;
             --built) shift ;;   # accepted for back-compat: the frontend is always built now
             --engine-only) ENGINE_ONLY="1"; BUILD="1"; shift ;;
             --engine-build) ENGINE_BUILD_ONLY="1"; BUILD="1"; shift ;;
+            --publish-to)
+                [ "$#" -ge 2 ] || { echo "ERROR: --publish-to needs a directory"; return 1; }
+                ENGINE_PUBLISH_TO="$2"; shift 2 ;;
+            --fresh) ENGINE_BUILD_FRESH=1; shift ;;
             -h|--help)
                 echo "Usage: $SCRIPT_NAME -w <workspace> [OPTIONS]"
                 echo ""
@@ -228,6 +237,7 @@ parse_dev_args() {
                 echo "  -b, --build           Build engine + gateway before starting"
                 echo "  -r, --release         Build in release mode (slower build, faster runtime)"
                 echo "  -f, --follow          Tail the engine log after startup (default: exit after ready)"
+                echo "  --exit-after-ready    Return after startup even without a terminal"
                 echo "  --engine-only         Rebuild and restart only the engine (skip Vite, keep parent scripts)"
                 echo "  -h, --help            Show this help"
                 echo ""
@@ -245,6 +255,18 @@ parse_dev_args() {
         esac
     done
 
+    if [ -n "$ENGINE_PUBLISH_TO" ] && [ -z "$ENGINE_BUILD_ONLY$ENGINE_ONLY" ]; then
+        echo "ERROR: --publish-to requires --engine-build or --engine-only"
+        return 1
+    fi
+    if [ -n "$ENGINE_BUILD_FRESH" ] && [ -z "$ENGINE_BUILD_ONLY" ]; then
+        echo "ERROR: --fresh requires --engine-build"
+        return 1
+    fi
+    if [ -n "$ENGINE_PUBLISH_TO" ]; then
+        configure_publish_target "$ENGINE_PUBLISH_TO" || return 1
+    fi
+
     if [ -z "$WORKSPACE" ]; then
         echo "Error: No workspace specified."
         echo ""
@@ -255,6 +277,38 @@ parse_dev_args() {
         echo "  $SCRIPT_NAME -w ~/workspaces/myws"
         exit 1
     fi
+}
+
+# Only checkout-local launch directories are supported build destinations.
+configure_publish_target() {
+    local target="$1" suffix profile variant part path
+    case "$target" in
+        "$PROJECT_DIR/.launch/"*) suffix="${target#"$PROJECT_DIR/.launch/"}" ;;
+        *) echo "ERROR: publish target must be inside this checkout's .launch directory"; return 1 ;;
+    esac
+    profile="${suffix%%/*}"
+    variant="${suffix#*/}"
+    case "$profile" in
+        debug|release|e2e) ;;
+        *) echo "ERROR: unsupported launch profile: $profile"; return 1 ;;
+    esac
+    case "$variant" in
+        plain) ENGINE_BUILD_FEATURES="" ;;
+        e2e-test-hooks|real-embedder-tests) ENGINE_BUILD_FEATURES="$variant" ;;
+        e2e-test-hooks_real-embedder-tests|real-embedder-tests_e2e-test-hooks)
+            ENGINE_BUILD_FEATURES="${variant//_/ }" ;;
+        *) echo "ERROR: unsupported launch variant: $variant"; return 1 ;;
+    esac
+    path="$PROJECT_DIR"
+    for part in .launch "$profile" "$variant"; do
+        path="$path/$part"
+        if [ -L "$path" ]; then
+            echo "ERROR: publish target must not traverse symlinks"
+            return 1
+        fi
+    done
+    ENGINE_CARGO_PROFILE="$profile"
+    export ENGINE_BUILD_FEATURES ENGINE_CARGO_PROFILE
 }
 
 # ── resolve_workspace_path ──────────────────────────────────────────────
@@ -1527,7 +1581,11 @@ publish_launch_binary() {
     # dev window compares it with its engine's start (ADR 0461).
     touch "$tmp" 2>/dev/null || true
     if [ "$sign" = "sign" ]; then
-        sign_engine_binary "$tmp"
+        if ! sign_engine_binary "$tmp"; then
+            echo "ERROR: could not sign $dst" >&2
+            rm -f "$tmp"
+            return 1
+        fi
     fi
     if ! mv -f "$tmp" "$dst"; then
         rm -f "$tmp"
@@ -1576,8 +1634,13 @@ publish_launch_binaries() {
     local src_dir="$1" dest_dir="$2"
     local rc=0
     prune_dead_launch_temps "$dest_dir"
-    publish_launch_binary "$src_dir/lucidos-engine" "$dest_dir/lucidos-engine" sign || rc=1
-    publish_launch_binary "$src_dir/lucidos-gateway" "$dest_dir/lucidos-gateway" sign || rc=1
+    local binary
+    for binary in lucidos-engine lucidos-gateway; do
+        if ! publish_launch_binary "$src_dir/$binary" "$dest_dir/$binary" sign; then
+            echo "ERROR: could not publish $binary to $dest_dir" >&2
+            rc=1
+        fi
+    done
     # The `lucidos` CLI must sit NEXT TO the engine: find_lucidos_cli_dir
     # (crates/lucidos-engine/src/runtime/lucidos_cli.rs) walks up from the
     # engine's exe dir looking for it, and the engine prepends that dir to PATH
@@ -1736,18 +1799,24 @@ cargo_build_in_slot() {
 # so a failure leaves the previous version whole and a switch never finds a
 # half-built one (ADR 0461).
 run_launch_cargo_builds() {
+    if [ -n "${ENGINE_BUILD_FRESH:-}" ]; then
+        local profile
+        profile="$(engine_build_profile)"
+        [ "$profile" != debug ] || profile=dev
+        "$PROJECT_DIR/scripts/with-build-slot.sh" --label "fresh engine build" -- \
+            cargo clean --profile "$profile" -p lucidos-engine -p lucidos-gateway -p lucidos-cli || return 1
+        ENGINE_BUILD_FRESH=""
+    fi
     run_engine_cargo_build || return 1
     if [ -n "$1" ]; then
         run_dev_window_cargo_build || return 1
     fi
 }
 
-# Publish every launch binary run_launch_cargo_builds compiled. Non-zero only
-# when the dev window could not be published. The engine half keeps its own
-# fallback in build_or_find_engine.
+# A failed required publish must stop the build before the window advances.
 publish_all_launch_binaries() {
     local uplift_dir="$1" launch_dir="$2" with_window="$3"
-    publish_launch_binaries "$uplift_dir" "$launch_dir" || true
+    publish_launch_binaries "$uplift_dir" "$launch_dir" || return 1
     # After the engine: an engine started after the window's publish time must
     # already run this build, or the window would move ahead of it.
     if [ -n "$with_window" ]; then
@@ -1896,13 +1965,7 @@ build_or_find_engine() {
     prune_stale_debug_objects "$uplift_dir/deps"
     publish_after_preflight "$uplift_dir" "$launch_dir" "$with_window" || return 1
 
-    # Did this build actually produce a binary for the source on disk now? If
-    # HEAD moved while cargo was running, it didn't — rebuild ONCE against the
-    # source that is there now. Bounded at one retry, and a surviving mismatch
-    # only WARNS: the compile genuinely succeeded, the engine's direction guard
-    # decides whether to offer the binary, and failing here would surface a
-    # false "New engine version failed to build" and abort the Apply-triggered
-    # background rebuild for every co-located workspace.
+    # HEAD may move while cargo runs. Retry once, then report head-moved.
     local state
     state="$(published_build_state "$launch_dir/lucidos-engine")"
     if [ "$state" = "stale" ]; then
@@ -1914,11 +1977,8 @@ build_or_find_engine() {
         state="$(published_build_state "$launch_dir/lucidos-engine")"
     fi
     if [ "$state" = "stale" ]; then
-        echo "WARNING: published engine is build id" \
-            "$("$launch_dir/lucidos-engine" --build-id 2>/dev/null || echo '?')" \
-            "while HEAD is $(git -C "$PROJECT_DIR" rev-parse --short HEAD 2>/dev/null || echo '?')."
-        echo "         Something keeps rebuilding an earlier checkout state. The running"
-        echo "         engine will refuse to offer it as a new version; rebuild with -b."
+        echo "ERROR: head-moved: published engine does not cover the current HEAD"
+        return 75
     fi
 
 
@@ -2209,7 +2269,7 @@ start_engine() {
     # Rotate log if > 10 MB
     if [ -f "$ENGINE_LOG" ]; then
         local log_size
-        log_size=$(stat -f %z "$ENGINE_LOG" 2>/dev/null || echo 0)
+        log_size=$(wc -c < "$ENGINE_LOG" 2>/dev/null || echo 0)
         if [ "$log_size" -gt 10485760 ]; then
             tail -c 1048576 "$ENGINE_LOG" > "$ENGINE_LOG.tmp" 2>/dev/null && mv "$ENGINE_LOG.tmp" "$ENGINE_LOG"
             echo "[$SCRIPT_NAME] Log rotated (was $(( log_size / 1048576 )) MB)" >> "$ENGINE_LOG"
@@ -2562,7 +2622,7 @@ start_gateway() {
     echo ""
     echo "Starting Lucidos workspace gateway..."
     if [ -f "$gw_log" ]; then
-        local log_size; log_size=$(stat -f %z "$gw_log" 2>/dev/null || echo 0)
+        local log_size; log_size=$(wc -c < "$gw_log" 2>/dev/null || echo 0)
         if [ "$log_size" -gt 10485760 ]; then
             tail -c 1048576 "$gw_log" > "$gw_log.tmp" 2>/dev/null && mv "$gw_log.tmp" "$gw_log"
         fi
@@ -3117,8 +3177,13 @@ show_banner() {
         echo "  Frontend:    built dist/ served by the engine (fresh vite build per change)"
     fi
     echo "  PostgreSQL:  shared localhost:$PG_PORT / $(workspace_database_name)"
-    echo "  Engine:      Native macOS"
-    echo "  Sleep:       $(sleep_prevention_status)"
+    case "$(uname -s)" in
+        Darwin)
+            echo "  Engine:      Native macOS"
+            echo "  Sleep:       $(sleep_prevention_status)"
+            ;;
+        *) echo "  Engine:      Native $(uname -s)" ;;
+    esac
     echo "  Log:         $ENGINE_LOG"
     echo "========================================"
     echo ""

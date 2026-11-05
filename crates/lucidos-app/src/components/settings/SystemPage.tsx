@@ -49,6 +49,8 @@ import { formatShortTime } from '../../utils/formatTime';
 import { connectionNotice } from '../../utils/connectionNotice';
 import { errorDetail } from '../../utils/errorDetail';
 import { BackupSection } from './BackupSection';
+import { SnapshotSection } from './SnapshotSection';
+import { RetainedRestoreSources } from './RetainedRestoreSources';
 import { InstallsSection } from './InstallsSection';
 import { DiskUsagePage } from './DiskUsagePage';
 import { PromptFootprintPage } from './PromptFootprintPage';
@@ -197,7 +199,7 @@ export function SystemPage({ panel }: { panel: SystemPanel }) {
       case 'release-notices': return <ReleaseNoticesPage />;
       case 'whats-new': return <WhatsNewPage />;
       case 'thread-queue': return <ThreadQueueView />;
-      case 'backup': return <BackupSection />;
+      case 'backup': return <><SnapshotSection /><BackupSection /><RetainedRestoreSources /></>;
       case 'memory': return <MemoryPage />;
       case 'disk-usage': return <DiskUsagePage />;
       case 'prompt-footprint': return <PromptFootprintPage />;

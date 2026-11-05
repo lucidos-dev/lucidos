@@ -193,7 +193,7 @@ mod tests {
     fn tap_target(tap: &Tap) -> (NavigateTarget, Option<String>) {
         match tap {
             Tap::Navigate { to } => (to.target, to.id.clone()),
-            Tap::Modal => panic!("the notice must navigate"),
+            Tap::Modal | Tap::RestoreSnapshot { .. } => panic!("the notice must navigate"),
         }
     }
 

@@ -42,8 +42,8 @@ export interface AppFrameProps {
 }
 
 /** The app iframe element: the one place an app frame's rules live. The
- *  Canvas pane and a widget on the shelf both draw this, so a widget's frame is an
- *  app's frame, attribute for attribute (ADR 0402).
+ *  Canvas pane and every widget draw this, so a widget's frame is an app's
+ *  frame, attribute for attribute (ADR 0402).
  *
  *  Freezes the JSX `src` at mount so Preact never diffs it. A live element must
  *  not have its `src` mutated: that adds an entry to iOS Safari's joint session

@@ -480,7 +480,7 @@ describe('an option preview', () => {
 describe('an option with a widget', () => {
   const player = {
     id: 'lucidos-sound-player', name: 'Sound player', description: '', reveal: 'on-load' as const,
-    kind: 'widget' as const, reusable: true, built_in: true, params: { clip: { description: 'What to play', required: true } },
+    kind: 'widget' as const, reusable: true, built_in: true, sizes: ['medium' as const], params: { clip: { description: 'What to play', required: true } },
   };
   const options = [
     { id: 'opt-0', label: 'Marin', description: 'Warm, unhurried', widget: { app_id: player.id, params: { clip: 'marin.mp3' }, label: 'Marin' } },
@@ -544,7 +544,7 @@ describe('an option with a widget', () => {
 describe('a widget embed in the question text', () => {
   const tapper = {
     id: 'tap-counter', name: 'Tap counter', description: '', reveal: 'on-load' as const,
-    kind: 'widget' as const, reusable: false, origin_thread_id: 't', built_in: false,
+    kind: 'widget' as const, reusable: false, origin_thread_id: 't', built_in: false, sizes: ['medium' as const],
   };
   const question = 'Here is the widget:\n\n![Tap counter](app:tap-counter)\n\nKeep it?';
   const options = [{ id: 'opt-0', label: 'Keep' }, { id: 'opt-1', label: 'Drop' }];

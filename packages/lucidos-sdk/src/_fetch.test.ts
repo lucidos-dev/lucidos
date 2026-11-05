@@ -189,3 +189,52 @@ describe('device attribution', () => {
     expect((init.headers as Record<string, string>)[HEADER_DEVICE_ID]).toBe('explicit');
   });
 });
+
+describe('direct SDK generation fencing', () => {
+  async function client() {
+    vi.resetModules();
+    return {
+      sdk: await import('./_fetch'),
+      fence: (await import('./_restoreGeneration')).directRestoreGeneration,
+    };
+  }
+  const generation = '11111111-1111-4111-8111-111111111111';
+  const changed = '22222222-2222-4222-8222-222222222222';
+
+  it('stamps provenance after caller headers so it cannot be overridden', async () => {
+    const { sdk, fence } = await client();
+    fence.observe(generation);
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response('{}'));
+    await sdk.request('/preferences', { method: 'POST', headers: {
+      'x-lucidos-restore-generation': changed,
+    } });
+    const init = vi.mocked(fetch).mock.calls[0][1]!;
+    expect(new Headers(init.headers).get('x-lucidos-restore-generation')).toBe(generation);
+  });
+
+  it('rejects a response crossing the first restored hello', async () => {
+    const { sdk, fence } = await client();
+    let finish!: (response: Response) => void;
+    globalThis.fetch = vi.fn(() => new Promise<Response>(resolve => { finish = resolve; }));
+    const pending = sdk.request('/threads/list');
+    fence.observe(generation);
+    finish(new Response('{}'));
+    await expect(pending).rejects.toThrow(/restored/i);
+  });
+
+  it('rejects a body completed after restore, then blocks new dispatch', async () => {
+    const { sdk, fence } = await client();
+    fence.observe(generation);
+    let body!: (text: string) => void;
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true,
+      text: () => new Promise<string>(resolve => { body = resolve; }),
+    });
+    const pending = sdk.request('/threads/list');
+    await vi.waitFor(() => expect(body).toBeTypeOf('function'));
+    fence.observe(changed);
+    body('{}');
+    await expect(pending).rejects.toThrow(/restored/i);
+    await expect(sdk.request('/preferences', { method: 'POST' })).rejects.toThrow(/restored/i);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+});

@@ -63,8 +63,8 @@ describe('installWidgetFrame', () => {
 
   it('every mark reports, so the host hears the size in a new place', () => {
     installWidgetFrame();
-    mark({ place: 'shelf' });
-    mark({ place: 'shelf' });
+    mark({ place: 'option' });
+    mark({ place: 'option' });
     expect(posted).toEqual([
       { type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, height: 200 },
       { type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, height: 200 },
@@ -125,8 +125,19 @@ describe('installWidgetFrame', () => {
     mark({ place: 'dashboard', size: 'small' });
     expect(document.documentElement.style.getPropertyValue('overflow')).toBe('hidden');
     expect(document.body.style.getPropertyValue('overflow')).toBe('hidden');
-    mark({ place: 'inline' });
+    mark({ place: 'option' });
     expect(document.documentElement.style.getPropertyValue('overflow')).toBe('');
+  });
+
+  it('a thread card is a widget box too: it stamps its size and never scrolls inside (I3)', () => {
+    const root = document.documentElement;
+    installWidgetFrame();
+    mark({ place: 'inline', size: 'medium' });
+    expect(root.getAttribute(WIDGET_SIZE_ATTRIBUTE)).toBe('medium');
+    expect(root.getAttribute(WIDGET_PLACE_ATTRIBUTE)).toBe('inline');
+    expect(widget.size()).toBe('medium');
+    expect(root.style.getPropertyValue('overflow')).toBe('hidden');
+    expect(document.body.style.getPropertyValue('overflow')).toBe('hidden');
   });
 
   it('an unknown size or place stamps nothing', () => {
@@ -267,7 +278,7 @@ describe('installWidgetFrame', () => {
 
     it('a long-press menu that reports the finger as a button still sends no point', () => {
       installWidgetFrame();
-      mark({ place: 'shelf', menu: true });
+      mark({ place: 'option', menu: true });
       document.body.dispatchEvent(finger('pointerdown'));
       document.body.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 9, clientY: 9, buttons: 1 }));
       expect(menus()).toEqual([{ type: WIDGET_MENU_MESSAGE_TYPE, held: true }]);
@@ -345,7 +356,7 @@ describe('installWidgetFrame', () => {
 
     it('sends no point for a menu the keyboard raised', () => {
       installWidgetFrame();
-      mark({ place: 'shelf', menu: true });
+      mark({ place: 'option', menu: true });
       const e = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
       place('<div data-pick>chart</div>').dispatchEvent(e);
       expect(menus()).toEqual([{ type: WIDGET_MENU_MESSAGE_TYPE }]);

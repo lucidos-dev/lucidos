@@ -148,6 +148,7 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   WidgetShown: 'metadata',
   WidgetPinned: 'metadata',
   WidgetUnpinned: 'metadata',
+  InlineWidgetSized: 'metadata',
   ThreadMcpServerEnabled: 'metadata',
   ThreadMcpServerDisabled: 'metadata',
   HomeBoardArranged: 'metadata',

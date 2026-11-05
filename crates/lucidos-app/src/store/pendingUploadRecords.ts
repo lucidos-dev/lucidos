@@ -1,17 +1,22 @@
 /** The bytes of each pending upload, kept on this device so a page reload does
  *  not lose the image. One IndexedDB database per workspace. The live entries
- *  are in `store/pendingUploads.ts`; a record here outlives its entry until the
- *  engine's draft holds the image.
+ *  are in `store/pendingUploads.ts`; a record here outlives its entry while
+ *  attached or referenced by an unresolved send.
  *
  *  Plan: `docs/plans/2026-10-02-pending-uploads-survive-a-reload.md`. */
 
-import type { UploadSendIntent } from '../components/chat/prompt-input-helpers';
+import { sourceGeneration, type RestoreSourceOrigin } from '../utils/restoreSourceGeneration';
+import type { UploadSendIntent } from './uploadSendIntents';
+import { signal } from '@preact/signals';
 import { WORKSPACE_ID } from '../utils/basePath';
-import { deviceDatabaseName, openDeviceDatabase } from './deviceDatabase';
+import { deviceDatabaseName } from './deviceDatabase';
+import { createIndexedDbBackend } from './pendingUploadBackend';
+export { createMemoryPendingUploadBackend } from './pendingUploadBackend';
+import { createMemoryPendingUploadBackend } from './pendingUploadBackend';
 import { pageOwnerId } from './pageOwner';
 import { showToast } from './store';
 
-export interface PendingUploadRecord {
+export interface PendingUploadRecord extends RestoreSourceOrigin {
   localId: string;
   threadId: string;
   name: string;
@@ -22,12 +27,12 @@ export interface PendingUploadRecord {
   createdAt: number;
   /** The page load that owns the record. See `liveOwnerIds`. */
   ownerId: string;
-  /** Set once the upload landed, until the engine's draft holds this hash. */
+  /** Content hash once landed, while the retained bytes are still needed. */
   landedHash?: string;
 }
 
 /** A send the user pressed while the thread's images were still uploading. */
-export interface QueuedUploadSendRecord {
+export interface QueuedUploadSendRecord extends RestoreSourceOrigin {
   threadId: string;
   intent: UploadSendIntent;
   ownerId: string;
@@ -47,9 +52,11 @@ export interface PendingUploadBackend {
   putUpload(record: PendingUploadRecord): Promise<void>;
   patchUpload(localId: string, patch: UploadPatch): Promise<void>;
   deleteUpload(localId: string): Promise<void>;
+  listUploadHistory(): Promise<PendingUploadRecord[]>;
   listUploads(): Promise<PendingUploadRecord[]>;
   putQueuedUploadSend(record: QueuedUploadSendRecord): Promise<void>;
-  deleteQueuedUploadSend(threadId: string): Promise<void>;
+  deleteQueuedUploadSend(record: QueuedUploadSendRecord): Promise<void>;
+  listQueuedUploadHistory(): Promise<QueuedUploadSendRecord[]>;
   listQueuedUploadSends(): Promise<QueuedUploadSendRecord[]>;
 }
 
@@ -65,52 +72,6 @@ export function pendingUploadDbName(workspaceId: string | null): string {
 }
 
 const DB_NAME = pendingUploadDbName(WORKSPACE_ID);
-const UPLOADS = 'uploads';
-const QUEUED_UPLOAD_SENDS = 'queued-upload-sends';
-
-function createIndexedDbBackend(name: string): PendingUploadBackend {
-  const { transact } = openDeviceDatabase(name, (db) => {
-    db.createObjectStore(UPLOADS, { keyPath: 'localId' });
-    db.createObjectStore(QUEUED_UPLOAD_SENDS, { keyPath: 'threadId' });
-  });
-
-  return {
-    putUpload: async (record) => { await transact(UPLOADS, 'readwrite', (s) => s.put(record)); },
-    patchUpload: async (localId, patch) => {
-      await transact(UPLOADS, 'readwrite', (s) => {
-        const get = s.get(localId);
-        get.onsuccess = () => {
-          if (get.result) s.put({ ...get.result, ...patch });
-        };
-      });
-    },
-    deleteUpload: async (localId) => { await transact(UPLOADS, 'readwrite', (s) => s.delete(localId)); },
-    listUploads: async () => (await transact<PendingUploadRecord[]>(UPLOADS, 'readonly', (s) => s.getAll())) ?? [],
-    putQueuedUploadSend: async (record) => { await transact(QUEUED_UPLOAD_SENDS, 'readwrite', (s) => s.put(record)); },
-    deleteQueuedUploadSend: async (threadId) => { await transact(QUEUED_UPLOAD_SENDS, 'readwrite', (s) => s.delete(threadId)); },
-    listQueuedUploadSends: async () => (await transact<QueuedUploadSendRecord[]>(QUEUED_UPLOAD_SENDS, 'readonly', (s) => s.getAll())) ?? [],
-  };
-}
-
-/** The same contract over two maps, for tests. Vitest runs under Node, which
- *  has no IndexedDB. */
-export function createMemoryPendingUploadBackend(): PendingUploadBackend {
-  const uploads = new Map<string, PendingUploadRecord>();
-  const queued = new Map<string, QueuedUploadSendRecord>();
-  return {
-    putUpload: async (record) => { uploads.set(record.localId, { ...record }); },
-    patchUpload: async (localId, patch) => {
-      const record = uploads.get(localId);
-      if (record) uploads.set(localId, { ...record, ...patch });
-    },
-    deleteUpload: async (localId) => { uploads.delete(localId); },
-    listUploads: async () => [...uploads.values()].map((r) => ({ ...r })),
-    putQueuedUploadSend: async (record) => { queued.set(record.threadId, { ...record }); },
-    deleteQueuedUploadSend: async (threadId) => { queued.delete(threadId); },
-    listQueuedUploadSends: async () => [...queued.values()].map((r) => ({ ...r })),
-  };
-}
-
 /** Every operation fails, so a browser without IndexedDB hears that its
  *  images will not survive a reload. */
 function createUnavailableBackend(): PendingUploadBackend {
@@ -118,8 +79,8 @@ function createUnavailableBackend(): PendingUploadBackend {
     throw new Error('this browser has no IndexedDB');
   };
   return {
-    putUpload: fail, patchUpload: fail, deleteUpload: fail, listUploads: fail,
-    putQueuedUploadSend: fail, deleteQueuedUploadSend: fail, listQueuedUploadSends: fail,
+    putUpload: fail, patchUpload: fail, deleteUpload: fail, listUploads: fail, listUploadHistory: fail,
+    putQueuedUploadSend: fail, deleteQueuedUploadSend: fail, listQueuedUploadSends: fail, listQueuedUploadHistory: fail,
   };
 }
 
@@ -140,8 +101,30 @@ export interface OwnedRecord {
 }
 
 const owned = new Map<string, OwnedRecord>();
+// Live bytes outlast pending entries even when IndexedDB or its cap refused
+// them. Explicit reference cleanup below is their lifetime, not upload landing.
+const live = new Map<string, PendingUploadRecord>();
+
+/** A send takes ownership before its draft/card clears and releases only
+ * after its accepted, refused or unsent destination is installed. Overlapping
+ * sends may reference the same content hash. */
+export const sendingImageHashes = signal<readonly string[]>([]);
+const sending = new Map<symbol, readonly string[]>();
+export function retainSendingImageHashes(hashes: readonly string[] = []): () => void {
+  const key = Symbol();
+  sending.set(key, [...hashes]);
+  sendingImageHashes.value = [...sending.values()].flat();
+  return () => {
+    if (!sending.delete(key)) return;
+    sendingImageHashes.value = [...sending.values()].flat();
+  };
+}
+
+export function livePendingUploadRecords(): PendingUploadRecord[] {
+  return [...live.values()];
+}
 /** What this page last stored for each queued upload send, by thread. */
-const ownedQueuedUploadSendsByThread = new Map<string, QueuedUploadSendSnapshot>();
+const ownedQueuedUploadSendsByThread = new Map<string, QueuedUploadSendRecord>();
 /** Records other open tabs own. They count against the caps all the same. */
 let othersUsage = { count: 0, bytes: 0 };
 
@@ -178,6 +161,8 @@ export function persistPendingUpload(args: {
   bytes: ArrayBuffer;
 }): boolean {
   const size = args.bytes.byteLength;
+  const record: PendingUploadRecord = { ...args, size, createdAt: Date.now(), ownerId: pageOwnerId, sourceGeneration: sourceGeneration() };
+  live.set(args.localId, record);
   let count = othersUsage.count;
   let bytes = othersUsage.bytes;
   for (const r of owned.values()) {
@@ -189,32 +174,36 @@ export function persistPendingUpload(args: {
     return false;
   }
   owned.set(args.localId, { localId: args.localId, threadId: args.threadId, size });
-  const record: PendingUploadRecord = { ...args, size, createdAt: Date.now(), ownerId: pageOwnerId };
   enqueue(() => store().putUpload(record));
   return true;
 }
 
-/** The upload landed as `hash`. The record now waits for the engine's draft. */
+/** The upload landed as `hash`. Retain bytes while the image is attached. */
 export function markPendingUploadLanded(localId: string, hash: string): void {
+  const inMemory = live.get(localId);
+  if (inMemory) live.set(localId, { ...inMemory, landedHash: hash });
   const record = owned.get(localId);
   if (!record) return;
   owned.set(localId, { ...record, landedHash: hash });
   enqueue(() => store().patchUpload(localId, { landedHash: hash }));
 }
 
-/** Take over a record a previous page load left, and resume it as unlanded. */
-export function adoptPendingUploadRecord(record: PendingUploadRecord): void {
-  owned.set(record.localId, { localId: record.localId, threadId: record.threadId, size: record.size });
-  enqueue(() => store().patchUpload(record.localId, { ownerId: pageOwnerId, landedHash: undefined }));
+/** Take over a record, retaining its landed identity only when already attached. */
+export function adoptPendingUploadRecord(record: PendingUploadRecord, retainLanded = false): void {
+  const landedHash = retainLanded ? record.landedHash : undefined;
+  live.set(record.localId, { ...record, ownerId: pageOwnerId, landedHash });
+  owned.set(record.localId, { localId: record.localId, threadId: record.threadId, size: record.size, landedHash });
+  enqueue(() => store().patchUpload(record.localId, { ownerId: pageOwnerId, landedHash }));
 }
 
 export function forgetPendingUploadRecord(localId: string): void {
+  live.delete(localId);
   owned.delete(localId);
   enqueue(() => store().deleteUpload(localId));
 }
 
 export function ownedPendingUploadRecords(): OwnedRecord[] {
-  return [...owned.values()];
+  return [...new Map<string, OwnedRecord>([...owned.entries(), ...live.entries()]).values()];
 }
 
 /** Count the records other tabs own against this page's caps. */
@@ -226,18 +215,24 @@ export function notePendingUploadsOwnedElsewhere(records: readonly PendingUpload
 }
 
 export function persistQueuedUploadSend(threadId: string, intent: UploadSendIntent, snapshot: QueuedUploadSendSnapshot): void {
-  ownedQueuedUploadSendsByThread.set(threadId, snapshot);
-  enqueue(() => store().putQueuedUploadSend({ threadId, intent, ownerId: pageOwnerId, ...snapshot }));
+  const record = { threadId, intent, ownerId: pageOwnerId, ...snapshot, sourceGeneration: sourceGeneration() };
+  ownedQueuedUploadSendsByThread.set(threadId, record);
+  enqueue(() => store().putQueuedUploadSend(record));
 }
 
 export function adoptQueuedUploadSendRecord(record: QueuedUploadSendRecord): void {
-  ownedQueuedUploadSendsByThread.set(record.threadId, { localIds: record.localIds, text: record.text });
-  enqueue(() => store().putQueuedUploadSend({ ...record, ownerId: pageOwnerId }));
+  const adopted = { ...record, ownerId: pageOwnerId };
+  ownedQueuedUploadSendsByThread.set(record.threadId, adopted);
+  enqueue(async () => {
+    await store().putQueuedUploadSend(adopted);
+    if (record.ownerId !== pageOwnerId) await store().deleteQueuedUploadSend(record);
+  });
 }
 
-export function forgetQueuedUploadSend(threadId: string): void {
-  ownedQueuedUploadSendsByThread.delete(threadId);
-  enqueue(() => store().deleteQueuedUploadSend(threadId));
+export function forgetQueuedUploadSend(threadId: string, source = ownedQueuedUploadSendsByThread.get(threadId)): void {
+  if (!source) return;
+  if (ownedQueuedUploadSendsByThread.get(threadId) === source) ownedQueuedUploadSendsByThread.delete(threadId);
+  enqueue(() => store().deleteQueuedUploadSend(source));
 }
 
 export function ownedQueuedUploadSends(): ReadonlyMap<string, QueuedUploadSendSnapshot> {
@@ -246,12 +241,12 @@ export function ownedQueuedUploadSends(): ReadonlyMap<string, QueuedUploadSendSn
 
 /** Everything stored, after every write this page has queued. A failed read
  *  rejects, so the caller can tell "nothing stored" from "could not look". */
-export async function readPendingUploadStore(): Promise<{
+export async function readPendingUploadStore(includeHistory = false): Promise<{
   uploads: PendingUploadRecord[];
   queuedUploadSendRecords: QueuedUploadSendRecord[];
 }> {
   await writes;
-  const [uploads, queuedUploadSendRecords] = await Promise.all([store().listUploads(), store().listQueuedUploadSends()]);
+  const [uploads, queuedUploadSendRecords] = await Promise.all([(includeHistory ? store().listUploadHistory() : store().listUploads()), (includeHistory ? store().listQueuedUploadHistory() : store().listQueuedUploadSends())]);
   return { uploads, queuedUploadSendRecords };
 }
 
@@ -261,6 +256,9 @@ export function _resetPendingUploadRecordsForTesting(
 ): void {
   backend = next;
   owned.clear();
+  live.clear();
+  sending.clear();
+  sendingImageHashes.value = [];
   ownedQueuedUploadSendsByThread.clear();
   othersUsage = { count: 0, bytes: 0 };
   writes = Promise.resolve();

@@ -22,6 +22,29 @@ use serde_json::json;
 use std::time::Duration;
 
 #[tokio::test]
+async fn gateway_builtin_without_sign_in_returns_an_actionable_error() {
+    let _apis = apis_json_lock().lock().await;
+    let response = user_client()
+        .await
+        .post(format!(
+            "{}/api/v1/proxy/claude-gateway/messages",
+            base_url()
+        ))
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": "claude-haiku-5-5", "max_tokens": 8,
+            "messages": [{"role":"user", "content":"Reply with OK."}]
+        }))
+        .send()
+        .await
+        .expect("gateway proxy route responds");
+    assert_eq!(response.status().as_u16(), 404);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("builtin model provider"), "{body}");
+    assert!(body.contains("Settings"), "{body}");
+}
+
+#[tokio::test]
 async fn proxy_returns_404_when_name_not_configured() {
     let client = http_client();
     let url = format!(

@@ -1,6 +1,6 @@
 # 0508: The Claude gateway is its own provider kind, with its own token table and refresh path
 
-- **Status**: Accepted
+- **Status**: Accepted; app-proxy exclusion superseded by [ADR 0614](0614-claude-gateway-builtin-proxy.md)
 - **Date**: 2026-10-17
 
 ## Context
@@ -68,8 +68,7 @@ What we deliberately do not do:
   application's keychain entry.
 - **No web search through the gateway.** The `anthropic-server-tool` backend
   stays with direct Anthropic, since the gateway does not promise server tools.
-- **No app proxy access.** `api/proxy_builtin.rs` has no gateway entry, so an
-  app cannot spend the gateway credential.
+- **App proxy access** now follows [ADR 0614](0614-claude-gateway-builtin-proxy.md), which supersedes this exclusion.
 - **No environment variable.** The sign-in needs a person, so an env-only setup
   could never finish.
 - **No change to coding-agent threads.** They follow Claude Code's managed

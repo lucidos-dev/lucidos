@@ -2,8 +2,9 @@
 //!
 //! The capture is `ContextCaptured` rows with whole bodies, which the arm's
 //! engine writes because the harness boots it with `LUCIDOS_EVAL_FULL_CAPTURE`.
-//! So there is no second file format and no second source of truth. The arm is
-//! an ordinary browsable workspace, and this reads what is in it.
+//! The event log is the source of truth. Completed runs preserve these rows in
+//! an immutable input snapshot, so replay survives removal of the arm. Older
+//! runs without a snapshot still read the ordinary workspace database.
 //!
 //! One round is one `ContextCaptured` row plus everything the thread did before
 //! the next one. That pairing is what makes it a replay rather than a dump: you
@@ -13,7 +14,7 @@
 //! and a rendering can be wrong where the bytes cannot.
 
 use lucidos_engine::core::prefs;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
@@ -31,6 +32,7 @@ const PREVIEW_CHARS: usize = 200;
 const AFTER_THE_REQUEST: [&str; 3] = ["ResponseGenerated", "ToolCalled", "ToolResult"];
 
 /// One captured round: the request, then what the model did with it.
+#[derive(Serialize, Deserialize)]
 pub struct Round {
     pub round: usize,
     pub capture: serde_json::Value,
@@ -38,6 +40,7 @@ pub struct Round {
 }
 
 /// One event the thread produced after a request.
+#[derive(Serialize, Deserialize)]
 pub struct Happened {
     pub event_type: String,
     pub payload: serde_json::Value,

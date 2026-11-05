@@ -624,7 +624,7 @@ pub(super) fn todo_write_tools(caps: &crate::llm::ToolCapabilities) -> Vec<ToolD
 
     vec![ToolDefinition {
         name: tn::TODO_WRITE.to_string(),
-        description: "Maintain your todo list: a per-thread, user-visible list of items you are working through during a response, rendered in the prompt bar. Replace-whole-list, so every call carries the ENTIRE new list; `[]` clears it. Max 50 items, at most ONE `in_progress`. EVERY CALL ANSWERS WITH THE RESULTING LIST, which is the same list the user sees. AT RESPONSE END the engine settles every unfinished item: `waiting` if you still hold an event wait, else `abandoned` (you walked away). Work you finish after a settle still shows `abandoned` until you write the list again, so re-read it with `action: \"read\"` before telling the user where a plan stands.".to_string(),
+        description: "Maintain your todo list: a per-thread, user-visible list of items you are working through during a response, rendered in the prompt bar. Replace-whole-list, so every call carries the ENTIRE new list; `[]` clears it. Max 50 items, at most ONE `in_progress`. EVERY CALL ANSWERS WITH THE RESULTING LIST, as the user sees it. AT RESPONSE END the engine settles every unfinished item: `waiting` if you hold an event wait or a live child thread still owes you a report, else `abandoned`. Work you finish after a settle still shows `abandoned` until you write the list again, so re-read it with `action: \"read\"` before telling the user where a plan stands.".to_string(),
         parameters,
     }]
 }

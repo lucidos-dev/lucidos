@@ -53,7 +53,7 @@ const SETTINGS: Record<SettingsSubview, Coverage> = {
   memory: { registers: ['settings/MemoryInspector.tsx', 'settings/SummaryTreeBrowser.tsx'] },
   devices: { sectionTable: true },
   accounts: { sectionTable: true },
-  backup: { registers: ['settings/BackupSection.tsx'] },
+  backup: { registers: ['settings/SnapshotSection.tsx', 'settings/BackupSection.tsx', 'settings/RetainedRestoreSources.tsx'] },
   'coding-agents': { sectionTable: true },
   locale: { static: 'preferences, which stay live over SSE' },
   marketplaces: { registers: ['settings/MarketplacesSection.tsx'] },

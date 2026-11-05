@@ -48,9 +48,9 @@ lucidos_signing_identity_ready() {
 # --sign <name>` resolves the identity through the *search list*, NOT through the
 # `--keychain` flag (that flag does not scope identity-name resolution). A
 # keychain that is created + trusted but never added to the search list yields
-# "no identity found", and because sign_engine_binary is best-effort every build
-# then silently falls back to an ad-hoc binary — whose CDHash changes each
-# rebuild, so macOS TCC re-prompts forever. Note that
+# "no identity found". Before signing failures stopped publication, every build
+# silently fell back to an ad-hoc binary, whose CDHash changes each rebuild.
+# macOS TCC then re-prompted forever. Note that
 # `find-identity -p codesigning "$KEYCHAIN"` (explicit) still reports the
 # identity as valid in that broken state, which is why the omission went
 # unnoticed.
@@ -77,8 +77,7 @@ lucidos_ensure_keychain_in_search_list() {
     security list-keychains -d user -s "${list[@]}" >/dev/null 2>&1 || true
 }
 
-# Sign the engine binary with the stable dev identity. Best-effort: prints a hint
-# and returns 0 on any problem so a signing issue never blocks the dev build.
+# Sign when an identity is configured. A failed signing attempt fails publication.
 # $1 = path to the engine binary.
 sign_engine_binary() {
     local bin="$1"
@@ -91,7 +90,7 @@ sign_engine_binary() {
         return 0
     fi
     # Self-heal: without our keychain in the search list, the codesign below
-    # fails with "no identity found" and silently leaves the binary ad-hoc.
+    # fails with "no identity found" and prevents publication.
     lucidos_ensure_keychain_in_search_list
     security unlock-keychain -p "$LUCIDOS_SIGNING_KC_PASS" "$LUCIDOS_SIGNING_KEYCHAIN" 2>/dev/null || true
     if codesign --force \
@@ -101,8 +100,9 @@ sign_engine_binary() {
         "$bin" 2>/dev/null; then
         echo "Signed engine with stable dev identity ($LUCIDOS_SIGNING_IDENTITY)."
     else
-        echo "⚠️  Failed to sign engine with dev identity — left ad-hoc signed."
+        echo "ERROR: failed to sign engine with dev identity."
         echo "    Re-run ./scripts/dev-codesign-setup.sh if the identity was removed."
+        return 1
     fi
     return 0
 }

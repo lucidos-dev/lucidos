@@ -7,6 +7,8 @@ use crate::core::secret_store::{OAuthAccessToken, OAuthRefreshToken, Secret};
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 
+pub use crate::core::oauth_callback::CallbackRoute;
+
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 // ---------------------------------------------------------------------------
@@ -850,11 +852,9 @@ pub fn account_env_names(provider: &str) -> [String; 2] {
 // Both legs therefore read the ONE value `resolve_redirect_uri` returns, never
 // a rebuilt literal.
 
-/// Port the temporary callback listener binds. Fixed (not ephemeral) because
-/// the URI has to be registered with the provider ahead of time.
-pub(crate) const CALLBACK_PORT: u16 = 14981;
-/// Path the callback listener answers on.
-pub(crate) const CALLBACK_PATH: &str = "/oauth/callback";
+pub(crate) use lucidos_gateway_constants::{
+    OAUTH_CALLBACK_PATH as CALLBACK_PATH, OAUTH_CALLBACK_PORT as CALLBACK_PORT,
+};
 /// Host form advertised unless the credential overrides it. The loopback IP is
 /// the default because some providers reject the name `localhost` outright.
 const DEFAULT_CALLBACK_HOST: &str = "127.0.0.1";
@@ -917,6 +917,81 @@ fn resolve_redirect_uri(client_config: &serde_json::Value) -> Result<String, Box
         accepted.join(", ")
     )
     .into())
+}
+
+/// The ONE redirect URI for a flow, chosen by where its browser runs.
+///
+/// A browser on the machine of the gateway it reached follows the loopback
+/// URI. Any other browser needs a *web redirect URI* on its own origin, listed
+/// on the credential. Without one the flow refuses before the provider page
+/// opens, rather than sending the browser to a loopback address that is dead
+/// for it.
+fn redirect_uri_for(
+    provider: &str,
+    route: &CallbackRoute,
+    client_config: &serde_json::Value,
+) -> Result<String, BoxError> {
+    match route {
+        CallbackRoute::Gateway(browser) if !browser.local => {
+            web_redirect_uri_for(provider, browser, client_config)
+        }
+        _ => resolve_redirect_uri(client_config),
+    }
+}
+
+/// The web redirect URI for a browser on another machine, or the refusal
+/// naming what to fix.
+///
+/// Each refusal is one sentence that fits an error toast with the URI in it.
+fn web_redirect_uri_for(
+    provider: &str,
+    browser: &crate::core::oauth_callback::BrowserContext,
+    client_config: &serde_json::Value,
+) -> Result<String, BoxError> {
+    // A plain-http page's `Origin` never reaches here: the gateway consumes it
+    // when it vouches for the request. So one refusal covers both causes.
+    let Some(uri) = browser
+        .web_redirect_uri()
+        .filter(|uri| uri.starts_with("https://"))
+    else {
+        return Err(format!(
+            "{provider} can return only to Lucidos over https, so open it at an https address, \
+             or on a computer running Lucidos."
+        )
+        .into());
+    };
+    if !web_redirect_uris(client_config).contains(&uri) {
+        return Err(format!(
+            "Register {uri} on a Web client, and add it under Web redirect URIs on the \
+             {provider} credential."
+        )
+        .into());
+    }
+    if ClientAuth::from_secret(client_config["client_secret"].as_str())
+        .client_secret()
+        .is_none()
+    {
+        return Err(format!(
+            "A web redirect URI needs a Web client with a client secret. Add the secret to the \
+             {provider} credential."
+        )
+        .into());
+    }
+    Ok(uri)
+}
+
+/// The credential's `web_redirect_uris`, trimmed. Absent means none.
+fn web_redirect_uris(client_config: &serde_json::Value) -> Vec<String> {
+    client_config["web_redirect_uris"]
+        .as_array()
+        .map(|uris| {
+            uris.iter()
+                .filter_map(|uri| uri.as_str())
+                .map(|uri| uri.trim().to_string())
+                .filter(|uri| !uri.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -1790,7 +1865,7 @@ async fn read_request_line(stream: &mut tokio::net::TcpStream) -> Result<String,
 /// human-readable text with `+` for space. An authorization code is an opaque
 /// RFC 3986 query value where `+` is literal, so decoding it as a space would
 /// corrupt the code.
-fn query_param(query: &str, key: &str, plus_is_space: bool) -> Option<String> {
+pub(crate) fn query_param(query: &str, key: &str, plus_is_space: bool) -> Option<String> {
     let raw = query
         .split('&')
         .find_map(|pair| pair.strip_prefix(key)?.strip_prefix('='))?;
@@ -1896,7 +1971,7 @@ const BRAND_MARK: &str = include_str!("../../../lucidos-app/public/favicon.svg")
 ///
 /// Written at callback receipt, BEFORE the code is exchanged, so it cannot
 /// claim the account is connected.
-fn callback_page(provider: &str, ok: bool) -> String {
+pub(crate) fn callback_page(provider: &str, ok: bool) -> String {
     let (heading, detail, provider_label) = if ok {
         (
             "Authorization complete",
@@ -2022,17 +2097,47 @@ async fn wait_for_oauth_callback(
             continue;
         }
 
-        let result = parse_callback_query(query);
-        // The provider's own reason goes to the engine, never into this page.
-        // See `callback_page` for why nothing from `query` is rendered.
-        let status = if result.is_ok() {
+        let received = callback_received(provider, query);
+        let status = if received.code.is_ok() {
             "200 OK"
         } else {
             "400 Bad Request"
         };
-        let body = callback_page(provider, result.is_ok());
-        respond_to_browser(&mut stream, status, &body).await;
-        return result;
+        respond_to_browser(&mut stream, status, &received.page).await;
+        return received.code;
+    }
+}
+
+/// A callback that carried this flow's `state`: the code, and the browser page.
+pub(crate) struct ReceivedCallback {
+    pub code: Result<String, BoxError>,
+    pub page: String,
+}
+
+/// The one step both delivery paths end in, once `state` has matched a flow.
+///
+/// The provider's own reason goes to the engine, never into the page. See
+/// [`callback_page`] for why nothing from `query` is rendered.
+pub(crate) fn callback_received(provider: &str, query: &str) -> ReceivedCallback {
+    let code = parse_callback_query(query);
+    let page = callback_page(provider, code.is_ok());
+    ReceivedCallback { code, page }
+}
+
+/// What a flow waits on for its callback.
+enum CallbackWait {
+    /// This engine's own loopback sockets (no gateway).
+    Listener(CallbackListener),
+    /// The gateway's forward to `/api/v1/internal/oauth/callback`.
+    Gateway(crate::core::oauth_callback::PendingCallback),
+}
+
+impl CallbackWait {
+    async fn code(self, provider: &str, state: &str) -> Result<String, BoxError> {
+        match self {
+            Self::Listener(listener) => wait_for_oauth_callback(listener, provider, state).await,
+            Self::Gateway(pending) => pending.received().await,
+        }
     }
 }
 
@@ -2094,12 +2199,15 @@ pub struct PreparedOAuthFlow {
 /// `OAuthAccountConnected` event, so the frontend can bring THAT device back to
 /// the front when the authorization lands. `None` for an engine-internal flow,
 /// which the frontend reads as "not mine".
+///
+/// `route` says how the callback comes back. See [`CallbackRoute`].
 pub async fn prepare_oauth_flow(
     pool: &PgPool,
     event_bus: &EventBus,
     provider: &str,
     scopes: &str,
     initiator: Option<MessageOrigin>,
+    route: CallbackRoute,
 ) -> Result<PreparedOAuthFlow, BoxError> {
     use crate::core::CredentialStore;
 
@@ -2160,37 +2268,27 @@ pub async fn prepare_oauth_flow(
     check_client_endpoints_in(&provider, &client_config)?;
 
     // The ONE redirect URI for this flow, resolved before anything else so a
-    // bad override cannot produce a redirect the listener never receives.
-    let redirect_uri = resolve_redirect_uri(&client_config)?;
+    // bad override, or a browser that cannot follow it, fails before Connect.
+    let redirect_uri = redirect_uri_for(&provider, &route, &client_config)?;
 
-    // This flow's nonce, generated before the listener binds so the URL and the
-    // listener are handed the same value by construction.
-    let state = generate_oauth_state();
+    // This flow's `state`, generated before anything waits on it so the URL and
+    // the wait are handed the same value by construction.
+    let state = route.state_for(&generate_oauth_state());
 
-    // Hold the lock past the release, the bind and the spawn, so two callers
-    // cannot both find the slot empty and race for the socket. See
-    // `docs/adr/0068-oauth-callback-port-has-one-owner.md`.
-    let mut active_flow = ACTIVE_CALLBACK_FLOW.lock().await;
-    if let Some(superseded) = release_callback_port(&mut active_flow).await {
-        crate::log!(
-            "[OAuth] Superseded an authorization still waiting on port {}",
-            CALLBACK_PORT
-        );
-        crate::engine::form_requests::resolve_or_log(
-            pool,
-            event_bus,
-            superseded,
-            crate::engine::thread_events::FormRequestOutcome::Superseded,
+    // Wait BEFORE returning the URL, so the callback cannot arrive before
+    // anything is waiting for it. Only the no-gateway path holds the slot.
+    let (wait, mut active_flow) = match route {
+        CallbackRoute::OwnListener => {
+            let (listener, slot) = bind_own_listener(pool, event_bus).await?;
+            (CallbackWait::Listener(listener), Some(slot))
+        }
+        CallbackRoute::Gateway(_) => (
+            CallbackWait::Gateway(crate::core::oauth_callback::PendingCallback::open(
+                &state, &provider,
+            )),
             None,
-        )
-        .await;
-    }
-
-    // Bind BEFORE returning the URL, so the callback cannot arrive before
-    // anything is listening for it.
-    let listener = CallbackListener::bind(CALLBACK_PORT)
-        .await
-        .map_err(|e| callback_bind_error(CALLBACK_PORT, e))?;
+        ),
+    };
 
     // From the same `redirect_uri` the exchange below will send.
     let auth_request_url = build_authorize_url(
@@ -2204,10 +2302,13 @@ pub async fn prepare_oauth_flow(
     );
 
     crate::log!(
-        "[OAuth] Prepared {} authorization URL ({} client), listener on port {}, redirect_uri {}",
+        "[OAuth] Prepared {} authorization URL ({} client, {}), redirect_uri {}",
         provider,
         auth.kind(),
-        CALLBACK_PORT,
+        match wait {
+            CallbackWait::Listener(_) => "own listener",
+            CallbackWait::Gateway(_) => "gateway delivers",
+        },
         redirect_uri
     );
 
@@ -2223,14 +2324,14 @@ pub async fn prepare_oauth_flow(
         let result = async {
             let waited = tokio::time::timeout(
                 std::time::Duration::from_secs(120),
-                wait_for_oauth_callback(listener, &provider, &state),
+                wait.code(&provider, &state),
             )
             .await;
 
-            // The future owns the listener, so both the completed and the
-            // timed-out path have already closed the sockets. Publish that
-            // BEFORE the token exchange, which is a network round trip and must
-            // not be abortable by a supersede.
+            // The future owns the listener or the delivery slot, so both the
+            // completed and the timed-out path have already closed it. Publish
+            // that BEFORE the token exchange, which is a network round trip and
+            // must not be abortable by a supersede.
             task_holds_port.store(false, std::sync::atomic::Ordering::Release);
 
             // The authorization page is answered the moment the wait ends,
@@ -2318,11 +2419,13 @@ pub async fn prepare_oauth_flow(
 
     // Register the new owner before releasing the lock, so the next flow has
     // something to supersede and the port is never orphaned again.
-    *active_flow = Some(ActiveCallbackFlow {
-        task,
-        request_id,
-        holds_port,
-    });
+    if let Some(slot) = active_flow.as_mut() {
+        **slot = Some(ActiveCallbackFlow {
+            task,
+            request_id,
+            holds_port,
+        });
+    }
     drop(active_flow);
 
     Ok(PreparedOAuthFlow {
@@ -2332,27 +2435,64 @@ pub async fn prepare_oauth_flow(
     })
 }
 
+/// Bind this engine's own callback listener, superseding the flow that holds it.
+///
+/// Returns the slot still locked: the caller holds it past the spawn, so two
+/// callers cannot both find it empty and race for the socket. See
+/// `docs/adr/0068-oauth-callback-port-has-one-owner.md`.
+async fn bind_own_listener(
+    pool: &PgPool,
+    event_bus: &EventBus,
+) -> Result<
+    (
+        CallbackListener,
+        tokio::sync::MutexGuard<'static, Option<ActiveCallbackFlow>>,
+    ),
+    BoxError,
+> {
+    let mut active_flow = ACTIVE_CALLBACK_FLOW.lock().await;
+    if let Some(superseded) = release_callback_port(&mut active_flow).await {
+        crate::log!(
+            "[OAuth] Superseded an authorization still waiting on port {}",
+            CALLBACK_PORT
+        );
+        crate::engine::form_requests::resolve_or_log(
+            pool,
+            event_bus,
+            superseded,
+            crate::engine::thread_events::FormRequestOutcome::Superseded,
+            None,
+        )
+        .await;
+    }
+    let listener = CallbackListener::bind(CALLBACK_PORT)
+        .await
+        .map_err(|e| callback_bind_error(CALLBACK_PORT, e))?;
+    Ok((listener, active_flow))
+}
+
 /// Run the full OAuth flow end-to-end, handing `auth_url` to `open_auth_url` at
-/// the moment the loopback listener is already bound.
+/// the moment something already waits for the callback.
 ///
 /// **The engine does not open browsers.** Deciding where a URL is displayed
 /// belongs to the client, which knows the platform and the user's
 /// in-app-browser preference, so the caller supplies an opener.
 ///
-/// The opener runs AFTER `prepare_oauth_flow` has bound the listener, so the
-/// callback can never arrive before something is listening for it.
+/// The opener runs AFTER `prepare_oauth_flow` has started waiting, so the
+/// callback can never arrive before something is waiting for it.
 pub async fn run_oauth_flow<F>(
     pool: &PgPool,
     event_bus: &EventBus,
     provider: &str,
     scopes: &str,
     initiator: Option<MessageOrigin>,
+    route: CallbackRoute,
     open_auth_url: F,
 ) -> Result<OAuthFlowOutcome, BoxError>
 where
     F: AsyncFnOnce(&str, uuid::Uuid) -> Result<(), BoxError>,
 {
-    let prepared = prepare_oauth_flow(pool, event_bus, provider, scopes, initiator).await?;
+    let prepared = prepare_oauth_flow(pool, event_bus, provider, scopes, initiator, route).await?;
 
     crate::log!(
         "[OAuth] Handing {} authorization URL to the client to open",

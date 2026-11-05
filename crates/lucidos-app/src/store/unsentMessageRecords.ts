@@ -6,6 +6,7 @@
  *
  *  Plan: `docs/plans/2026-10-03-unsent-messages-survive-a-reload.md`. */
 
+import { sourceGeneration, type RestoreSourceOrigin } from '../utils/restoreSourceGeneration';
 import type { ChatRequestBody } from '../api/types';
 import { WORKSPACE_ID } from '../utils/basePath';
 import { deviceDatabaseName, openDeviceDatabase } from './deviceDatabase';
@@ -13,7 +14,7 @@ import { pageOwnerId } from './pageOwner';
 import { showToast } from './store';
 import type { SendSettlement } from './unsentMessages';
 
-export interface UnsentMessageRecord {
+export interface UnsentMessageRecord extends RestoreSourceOrigin {
   /** The send's client event id: the key, and the exchange's starter id. */
   eventId: string;
   threadId: string;
@@ -94,6 +95,13 @@ function createUnavailableBackend(): UnsentMessageBackend {
 }
 
 let backend: UnsentMessageBackend | null = null;
+const live = new Map<string, UnsentMessageRecord>();
+
+/** Includes requests still building/waiting/posting even if persistence failed.
+ * Restore capture copies these before it acknowledges the old page's intent. */
+export function liveUnsentMessageRecords(): UnsentMessageRecord[] {
+  return [...live.values()];
+}
 
 function store(): UnsentMessageBackend {
   backend ??= typeof indexedDB === 'undefined'
@@ -123,24 +131,29 @@ function enqueue(write: () => Promise<void>): void {
 
 /** Keep a send that is about to post. */
 export function persistSendingMessage(
-  record: Omit<UnsentMessageRecord, 'phase' | 'failedRetries' | 'ownerId'>,
+  record: Omit<UnsentMessageRecord, 'phase' | 'failedRetries' | 'ownerId' | 'sourceGeneration'>,
 ): void {
-  const stored: UnsentMessageRecord = { ...record, phase: 'sending', failedRetries: 0, ownerId: pageOwnerId };
+  const stored: UnsentMessageRecord = { ...record, phase: 'sending', failedRetries: 0, ownerId: pageOwnerId, sourceGeneration: sourceGeneration() };
+  live.set(record.eventId, stored);
   enqueue(() => store().put(stored));
 }
 
 /** The send, or a Retry of it, got no answer. */
 export function markUnsentMessageRecordUnsent(eventId: string, failedRetries: number): void {
+  const record = live.get(eventId);
+  if (record) live.set(eventId, { ...record, phase: 'unsent', failedRetries });
   enqueue(() => store().patch(eventId, { phase: 'unsent', failedRetries }));
 }
 
 /** Take over a record a previous page load left. */
 export function adoptUnsentMessageRecord(record: UnsentMessageRecord): void {
+  live.set(record.eventId, { ...record, ownerId: pageOwnerId });
   enqueue(() => store().patch(record.eventId, { ownerId: pageOwnerId }));
 }
 
 /** The send was decided, or the user discarded it. */
 export function forgetUnsentMessageRecord(eventId: string): void {
+  live.delete(eventId);
   enqueue(() => store().delete(eventId));
 }
 
@@ -156,6 +169,7 @@ export function _resetUnsentMessageRecordsForTesting(
   next: UnsentMessageBackend | null = createMemoryUnsentMessageBackend(),
 ): void {
   backend = next;
+  live.clear();
   writes = Promise.resolve();
   warned = false;
 }

@@ -410,6 +410,31 @@ impl EventBus {
             return;
         }
 
+        // Restored-log settlement may emit a new idle/abort row for an old
+        // turn. Its new sequence does not grant permission to wake the parent.
+        if matches!(
+            event,
+            ThreadEvent::ResponseAborted {
+                cause: crate::engine::thread_events::AbortCause::SnapshotRestored,
+                ..
+            }
+        ) {
+            return;
+        }
+        match crate::engine::agent_recovery::thread_turn_after_restore(&self.pool, child_thread_id)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                crate::log!(
+                    "[FanOut] Restore boundary unavailable; refusing parent callback: {}",
+                    error
+                );
+                return;
+            }
+        }
+
         // **A terminal the engine is about to auto-resume is not a completion.**
         // The child is still working, and the resume lands seconds later. A card
         // here tells the parent the work is lost, and a parent that believes it
@@ -1456,6 +1481,15 @@ impl EventBus {
     /// `propose_held_back_changes_on_startup`: the persisted event is the source
     /// of truth, the in-memory wake is a cache rebuilt from it.
     pub async fn refire_unprocessed_child_completions(&self) -> usize {
+        // Restored completion cards are history on every boot, including
+        // after the first-boot marker is gone. An unknown floor refuses wakes.
+        let floor = match crate::core::snapshot::boundary::read(&self.pool).await {
+            Ok(boundary) => boundary.map_or(0, |boundary| boundary.event_sequence),
+            Err(error) => {
+                crate::log!("[FanOut] restore boundary unavailable: {}", error);
+                return 0;
+            }
+        };
         // `e.aggregate_id` is the parent thread id (text); `payload->>'child_thread_id'`
         // is the child's uuid string. The JOIN drops parents whose summary row is
         // gone (can't resume a parent with no row); `state IS DISTINCT FROM
@@ -1493,7 +1527,7 @@ impl EventBus {
              LEFT JOIN thread_summaries c \
                ON c.thread_id::text = e.payload->>'child_thread_id' \
              WHERE e.aggregate = 'thread' \
-               AND e.event_type = 'ChildThreadCompleted' \
+               AND e.event_type = 'ChildThreadCompleted' AND e.sequence > $4 \
                AND p.state IS DISTINCT FROM 'discarded' \
                AND c.wake_mode IS DISTINCT FROM $3 \
                AND NOT EXISTS ( \
@@ -1508,6 +1542,7 @@ impl EventBus {
         .bind(crate::engine::thread_events::ThreadEvent::PARENT_NOTE_EVENT_TYPES)
         .bind(crate::engine::thread_events::ThreadEvent::SIDE_QUESTION_EVENT_TYPES)
         .bind(WakeMode::NoWake.as_str())
+        .bind(floor)
         .fetch_all(&self.pool)
         .await
         {

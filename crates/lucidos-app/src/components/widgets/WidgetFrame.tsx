@@ -30,14 +30,19 @@ export const OFF_SCREEN_HOLD_MS = 120_000;
 
 export type { WidgetPlace };
 
+/** Where a frame sits. A thread card and a dashboard tile are widget boxes,
+ *  so they always take a size, and the other places never do. */
+export type WidgetFramePlacement =
+  | { place: 'inline' | 'dashboard'; size: WidgetSize }
+  | { place: Exclude<WidgetPlace, 'inline' | 'dashboard'>; size?: undefined };
+
 /** A frame's height before its widget reports one. */
 export function defaultWidgetHeight(place: WidgetPlace): number {
   return place === 'option' ? OPTION_WIDGET_HEIGHT_PX : DEFAULT_WIDGET_HEIGHT_PX;
 }
 
 /** The last size each widget instance reported. An instance opened again
- *  starts at its own size. An inline frame that unmounts off screen keeps it as its
- *  placeholder, so the transcript does not jump. */
+ *  starts at its own size, and a widget box starts its fade from it. */
 const lastSizes = new Map<string, ContentSize>();
 
 /** Test-only: forget every remembered size. */
@@ -45,10 +50,10 @@ export function _resetWidgetHeightsForTesting(): void {
   lastSizes.clear();
 }
 
-/** The box a frame takes up in the transcript: the card's clip, which caps a
- *  tall inline frame, else the frame itself. */
+/** The box a frame takes up in the transcript: its widget box, else the frame
+ *  itself. */
 function transcriptBox(host: HTMLElement): HTMLElement {
-  return host.closest<HTMLElement>('.inline-widget-clip') ?? host;
+  return host.closest<HTMLElement>('.widget-box') ?? host;
 }
 
 /** Hold what follows `box` still while it changes height across or above the
@@ -95,29 +100,24 @@ function watchInViewport(el: HTMLElement, onChange: (inView: boolean) => void): 
   return () => observer.disconnect();
 }
 
-/** A widget's app frame, sized to what it draws (ADRs 0402, 0407).
+/** A widget's app frame (ADRs 0402, 0432).
  *
- *  `place` decides two things. An `inline` frame sits in an *inline widget*
- *  in the transcript. It takes the full reported height and never scrolls, and
- *  the inline widget clips it. It mounts once it first comes on screen, since
- *  each frame is a renderer process of its own. Scrolled off, it stays for
- *  `OFF_SCREEN_HOLD_MS` and then unloads. An `option` frame sits in a question
- *  option and mounts the same way.
+ *  An `inline` or `dashboard` frame given a `size` fills its *widget box*,
+ *  a thread card's or a dashboard tile's (`WidgetBox`). A report never sizes
+ *  it, and only reaches `onSize`, for the box's fade.
  *
- *  A `shelf` frame drops open under the title. It is on screen by definition,
- *  so it mounts at once, and it caps its height. A `dashboard` frame fills
- *  its dashboard tile, whose size class sets the box: a report never sizes it
- *  (ADR 0432). It mounts once on screen, and a hidden dashboard holds it as an
- *  off-screen transcript frame is held. Every place shares one cap on mounted
- *  frames (`widgetFrameBudget.ts`).
+ *  Each frame is a renderer process of its own. An inline or `option` frame
+ *  mounts once it first comes on screen in the transcript. Scrolled off, one
+ *  stays for `OFF_SCREEN_HOLD_MS` and then unloads. A dashboard frame mounts
+ *  once in the viewport, and a hidden dashboard holds it the same way. Every
+ *  place shares one cap on mounted frames (`widgetFrameBudget.ts`).
  *
  *  `params` are the instance's *widget params*, carried in the frame URL.
- *  `size` is a dashboard tile's widget size, and `visible` false while a
- *  loaded frame is out of sight. Both and the place are pushed to the frame on
- *  load and on each change.
+ *  `visible` is false while a loaded frame is out of sight. It, the size and
+ *  the place are pushed to the frame on load and on each change.
  *
- *  A report sizes the frame only through the widget height guard
- *  (`widgetHeightGuard.ts`), at most once per animation frame.
+ *  An option frame takes its widget's height, through the widget
+ *  height guard (`widgetHeightGuard.ts`), at most once per animation frame.
  *  `onHeight` hears the frame's height on mount and on each applied report,
  *  and `onSize` the whole size, saying whether the widget reported it.
  *
@@ -128,12 +128,10 @@ function watchInViewport(el: HTMLElement, onChange: (inView: boolean) => void): 
  *  `onMenu` opens the widget's menu. Given one, the frame is marked `menu`, so
  *  an unclaimed right-click inside it lands there, at its point in the
  *  viewport. A frame with no menu leaves its right-click alone. */
-export function WidgetFrame({ appId, params, reveal, place, size, visible = true, onHeight, onSize, onFrameState, onMenu }: {
+export function WidgetFrame({ appId, params, reveal, place, size, visible = true, onHeight, onSize, onFrameState, onMenu }: WidgetFramePlacement & {
   appId: string;
   params?: WidgetParams;
   reveal: AppReveal;
-  place: WidgetPlace;
-  size?: WidgetSize;
   visible?: boolean;
   onHeight?: (px: number) => void;
   onSize?: (size: ContentSize, fromReport: boolean) => void;
@@ -142,10 +140,9 @@ export function WidgetFrame({ appId, params, reveal, place, size, visible = true
 }) {
   const [host, setHost] = useState<HTMLDivElement | null>(null);
   const frame = useRef<HTMLIFrameElement | null>(null);
-  const eager = place === 'shelf';
-  // Set on screen, cleared by the off-screen hold or by eviction. A shelf
-  // frame starts held and is never set again.
-  const [held, setHeld] = useState(eager);
+  const boxed = size !== undefined;
+  // Set on screen, cleared by the off-screen hold or by eviction.
+  const [held, setHeld] = useState(false);
   const instanceKey = widgetInstanceKey(appId, params);
   const [height, setHeight] = useState(() => lastSizes.get(instanceKey)?.height ?? defaultWidgetHeight(place));
   // Only `onReport` changes the height, and it sets this first.
@@ -156,21 +153,20 @@ export function WidgetFrame({ appId, params, reveal, place, size, visible = true
   // watches afresh, and until the new answer lands its place is unknown.
   const [observed, setObserved] = useState<{ visible: boolean; inView: boolean } | null>(null);
   useEffect(() => {
-    if (eager || !host) return undefined;
+    if (!host) return undefined;
     const answer = (inView: boolean) => setObserved({ visible, inView });
     return place === 'dashboard' ? watchInViewport(host, answer) : watchOnScreen(transcriptBox(host), answer);
-  }, [host, eager, place, visible]);
-  const inView = eager ? true : observed?.visible === visible ? observed.inView : null;
+  }, [host, place, visible]);
+  const inView = observed?.visible === visible ? observed.inView : null;
   const showing = inView === true && visible;
   useEffect(() => {
-    if (eager) return undefined;
     if (showing) {
       setHeld(true);
       return undefined;
     }
     const release = setTimeout(() => setHeld(false), OFF_SCREEN_HOLD_MS);
     return () => clearTimeout(release);
-  }, [showing, eager]);
+  }, [showing]);
 
   // Lives for the mount, so a remount follows its widget afresh.
   const guard = useRef(initialHeightGuard(height));
@@ -201,6 +197,11 @@ export function WidgetFrame({ appId, params, reveal, place, size, visible = true
       if (!pending) return;
       const reported = pending;
       pending = null;
+      if (boxed) {
+        lastSizes.set(instanceKey, reported);
+        onSizeRef.current?.(reported, true);
+        return;
+      }
       const { state, decision } = decideHeight(guard.current, reported.height, now);
       guard.current = state;
       if (decision.kind === 'ignore') return;
@@ -211,9 +212,8 @@ export function WidgetFrame({ appId, params, reveal, place, size, visible = true
       }
       const size = { ...reported, height: decision.height };
       lastSizes.set(instanceKey, size);
-      // Taken while the old height is laid out. A shelf or dashboard frame
-      // is outside the transcript, so its height moves nothing in it.
-      pendingHold.current = eager || place === 'dashboard' ? null : holdWhatFollows(transcriptBox(host));
+      // Taken while the old height is laid out.
+      pendingHold.current = holdWhatFollows(transcriptBox(host));
       setHeight(size.height);
       onSizeRef.current?.(size, true);
     };
@@ -226,7 +226,7 @@ export function WidgetFrame({ appId, params, reveal, place, size, visible = true
       host.removeEventListener(APP_FRAME_SIZE_EVENT, onReport);
       cancelAnimationFrame(frameRequest);
     };
-  }, [host, appId, instanceKey, eager, place]);
+  }, [host, appId, instanceKey, place, boxed]);
 
   useLayoutEffect(() => {
     pendingHold.current?.();
@@ -268,7 +268,7 @@ export function WidgetFrame({ appId, params, reveal, place, size, visible = true
   const url = appUrl(appId, undefined, undefined, params);
   const src = refreshKey > 0 ? cacheBust(url, refreshKey) : url;
   return (
-    <div ref={setHost} class={`widget-frame widget-frame-${place}`} style={place === 'dashboard' ? undefined : { height: `${height}px` }}>
+    <div ref={setHost} class={`widget-frame widget-frame-${place}`} style={boxed ? undefined : { height: `${height}px` }}>
       {held && (
         <AppFrame
           key={refreshKey}

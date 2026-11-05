@@ -260,62 +260,15 @@ impl LucidosEngine {
         reason: &str,
         timeout_secs: i64,
     ) -> Result<LiveWait, Box<dyn std::error::Error + Send + Sync>> {
-        let watermark = self.read_watermark(thread_id).await?;
-        Ok(self.build_wait_at(thread_id, tool_use_id, on, reason, timeout_secs, watermark))
-    }
-
-    /// A wait's watermark: the event store's *committed horizon*, so no event
-    /// at or below it can still commit after this read (ADR 0364). The read may
-    /// wait out appends already in flight, for milliseconds.
-    ///
-    /// Separate from [`Self::build_wait`] for the ONE caller that must read it
-    /// earlier than the rest of its own inputs: see
-    /// [`Self::build_wait_at`].
-    pub(super) async fn read_watermark(
-        &self,
-        thread_id: Uuid,
-    ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(committed_event_horizon(&self.pool).await.inspect_err(|e| {
-            crate::log!("[EventWait] Watermark read failed for thread {thread_id}: {e}");
-        })?)
-    }
-
-    /// [`Self::build_wait`] with the watermark supplied rather than read here.
-    ///
-    /// **The watermark must be read before whatever state decided the `on`
-    /// list.** The catch-up scan is `sequence > watermark`, so any matching
-    /// event that landed at or below it is invisible to this wait: it will not
-    /// match, and the thread sits until the timeout. Reading the watermark
-    /// afterwards leaves exactly that gap, sized by everything in between.
-    ///
-    /// `register_event_wait` has no gap to worry about, because the model's
-    /// `on` list arrives with the tool call and the watermark is the first
-    /// thing read after it (what covers the model's own observe-then-arm gap is
-    /// the separate arming lookback). The engine-armed background-task wait
-    /// does: it decides `on` from the task registry, and asks the database for
-    /// the subscription count in between, so a task completing across those
-    /// milliseconds would be armed for and then never delivered, which is the
-    /// exact stall the wait exists to prevent.
-    pub(super) fn build_wait_at(
-        &self,
-        thread_id: Uuid,
-        tool_use_id: &str,
-        on: Vec<EventSubscription>,
-        reason: &str,
-        timeout_secs: i64,
-        watermark: i64,
-    ) -> LiveWait {
-        let armed_at = Utc::now();
-        LiveWait {
-            wait_id: Uuid::new_v4(),
+        let watermark = read_watermark(&self.pool, thread_id).await?;
+        Ok(build_wait_at(
             thread_id,
-            tool_use_id: tool_use_id.to_string(),
+            tool_use_id,
             on,
-            reason: reason.to_string(),
-            armed_at,
-            expires_at: armed_at + Duration::seconds(timeout_secs),
+            reason,
+            timeout_secs,
             watermark,
-        }
+        ))
     }
 
     /// Persist a built wait and make it live: emit `EventWaitStarted`, insert
@@ -451,6 +404,58 @@ impl LucidosEngine {
     /// model does not watch for 24 hours for a typo.
     pub(crate) async fn event_type_seen_before(&self, event_type: &str) -> bool {
         crate::core::event_subscription::event_type_ever_emitted(&self.pool, event_type).await
+    }
+}
+
+/// A wait's watermark: the event store's *committed horizon*, so no event
+/// at or below it can still commit after this read (ADR 0364). The read may
+/// wait out appends already in flight, for milliseconds.
+///
+/// Separate from [`LucidosEngine::build_wait`] for the ONE caller that must
+/// read it earlier than the rest of its own inputs: see [`build_wait_at`].
+pub(super) async fn read_watermark(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(committed_event_horizon(pool).await.inspect_err(|e| {
+        crate::log!("[EventWait] Watermark read failed for thread {thread_id}: {e}");
+    })?)
+}
+
+/// [`LucidosEngine::build_wait`] with the watermark supplied rather than read here.
+///
+/// **The watermark must be read before whatever state decided the `on`
+/// list.** The catch-up scan is `sequence > watermark`, so any matching
+/// event that landed at or below it is invisible to this wait: it will not
+/// match, and the thread sits until the timeout. Reading the watermark
+/// afterwards leaves exactly that gap, sized by everything in between.
+///
+/// `register_event_wait` has no such gap. The model's `on` list arrives with
+/// the tool call, and the watermark is the first thing read after it. The
+/// separate arming lookback covers the model's own observe-then-arm gap.
+///
+/// The engine-armed background-task wait does have the gap. It decides `on`
+/// from the task registry, and asks the database for the subscription count
+/// in between. A task completing across those milliseconds would be armed for
+/// and never delivered: the exact stall the wait exists to prevent.
+pub(super) fn build_wait_at(
+    thread_id: Uuid,
+    tool_use_id: &str,
+    on: Vec<EventSubscription>,
+    reason: &str,
+    timeout_secs: i64,
+    watermark: i64,
+) -> LiveWait {
+    let armed_at = Utc::now();
+    LiveWait {
+        wait_id: Uuid::new_v4(),
+        thread_id,
+        tool_use_id: tool_use_id.to_string(),
+        on,
+        reason: reason.to_string(),
+        armed_at,
+        expires_at: armed_at + Duration::seconds(timeout_secs),
+        watermark,
     }
 }
 

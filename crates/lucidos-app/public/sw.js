@@ -20,6 +20,13 @@ function scopeRelative(path) {
   return path.startsWith(SCOPE_PATH) ? '/' + path.slice(SCOPE_PATH.length) : path;
 }
 
+// Unknown provenance must remain unknown: never borrow a newly connected page's
+// generation for a queued worker event. Null explicitly names the original era.
+function notificationGeneration(data) {
+  return data.restore_generation === null ? 'none'
+    : typeof data.restore_generation === 'string' ? data.restore_generation : 'unknown';
+}
+
 /** Best-effort breadcrumb to the engine's client-log (same channel the page
  *  uses via postClientLog). Diagnostic only: it answers the otherwise-invisible
  *  question "does the SW's push / notificationclick run on iOS?" — iOS handles a
@@ -27,11 +34,11 @@ function scopeRelative(path) {
  *  ABSENCE of these lines on iOS (while they appear on Chrome) is itself the
  *  signal. Returns the fetch promise so callers can keep the SW alive via
  *  waitUntil. Never throws (telemetry must not break the handler). */
-function swLog(message, data) {
+function swLog(message, data, generation = 'unknown') {
   try {
     return fetch(`${self.location.origin}${SCOPE_PATH}api/v1/internal/client-log`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-lucidos-restore-generation': generation },
       body: JSON.stringify({ category: 'sw', message, data: data || {} }),
       keepalive: true,
     }).catch(() => {});
@@ -531,7 +538,7 @@ self.addEventListener('push', (event) => {
     wake: isWake,
     has_navigate: !!navigateRelative,
     notification_id: (data && data.notification_id) || null,
-  });
+  }, notificationGeneration(data));
   event.waitUntil(self.registration.showNotification(title, {
     body,
     icon: SCOPE_PATH + 'favicon.svg',
@@ -590,6 +597,7 @@ self.addEventListener('notificationclick', (event) => {
 
   const data = event.notification.data || {};
   const notificationId = data.notification_id || null;
+  const generation = notificationGeneration(data);
 
   // This handler runs on Chrome (and any browser that doesn't natively process
   // the declarative envelope). iOS Safari handles the tap declaratively and
@@ -615,6 +623,7 @@ self.addEventListener('notificationclick', (event) => {
   const markReadPromise = notificationId
     ? fetch(`${self.location.origin}${SCOPE_PATH}api/v1/notification/read?id=${encodeURIComponent(notificationId)}`, {
         method: 'POST',
+        headers: { 'x-lucidos-restore-generation': generation },
       }).catch(() => {})
     : Promise.resolve();
 
@@ -627,7 +636,7 @@ self.addEventListener('notificationclick', (event) => {
     notification_id: notificationId,
     has_navigate: !!data.navigate,
     target_url: targetUrl.slice(0, 200),
-  });
+  }, generation);
 
   event.waitUntil(Promise.all([logPromise, markReadPromise, routeToDeepLink(targetUrl, data)]));
 });

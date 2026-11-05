@@ -1,5 +1,7 @@
 use super::*;
+use crate::auth;
 use crate::gateway_protocol::GatewayRedemption;
+use crate::gateway_protocol::HEADER_GATEWAY_CREDENTIAL;
 use crate::registry::Workspace;
 use crate::remote_gateways::tests::{localhost_cert, serve_https};
 use axum::body::Body;
@@ -29,9 +31,13 @@ async fn pair() -> Pair {
         40_123,
     ));
     let cert = localhost_cert();
-    let port = serve_https(crate::server::gateway_router(b.clone()), &cert).await;
+    let port = serve_https(
+        crate::remote_gateways::tests::proxy_guard(crate::server::gateway_router(b.clone())),
+        &cert,
+    )
+    .await;
     let b_address = format!("https://localhost:{port}");
-    let code = b.paired_gateways().mint_code(None).unwrap();
+    let code = b.paired_gateways().mint_secret(None).unwrap();
     let GatewayRedemption::Paired {
         pairing_id,
         credential,
@@ -42,7 +48,8 @@ async fn pair() -> Pair {
 
     let a_dir = tempfile::tempdir().unwrap();
     let a = GatewayState::for_tests_with_static_dir(Some(a_dir.path().to_path_buf()));
-    a.relay_client().trust_for_test(cert.cert.pem().as_bytes());
+    a.peer_connection()
+        .trust_for_test(cert.cert.pem().as_bytes());
     add_remote(&a, "cloud", &b_address, &credential);
     a.write_paired_devices_for_test(|paired| {
         paired.devices.push(auth::PairedDevice {
@@ -71,8 +78,10 @@ fn add_remote(a: &GatewayState, name: &str, address: &str, credential: &str) {
             address: address.to_string(),
             pairing_id: "pairing".to_string(),
             credential: credential.to_string(),
+            headers: crate::remote_gateways::tests::proxy_headers(),
             gateway_protocol: 1,
             added_at: "2020-01-01T00:00:00Z".to_string(),
+            rotation: Default::default(),
         })
         .unwrap();
 }
@@ -140,13 +149,11 @@ async fn a_lists_each_remote_gateways_workspaces_and_names_the_one_it_cannot_rea
     let (status, body) = listed_on_a(&p).await;
     assert_eq!(status, StatusCode::OK);
     let listings = body.as_array().expect("a list");
+    assert!(listings[0]["last_seen_at"].is_string());
+    assert_eq!(listings[1]["reason_kind"], "refused");
     assert_eq!(
-        listings[0],
-        json!({
-            "gateway": "cloud",
-            "state": "reachable",
-            "workspaces": [{ "id": "dev", "name": "Dev", "health": "unhealthy", "last_error": "not started" }],
-        })
+        listings[0]["workspaces"],
+        json!([{ "id": "dev", "name": "Dev", "health": "unhealthy", "last_error": "not started" }])
     );
     assert_eq!(listings[1]["gateway"], "gone");
     assert_eq!(listings[1]["state"], "unreachable");
@@ -163,6 +170,7 @@ async fn an_unpaired_b_reads_as_a_revoked_grant() {
     assert!(p.b.paired_gateways().unpair(&p.pairing_id).unwrap());
     let (_, body) = listed_on_a(&p).await;
     assert_eq!(body[0]["state"], "unreachable");
+    assert_eq!(body[0]["reason_kind"], "revoked");
     let reason = body[0]["reason"].as_str().unwrap();
     assert_eq!(
         reason,
@@ -194,4 +202,103 @@ async fn bs_credential_lists_nothing_on_a() {
         .unwrap();
     let (status, _) = send(&p.a, req).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn proxy_headers_can_be_replaced_without_repairing_and_require_a_device() {
+    let p = pair().await;
+    let update = |authenticated: bool| {
+        let mut req = Request::builder()
+            .method("PUT")
+            .uri("/~/api/v1/remote-gateways/cloud")
+            .header(header::CONTENT_TYPE, "application/json");
+        if authenticated {
+            req = req.header(
+                header::COOKIE,
+                format!("{}={DEVICE_CREDENTIAL}", p.a.device_cookie_name()),
+            );
+        }
+        req.body(Body::from(r#"{"headers":{"X-Token":"new-proxy-secret"}}"#))
+            .unwrap()
+    };
+    let (status, _) = send(&p.a, update(false)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, row) = send(&p.a, update(true)).await;
+    assert_eq!(status, StatusCode::OK, "{row}");
+    assert_eq!(row["header_names"], json!(["x-token"]));
+    assert!(!row.to_string().contains("new-proxy-secret"));
+    assert_eq!(p.a.remote_gateways().list()[0].credential, p.credential);
+    let cookie = format!("{}={DEVICE_CREDENTIAL}", p.a.device_cookie_name());
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/~/api/v1/remote-gateways/cloud")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, cookie)
+        .body(Body::from(r#"{"headers":{}}"#))
+        .unwrap();
+    let (status, row) = send(&p.a, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row["header_names"], json!([]));
+}
+
+#[tokio::test]
+async fn revoked_gateway_keeps_its_last_success_timestamp() {
+    let p = pair().await;
+    let (_, first) = listed_on_a(&p).await;
+    assert!(first[0]["last_seen_at"].is_string());
+    p.b.paired_gateways().unpair(&p.pairing_id).unwrap();
+    let (_, second) = listed_on_a(&p).await;
+    assert_eq!(second[0]["last_seen_at"], first[0]["last_seen_at"]);
+    assert_eq!(second[0]["reason_kind"], "revoked");
+}
+
+#[tokio::test]
+async fn b_does_not_list_its_own_remote_gateways() {
+    let p = pair().await;
+    add_remote(&p.b, "elsewhere", "https://example.invalid", "unused");
+    let (_, body) = listed_on_a(&p).await;
+    assert_eq!(body[0]["workspaces"].as_array().unwrap().len(), 1);
+    assert_eq!(body[0]["workspaces"][0]["id"], "dev");
+}
+
+#[tokio::test]
+async fn a_remote_that_never_completes_tls_times_out() {
+    let p = pair().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = format!(
+        "https://127.0.0.1:{}",
+        listener.local_addr().unwrap().port()
+    );
+    let task = tokio::spawn(async move {
+        let (_socket, _) = listener.accept().await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    add_remote(&p.a, "silent", &address, "unused");
+    let (_, body) = listed_on_a(&p).await;
+    task.abort();
+    let silent = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["gateway"] == "silent")
+        .unwrap();
+    assert_eq!(silent["reason_kind"], "timeout");
+}
+
+#[tokio::test]
+async fn newer_additive_protocol_can_still_list_workspaces() {
+    let p = pair().await;
+    let mut remote = p.a.remote_gateways().remove("cloud").unwrap().unwrap();
+    remote.gateway_protocol = crate::gateway_protocol::GATEWAY_PROTOCOL + 1;
+    p.a.remote_gateways().add(remote).unwrap();
+    let (_, body) = listed_on_a(&p).await;
+    assert_eq!(body[0]["state"], "reachable");
+}
+
+#[tokio::test]
+async fn removing_gateway_forgets_last_seen() {
+    let p = pair().await;
+    listed_on_a(&p).await;
+    p.a.remote_gateways().remove("cloud").unwrap();
+    assert!(p.a.remote_gateways().last_seen.lock().unwrap().is_empty());
 }

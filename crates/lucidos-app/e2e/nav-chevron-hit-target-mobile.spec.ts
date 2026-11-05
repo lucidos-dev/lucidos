@@ -132,13 +132,11 @@ async function prepare(page: Page): Promise<void> {
   await page.waitForFunction(
     () => localStorage.getItem('lucidos-ui-scale') !== null, undefined, { timeout: 10_000 },
   );
-  // The emulator zeroes `env(safe-area-inset-top)`, which puts the row at
-  // y=0 and every tap above a chevron off screen. A phone has the status bar
-  // there, so stamp its inset on, as mobile-threads-top-clipping does.
+  // The emulator zeroes the safe-area insets, which puts the row at the top
+  // edge, where a tap above a chevron is off screen. A phone has the status
+  // bar there, so stamp its inset on the floor the layout reads.
   await page.evaluate((px) => {
-    const style = document.createElement('style');
-    style.innerHTML = `.app-header { padding-top: ${px}px !important; }`;
-    document.head.appendChild(style);
+    document.documentElement.style.setProperty('--safe-area-floor-top', `${px}px`);
   }, SIMULATED_SAFE_AREA_TOP_PX);
 }
 
@@ -221,6 +219,10 @@ test.describe('The mobile nav chevrons take a near miss', () => {
           console.log(`${where}: button ${(p.box.right - p.box.left).toFixed(1)}x${(p.box.bottom - p.box.top).toFixed(1)}, `
             + `hit ${(p.hit.right - p.hit.left).toFixed(1)}x${(p.hit.bottom - p.hit.top).toFixed(1)} `
             + `[${p.hit.left.toFixed(1)}..${p.hit.right.toFixed(1)}], near misses ${JSON.stringify(p.nearMiss)}`);
+
+          // The row sits below the simulated status bar. At the top edge the
+          // walk would stop at the viewport, and the hit box would read short.
+          expect(p.box.top, `${where}: the row is under the status bar`).toBeGreaterThanOrEqual(SIMULATED_SAFE_AREA_TOP_PX);
 
           // The chevron did not move: its button is still one icon box, set
           // the reserve in from its row edge, with the glyph centred in it.

@@ -5,6 +5,9 @@ import type { Notification } from '../types';
 // so the whole navigate graph loads with it. None of it runs here: these keep
 // the import inert, exactly as `__tests__/presence-check-toast.test.ts`
 // does for the arrival matrix.
+vi.mock('./restore-snapshot', () => ({ confirmSnapshotRestore: vi.fn().mockResolvedValue(undefined) }));
+import { confirmSnapshotRestore } from './restore-snapshot';
+
 vi.mock('./threads', () => ({
   focusThread: vi.fn(),
   unfocusThread: vi.fn(),
@@ -264,5 +267,22 @@ describe('the overflow toast counts what is still unread', () => {
     arrive('n-7');
 
     expect(overflow()!.message).toBe('+1 more notification');
+  });
+});
+
+describe('Undo restore toast intent', () => {
+  it('opens confirmation only on a tap and ignores a double tap', () => {
+    vi.mocked(confirmSnapshotRestore).mockClear();
+    const tap = { kind: 'restore-snapshot' as const, workspace_id: 'demo', handle: 'snap_00000000000000000000000000' };
+    presentInAppNotification({
+      title: 'Workspace restored', body: 'Recovery snapshot retained',
+      target: { notification: 'undo', tap },
+    });
+    expect(confirmSnapshotRestore).not.toHaveBeenCalled();
+    const toast = toastFor('undo');
+    expect(toast?.onClick).toBeTypeOf('function');
+    toast!.onClick!();
+    toast!.onClick!();
+    expect(confirmSnapshotRestore).toHaveBeenCalledExactlyOnceWith(tap);
   });
 });

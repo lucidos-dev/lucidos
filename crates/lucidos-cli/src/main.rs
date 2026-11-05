@@ -39,6 +39,7 @@ mod external_address;
 mod frontend_preview;
 mod gateway;
 mod intelligence_ladder;
+mod workspaces;
 /// Manifest-generated subcommands, one per `cli = true` capability domain,
 /// rendered by `build.rs` from `lucidos-capabilities`. Wire each enum below.
 mod generated {
@@ -58,6 +59,7 @@ mod pair;
 mod planned;
 mod proxy;
 mod request_read;
+mod snapshot;
 mod spawn_thread;
 mod successor;
 mod threads;
@@ -84,6 +86,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Read-only workspace cleanup review from this machine's gateway.
+    Workspaces {
+        #[command(subcommand)]
+        action: WorkspacesCmd,
+    },
     /// Operations on the parent workspace's `data/` directory.
     Data {
         #[command(subcommand)]
@@ -163,10 +170,16 @@ enum Command {
     AskOwnerApproval {
         /// The act, in kebab-case: apply, archive, cancel, ...
         verb: String,
-        /// The thread the act aims at. Every verb needs one; the engine
-        /// refuses a request without it.
+        /// The thread the act aims at (except restore-snapshot).
         #[arg(long)]
         thread: Option<String>,
+        /// Exact target workspace slug for restore-snapshot. The request is
+        /// recorded on the source workspace's calling thread.
+        #[arg(long, requires = "snapshot", conflicts_with = "thread")]
+        target_workspace: Option<String>,
+        /// Snapshot handle for restore-snapshot.
+        #[arg(long, requires = "target_workspace", conflicts_with = "thread")]
+        snapshot: Option<String>,
         /// Why you need it, in a sentence or two. The owner reads it on the
         /// card, quoted as yours.
         #[arg(long)]
@@ -179,7 +192,7 @@ enum Command {
     /// Run this in a terminal, then type the code into the device.
     ///
     /// The code works once and expires in five minutes. `--gateway` mints a
-    /// gateway pairing code instead, for another gateway.
+    /// gateway pairing secret instead, for another gateway.
     Pair {
         /// Gateway port, when it is not on 5252 (packaged) or 5251 (dev).
         #[arg(long)]
@@ -198,7 +211,7 @@ enum Command {
         /// or absent. Implies `--qr`.
         #[arg(long)]
         host: Option<String>,
-        /// Mint a gateway pairing code instead, so another gateway can relay
+        /// Mint a gateway pairing secret instead, so another gateway can relay
         /// this one's workspaces. Enter it there under Settings, Access, Add a
         /// remote gateway.
         #[arg(long, conflicts_with_all = ["qr", "host"])]
@@ -358,6 +371,11 @@ enum Command {
     /// tokens, card by dated card, with the workspace override merged in.
     #[command(name = "model-prices")]
     ModelPrices,
+    /// Capture, inspect, check and delete local workspace snapshots.
+    Snapshot {
+        #[command(subcommand)]
+        action: snapshot::Action,
+    },
     /// Start, stop, or inspect the frontend preview: a Vite dev server the
     /// engine supervises inside a coding-agent worktree, on its own port, so a
     /// TypeScript or CSS change is visible in the real app BEFORE Apply. The
@@ -617,10 +635,10 @@ enum Command {
         #[command(subcommand)]
         action: generated::EnvVarsCmd,
     },
-    /// A thread's widgets, the shelf in its title row, and reusable widgets:
-    /// `list`, `thread`, `pin`, `unpin`, `make-reusable` and `stop-reusing`.
-    /// A verb's `--thread-id` defaults to `$LUCIDOS_THREAD_ID`, the session's
-    /// own thread.
+    /// Reusable widgets, a thread's widget card sizes and the dashboards:
+    /// `list`, `size`, `make-reusable`, `stop-reusing` and the dashboard verbs.
+    /// `size --thread-id` defaults to `$LUCIDOS_THREAD_ID`, the session's own
+    /// thread.
     Widgets {
         #[command(subcommand)]
         action: generated::WidgetsCmd,
@@ -681,6 +699,16 @@ enum Command {
     WorkspacePromptFootprint {
         #[command(subcommand)]
         action: generated::WorkspacePromptFootprintCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkspacesCmd {
+    /// List registered workspaces and discovered cleanup candidates as JSON.
+    Review {
+        /// Gateway port, required when more than one gateway is running.
+        #[arg(long)]
+        port: Option<u16>,
     },
 }
 
@@ -929,7 +957,8 @@ enum ThreadsCmd {
 enum BackgroundTaskCmd {
     /// Start a background task. Without `--poll`, end your turn: the thread
     /// re-opens when it finishes, with its exit status and the tail of its
-    /// output. With `--poll`, keep your turn and call `wait`.
+    /// output. With `--poll`, keep your turn and call `wait`. If your turn
+    /// ends first, the thread re-opens when the task finishes.
     ///
     /// One argument after `--` runs as written, so quote a pipeline or a
     /// redirect as one string. Several arguments run as exactly those words.
@@ -1698,6 +1727,12 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
     match cli.command {
+        Command::Workspaces {
+            action: WorkspacesCmd::Review { port },
+        } => {
+            workspaces::review(port)?;
+            Ok(0)
+        }
         Command::Data { action } => {
             let ws = resolve_from_env()?;
             match action {
@@ -1816,6 +1851,7 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             intelligence_ladder::cmd(&ws, surface, json)?;
             Ok(0)
         }
+        Command::Snapshot { action } => snapshot::run(action),
         Command::ModelPrices => {
             model_prices::cmd(&resolve_from_env()?)?;
             Ok(0)
@@ -2031,10 +2067,19 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
         Command::AskOwnerApproval {
             verb,
             thread,
+            target_workspace,
+            snapshot,
             reason,
         } => {
             let ws = resolve_from_env()?;
-            owner_approval::cmd_ask(&ws, &verb, thread.as_deref(), &reason)?;
+            owner_approval::cmd_ask(
+                &ws,
+                &verb,
+                thread.as_deref(),
+                target_workspace.as_deref(),
+                snapshot.as_deref(),
+                &reason,
+            )?;
             Ok(0)
         }
         Command::BackgroundTask { action } => {
@@ -2273,10 +2318,7 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
         }
         Command::Widgets { mut action } => {
             let ws = resolve_from_env()?;
-            if let generated::WidgetsCmd::Thread { thread_id, .. }
-            | generated::WidgetsCmd::Pin { thread_id, .. }
-            | generated::WidgetsCmd::Unpin { thread_id, .. } = &mut action
-            {
+            if let generated::WidgetsCmd::Size { thread_id, .. } = &mut action {
                 if thread_id.is_none() {
                     *thread_id = threads::source_thread_id_from_env();
                 }
@@ -2322,12 +2364,45 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    #[test]
+    fn snapshot_approval_requires_both_target_dimensions_and_no_thread() {
+        let args = [
+            "lucidos",
+            "ask-owner-approval",
+            "restore-snapshot",
+            "--reason",
+            "recover",
+        ];
+        let target = [
+            "--target-workspace",
+            "demo",
+            "--snapshot",
+            "snap_01JBX6Q4T5Z8W2N9R3C7D1F0HK",
+        ];
+        assert!(Cli::try_parse_from(args.into_iter().chain(target)).is_ok());
+        assert!(Cli::try_parse_from(args.into_iter().chain(target[..2].iter().copied())).is_err());
+        assert!(
+            Cli::try_parse_from(args.into_iter().chain(target).chain(["--thread", "thread"]))
+                .is_err()
+        );
+    }
+
     /// The clap tree is built at startup and panics on a malformed
     /// definition, so asserting it builds is the cheapest coverage there is
     /// for a newly added subcommand.
     #[test]
     fn the_command_tree_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn workspace_review_is_read_only_and_accepts_a_gateway_port() {
+        assert!(Cli::try_parse_from(["lucidos", "workspaces", "review", "--port", "5252"]).is_ok());
+        assert!(Cli::try_parse_from(["lucidos", "workspaces", "delete", "sample"]).is_err());
+        assert!(
+            Cli::try_parse_from(["lucidos", "workspaces", "review", "--confirm", "sample"])
+                .is_err()
+        );
     }
 
     fn command_surface(command: &clap::Command) -> serde_json::Value {

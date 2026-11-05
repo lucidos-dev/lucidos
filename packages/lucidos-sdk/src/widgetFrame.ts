@@ -59,7 +59,7 @@ export const WIDGET_PLACE_ATTRIBUTE = 'data-widget-place';
 
 /** Every place a widget frame shows in (ADRs 0407, 0415, 0432, 0466). A
  *  reply's embed is an inline widget, so it shows `inline`. */
-export const WIDGET_PLACES = ['inline', 'shelf', 'option', 'dashboard'] as const;
+export const WIDGET_PLACES = ['inline', 'option', 'dashboard'] as const;
 
 export type WidgetPlace = (typeof WIDGET_PLACES)[number];
 
@@ -103,12 +103,18 @@ function placeOf(data: unknown): WidgetPlace | null {
   return WIDGET_PLACES.includes(place as WidgetPlace) ? (place as WidgetPlace) : null;
 }
 
-/** A dashboard tile never scrolls inside (ADR 0432), whatever stylesheet the
+/** A *widget box*: a thread card or a dashboard tile given a size. The host
+ *  sets its box, and an option or a place with no size has none. */
+function inBox(at: WidgetPlace | null, sized: WidgetSize | null): boolean {
+  return sized !== null && (at === 'inline' || at === 'dashboard');
+}
+
+/** A widget box never scrolls inside (ADR 0432), whatever stylesheet the
  *  widget links. Inline and constant, so no stylesheet is built (ADR 0307). */
-function holdStillInTile(inTile: boolean): void {
+function holdStillInBox(boxed: boolean): void {
   for (const el of [document.documentElement, document.body]) {
     if (!el) continue;
-    if (inTile) el.style.setProperty('overflow', 'hidden', 'important');
+    if (boxed) el.style.setProperty('overflow', 'hidden', 'important');
     else el.style.removeProperty('overflow');
   }
 }
@@ -296,8 +302,9 @@ export function installWidgetFrame(): void {
     // Write `<html>` only when the host's value changes. Rewriting a value
     // still queues a mutation record. A widget observer that answers each
     // record with a write of its own would then loop forever.
+    const nextBoxed = inBox(nextPlace, nextSize);
+    if (nextBoxed !== inBox(place, size)) holdStillInBox(nextBoxed);
     if (nextPlace !== place) {
-      if ((nextPlace === 'dashboard') !== (place === 'dashboard')) holdStillInTile(nextPlace === 'dashboard');
       place = nextPlace;
       stamp(WIDGET_PLACE_ATTRIBUTE, place);
     }
@@ -326,7 +333,8 @@ export function installWidgetFrame(): void {
 
 /** `lucidos.widget`: what the host told this widget about where it shows. */
 export const widget = {
-  /** The tile's widget size on the dashboard, `null` anywhere else. */
+  /** The widget box's size, in a thread card or a dashboard tile. `null`
+   *  anywhere else, such as a question option or the Canvas. */
   size(): WidgetSize | null {
     return size;
   },
@@ -338,7 +346,7 @@ export const widget = {
     return () => sizeListeners.delete(callback);
   },
 
-  /** Where the widget shows: `dashboard`, `inline`, `shelf` or `option`.
+  /** Where the widget shows: `dashboard`, `inline` or `option`.
    *  `null` outside a widget place, such as the Canvas. */
   place(): WidgetPlace | null {
     return place;
@@ -367,6 +375,7 @@ export function _resetWidgetFrameForTesting(): void {
   menu = menuPress = selectionAtPress = menuFromPointer = menuOverSelection = false;
   primaryDown = heldOpenedMenu = false;
   releaseNativeLongPress();
+  holdStillInBox(false);
   endHold?.();
   sizeListeners.clear();
   visibilityListeners.clear();

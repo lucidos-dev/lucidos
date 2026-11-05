@@ -76,38 +76,46 @@ pub enum Located {
 /// land here, on a slug we do not serve. If it is two other installs, the URL
 /// is a guess either way, so [`port_is_contended`] drops the hit.
 pub fn locate(inventory: &Inventory, own_gateway_port: u16, name: &str) -> Located {
-    let mut hits: Vec<PeerWorkspace> = Vec::new();
-    let mut seen: Vec<&Path> = Vec::new();
-    for install in &inventory.installs {
-        // Our own install is what the caller already searched, through the live
-        // control listing. Offering it back would hand the page a URL to here.
-        if install.running_here || install.port == Some(own_gateway_port) {
-            continue;
-        }
-        let (Some(port), Some(data_dir)) = (install.port, install.data_dir.as_deref()) else {
-            continue;
-        };
-        // Two bundles in two application directories share one data dir, so
-        // they report the same workspace twice. That is one install found
-        // twice rather than an ambiguity, and the two resolve identically. The
-        // data dir is what makes them one, so it is what the dedupe keys on.
-        if seen.contains(&data_dir) {
-            continue;
-        }
-        if port_is_contended(inventory, port) {
-            continue;
-        }
-        let Some(peer) = workspace_in(install, name) else {
-            continue;
-        };
-        seen.push(data_dir);
-        hits.push(peer);
-    }
+    let mut hits: Vec<PeerWorkspace> = peer_installs(inventory, own_gateway_port)
+        .filter_map(|install| workspace_in(install, name))
+        .collect();
     match hits.len() {
         0 => Located::Nowhere,
         1 => Located::One(hits.remove(0)),
         _ => Located::Ambiguous(hits),
     }
+}
+
+/// The gateway ports of every other install on this machine that one port
+/// addresses unambiguously.
+pub fn peer_gateway_ports(inventory: &Inventory, own_gateway_port: u16) -> Vec<u16> {
+    peer_installs(inventory, own_gateway_port)
+        .filter_map(|install| install.port)
+        .collect()
+}
+
+/// The installs that are not this one, each addressable by its port alone.
+fn peer_installs(inventory: &Inventory, own_gateway_port: u16) -> impl Iterator<Item = &Install> {
+    let mut seen: Vec<&Path> = Vec::new();
+    inventory.installs.iter().filter(move |install| {
+        // Our own install is what the caller already searched. Offering it
+        // back would hand the caller a URL to here.
+        if install.running_here || install.port == Some(own_gateway_port) {
+            return false;
+        }
+        let (Some(port), Some(data_dir)) = (install.port, install.data_dir.as_deref()) else {
+            return false;
+        };
+        // Two bundles in two application directories share one data dir, so
+        // they report the same workspace twice. That is one install found
+        // twice rather than an ambiguity. The data dir is what makes them one,
+        // so it is what the dedupe keys on.
+        if seen.contains(&data_dir) {
+            return false;
+        }
+        seen.push(data_dir);
+        !port_is_contended(inventory, port)
+    })
 }
 
 /// Is more than one install configured for `port`?
@@ -185,6 +193,41 @@ async fn answered_as_gateway(client: &reqwest::Client, scheme: &str, port: u16) 
         return false;
     };
     body.get("role").and_then(|v| v.as_str()) == Some(GATEWAY_ROLE)
+}
+
+/// How long a peer gateway may take to answer a handed-off OAuth callback,
+/// its own engine hop included.
+const HANDOFF_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Hand an OAuth callback to the peer gateway on `port`, as its status and page.
+///
+/// `query` holds only the fields a browser's callback carries
+/// (`crate::oauth_callback::forwarded_query`). That is all ADR 0132 lets cross
+/// installs: the browser could have sent the same request to that gateway
+/// itself. `None` means no gateway on `port` answered from the hand-off route.
+pub async fn hand_off_oauth_callback(
+    client: &reqwest::Client,
+    port: u16,
+    query: &str,
+) -> Option<(u16, String)> {
+    let scheme = probe_scheme(client, port).await?;
+    let handoff = crate::oauth_callback::HANDOFF_PATH;
+    let url = format!("{scheme}://127.0.0.1:{port}{handoff}?{query}");
+    let res = client
+        .get(&url)
+        .timeout(HANDOFF_TIMEOUT)
+        .send()
+        .await
+        .ok()?;
+    if !res
+        .headers()
+        .contains_key(crate::oauth_callback::HANDOFF_ANSWERED_HEADER)
+    {
+        return None;
+    }
+    let status = res.status().as_u16();
+    let page = res.text().await.ok()?;
+    Some((status, page))
 }
 
 /// The client the probe uses.

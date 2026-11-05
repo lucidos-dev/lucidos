@@ -256,17 +256,13 @@ impl LucidosEngine {
         };
 
         // Both arms, because a failure is the likelier leak: a script that dies
-        // mid-request prints the request it was making.
+        // mid-request prints the request it was making. The secret note stays
+        // in the log above: no agent reads this output, and in a notification
+        // it would crowd out what the script wrote.
         let output = match result {
-            Ok(output) => {
-                crate::core::redact_subprocess_output(&script_env.with_note(output), &secrets)
-            }
+            Ok(output) => crate::core::redact_subprocess_output(&output, &secrets),
             Err(e) => {
-                return Err(crate::core::redact_subprocess_output(
-                    &script_env.with_note(e.to_string()),
-                    &secrets,
-                )
-                .into())
+                return Err(crate::core::redact_subprocess_output(&e.to_string(), &secrets).into())
             }
         };
 
@@ -303,7 +299,12 @@ impl LucidosEngine {
         if outcome.is_success() {
             Ok(stdout)
         } else {
-            Err(format!("Shell script error ({}):\n{}", outcome.describe(), stderr).into())
+            Err(format!(
+                "Shell script error ({}):\n{}",
+                outcome.describe(),
+                crate::runtime::python::script_error_output(&stderr, &stdout, stdout.len() as u64)
+            )
+            .into())
         }
     }
 
@@ -356,7 +357,7 @@ pub(crate) struct ScriptEnv {
 
 impl ScriptEnv {
     /// `result` with the secret-names note appended, when there is one. The
-    /// one place a tool result or a script output gains it.
+    /// one place a tool result gains it.
     pub(crate) fn with_note(&self, mut result: String) -> String {
         if let Some(note) = &self.secret_note {
             if !result.is_empty() {

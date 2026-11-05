@@ -457,6 +457,82 @@ async fn execute_file_shapes_errors_like_run_script() {
     assert!(err.contains("ValueError: kaboom"), "got: {err}");
 }
 
+/// A script that logs its error to stdout and exits non-zero with an empty
+/// stderr reports the end of its stdout, not a blank error.
+#[tokio::test]
+async fn a_failure_with_empty_stderr_reports_the_end_of_stdout() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path().canonicalize().unwrap();
+    let runtime = PythonRuntime::new(ws.clone()).unwrap();
+
+    let script = write_trigger_script(
+        &ws,
+        "logs-to-stdout",
+        "import sys\nprint('fetching')\nprint('HTTP 500 from the provider')\nsys.exit(1)\n",
+    );
+
+    let err = runtime
+        .execute_file_with_env(&script, vec![])
+        .await
+        .expect_err("script exits 1");
+    assert!(err.contains("end of stdout"), "got: {err}");
+    assert!(
+        err.trim_end().ends_with("HTTP 500 from the provider"),
+        "got: {err}"
+    );
+}
+
+/// A stdout log past every read cap keeps its label and its last line. The
+/// stderr trimmer never sees it, and no head cut hides the end.
+#[tokio::test]
+async fn a_long_stdout_log_reports_its_end_under_the_label() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path().canonicalize().unwrap();
+    let runtime = PythonRuntime::new(ws.clone()).unwrap();
+
+    let script = write_trigger_script(
+        &ws,
+        "long-stdout-log",
+        "import sys\nfor i in range(10000):\n    print('progress line', i, 'x' * 60)\n\
+         print('HTTP 500 from the provider')\nsys.exit(1)\n",
+    );
+
+    let err = runtime
+        .execute_file_with_env(&script, vec![])
+        .await
+        .expect_err("script exits 1");
+    assert!(err.contains("this is the end of stdout"), "got: {err}");
+    assert!(err.contains("bytes of stdout omitted"), "got: {err}");
+    assert!(!err.contains("stderr omitted"), "got: {err}");
+    assert!(
+        err.trim_end().ends_with("HTTP 500 from the provider"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn script_error_output_prefers_stderr_and_keeps_the_end_of_stdout() {
+    assert_eq!(script_error_output("boom\n", "log\n", 4), "boom\n");
+    assert_eq!(script_error_output(" \n", "\n", 1), "");
+    let long = format!("{}\nthe real error", "x".repeat(10_000));
+    let tail = script_error_output("", &long, long.len() as u64);
+    assert!(tail.ends_with("the real error"), "{tail}");
+    assert!(tail.contains("bytes of stdout omitted"), "{tail}");
+    assert!(tail.len() < 5_000, "{}", tail.len());
+}
+
+/// The omitted count covers what the reader dropped before the end it kept.
+#[test]
+fn the_omitted_count_includes_what_the_reader_dropped() {
+    let tail = script_error_output("", "last line", 1_009);
+    assert_eq!(
+        tail,
+        "(stderr was empty, so this is the end of stdout)\n\
+         [... 1000 bytes of stdout omitted ...]\nlast line"
+    );
+    assert!(!script_error_output("", "last line", 9).contains("omitted"));
+}
+
 /// Env vars reach an in-place script the same way they reach a string-code one.
 /// `execute_script` injects `LUCIDOS_*`, `CRED_*`, `OAUTH_*`, and the trigger
 /// event vars through exactly this argument.

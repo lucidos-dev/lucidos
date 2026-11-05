@@ -189,3 +189,10 @@ describe('identity is not the label', () => {
     expect(workspaceName.value).toBe('personal');
   });
 });
+
+it('does not adopt the local namesake when served under a remote route', () => {
+  mocks.workspaceId = 'dev@cloud';
+  workspaceName.value = 'dev';
+  adoptWorkspaceDisplayName([entry('dev', 'Local dev')]);
+  expect(visibleWorkspaceName.value).toBe('dev');
+});

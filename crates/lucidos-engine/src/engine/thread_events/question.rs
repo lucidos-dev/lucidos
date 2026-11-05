@@ -92,10 +92,14 @@ pub enum AnswerKind {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OwnerApproval {
     pub verb: ThreadReachVerb,
-    /// The thread the act aims at. `None` only on a card asked for a
-    /// top-thread before that needed no approval (ADR 0475).
+    /// The thread the act aims at. Workspace-scoped snapshot approvals use
+    /// explicit workspace and snapshot fields instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_thread_id: Option<uuid::Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_handle: Option<String>,
 }
 
 impl AnswerKind {

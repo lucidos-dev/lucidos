@@ -1,6 +1,6 @@
 # 0402: A widget is an app kind shown in a thread, with full app reach: same app frame, same data/apps/ folder, no artifact frame, typed spec or data/widgets/ root
 
-- **Status**: Accepted. Placement amended by 0405: a widget opens from the shelf, and the transcript holds a one-line row
+- **Status**: Accepted. Placement amended by 0405: a widget opens from the shelf, and the transcript holds a one-line row. The shelf chip retired by [ADR 0621](0621-widgets-one-box-no-pin.md)
 - **Date**: 2026-10-09
 
 ## Context

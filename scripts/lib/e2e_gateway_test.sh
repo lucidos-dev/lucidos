@@ -201,21 +201,20 @@ EOF
         export WORKSPACE="$E2E_WORKSPACE" ENGINE_PORT=5341 LUCIDOS_E2E_GATEWAY=own
         export LUCIDOS_GATEWAY_PORT=5251 LUCIDOS_WORKSPACE_ID=dev
         ENGINE_BIN="$SANDBOX/lucidos-engine" GATEWAY_BIN="$fake"
-        # Health answers once the fake has written its env. The adopt POST is
-        # recorded and accepted, and the listing then reports what it carried.
+        # This case tests process/environment wiring. The Python contract tests
+        # below exercise registry observation, provenance and private publication.
         # shellcheck disable=SC2329 # called by start_e2e_gateway in this subshell
-        curl() {
-            case "$*" in
-                (*/workspaces/adopt*)
-                    printf '%s\n' "$@" >"$SANDBOX/adopt-request"
-                    printf '{"workspace":{"id":"e2e-test","port":5341}}\n200'
-                    ;;
-                (*) [ -s "$env_file" ] ;;
+        curl() { [ -s "$env_file" ]; }
+        # shellcheck disable=SC2329 # called by e2e_adopt_into_gateway in this subshell
+        python3() {
+            case "$1" in
+                (*/e2e_adopt.py) printf '%s\n' "$@" >"$SANDBOX/adopt-request" ;;
+                (*) command python3 "$@" ;;
             esac
         }
         # shellcheck disable=SC2329 # called by attach_e2e_gateway in this subshell
         e2e_gateway_listed_port() {
-            if grep -q '"port": 5341' "$SANDBOX/adopt-request"; then echo 5341; fi
+            if grep -qx 5341 "$SANDBOX/adopt-request"; then echo 5341; fi
         }
         attach_e2e_gateway >/dev/null 2>&1 || echo "attach failed"
         echo "port=${LUCIDOS_GATEWAY_PORT:-} id=${LUCIDOS_WORKSPACE_ID:-}"
@@ -228,8 +227,8 @@ EOF
     esac
     check "data dir is inside the e2e workspace" grep -qx "LUCIDOS_GATEWAY_DATA=$dir" "$env_file"
     check "the gateway inherits no workspace id" not_grep '^LUCIDOS_WORKSPACE_ID=' "$env_file"
-    check "the workspace was adopted at the engine's port" grep -q '"port": 5341' "$SANDBOX/adopt-request"
-    check "autostart is left to its off default" not_grep autostart "$SANDBOX/adopt-request"
+    check "the workspace was adopted at the engine's port" grep -qx 5341 "$SANDBOX/adopt-request"
+    check "the owner helper receives the workspace identity" grep -qx e2e-test "$SANDBOX/adopt-request"
     check "nothing wrote the gateway's registry file" test ! -e "$dir/config/workspaces.json"
 
     stop_e2e_gateway >/dev/null
@@ -241,6 +240,8 @@ EOF
     fi
     check "pidfile removed" test ! -e "$dir/gateway.pid"
 }
+
+check "E2E adoption ownership contract" env PYTHONDONTWRITEBYTECODE=1 python3 "$SCRIPT_DIR/e2e_adopt_test.py"
 
 test_identity_needs_the_engine_port_listed
 test_auto_candidates_are_deduplicated

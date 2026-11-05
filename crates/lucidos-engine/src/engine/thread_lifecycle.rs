@@ -384,7 +384,9 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         "CommandCheckpointed" | "CommandCheckpointReverted" => EventClass::Metadata,
         // An inline widget or chip is a card projection (ADR 0402): it moves no
         // status, and the turn that drew it already counts as activity.
-        "WidgetShown" | "WidgetPinned" | "WidgetUnpinned" => EventClass::Metadata,
+        "WidgetShown" | "WidgetPinned" | "WidgetUnpinned" | "InlineWidgetSized" => {
+            EventClass::Metadata
+        }
         // A thread's enabled MCP servers change what its next request carries,
         // not what the thread is doing (ADR 0430).
         "ThreadMcpServerEnabled" | "ThreadMcpServerDisabled" => EventClass::Metadata,
@@ -659,11 +661,13 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "SideQuestionAnswered",
         "SideQuestionFailed",
         "SideQuestionDismissed",
-        // Widgets. Persisted so the shelf and an old showing's inline widget
-        // survive a reload and show on every device (ADRs 0402, 0407).
+        // Widgets. Persisted so an old showing's inline widget, a card's size
+        // and Home's legacy pins survive a reload and show on every device
+        // (ADRs 0402, 0621).
         "WidgetShown",
         "WidgetPinned",
         "WidgetUnpinned",
+        "InlineWidgetSized",
         // A thread's enabled MCP servers. Persisted because the events ARE the
         // record: the projection rebuilds from them (ADR 0430).
         "ThreadMcpServerEnabled",
@@ -1066,6 +1070,7 @@ pub fn resolve_transition(
         | "WidgetShown"
         | "WidgetPinned"
         | "WidgetUnpinned"
+        | "InlineWidgetSized"
         // Enabling an MCP server moves the thread nowhere (ADR 0430).
         | "ThreadMcpServerEnabled"
         | "ThreadMcpServerDisabled" => no_change,

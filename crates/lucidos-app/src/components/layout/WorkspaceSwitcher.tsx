@@ -48,7 +48,7 @@ import { Disclosure } from '../shared/Disclosure';
 import { SkeletonProvider, SkText, SkBlock } from '../shared/Skeleton';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { CheckIcon, ChevronDownIcon } from '../shared/icons';
-import { listWorkspaces, type WorkspaceStatus } from '../../api/client/control';
+import { listRemoteWorkspaces, listWorkspaces, type WorkspaceStatus } from '../../api/client/control';
 import { adoptWorkspaceDisplayName } from '../../store/actions/workspace-label';
 import { showToast, visibleWorkspaceName } from '../../store/store';
 import {
@@ -69,6 +69,10 @@ import {
   rememberWorkspaceSwitcherExpanded,
   recallWorkspaceSwitcherExpanded,
 } from '../../utils/lastWorkspace';
+import { LoadableError } from '../shared/LoadableError';
+import { remoteSwitcherRows } from './RemoteSwitcherRows';
+import { mergeRemoteListings, recallRemoteListings, rememberRemoteListings, type RemoteGatewayView } from '../../utils/remoteWorkspaces';
+import { REMOTE_GATEWAY } from '../../utils/basePath';
 import { workspaceState, workspaceStateLabel } from '../../utils/workspaceState';
 
 /** Skeleton rows when this device has never recorded a workspace count. Two,
@@ -491,6 +495,8 @@ export function WorkspacesMenuRow({ onClose }: { onClose: () => void }) {
   const canList = WORKSPACE_ID !== null;
   const expanded = useSignal(initiallyExpanded(canList, recallWorkspaceSwitcherExpanded()));
   const list = useSignal<Loadable<WorkspaceStatus[]>>({ status: 'not-loaded' });
+  const remote = useSignal<Loadable<RemoteGatewayView[]>>({ status: 'not-loaded' });
+  const cachedRemote = useRef(recallRemoteListings());
   // Sized to the count the last successful listing saw, on this device, so the
   // skeleton does not bounce into the list. Captured once per mount so it holds
   // still while the skeleton fades out over the fresher count just recorded.
@@ -512,6 +518,20 @@ export function WorkspacesMenuRow({ onClose }: { onClose: () => void }) {
     let live = true;
     list.value = { status: 'loading' };
     contextId.value = null;
+    cachedRemote.current = cachedRemote.current.map((view) => ({ ...view, unreachable: 'Checking gateway' }));
+    remote.value = { status: 'loading' };
+    listRemoteWorkspaces().then((listings) => {
+      if (!live) return;
+      const data = mergeRemoteListings(cachedRemote.current, listings);
+      cachedRemote.current = data;
+      rememberRemoteListings(data);
+      remote.value = { status: 'loaded', data };
+    }).catch((e) => {
+      if (!live) return;
+      const failure = { status: 'failed' as const, error: errorDetail(e) };
+      cachedRemote.current = cachedRemote.current.map((view) => ({ ...view, unreachable: failure.error }));
+      remote.value = failure;
+    });
     listWorkspaces()
       .then((data) => {
         if (!live) return;
@@ -532,7 +552,10 @@ export function WorkspacesMenuRow({ onClose }: { onClose: () => void }) {
   }, [expanded.value]);
 
   const loading = list.value.status === 'not-loaded' || list.value.status === 'loading';
-  const showSkeleton = useDelayedFlag(expanded.value && loading);
+  const remoteLoading = remote.value.status === 'not-loaded' || remote.value.status === 'loading';
+  const showLoading = useDelayedFlag(expanded.value && (loading || remoteLoading));
+  const showSkeleton = showLoading && loading;
+  const showRemoteSkeleton = showLoading && remoteLoading;
   const placeholder = <WorkspaceSwitcherSkeleton rows={skeleton.rows} manage={skeleton.manage} />;
 
   // Every way out of this list, in either mode. The menu always shuts. An
@@ -556,7 +579,7 @@ export function WorkspacesMenuRow({ onClose }: { onClose: () => void }) {
       {workspacesMenuRow({
         canList,
         manageHref,
-        workspaceName: visibleWorkspaceName.value,
+        workspaceName: visibleWorkspaceName.value + (REMOTE_GATEWAY ? ` @${REMOTE_GATEWAY}` : ''),
         expanded: expanded.value,
         onToggle: () => {
           expanded.value = !expanded.value;
@@ -586,6 +609,13 @@ export function WorkspacesMenuRow({ onClose }: { onClose: () => void }) {
             contextId: contextId.value,
             onContext: (id) => { contextId.value = id; },
             onAlternate: open,
+          })}
+        </LoadingFade>
+        <LoadingFade showSkeleton={showRemoteSkeleton} skeleton={<WorkspaceSwitcherSkeleton rows={Math.max(1, cachedRemote.current.reduce((n, v) => n + v.workspaces.length, 0))} manage={false} />}>
+          {remote.value.status === 'failed' && <div role="alert"><LoadableError error={remote.value.error} noun="remote workspaces" /></div>}
+          {remoteSwitcherRows(remote.value.status === 'loaded' ? remote.value.data : cachedRemote.current, WORKSPACE_ID, (route) => {
+            onClose();
+            void openWorkspaceIn('in-place', route).catch((e: unknown) => showToast(`Could not open workspace: ${errorDetail(e)}`, 'error'));
           })}
         </LoadingFade>
       </Disclosure>

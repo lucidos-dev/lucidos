@@ -7,7 +7,9 @@
  *
  *  Plan: `docs/plans/2026-10-03-unsent-messages-survive-a-reload.md`. */
 
+import { isHistoricalRestoreSource } from '../../utils/restoreSourceGeneration';
 import { effect } from '@preact/signals';
+import { waitForRestoreAdmission, restoreSourcePreserved } from '../../utils/restoreAdmission';
 
 import { makeOptimisticThreadState } from '../thread-events';
 import { holdPageOwnerLock, liveOwnerIds, ownedByAnotherLiveTab, pageOwnerId } from '../pageOwner';
@@ -84,19 +86,26 @@ export function restoreUnsentMessages(): Promise<UnsentRestoreOutcome> {
 }
 
 async function restorePass(): Promise<UnsentRestoreOutcome> {
+  await waitForRestoreAdmission();
   const outcome: UnsentRestoreOutcome = { shown: 0, delivered: 0, movedToDraft: 0, unresolved: 0 };
-  const records = await readUnsentMessageStore();
+  const stored = await readUnsentMessageStore();
+  await waitForRestoreAdmission();
+  const records = stored.filter((r) => !isHistoricalRestoreSource(r) && !restoreSourcePreserved('send', r.eventId));
   const liveOwners = await liveOwnerIds();
+  await waitForRestoreAdmission();
   // Oldest first, so a thread's cards and any fresh drafts keep the send order.
   records.sort((a, b) => (a.sentAt < b.sentAt ? -1 : a.sentAt > b.sentAt ? 1 : 0));
 
   for (const record of records) {
+    if (isHistoricalRestoreSource(record)) continue;
     if (record.ownerId === pageOwnerId || ownedByAnotherLiveTab(record.ownerId, liveOwners)) continue;
     // An earlier pass already brought it back.
     if (unsentMessages.peek().has(record.eventId)) continue;
     let verdict: ThreadVerdict;
     try {
       verdict = await threadVerdict(record);
+      await waitForRestoreAdmission();
+      if (isHistoricalRestoreSource(record)) continue;
     } catch (err) {
       outcome.unresolved += 1;
       outcome.unresolvedReason ??= errorDetail(err);

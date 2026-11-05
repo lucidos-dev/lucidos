@@ -4,6 +4,10 @@
   "icon": "assets/icon.svg",
   "kind": "widget",
   "reusable": true,
+  "sizes": [
+    "medium",
+    "large"
+  ],
   "params": {
     "clip": {
       "description": "The clip to play: a workspace path such as artifacts/films/ending-a.mp4, or an https URL",

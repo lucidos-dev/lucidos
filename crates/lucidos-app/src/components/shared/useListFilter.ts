@@ -2,7 +2,7 @@ import { useSignal } from '@preact/signals';
 import { useRef } from 'preact/hooks';
 import { useEscapeStep } from '../../hooks/useEscapeStep';
 import { isTextInput } from '../../utils/dom';
-import { hasCoarsePointer, isMobile } from '../../utils/viewport';
+import { hasCoarsePointer, viewportGetsPhoneLayout } from '../../utils/layoutMedia';
 import { isTypeaheadKey } from './typeahead';
 
 export { filterListItems, listFilterVisible } from '../../utils/listFilter';
@@ -18,7 +18,7 @@ export function useListFilter({ enabled = true, escape = true, onChange }: {
   const query = useSignal('');
   const inputRef = useRef<HTMLInputElement>(null);
   const searching = query.value.length > 0;
-  const visible = listFilterVisible({ query: query.value, coarse: hasCoarsePointer(), narrow: isMobile() });
+  const visible = listFilterVisible({ query: query.value, coarse: hasCoarsePointer(), narrow: viewportGetsPhoneLayout() });
 
   function setQuery(value: string) {
     query.value = value;

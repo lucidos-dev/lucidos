@@ -1,6 +1,6 @@
 ---
 name: Backups
-description: Workspace backups: coverage, the encrypted archive, the schedule, the backup key needed to restore, retention, staleness, and provider scopes. Load for "when is my next backup", "back up to Dropbox", "change the backup time", "is my backup stale", or a restore.
+description: Workspace backups and local snapshots: coverage, the encrypted archive, the schedule, the backup key, retention, staleness, provider scopes, and snapshot restore. Load for "when is my next backup", "back up to Dropbox", "snapshot before this", or a restore.
 ---
 
 # Backups
@@ -8,6 +8,11 @@ description: Workspace backups: coverage, the encrypted archive, the schedule, t
 A **backup** is one encrypted archive of a workspace, uploaded to a cloud
 provider. Restoring it recreates the workspace's files and database on a fresh
 machine.
+
+For an in-place copy before risky work on this machine, use
+[workspace snapshots](backups/workspace-snapshots.md). A snapshot replaces the same
+workspace through the gateway; an encrypted backup restores into a new workspace.
+Snapshots need the existing key store and do not replace off-machine backups.
 
 ## What a backup contains
 
@@ -62,6 +67,14 @@ Set them with `preferences(action="set")`, for example `preferences(action="set"
 value="0 0 3 * * *")` then `preferences(action="set", key="backup_provider",
 value="google_drive")`. The schedule re-registers immediately, with no restart.
 With no connected account, scheduled backups still run but the upload fails.
+
+**Engine start runs one missed backup.** Lucidos checks the first slot after
+the latest of three times: the start of the last completed backup, the last
+change to `backup_schedule`, and the last snapshot restore. When that slot has already passed, it runs one
+backup at once, however many slots it missed. Only a completed backup counts,
+so a failed one runs again on the next start. Setting or changing the schedule
+never triggers it: a schedule set at 10:00 does not back up for the 03:00 slot
+that morning.
 
 **A backup keeps the computer awake while it runs**, as all Lucidos work does
 (ADR 0366). On macOS that is an idle-sleep assertion named after the workspace,

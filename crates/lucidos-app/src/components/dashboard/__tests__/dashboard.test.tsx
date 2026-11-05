@@ -58,8 +58,10 @@ import {
   DASHBOARD_MIN_COLUMNS,
   DASHBOARD_PAD_X_REM,
   DASHBOARD_STEPS_PER_CELL,
+  WIDGET_GAP_CSS,
   dashboardColumns,
   dashboardContentWidth,
+  widgetCellCss,
 } from '../../../utils/dashboardGeometry';
 import { SIZE_SPANS } from '../DashboardTile';
 import { SPINNER_DELAY_MS } from '../../../hooks/useDelayedLoading';
@@ -83,7 +85,6 @@ function tile(appId: string, size: WidgetDashboardTile['size'], extra: Partial<W
     reusable: true,
     reveal: 'on-load',
     sizes: ['small', 'medium', 'large'],
-    pinned: true,
     size,
     ...extra,
   };
@@ -114,6 +115,24 @@ describe('dashboard geometry', () => {
     const fourCells = 4 * DASHBOARD_CELL_REM * rem + 3 * DASHBOARD_GAP_REM * rem;
     expect(dashboardContentWidth(fourCells + 2 * DASHBOARD_PAD_X_REM * rem, rem)).toBe(fourCells);
     expect(dashboardColumns(dashboardContentWidth(fourCells, rem), rem)).toBe(3);
+  });
+
+  /** Invariant: a thread card's box takes the cell the column count gives,
+   *  from the width alone. */
+  it('gives the cell edge of the column count at every width', () => {
+    const rem = 16;
+    const evaluate = (css: string): number => Number(new Function(`return ${css
+      .replace(/min\(/g, 'Math.min(')
+      .replace(/([\d.]+)rem/g, `($1*${rem})`)
+      .replace(/([\d.]+)px/g, '$1')};`)());
+    const cell = DASHBOARD_CELL_REM * rem;
+    const gap = DASHBOARD_GAP_REM * rem;
+    for (const width of [200, 320, 375, 390, 2 * cell + gap + 2 * DASHBOARD_PAD_X_REM * rem, 600, 1280]) {
+      const content = dashboardContentWidth(width, rem);
+      const columns = dashboardColumns(content, rem);
+      const edge = Math.min(cell, (content - (columns - 1) * gap) / columns);
+      expect(evaluate(widgetCellCss(width)), `at ${width}px`).toBeCloseTo(edge);
+    }
   });
 
   it('scales with the UI scale, since cells are in rem', () => {
@@ -202,13 +221,14 @@ describe('<Dashboard>', () => {
     ]);
   });
 
-  /** Invariant: the cell edge is one constant, read by the grid and the head. */
-  it('publishes its fixed cell on the dashboard, for the grid and the head', () => {
+  /** Invariant: the cell edge is one function of the dashboard's width, read
+   *  by the grid, the head and a thread card's widget box alike. */
+  it('publishes its cell on the dashboard, for the grid and the head', () => {
     setDashboard([tile('clock', 'small')]);
     act(() => render(<Dashboard dashboard="desktop" />, host));
     const dashboard = host.querySelector<HTMLElement>('.dashboard')!;
-    expect(dashboard.style.getPropertyValue('--dashboard-cell')).toBe(`${DASHBOARD_CELL_REM}rem`);
-    expect(dashboard.style.getPropertyValue('--dashboard-gap')).toBe(`${DASHBOARD_GAP_REM}rem`);
+    expect(dashboard.style.getPropertyValue('--widget-cell')).toBe(widgetCellCss(dashboard.clientWidth));
+    expect(dashboard.style.getPropertyValue('--widget-gap')).toBe(WIDGET_GAP_CSS);
     expect(dashboard.style.getPropertyValue('--dashboard-columns')).toBe(String(DASHBOARD_MIN_COLUMNS));
     expect(dashboard.style.getPropertyValue('--dashboard-steps-per-cell')).toBe(String(DASHBOARD_STEPS_PER_CELL));
     expect(dashboard.style.getPropertyValue('--dashboard-steps')).toBe(String(DASHBOARD_MIN_COLUMNS * DASHBOARD_STEPS_PER_CELL));
@@ -461,7 +481,7 @@ describe('<Dashboard> app shortcuts', () => {
     act(() => shortcutTile().click());
     expect(openApp).not.toHaveBeenCalled();
     expect(shortcutTile().querySelector('.dashboard-tile-shield')).not.toBeNull();
-    expect(shortcutTile().querySelector('.dashboard-size-pill')).toBeNull();
+    expect(shortcutTile().querySelector('.widget-size-pill')).toBeNull();
   });
 
   it('its remove badge removes the app by id', () => {
@@ -501,9 +521,9 @@ describe('<Dashboard> in edit mode', () => {
     setDashboard([tile('clock', 'small', { sizes: ['small', 'large'] }), tile('inbox', 'medium', { sizes: ['medium'] })]);
     edit();
     expect(host.querySelectorAll('.dashboard-tile-shield')).toHaveLength(2);
-    const pill = [...tileOf('clock').querySelectorAll('.dashboard-size-pill button')].map((b) => b.textContent);
+    const pill = [...tileOf('clock').querySelectorAll('.widget-size-pill button')].map((b) => b.textContent);
     expect(pill).toEqual(['S', 'L']);
-    expect(tileOf('inbox').querySelector('.dashboard-size-pill')).toBeNull();
+    expect(tileOf('inbox').querySelector('.widget-size-pill')).toBeNull();
   });
 
   /** Invariant: a widget that declares no sizes comes with all three, so it
@@ -511,14 +531,14 @@ describe('<Dashboard> in edit mode', () => {
   it('offers S, M and L on a widget that takes every size', () => {
     setDashboard([tile('inbox', 'medium')]);
     edit();
-    const pill = [...tileOf('inbox').querySelectorAll('.dashboard-size-pill button')].map((b) => b.textContent);
+    const pill = [...tileOf('inbox').querySelectorAll('.widget-size-pill button')].map((b) => b.textContent);
     expect(pill).toEqual(['S', 'M', 'L']);
   });
 
   it('a size change writes one arrangement with every tile', () => {
     setDashboard([tile('clock', 'small', { sizes: ['small', 'large'] }), tile('inbox', 'medium')]);
     edit();
-    act(() => tileOf('clock').querySelector<HTMLButtonElement>('.dashboard-size-pill button[aria-label="large"]')!.click());
+    act(() => tileOf('clock').querySelector<HTMLButtonElement>('.widget-size-pill button[aria-label="large"]')!.click());
     expect(api.arranged).toEqual([{
       dashboard: 'desktop',
       tiles: [{ app_id: 'clock', size: 'large' }, { app_id: 'inbox', size: 'medium' }],

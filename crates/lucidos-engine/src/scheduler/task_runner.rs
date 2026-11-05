@@ -123,8 +123,8 @@ async fn run_task_loop(
         chrono_tz::UTC
     });
 
-    // Check if we just missed a scheduled time (grace period)
-    check_and_execute_missed(
+    settle_missed_slots(
+        None,
         &schedules,
         tz,
         &trigger_id,
@@ -209,7 +209,17 @@ async fn run_task_loop(
                 next.format("%H:%M:%S"),
                 actual_now.format("%H:%M:%S")
             );
-            // Don't execute, wait for next occurrence
+            // The overslept slot and any after it are settled, never fired late.
+            settle_missed_slots(
+                Some(next_utc - chrono::Duration::nanoseconds(1)),
+                &schedules,
+                tz,
+                &trigger_id,
+                &task_name,
+                &engine,
+                &trigger_configs,
+            )
+            .await?;
             continue;
         }
 
@@ -313,9 +323,9 @@ fn scheduled_fire_refusal(shutting_down: bool, paused: Option<bool>) -> Option<F
     }
 }
 
-/// Whether the startup catch-up should run a missed *cron slot*, and if not, why.
+/// Whether the catch-up should run a missed *cron slot* within grace, and if not, why.
 ///
-/// Split out from [`check_and_execute_missed`] so the decision is unit-testable
+/// Split out from [`catch_up_missed_slot`] so the decision is unit-testable
 /// without a scheduler, an engine, or a database — the 2026-07-29 double-fire
 /// was a one-line comparison nobody could assert on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,9 +369,9 @@ impl SkipReason {
 /// fired.
 ///
 /// `in_memory_last_run` is the replayed [`TriggerConfig::last_run`] and
-/// `history` is an independent read of the same durable truth. Both are
-/// engine-clock *recorded run times*; the catch-up takes the later of the two so
-/// neither a stale config nor a lagging read can authorize a re-fire.
+/// `history` is an independent read of the same durable truth. The decision
+/// takes the later of the two
+/// ([`TriggerRunHistory::effective_last_run`](crate::triggers::TriggerRunHistory::effective_last_run)).
 fn catch_up_decision(
     slot_utc: chrono::DateTime<chrono::Utc>,
     in_memory_last_run: Option<chrono::DateTime<chrono::Utc>>,
@@ -371,12 +381,10 @@ fn catch_up_decision(
         return CatchUp::Skip(SkipReason::HistoryUnavailable);
     };
 
-    let effective_last_run = match (in_memory_last_run, history.last_run) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (a, b) => a.or(b),
-    };
-
-    if effective_last_run.is_some_and(|last_run| last_run >= slot_utc) {
+    if history
+        .effective_last_run(in_memory_last_run)
+        .is_some_and(|last_run| last_run >= slot_utc)
+    {
         return CatchUp::Skip(SkipReason::AlreadyRan);
     }
     if history.created_at.is_some_and(|created| created > slot_utc) {
@@ -385,8 +393,15 @@ fn catch_up_decision(
     CatchUp::Fire
 }
 
-/// Check if we just missed a scheduled time and execute if within grace period
-async fn check_and_execute_missed(
+/// Settle the cron slots that passed with no run.
+///
+/// Every path that arms a runner funnels through here: engine start, trigger
+/// create, update or enable, and the health monitor's crash restart. So does a
+/// late wake, with `missed_after` just before the slot it overslept. A slot
+/// within grace fires once. Older slots never run, and the user hears of them
+/// once. Any doubt about the store reports nothing.
+async fn settle_missed_slots(
+    missed_after: Option<chrono::DateTime<chrono::Utc>>,
     schedules: &[cron::Schedule],
     tz: chrono_tz::Tz,
     trigger_id: &str,
@@ -394,104 +409,148 @@ async fn check_and_execute_missed(
     engine: &SharedEngine,
     trigger_configs: &Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let now_in_tz = chrono::Utc::now().with_timezone(&tz);
-    let grace_period = chrono::Duration::minutes(MISSED_TASK_GRACE_MINUTES);
+    use super::skipped_slots::{
+        load_slot_floors, plan_missed_slots, report_skipped_slots, SlotPlan,
+    };
 
-    // Check all schedules for missed occurrences, find the most recent missed one
-    let mut best_missed: Option<chrono::DateTime<chrono_tz::Tz>> = None;
-
-    for schedule in schedules {
-        for occurrence in schedule.after(&(now_in_tz - grace_period)).take(3) {
-            let occurrence_utc = occurrence.with_timezone(&chrono::Utc);
-            let now_utc = chrono::Utc::now();
-
-            if occurrence_utc < now_utc {
-                let delay = now_utc - occurrence_utc;
-                if delay < grace_period {
-                    // This is a valid missed occurrence — keep the most recent
-                    if best_missed.is_none_or(|b| occurrence > b) {
-                        best_missed = Some(occurrence);
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(missed) = best_missed {
-        let missed_utc = missed.with_timezone(&chrono::Utc);
-        let now_utc = chrono::Utc::now();
-        let delay = now_utc - missed_utc;
-
-        let config = {
-            let configs = trigger_configs.read().unwrap();
-            configs.get(trigger_id).cloned()
-        };
-        let paused = config.as_ref().map(|c| c.paused);
-
-        // Guard: only fire a slot we can positively show is still due. Reached
-        // only once a missed slot has actually been found, but every path that
-        // registers a task runner — engine start, trigger create, trigger
-        // update/enable, and the health monitor's crash restart — funnels its
-        // catch-up through here, so this is the single choke point for all of
-        // them.
-        let skip = match scheduled_fire_refusal(engine.is_shutting_down(), paused) {
-            Some(refusal) => Some(refusal.as_str()),
-            None => {
-                let history =
-                    crate::triggers::load_trigger_run_history(engine.pool(), trigger_id).await;
-                if let Err(e) = &history {
-                    log!(
-                        "[Scheduler] Task '{}' run-history lookup failed: {}",
-                        task_name,
-                        e
-                    );
-                }
-                let in_memory_last_run = config.and_then(|c| c.last_run);
-                match catch_up_decision(missed_utc, in_memory_last_run, history) {
-                    CatchUp::Skip(reason) => Some(reason.as_str()),
-                    CatchUp::Fire => None,
-                }
-            }
-        };
-        if let Some(reason) = skip {
+    let config = {
+        let configs = trigger_configs.read().unwrap();
+        configs.get(trigger_id).cloned()
+    };
+    let config = match (
+        scheduled_fire_refusal(engine.is_shutting_down(), config.as_ref().map(|c| c.paused)),
+        config,
+    ) {
+        (None, Some(config)) => config,
+        (refusal, _) => {
+            let reason = refusal.map_or(FireRefusal::Deleted.as_str(), FireRefusal::as_str);
             log!(
-                "[Scheduler] Task '{}' missed at {}, not executing: {}",
+                "[Scheduler] Task '{}' leaves its missed slots alone: {}",
                 task_name,
-                missed.format("%H:%M:%S"),
                 reason
             );
             return Ok(());
         }
+    };
 
-        log!(
-            "[Scheduler] Task '{}' missed at {} ({}s ago), executing now",
-            task_name,
-            missed.format("%H:%M:%S"),
-            delay.num_seconds()
-        );
-
-        // Same Thread Queue routing as the on-time path; the executor owns
-        // record_trigger_executed and failure logging. No cancel token —
-        // matches the pre-queue missed-grace call.
-        let outcome = engine
-            .thread_queue
-            .submit(
-                crate::engine::thread_queue::ThreadQueueRequest::Cron {
-                    retry_of: None,
-                    trigger_id: trigger_id.to_string(),
-                },
-                None,
-                None,
-            )
-            .await;
-        if outcome.completion.await.is_err() {
+    let floors = match load_slot_floors(engine.pool(), trigger_id, config.last_run).await {
+        Ok(floors) => floors,
+        Err(e) => {
             log!(
-                "[Scheduler] Task '{}' grace-period completion channel dropped",
-                task_name
+                "[Scheduler] Task '{}' missed-slot history unavailable: {}",
+                task_name,
+                e
             );
+            return Ok(());
+        }
+    };
+    let now = chrono::Utc::now();
+    let grace = chrono::Duration::minutes(MISSED_TASK_GRACE_MINUTES);
+    match plan_missed_slots(schedules, tz, floors.floor(missed_after, now), now, grace) {
+        SlotPlan::Nothing => Ok(()),
+        SlotPlan::Report(slots) => {
+            log!(
+                "[Scheduler] Task '{}' skipped {} slot(s) from {} to {}",
+                task_name,
+                slots.count,
+                slots.first,
+                slots.last
+            );
+            match report_skipped_slots(&engine.event_bus, trigger_id, &config.name, tz, slots).await
+            {
+                Ok(notice) => notice.send_push(engine),
+                Err(e) => log!(
+                    "[Scheduler] Task '{}' skipped-slot report failed: {}",
+                    task_name,
+                    e
+                ),
+            }
+            Ok(())
+        }
+        SlotPlan::CatchUp(slot) => {
+            catch_up_missed_slot(slot, tz, trigger_id, task_name, engine, trigger_configs).await
         }
     }
+}
 
+/// Fire one missed slot within grace, once the store shows it is still due.
+async fn catch_up_missed_slot(
+    missed_utc: chrono::DateTime<chrono::Utc>,
+    tz: chrono_tz::Tz,
+    trigger_id: &str,
+    task_name: &str,
+    engine: &SharedEngine,
+    trigger_configs: &Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let missed = missed_utc.with_timezone(&tz);
+    let config = {
+        let configs = trigger_configs.read().unwrap();
+        configs.get(trigger_id).cloned()
+    };
+    let paused = config.as_ref().map(|c| c.paused);
+
+    // Re-read after the floors load: the trigger may have paused meanwhile.
+    let skip = match scheduled_fire_refusal(engine.is_shutting_down(), paused) {
+        Some(refusal) => Some(refusal.as_str()),
+        None => {
+            match crate::core::snapshot::boundary::permits_slot(engine.pool(), missed_utc).await {
+                Ok(true) => {}
+                Ok(false) => return Ok(()),
+                Err(_) => return Err("snapshot_restore_boundary_unavailable".into()),
+            }
+            let history =
+                crate::triggers::load_trigger_run_history(engine.pool(), trigger_id).await;
+            if let Err(e) = &history {
+                log!(
+                    "[Scheduler] Task '{}' run-history lookup failed: {}",
+                    task_name,
+                    e
+                );
+            }
+            let in_memory_last_run = config.and_then(|c| c.last_run);
+            match catch_up_decision(missed_utc, in_memory_last_run, history) {
+                CatchUp::Skip(reason) => Some(reason.as_str()),
+                CatchUp::Fire => None,
+            }
+        }
+    };
+    if let Some(reason) = skip {
+        log!(
+            "[Scheduler] Task '{}' missed at {}, not executing: {}",
+            task_name,
+            missed.format("%H:%M:%S"),
+            reason
+        );
+        return Ok(());
+    }
+
+    log!(
+        "[Scheduler] Task '{}' missed at {} ({}s ago), executing now",
+        task_name,
+        missed.format("%H:%M:%S"),
+        (chrono::Utc::now() - missed_utc).num_seconds()
+    );
+
+    // Same Thread Queue routing as the on-time path; the executor owns
+    // record_trigger_executed and failure logging. No cancel token, which
+    // matches the pre-queue missed-grace call.
+    let outcome = engine
+        .thread_queue
+        .submit(
+            crate::engine::thread_queue::ThreadQueueRequest::Cron {
+                retry_of: None,
+                trigger_id: trigger_id.to_string(),
+            },
+            None,
+            None,
+        )
+        .await;
+    if outcome.completion.await.is_err() {
+        log!(
+            "[Scheduler] Task '{}' grace-period completion channel dropped",
+            task_name
+        );
+    }
     Ok(())
 }
 
@@ -1125,6 +1184,33 @@ pub(super) async fn check_task_health_and_restart(
 
         log!("[Scheduler] Restarted task '{}'", task_name);
     }
+}
+
+/// Run the production catch-up choke point against a pre-restore minute slot.
+#[cfg(test)]
+pub(crate) async fn assert_snapshot_catch_up_excluded(engine: &SharedEngine) {
+    let id = "snapshot-combined-cron";
+    let config = TriggerConfig::from_created_payload(&serde_json::json!({
+        "trigger_id": id, "name": "Synthetic cron", "schedule": ["0 * * * * *"],
+        "timezone": "UTC", "run": {"type":"intent", "intent":"Synthetic fixture"}
+    }))
+    .unwrap();
+    let configs = Arc::new(std::sync::RwLock::new(HashMap::from([(id.into(), config)])));
+    let schedule = crate::engine::tools::scheduler::parse_standard_cron("0 * * * * *").unwrap();
+    settle_missed_slots(
+        None,
+        &[schedule],
+        chrono_tz::UTC,
+        id,
+        "Synthetic cron",
+        engine,
+        &configs,
+    )
+    .await
+    .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = 'TriggerStarted' AND payload->>'trigger_id' = $1")
+        .bind(id).fetch_one(engine.pool()).await.unwrap();
+    assert_eq!(count, 0);
 }
 
 #[cfg(test)]

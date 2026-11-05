@@ -245,6 +245,19 @@ impl PreferenceStore {
         Ok(result)
     }
 
+    /// When the global row for `key` was last written. Private like [`Self::get`].
+    async fn get_written_at(
+        pool: &PgPool,
+        key: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT updated_at FROM preferences WHERE key = $1 AND device_id IS NULL",
+        )
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+    }
+
     /// Get a preference for a specific device, falling back to the global value.
     /// Private for the same reason as [`Self::get`].
     async fn get_for_device(
@@ -788,6 +801,15 @@ impl<K> Pref<K> {
     /// The stored global row, untouched. `Ok(None)` when no row exists.
     pub async fn try_stored(&self, pool: &PgPool) -> Result<Option<String>, sqlx::Error> {
         PreferenceStore::get(pool, self.key()).await
+    }
+
+    /// When the stored global row was last written, on the database clock.
+    /// `Ok(None)` when no row exists.
+    pub async fn try_stored_written_at(
+        &self,
+        pool: &PgPool,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, sqlx::Error> {
+        PreferenceStore::get_written_at(pool, self.key()).await
     }
 
     /// [`Self::try_stored`], with a failed read logged and read as unset.

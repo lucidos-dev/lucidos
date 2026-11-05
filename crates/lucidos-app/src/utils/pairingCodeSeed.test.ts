@@ -8,6 +8,7 @@ import {
 } from './pairingCodeSeed';
 
 const CODE = '01234567';
+const SECRET = 'ldp_abcdefghijklmnopqrstuvwxyz';
 
 describe('pairingCodeToAdopt', () => {
   it('adopts the eight digits a scanned QR carried', () => {
@@ -36,6 +37,19 @@ describe('pairingCodeToAdopt', () => {
         pairingCodeToAdopt(`?${PAIR_PARAM}=${encodeURIComponent(bad)}`),
         `should have rejected ${JSON.stringify(bad)}`,
       ).toBeNull();
+    }
+  });
+
+  it('adopts the long secret a current gateway puts in the link', () => {
+    expect(pairingCodeToAdopt(`?${PAIR_PARAM}=${SECRET}`)).toBe(SECRET);
+    for (const bad of [
+      SECRET.slice(0, -1),
+      `${SECRET}a`,
+      SECRET.toUpperCase(),
+      SECRET.replace('ldp_', 'lgp_'),
+      `${SECRET.slice(0, -1)}"`,
+    ]) {
+      expect(pairingCodeToAdopt(`?${PAIR_PARAM}=${encodeURIComponent(bad)}`), bad).toBeNull();
     }
   });
 

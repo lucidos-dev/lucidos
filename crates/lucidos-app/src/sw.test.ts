@@ -440,6 +440,8 @@ describe('Service Worker fetch handler — immutable /assets bundle caching', ()
     // Registered during dispatch, never from a later callback.
     expect(event.waitUntil).toHaveBeenCalledTimes(1);
     await event.waitUntil.mock.calls[0][0];
+    expect(sw.mockFetch).toHaveBeenCalledWith(expect.stringContaining('/internal/client-log'),
+      expect.objectContaining({ headers: expect.objectContaining({ 'x-lucidos-restore-generation': 'unknown' }) }));
     expect(clientLogBodies(sw)).toEqual([{
       category: 'sw',
       message: 'asset_failed',
@@ -1510,5 +1512,45 @@ describe('Service Worker base-path awareness (gateway scope)', () => {
     const opts = mockRegistration.showNotification.mock.calls[0][1] as Record<string, string>;
     expect(opts.icon).toBe('/ws/work/favicon.svg');
     expect(opts.navigate).toBe('https://example.com/ws/work/');
+  });
+});
+
+describe('Service Worker source generation', () => {
+  it.each([
+    ['12345678-1234-4234-8234-123456789abc', '12345678-1234-4234-8234-123456789abc'],
+    [null, 'none'],
+    [undefined, 'unknown'],
+  ])('binds read and click log to notification generation %s', async (generation, header) => {
+    const { handlers, mockFetch } = loadSw();
+    mockFetch.mockResolvedValue(new Response('ok'));
+    const waited: Promise<unknown>[] = [];
+    const data = { notification_id: 'source', restore_generation: generation };
+    handlers.notificationclick({
+      notification: { data, close: vi.fn() },
+      waitUntil: (p: Promise<unknown>) => waited.push(p),
+    });
+    data.restore_generation = 'changed-after-dispatch';
+    await Promise.all(waited);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    for (const [, options] of mockFetch.mock.calls) {
+      expect(options.headers['x-lucidos-restore-generation']).toBe(header);
+    }
+  });
+
+  it('binds push logging to payload provenance', async () => {
+    const { handlers, mockFetch } = loadSw();
+    mockFetch.mockResolvedValue(new Response('ok'));
+    const waited: Promise<unknown>[] = [];
+    handlers.push({
+      data: { json: () => ({ web_push: 8030, notification: {
+        title: 'Source', data: { restore_generation: '12345678-1234-4234-8234-123456789abc' },
+      } }) },
+      waitUntil: (p: Promise<unknown>) => waited.push(p),
+    });
+    await Promise.all(waited);
+    expect(mockFetch).toHaveBeenCalledWith(expect.stringContaining('/internal/client-log'),
+      expect.objectContaining({ headers: expect.objectContaining({
+        'x-lucidos-restore-generation': '12345678-1234-4234-8234-123456789abc',
+      }) }));
   });
 });

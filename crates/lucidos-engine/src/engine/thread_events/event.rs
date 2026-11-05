@@ -15,6 +15,16 @@ use super::{
     WakeBucket, WakeMode, WakeSource,
 };
 
+/// Initial restored composer, inserted only when its fresh destination is absent.
+/// The generation fences requests delayed across another workspace restore.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveredCompose {
+    pub generation: uuid::Uuid,
+    pub text: String,
+    pub image_hashes: Vec<String>,
+    pub selection: Option<Value>,
+}
+
 /// Replay default for events persisted before the `agent` field existed —
 /// all such events were Claude Code (the only agent at the time).
 fn default_coding_agent_claude_code() -> CodingAgent {
@@ -969,6 +979,8 @@ pub enum ThreadEvent {
     /// image attach, or mode toggle on a fresh compose). The thread can
     /// be addressed by id immediately after this event lands.
     ThreadStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recovered_compose: Option<RecoveredCompose>,
         /// Initial mode the user opened compose with. Mutable while the
         /// thread is `Composing`; locked on first `MessageReceived`.
         mode: String,
@@ -1500,6 +1512,10 @@ pub enum ThreadEvent {
         verb: ThreadReachVerb,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_thread_id: Option<uuid::Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_workspace_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        snapshot_handle: Option<String>,
     },
 
     /// CC requested permission for a tool call (e.g. Edit/Write/Bash on a path
@@ -2101,13 +2117,13 @@ pub enum ThreadEvent {
         /// The instance's *widget params*. Absent means none.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         params: Option<BTreeMap<String, Value>>,
-        /// The instance's chip label. Absent means the widget's name.
+        /// The instance's card label. Absent means the widget's name.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
     },
-    /// The user or the agent pinned a widget instance: its chip is now on this
-    /// thread's widget shelf. A pin alone adds the instance, as from an
-    /// embed. No file changes.
+    /// Legacy: a widget instance was pinned to the thread's shelf, which is
+    /// gone. Nothing writes it any more. Only the dashboard seed reads it, for
+    /// Home's old pins (ADR 0496).
     #[serde(alias = "WidgetRestored")]
     WidgetPinned {
         app_id: String,
@@ -2115,13 +2131,14 @@ pub enum ThreadEvent {
         params: Option<BTreeMap<String, Value>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
-        /// The event whose reply draws the widget, so "Show in thread" can
-        /// land there. Absent when the pin came from nowhere in the thread.
+        /// The event whose reply drew the widget. Absent when the pin came
+        /// from nowhere in the thread.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         shown_event_id: Option<uuid::Uuid>,
     },
-    /// A widget instance was unpinned: its chip left this thread's widget
-    /// shelf. The inline widget stays, and no file changes.
+    /// Legacy: a widget instance was unpinned from the thread's shelf, which
+    /// is gone. Nothing writes it any more. Only the dashboard seed reads it,
+    /// for Home's old pins (ADR 0496).
     #[serde(alias = "WidgetHidden")]
     WidgetUnpinned {
         app_id: String,
@@ -2129,6 +2146,15 @@ pub enum ThreadEvent {
         params: Option<BTreeMap<String, Value>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
+    },
+    /// The user or the agent picked the size of a widget instance's cards in
+    /// this thread. The newest one wins, and a card with none starts at the
+    /// widget's default size. No file changes.
+    InlineWidgetSized {
+        app_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        params: Option<BTreeMap<String, Value>>,
+        size: crate::core::apps::WidgetSize,
     },
     /// This thread switched an MCP server on for itself, so its requests now
     /// carry the server's tools (ADR 0430). Projected into

@@ -1436,8 +1436,7 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
 
 /* The desktop title hugs its text on one line, so the pin sits right beside
  * it, and ellipsises once the row is too narrow. Its cap leaves the pin's box
- * and the row's column gap, so in a row that wraps for the widget shelf
- * (chat/widgets.css) only the shelf ever moves to a second line. */
+ * and the row's column gap. */
 .thread-view-header .thread-title {
     margin-top: max(0px, calc((var(--title-icon-box) - var(--title-line-box)) / 2));
     flex: 0 1 auto;

@@ -759,29 +759,29 @@ pub(super) async fn list_models(
         crate::runtime::intelligence_ladder::LadderSurface::Chat,
     )
     .await;
+    let configured = state.engine.configured_providers();
     let models = models
         .into_iter()
         .map(|model| {
             let on_chat_ladder = chat_ladder.lists_model(&model.id);
-            model_info(model, on_chat_ladder)
+            model_info(model, on_chat_ladder, configured.as_deref())
         })
         .collect();
     Ok(Json(ModelsListResponse { models }))
 }
 
 /// Serve one registry row, deriving each route's reasoning efforts.
-fn model_info(model: crate::core::Model, on_chat_ladder: bool) -> ModelInfo {
+fn model_info(
+    model: crate::core::Model,
+    on_chat_ladder: bool,
+    configured: Option<&[String]>,
+) -> ModelInfo {
     let routes = model
         .routes
         .iter()
         .map(|r| {
             let wire_id = r.wire_id(&model.id);
-            RouteInfo {
-                provider: r.provider.clone(),
-                id: wire_id.to_string(),
-                context_window: r.context_window,
-                reasoning_efforts: supported_efforts(ProviderKind::parse(&r.provider), wire_id),
-            }
+            route_info(&r.provider, wire_id, r.context_window, configured)
         })
         .collect();
     ModelInfo {
@@ -796,6 +796,22 @@ fn model_info(model: crate::core::Model, on_chat_ladder: bool) -> ModelInfo {
         source: model.source,
         on_chat_ladder,
         created_at: model.created_at,
+    }
+}
+
+fn route_info(
+    provider: &str,
+    wire_id: &str,
+    context_window: Option<i32>,
+    configured: Option<&[String]>,
+) -> RouteInfo {
+    RouteInfo {
+        provider: provider.to_string(),
+        id: wire_id.to_string(),
+        context_window,
+        reasoning_efforts: supported_efforts(ProviderKind::parse(provider), wire_id),
+        configured: configured.map(|providers| providers.iter().any(|p| p == provider)),
+        proxy: super::proxy_builtin::model_proxy_info(provider, wire_id),
     }
 }
 
@@ -1080,12 +1096,16 @@ pub(super) async fn reauthorize_oauth(
     // The device clicking Connect is the one to bring back to the front when the
     // authorization lands, so it rides along to `OAuthAccountConnected`.
     let initiator = crate::api::actor::user_actor(&headers, None);
+    let route = crate::core::oauth::CallbackRoute::for_browser(
+        crate::core::oauth_callback::BrowserContext::from_headers(&headers),
+    );
     match crate::core::oauth::prepare_oauth_flow(
         &state.pool,
         &state.engine.event_bus,
         &provider,
         &scopes,
         initiator,
+        route,
     )
     .await
     {
@@ -1181,7 +1201,13 @@ pub(super) async fn set_preference(
     // is held to the keys its tool may write, and an app is refused by
     // `app_reach::enforce_app_reach`.
     refuse_agent_human_only_preference(&headers, &query.key)?;
-    let actor = super::actor::user_actor(&headers, request.device_id.as_deref());
+    let actor = preference_write_actor(
+        &headers,
+        &state.pool,
+        &query.key,
+        request.device_id.as_deref(),
+    )
+    .await?;
     Ok(
         match state
             .engine
@@ -1210,7 +1236,7 @@ pub(super) async fn delete_preference(
     refuse_agent_human_only_preference(&headers, &key)?;
     // `delete` emits the `PreferencesChanged` with `value: None` ("back to the
     // default") itself; resolve the device actor for it.
-    let actor = crate::api::actor::user_actor(&headers, None);
+    let actor = preference_write_actor(&headers, &state.pool, &key, None).await?;
     Ok(
         match PreferenceStore::delete(&state.pool, &state.engine.event_bus, &key, actor).await {
             Ok(true) => ApiResult::ok(),
@@ -1218,6 +1244,29 @@ pub(super) async fn delete_preference(
             Err(e) => ApiResult::err(format!("Failed to delete preference: {}", e)),
         },
     )
+}
+
+/// Restore policy writes require a registered owner device even for deletion.
+/// All other preferences retain their existing attribution and access rules.
+pub(in crate::api) async fn preference_write_actor(
+    headers: &HeaderMap,
+    pool: &sqlx::PgPool,
+    key: &str,
+    device: Option<&str>,
+) -> Result<Option<crate::engine::thread_events::MessageOrigin>, ApiError> {
+    if key == crate::core::prefs::SNAPSHOT_RESTORE_BY_AGENTS.key() {
+        Ok(Some(
+            super::actor::require_owner_device_for(
+                headers,
+                pool,
+                device,
+                "snapshot_restore_policy_owner_device_required",
+            )
+            .await?,
+        ))
+    } else {
+        Ok(super::actor::user_actor(headers, device))
+    }
 }
 
 /// Refuse an agent writing a preference its own tool may not write.
@@ -2150,6 +2199,122 @@ pub(super) fn router() -> Router<AppState> {
         )
         // Email endpoints
         .route("/email/send", post(send_email_confirmed))
+}
+
+#[cfg(test)]
+mod model_picker_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn availability_preserves_unknown_and_proxy_capability_is_independent() {
+        let route = |provider: &str, configured: Option<&[String]>| {
+            route_info(provider, "wire-model", None, configured)
+        };
+        let unknown = route("openai", None);
+        assert_eq!(unknown.configured, None);
+        assert!(unknown.proxy.is_some());
+        let none: &[String] = &[];
+        assert_eq!(route("openai", Some(none)).configured, Some(false));
+        let configured = vec!["opencode-free".to_string()];
+        let unsupported = route("opencode-free", Some(&configured));
+        assert_eq!(unsupported.configured, Some(true));
+        assert!(unsupported.proxy.is_none());
+        assert!(route("custom-provider", None).proxy.is_none());
+        let json = serde_json::to_value(unknown).unwrap();
+        assert_eq!(json["configured"], serde_json::Value::Null);
+        assert_eq!(json["id"], "wire-model");
+        assert_eq!(json["proxy"]["name"], "openai");
+        assert_eq!(json["proxy"]["protocol"], "openai-chat-completions");
+        let fields = json.as_object().unwrap();
+        assert_eq!(fields.len(), 5);
+        for key in ["configured", "id", "provider", "proxy", "reasoning_efforts"] {
+            assert!(fields.contains_key(key), "missing public field {key}");
+        }
+        assert_eq!(json["proxy"].as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn request_defaults_use_transport_effort_authorities() {
+        let anthropic = route_info("anthropic", "claude-haiku-4-5", None, None);
+        let json = serde_json::to_value(anthropic).unwrap();
+        let high = &json["proxy"]["request_defaults"]["high"]["body"];
+        assert_eq!(
+            high["thinking"]["budget_tokens"],
+            crate::llm::thinking_budget_for_effort("high")
+        );
+        assert!(json["proxy"]["request_defaults"][""]["body"]["thinking"].is_null());
+        let vertex =
+            serde_json::to_value(route_info("vertex", "gemini-3-pro", None, None)).unwrap();
+        assert_eq!(
+            vertex["proxy"]["request_defaults"]["medium"]["body"]["generationConfig"]
+                ["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
+    }
+
+    #[test]
+    fn openai_protocol_uses_wire_id_and_compatible_backends_keep_chat() {
+        for (provider, wire_id, expected) in [
+            ("openai", "gpt-5.5", "openai-responses"),
+            ("openai", "gpt-4o", "openai-chat-completions"),
+            ("openrouter", "openai/gpt-5.5", "openai-chat-completions"),
+            ("local", "gpt-5.5", "openai-chat-completions"),
+            ("xai", "grok-example", "openai-chat-completions"),
+            ("anthropic", "claude-example", "anthropic-messages"),
+        ] {
+            let route = route_info(provider, wire_id, None, Some(&[provider.to_string()]));
+            assert_eq!(route.configured, Some(true));
+            let json = serde_json::to_value(route).unwrap();
+            assert_eq!(json["proxy"]["protocol"], expected, "{provider}/{wire_id}");
+        }
+    }
+
+    #[test]
+    fn vertex_protocol_follows_the_transport_model_split() {
+        let claude = route_info("vertex", "claude-example@default", None, None);
+        let gemini = route_info("vertex", "gemini-example", None, None);
+        assert_eq!(
+            serde_json::to_value(claude).unwrap()["proxy"]["protocol"],
+            "vertex-anthropic"
+        );
+        assert_eq!(
+            serde_json::to_value(gemini).unwrap()["proxy"]["protocol"],
+            "vertex-google"
+        );
+    }
+
+    #[test]
+    fn registry_alias_is_resolved_before_capabilities_are_derived() {
+        let model = crate::core::Model {
+            id: "my-model".into(),
+            label: "My model".into(),
+            routes: vec![crate::core::Route {
+                provider: "openai".into(),
+                id: Some("gpt-5.5".into()),
+                context_window: Some(200_000),
+            }],
+            preferred_provider: None,
+            vision: false,
+            default_effort: None,
+            successor: None,
+            sort_order: 0,
+            source: "user".into(),
+            created_at: chrono::Utc::now(),
+        };
+        let info = model_info(model, true, Some(&["openai".into()]));
+        assert!(info.on_chat_ladder);
+        let route = &info.routes[0];
+        assert_eq!(route.id, "gpt-5.5");
+        assert_eq!(route.context_window, Some(200_000));
+        assert_eq!(
+            route.reasoning_efforts,
+            supported_efforts(ProviderKind::OpenAi, "gpt-5.5")
+        );
+        assert_eq!(
+            route.proxy.as_ref().unwrap().protocol,
+            ModelProxyProtocol::OpenaiResponses
+        );
+    }
 }
 
 #[cfg(test)]

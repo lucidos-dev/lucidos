@@ -4,7 +4,7 @@ import { instantMicros } from '../../utils/isoInstant';
 import { eventWaitProjection } from './event-waits';
 import { findQuestionAnswer, isAgentReplyText, modeToInitiator, parentToolUseIdOf } from './exchange';
 import { isOneUtterance, joinSpoken } from './spokenMerge';
-import { CONTINUATION_EFFORT_RESTART_REASON, SIDE_QUESTION_TYPES, WIDGET_SHELF_CHANGE_TYPES, isFormRequest, isRedirectCancel, isSideQuestionEvent, isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
+import { CONTINUATION_EFFORT_RESTART_REASON, SIDE_QUESTION_TYPES, LEGACY_WIDGET_PIN_TYPES, isFormRequest, isRedirectCancel, isSideQuestionEvent, isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
 import { applyAggregateToMeta, updatesLastActivity } from './thread-meta';
 import type { Exchange, TypedAnswer } from './exchange';
 import type { MessageOrigin, SequencedEvent, StoredEvent, ThreadEvent, TransientEvent } from './thread-event-types';
@@ -729,9 +729,10 @@ const NON_EXCHANGE_METADATA_EVENTS: ReadonlySet<string> = new Set([
   // A side question is a card beside the thread (`store/sideQuestions.ts`),
   // never a step of a turn (ADR 0320).
   ...SIDE_QUESTION_TYPES,
-  // A pin or an unpin is shelf bookkeeping (ADR 0407). The inline widget it
-  // names stays as it is.
-  ...WIDGET_SHELF_CHANGE_TYPES,
+  // A legacy pin or unpin, read only by the dashboard seed (ADR 0496).
+  ...LEGACY_WIDGET_PIN_TYPES,
+  // A card's size. `widgetCardSize` reads it from the thread's events.
+  'InlineWidgetSized',
   // A legacy arrangement of Home's old board, read only, draws nothing (ADR 0496).
   'HomeBoardArranged',
   // An Apply Now's bracket only marks the row as applying (ADR 0437). What the

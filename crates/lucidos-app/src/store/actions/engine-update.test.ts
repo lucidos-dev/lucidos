@@ -18,14 +18,15 @@ vi.mock('../../hooks/sw-update', () => ({
   markSwUpdateDismissed: vi.fn(),
 }));
 
-import { checkEngineVersion, strandedMessage, openEngineVersionToast, resetEngineVersionToastForTest, handleFrontendUpdateDeferred, handleFrontendUpdateStranded, handleEngineBuildStateChanged, handleFrontendRefreshStateChanged, DEFERRED_HINT_STALE_AFTER_MS } from './engine-update';
+import { engineBuildLogOpen } from '../engineBuildLog';
+import { showEngineBuildLog, checkEngineVersion, strandedMessage, openEngineVersionToast, resetEngineVersionToastForTest, handleFrontendUpdateDeferred, handleFrontendUpdateStranded, handleEngineBuildStateChanged, handleFrontendRefreshStateChanged, DEFERRED_HINT_STALE_AFTER_MS } from './engine-update';
 import { engineVersionStatus, rebuildEngine } from '../../api/client';
 import { confirmAndRestartEngine, initiateEngineRestart } from './chat-changes';
 // Type-only, so it is erased before the `vi.mock` above replaces that module.
 import type { BuildFailure, PendingCommits, QueuedBuild } from '../../api/client';
 import { noteAnnouncedEngineVersion, wasEngineVersionDismissed, markEngineVersionDismissed } from '../../hooks/sw-update';
 import { toastTap } from '../../components/shared/toastTap';
-import { toasts, engineVersionReady, engineVersionPending, engineRebuildWedged, engineBuilding, engineBuildDetail, frontendRefreshDetail, enginePendingCommits, engineRestarting, preferences, showToast, dismissToast, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
+import { toasts, engineVersionReady, engineVersionPending, engineBuilding, engineBuildDetail, frontendRefreshDetail, enginePendingCommits, engineRestarting, preferences, showToast, dismissToast, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
 
 const mockStatus = vi.mocked(engineVersionStatus);
 const mockWasDismissed = vi.mocked(wasEngineVersionDismissed);
@@ -38,10 +39,9 @@ function status(over: Partial<{
   update_available: boolean;
   disk_build_id: string;
   packaged: boolean;
-  build_state: 'idle' | 'building' | 'ready' | 'failed';
+  build_state: 'idle' | 'building' | 'verifying' | 'ready' | 'failed';
   source_behind_head: boolean;
   head_commit: string;
-  rebuild_wedged: boolean;
   shared_build_in_progress: boolean;
   build_elapsed_ms: number;
   pending_commits: PendingCommits;
@@ -57,7 +57,6 @@ function status(over: Partial<{
     build_state: 'idle' as const,
     source_behind_head: false,
     head_commit: 'head777',
-    rebuild_wedged: false,
     shared_build_in_progress: false,
     ...over,
   };
@@ -80,7 +79,6 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
     toasts.value = [];
     engineVersionReady.value = false;
     engineVersionPending.value = false;
-    engineRebuildWedged.value = false;
     engineBuilding.value = false;
     engineRestarting.value = false;
     enginePendingCommits.value = null;
@@ -398,11 +396,7 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
   });
 });
 
-/** What a failed build TELLS the user.
- *
- *  The copy this replaced said "see the engine log" and offered Retry, which is
- *  two dead ends at once on a phone: the log is unreachable there, and for a
- *  deterministic failure Retry replays the same cached artifact forever. */
+/** Failures report their cause and retain Retry and build output. */
 describe('the build-failed toast says what broke, and what to do', () => {
   beforeEach(() => {
     mockStatus.mockReset();
@@ -414,7 +408,6 @@ describe('the build-failed toast says what broke, and what to do', () => {
     toasts.value = [];
     engineVersionReady.value = false;
     engineVersionPending.value = false;
-    engineRebuildWedged.value = false;
     engineBuilding.value = false;
     engineRestarting.value = false;
     preferences.value = { status: 'loaded', data: {} };
@@ -434,66 +427,13 @@ describe('the build-failed toast says what broke, and what to do', () => {
     expect(failedToast()?.message).not.toContain('engine log');
   });
 
-  it('withholds Retry when retrying is proved futile, and names the fix', async () => {
-    // The reported loop: cargo calls the broken artifact fresh, so every tap
-    // reruns it byte for byte. The button has to go, exactly as it does for a
-    // wedged successful build.
-    mockStatus.mockResolvedValue(failedWith({
-      summary: 'Failed to create default VERSION: NotFound',
-      remedy: 'cargo clean -p lucidos-engine',
-      repeatable: true,
-    }));
+  it.each([false, true])('keeps Retry for repeatable=%s', async (repeatable) => {
+    mockStatus.mockResolvedValue(failedWith({ summary: 'Publish failed', repeatable }));
     await checkEngineVersion();
-    const toast = failedToast();
-    expect(toast?.type).toBe('warning');
-    expect(toast?.action?.label).toBe('OK');
-    expect(toast?.message).toContain('retrying cannot help');
-    expect(toast?.message).toContain('cargo clean -p lucidos-engine');
-    toast?.action?.onClick();
-    expect(mockRebuild).not.toHaveBeenCalled();
-  });
-
-  it('OK actually puts the repeatable toast away, and the 4s poll leaves it away', async () => {
-    // The button has to mean something. `showToast` recreates a keyed toast the
-    // instant it is gone. So without an acknowledgement, OK on an
-    // un-dismissable toast brought it straight back on the next poll, forever.
-    mockStatus.mockResolvedValue(failedWith({ summary: 'stuck', repeatable: true }));
-    await checkEngineVersion();
+    expect(failedToast()?.action?.label).toBe('Retry build');
+    expect(failedToast()?.secondaryAction?.label).toBe('Show build log');
     failedToast()?.action?.onClick();
-    expect(failedToast()).toBeUndefined();
-    await checkEngineVersion();
-    expect(failedToast()).toBeUndefined();
-  });
-
-  it('a DIFFERENT failure surfaces again after one was acknowledged', async () => {
-    // The acknowledgement is keyed on the cause, so it silences that failure
-    // and not the surface. A new thing going wrong is a new thing to say.
-    mockStatus.mockResolvedValue(failedWith({ summary: 'stuck', repeatable: true }));
-    await checkEngineVersion();
-    failedToast()?.action?.onClick();
-    mockStatus.mockResolvedValue(failedWith({ summary: 'stuck differently', repeatable: true }));
-    await checkEngineVersion();
-    expect(failedToast()?.message).toContain('stuck differently');
-  });
-
-  it('a build that starts or succeeds re-arms the acknowledged failure', async () => {
-    // Clearing on the way out matters: the next failure is a new event even
-    // when it reads identically, and the user has not seen THAT one.
-    mockStatus.mockResolvedValue(failedWith({ summary: 'stuck', repeatable: true }));
-    await checkEngineVersion();
-    failedToast()?.action?.onClick();
-    mockStatus.mockResolvedValue(status({ build_state: 'building' }));
-    await checkEngineVersion();
-    mockStatus.mockResolvedValue(failedWith({ summary: 'stuck', repeatable: true }));
-    await checkEngineVersion();
-    expect(failedToast()?.message).toContain('stuck');
-  });
-
-  it('still offers a way forward when there is no exact remedy to name', async () => {
-    mockStatus.mockResolvedValue(failedWith({ summary: 'something deterministic', repeatable: true }));
-    await checkEngineVersion();
-    // A summary with no full stop must not run into the instruction after it.
-    expect(failedToast()?.message).toContain('something deterministic. Ask a coding agent');
+    expect(mockRebuild).toHaveBeenCalledOnce();
   });
 
   it('keeps Retry when the cause was not reported at all', async () => {
@@ -540,7 +480,6 @@ describe('checkEngineVersion: the pending version is dismissable, and the badge 
     toasts.value = [];
     engineVersionReady.value = false;
     engineVersionPending.value = false;
-    engineRebuildWedged.value = false;
     engineBuilding.value = false;
     engineRestarting.value = false;
     preferences.value = { status: 'loaded', data: {} };
@@ -550,7 +489,6 @@ describe('checkEngineVersion: the pending version is dismissable, and the badge 
     mockStatus.mockResolvedValue(status({ ...PENDING, head_commit: 'head777' }));
     await checkEngineVersion();
     expect(engineVersionPending.value).toBe(true);
-    expect(engineRebuildWedged.value).toBe(false);
     // The HEAD is the pending version's identity, standing in for the on-disk
     // build id the ready branch pins to.
     expect(mockNoteAnnounced).toHaveBeenCalledWith('head777');
@@ -643,41 +581,13 @@ describe('checkEngineVersion: the pending version is dismissable, and the badge 
     expect(hasSwitchToast()).toBe(false);
   });
 
-  /** The second reported bug: Rebuild ran a few-second no-op build and the toast
-   *  came straight back. The engine now says a rebuild for this HEAD already
-   *  proved futile, so the button that loops is withheld. */
-  it('a wedged rebuild withholds the button that loops and names the fix', async () => {
-    mockStatus.mockResolvedValue(status({
-      ...PENDING,
-      build_state: 'ready',
-      rebuild_wedged: true,
-    }));
+  it.each([false, true])('verification stays progress with update_available=%s', async (update_available) => {
+    mockStatus.mockResolvedValue(status({ ...PENDING, build_state: 'verifying', update_available }));
     await checkEngineVersion();
-    const toast = toasts.value.find((t) => t.key === 'engine-new-version');
-    expect(toast?.type).toBe('warning');
-    expect(toast?.action?.label).not.toBe('Rebuild');
-    expect(toast?.message).toMatch(/relaunch/i);
-    expect(engineRebuildWedged.value).toBe(true);
-  });
-
-  it('a wedged toast is acknowledged with OK rather than a bare X', async () => {
-    mockStatus.mockResolvedValue(status({ ...PENDING, build_state: 'ready', rebuild_wedged: true }));
-    await checkEngineVersion();
-    const toast = toasts.value.find((t) => t.key === 'engine-new-version');
-    expect(toast?.dismissable).toBe(false);
-    expect(toast?.action?.label).toBe('OK');
-    toast?.action?.onClick();
+    expect(engineBuilding.value).toBe(true);
+    expect(engineVersionReady.value).toBe(false);
+    expect(engineVersionPending.value).toBe(false);
     expect(hasSwitchToast()).toBe(false);
-  });
-
-  it('keeps Rebuild for a completed build that says nothing about this HEAD', async () => {
-    // build_state 'ready' looks like the wedge and is not: only the engine knows
-    // which HEAD that build was started from, so the verdict is its call. With
-    // the flag false, the escape hatch stays offered.
-    mockStatus.mockResolvedValue(status({ ...PENDING, build_state: 'ready', rebuild_wedged: false }));
-    await checkEngineVersion();
-    expect(toasts.value.find((t) => t.key === 'engine-new-version')?.action?.label).toBe('Rebuild');
-    expect(engineRebuildWedged.value).toBe(false);
   });
 
   it.each([
@@ -687,17 +597,13 @@ describe('checkEngineVersion: the pending version is dismissable, and the badge 
     ['nothing is pending at all', status({})],
     ['this is a packaged build', status({ ...PENDING, packaged: true })],
   ])('drops the pending badge once %s', async (_case, next) => {
-    mockStatus.mockResolvedValue(status({ ...PENDING, rebuild_wedged: true, build_state: 'ready' }));
+    mockStatus.mockResolvedValue(status(PENDING));
     await checkEngineVersion();
     expect(engineVersionPending.value).toBe(true);
-    expect(engineRebuildWedged.value).toBe(true);
 
     mockStatus.mockResolvedValue(next);
     await checkEngineVersion();
     expect(engineVersionPending.value).toBe(false);
-    // The wedged flag is written by the same helper, so it cannot outlive the
-    // state it describes and tint a badge for a workspace that is merely busy.
-    expect(engineRebuildWedged.value).toBe(false);
   });
 
   it('the pending badge stands down for a failed build, which owns its own toast and Retry', async () => {
@@ -1148,4 +1054,11 @@ describe('strandedMessage: a stopped build-watch is not recoverable', () => {
     expect(message).toContain("hasn't rebuilt");
     expect(message).not.toContain('undefined');
   });
+});
+
+it('opens build output inside the authenticated app', () => {
+  engineBuildLogOpen.value = false;
+  showEngineBuildLog();
+  expect(engineBuildLogOpen.value).toBe(true);
+  engineBuildLogOpen.value = false;
 });

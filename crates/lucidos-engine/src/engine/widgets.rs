@@ -1,24 +1,20 @@
-//! A thread's widgets, its shelf, and the verbs that change them (ADRs 0402,
-//! 0407, 0415).
+//! The checks and verbs a widget instance goes through (ADRs 0402, 0415).
 //!
-//! A thread's widgets are derived on read from its widget events plus each
-//! widget's app manifest. No column caches them, so a reload, another device
-//! or a compaction cannot lose them. Each verb checks first and then writes:
-//! show, pin and unpin write one thread event and touch no file.
+//! Each verb checks first and then writes. Sizing a thread's cards writes one
+//! thread event and touches no file.
 //!
 //! Everything here keys on the *widget instance*: the widget plus its canonical
 //! params. The label is not part of the key.
 
 use std::collections::BTreeMap;
-use std::sync::LazyLock;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::core::apps::WidgetSize;
-use crate::core::{App, AppManager, AppReveal};
+use crate::core::{App, AppManager};
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventMeta, MessageOrigin, ThreadEvent};
 
@@ -75,178 +71,6 @@ impl InstanceKey {
     }
 }
 
-/// One widget instance in a thread, pinned or shown by an old `WidgetShown`.
-/// Only a pinned one has a chip on the shelf; the inline widgets read them all.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct ThreadWidget {
-    pub app_id: String,
-    /// The instance's params. Absent means none.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub params: Option<WidgetParams>,
-    /// The instance's chip label, newest first. Absent means the name.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    pub name: String,
-    /// The validated `App::icon`, a path inside the widget's folder.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub icon: Option<String>,
-    pub reusable: bool,
-    /// The plugin that ships this widget. Such a widget offers no Stop reusing.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub origin_plugin_id: Option<String>,
-    /// A *built-in widget*, which no menu may change (ADR 0415).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub built_in: bool,
-    /// When the frame's cover lifts, from the manifest, as for any app.
-    pub reveal: AppReveal,
-    /// Its *widget sizes*, first the default (ADR 0432).
-    pub sizes: Vec<WidgetSize>,
-    /// Its tile is see-through, so it draws its own shape.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub transparent: bool,
-    /// Pinned to the shelf, so it has a chip there. The inline widget shows
-    /// either way.
-    pub pinned: bool,
-    /// Where "Show in thread" scrolls to: the event whose reply drew the
-    /// instance when it was pinned, or an old `WidgetShown`. Absent for an
-    /// instance pinned from nowhere in the thread.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub shown_event_id: Option<Uuid>,
-}
-
-/// A widget event as the fold reads it, in thread order.
-#[derive(Debug, Clone)]
-pub struct WidgetEventRow {
-    pub event_id: Uuid,
-    pub event_type: String,
-    pub app_id: String,
-    pub params: Option<WidgetParams>,
-    pub label: Option<String>,
-    /// A pin's reply event, where it names one.
-    pub shown_event_id: Option<Uuid>,
-}
-
-/// What the events alone say about one widget instance in a thread.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FoldedWidget {
-    pub app_id: String,
-    pub params: Option<WidgetParams>,
-    pub label: Option<String>,
-    pub pinned: bool,
-    pub shown_event_id: Option<Uuid>,
-}
-
-impl FoldedWidget {
-    fn key(&self) -> InstanceKey {
-        InstanceKey::new(&self.app_id, self.params.as_ref())
-    }
-}
-
-/// Fold a thread's widget events into its instances, ordered by first
-/// appearance. Only a pin puts an instance on the shelf and only an unpin
-/// takes it off; an old showing changes neither. A pin alone adds the
-/// instance, since an embed records no showing. An unpin of an instance never
-/// seen is ignored. The newest label given wins.
-pub fn fold_thread_widgets(rows: &[WidgetEventRow]) -> Vec<FoldedWidget> {
-    let mut widgets: Vec<FoldedWidget> = Vec::new();
-    for row in rows {
-        let Some(kind) = WidgetEventKind::from_event_type(&row.event_type) else {
-            continue;
-        };
-        let key = InstanceKey::new(&row.app_id, row.params.as_ref());
-        let existing = widgets.iter_mut().find(|w| w.key() == key);
-        let widget = match (kind, existing) {
-            (WidgetEventKind::Unpinned, None) => continue,
-            (_, Some(widget)) => widget,
-            (_, None) => {
-                widgets.push(FoldedWidget {
-                    app_id: row.app_id.clone(),
-                    params: row.params.clone().filter(|p| !p.is_empty()),
-                    label: None,
-                    pinned: false,
-                    shown_event_id: None,
-                });
-                widgets.last_mut().expect("just pushed")
-            }
-        };
-        match kind {
-            WidgetEventKind::Shown => widget.shown_event_id = Some(row.event_id),
-            WidgetEventKind::Pinned => {
-                widget.pinned = true;
-                if row.shown_event_id.is_some() {
-                    widget.shown_event_id = row.shown_event_id;
-                }
-            }
-            WidgetEventKind::Unpinned => widget.pinned = false,
-        }
-        if row.label.is_some() && kind != WidgetEventKind::Unpinned {
-            widget.label = row.label.clone();
-        }
-    }
-    widgets
-}
-
-async fn widget_event_rows(
-    pool: &PgPool,
-    thread_id: Uuid,
-) -> Result<Vec<WidgetEventRow>, BoxError> {
-    type Row = (
-        Uuid,
-        String,
-        Option<String>,
-        Option<Value>,
-        Option<String>,
-        Option<String>,
-    );
-    let rows: Vec<Row> = sqlx::query_as(
-        "SELECT id, event_type, payload->>'app_id', payload->'params', payload->>'label', \
-         payload->>'shown_event_id' \
-         FROM events WHERE thread_id = $1 AND event_type = ANY($2) ORDER BY sequence",
-    )
-    .bind(thread_id)
-    .bind(STORED_WIDGET_EVENT_TYPES.as_slice())
-    .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|(event_id, event_type, app_id, params, label, shown)| {
-            Some(WidgetEventRow {
-                event_id,
-                event_type,
-                app_id: app_id?,
-                params: params.and_then(|p| serde_json::from_value(p).ok()),
-                label,
-                shown_event_id: shown.and_then(|id| id.parse().ok()),
-            })
-        })
-        .collect())
-}
-
-/// Every widget instance in a thread, unpinned ones included. A widget whose
-/// folder is gone drops off: there is nothing left to open. One whose manifest
-/// does not parse drops off as it does from the apps list. Any other read
-/// failure fails the read, since it says nothing about whether the widget
-/// exists.
-pub async fn thread_widgets(
-    pool: &PgPool,
-    app_manager: &AppManager,
-    thread_id: Uuid,
-) -> Result<Vec<ThreadWidget>, BoxError> {
-    let folded = fold_thread_widgets(&widget_event_rows(pool, thread_id).await?);
-    let mut widgets = Vec::with_capacity(folded.len());
-    for widget in folded {
-        let Some(app) = listed_widget(app_manager, &widget.app_id)? else {
-            continue;
-        };
-        widgets.push(ThreadWidget {
-            pinned: widget.pinned,
-            shown_event_id: widget.shown_event_id,
-            ..ThreadWidget::of(app, widget.params, widget.label)
-        });
-    }
-    Ok(widgets)
-}
-
 /// The widget a stored event names, or `None` when it no longer lists: its
 /// folder is gone, or its manifest does not parse, as for the apps list. Any
 /// other read failure fails, since it says nothing about whether it exists.
@@ -262,27 +86,6 @@ pub(crate) fn listed_widget(
             Ok(None)
         }
         Err(e) => Err(format!("reading widget '{app_id}': {e}").into()),
-    }
-}
-
-impl ThreadWidget {
-    /// One instance of `app`, unpinned, as its manifest describes it.
-    pub(crate) fn of(app: App, params: Option<WidgetParams>, label: Option<String>) -> Self {
-        Self {
-            origin_plugin_id: app.origin_plugin().map(str::to_string),
-            app_id: app.id,
-            params,
-            label,
-            name: app.name,
-            icon: app.icon,
-            reusable: app.reusable,
-            built_in: app.built_in,
-            reveal: app.reveal,
-            sizes: app.sizes,
-            transparent: app.transparent,
-            pinned: false,
-            shown_event_id: None,
-        }
     }
 }
 
@@ -357,15 +160,15 @@ pub fn check_widget_params(app: &App, params: Option<&WidgetParams>) -> Result<(
 fn check_widget_owner(app: &App, thread_id: Uuid) -> Result<(), WidgetCheckFailed> {
     if !app.reusable && app.origin_thread() != Some(thread_id) {
         return Err(Refused(format!(
-            "Widget '{}' belongs to another thread. Make it reusable first, then pin or embed it here.",
+            "Widget '{}' belongs to another thread. Make it reusable first, then embed it here.",
             app.id
         )));
     }
     Ok(())
 }
 
-/// Whether a widget can be embedded in this thread with these params: the
-/// checks a new pin runs, with no thread lookup. A question card runs it on each
+/// Whether a widget can be embedded in this thread with these params, with
+/// no thread lookup. A question card runs it on each
 /// option's widget before it is asked (ADR 0415).
 pub fn check_widget_embed(
     app_manager: &AppManager,
@@ -378,17 +181,6 @@ pub fn check_widget_embed(
     check_widget_params(&app, params).map_err(Refused)
 }
 
-/// Whether this event happened in this thread: a pin's reply event must.
-async fn event_in_thread(pool: &PgPool, event_id: Uuid, thread_id: Uuid) -> Result<bool, BoxError> {
-    Ok(sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (SELECT 1 FROM events WHERE id = $1 AND thread_id = $2)",
-    )
-    .bind(event_id)
-    .bind(thread_id)
-    .fetch_one(pool)
-    .await?)
-}
-
 async fn thread_exists(pool: &PgPool, thread_id: Uuid) -> Result<bool, BoxError> {
     Ok(sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT 1 FROM thread_summaries WHERE thread_id = $1)",
@@ -396,73 +188,6 @@ async fn thread_exists(pool: &PgPool, thread_id: Uuid) -> Result<bool, BoxError>
     .bind(thread_id)
     .fetch_one(pool)
     .await?)
-}
-
-/// A widget change in a thread that the user or an agent asked for: pinning
-/// or unpinning its chip on the shelf. A pin from a reply's inline widget
-/// names that reply's event, so "Show in thread" can land there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WidgetChange {
-    Pin { shown_event_id: Option<Uuid> },
-    Unpin,
-}
-
-/// What a stored widget event records, as the fold reads it. `Shown` is only
-/// ever an old row: nothing writes `WidgetShown` any more (ADR 0466).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WidgetEventKind {
-    Shown,
-    Pinned,
-    Unpinned,
-}
-
-/// Every `event_type` a stored widget event may carry: the current names plus
-/// the legacy ones their `serde(alias)` still reads.
-pub(crate) static STORED_WIDGET_EVENT_TYPES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-    ThreadEvent::RESERVED_TYPE_NAMES
-        .iter()
-        .chain(ThreadEvent::LEGACY_TYPE_NAME_ALIASES)
-        .copied()
-        .filter(|name| WidgetEventKind::from_event_type(name).is_some())
-        .collect()
-});
-
-impl WidgetEventKind {
-    /// The kind a stored row records. Goes through `ThreadEvent`'s own
-    /// deserializer, so a legacy name reads as the variant it was renamed to.
-    fn from_event_type(name: &str) -> Option<Self> {
-        let event = ThreadEvent::from_stored(name, serde_json::json!({ "app_id": "" })).ok()?;
-        match event {
-            ThreadEvent::WidgetShown { .. } => Some(Self::Shown),
-            ThreadEvent::WidgetPinned { .. } => Some(Self::Pinned),
-            ThreadEvent::WidgetUnpinned { .. } => Some(Self::Unpinned),
-            _ => None,
-        }
-    }
-}
-
-impl WidgetChange {
-    fn event(self, instance: WidgetInstance) -> ThreadEvent {
-        let WidgetInstance {
-            app_id,
-            params,
-            label,
-        } = instance;
-        let params = params.filter(|p| !p.is_empty());
-        match self {
-            Self::Pin { shown_event_id } => ThreadEvent::WidgetPinned {
-                app_id,
-                params,
-                label,
-                shown_event_id,
-            },
-            Self::Unpin => ThreadEvent::WidgetUnpinned {
-                app_id,
-                params,
-                label,
-            },
-        }
-    }
 }
 
 /// The widget instance a request names, as it arrives: `app_id`, and an
@@ -497,7 +222,7 @@ impl TryFrom<WidgetInstanceArgs> for WidgetInstance {
 }
 
 /// The widget instance a verb names: the widget, its params, and the label
-/// its chip reads.
+/// its tile reads.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WidgetInstance {
     pub app_id: String,
@@ -511,18 +236,6 @@ impl WidgetInstance {
         let args: WidgetInstanceArgs = serde_json::from_value(args.clone())
             .map_err(|e| format!("bad widget arguments: {e}"))?;
         args.try_into()
-    }
-
-    fn key(&self) -> InstanceKey {
-        InstanceKey::new(&self.app_id, self.params.as_ref())
-    }
-
-    /// How a reply names the instance: its label, else its id.
-    fn describe(&self) -> String {
-        match &self.label {
-            Some(label) => format!("'{}' ({label})", self.app_id),
-            None => format!("'{}'", self.app_id),
-        }
     }
 }
 
@@ -546,71 +259,99 @@ impl std::fmt::Display for WidgetCheckFailed {
 
 use WidgetCheckFailed::{ReadFailed, Refused};
 
-/// Whether a widget change can happen.
-pub async fn check_widget_change(
+/// Whether a widget instance's cards in this thread can take this size: the
+/// thread exists, it may hold the widget, and the widget declares the size.
+pub async fn check_card_size(
     pool: &PgPool,
     app_manager: &AppManager,
-    change: WidgetChange,
     instance: &WidgetInstance,
+    size: WidgetSize,
     thread_id: Uuid,
 ) -> Result<(), WidgetCheckFailed> {
     let app = widget(app_manager, &instance.app_id)?;
     if !thread_exists(pool, thread_id).await.map_err(ReadFailed)? {
         return Err(Refused(format!("No thread {} exists", thread_id)));
     }
-    // Home's old pins seed the dashboards, so a change there would move them
-    // (ADR 0496).
-    if crate::engine::home_thread::is_home_thread(pool, thread_id)
+    check_widget_owner(&app, thread_id)?;
+    check_widget_params(&app, instance.params.as_ref()).map_err(Refused)?;
+    check_declared_size(&app, size).map_err(Refused)
+}
+
+/// Whether the widget draws at this size: one its manifest declares.
+pub fn check_declared_size(app: &App, size: WidgetSize) -> Result<(), String> {
+    if app.sizes.contains(&size) {
+        return Ok(());
+    }
+    let declared: Vec<&str> = app.sizes.iter().map(|s| s.as_str()).collect();
+    Err(format!(
+        "Widget '{}' does not draw at {}. It takes: {}.",
+        app.id,
+        size.as_str(),
+        declared.join(", ")
+    ))
+}
+
+/// Write the one thread event a checked card size consists of.
+pub async fn emit_card_size(
+    event_bus: &EventBus,
+    instance: WidgetInstance,
+    size: WidgetSize,
+    thread_id: Uuid,
+    actor: Option<MessageOrigin>,
+) -> Result<(), BoxError> {
+    event_bus
+        .emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::InlineWidgetSized {
+                app_id: instance.app_id,
+                params: instance.params.filter(|p| !p.is_empty()),
+                size,
+            },
+            meta: EventMeta::with_actor(actor),
+        })
         .await
-        .map_err(|e| ReadFailed(e.into()))?
-    {
-        return Err(Refused(
-            "Home has no shelf. Add the widget to a dashboard, or remove it from one, instead."
-                .into(),
-        ));
+        .map_err(|e| format!("recording the card size: {e}"))?;
+    Ok(())
+}
+
+/// The newest size picked for one widget instance's cards in a thread. A paged
+/// thread snapshot carries these, since the `InlineWidgetSized` that set one
+/// may sit behind the page.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, Deserialize)]
+pub struct CardSize {
+    pub sequence: i64,
+    pub app_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<WidgetParams>,
+    pub size: WidgetSize,
+}
+
+/// A thread's card sizes: the newest `InlineWidgetSized` per widget instance,
+/// oldest first.
+pub async fn thread_card_sizes(pool: &PgPool, thread_id: Uuid) -> Result<Vec<CardSize>, BoxError> {
+    let rows: Vec<(i64, Value)> = sqlx::query_as(
+        "SELECT sequence, payload FROM events \
+         WHERE thread_id = $1 AND event_type = 'InlineWidgetSized' \
+         ORDER BY sequence",
+    )
+    .bind(thread_id)
+    .fetch_all(pool)
+    .await?;
+    let mut newest: BTreeMap<String, CardSize> = BTreeMap::new();
+    for (sequence, mut payload) in rows {
+        payload["sequence"] = sequence.into();
+        let size: CardSize = serde_json::from_value(payload)
+            .map_err(|e| format!("reading card size event {sequence}: {e}"))?;
+        let key = format!(
+            "{}?{}",
+            size.app_id,
+            canonical_widget_params(size.params.as_ref().unwrap_or(&WidgetParams::new()))
+        );
+        newest.insert(key, size);
     }
-    if let WidgetChange::Pin {
-        shown_event_id: Some(event_id),
-    } = change
-    {
-        if !event_in_thread(pool, event_id, thread_id)
-            .await
-            .map_err(ReadFailed)?
-        {
-            return Err(Refused(format!(
-                "No event {event_id} in thread {thread_id}"
-            )));
-        }
-    }
-    let widgets = fold_thread_widgets(
-        &widget_event_rows(pool, thread_id)
-            .await
-            .map_err(ReadFailed)?,
-    );
-    let key = instance.key();
-    let pinned = widgets.iter().find(|w| w.key() == key).map(|w| w.pinned);
-    match (change, pinned) {
-        // A new instance must be one this thread may hold. One the thread
-        // already holds stays pinnable, even if its widget stopped being
-        // reusable since.
-        (WidgetChange::Pin { .. }, None) => {
-            check_widget_owner(&app, thread_id)?;
-            check_widget_params(&app, instance.params.as_ref()).map_err(Refused)
-        }
-        (WidgetChange::Pin { .. }, Some(true)) => Err(Refused(format!(
-            "Widget {} is already pinned to this thread's shelf",
-            instance.describe()
-        ))),
-        (WidgetChange::Unpin, None) => Err(Refused(format!(
-            "Widget {} was never shown or pinned in this thread",
-            instance.describe()
-        ))),
-        (WidgetChange::Unpin, Some(false)) => Err(Refused(format!(
-            "Widget {} is not pinned to this thread's shelf",
-            instance.describe()
-        ))),
-        _ => Ok(()),
-    }
+    let mut sizes: Vec<CardSize> = newest.into_values().collect();
+    sizes.sort_by_key(|s| s.sequence);
+    Ok(sizes)
 }
 
 /// Whether a widget may be made reusable, or stop being reusable. Stopping
@@ -666,149 +407,14 @@ pub async fn check_set_reusable(
     Ok(())
 }
 
-/// Write the one thread event a checked widget change consists of. No file
-/// and no commit: unpinning is never destructive.
-pub async fn emit_widget_change(
-    event_bus: &EventBus,
-    change: WidgetChange,
-    instance: WidgetInstance,
-    thread_id: Uuid,
-    actor: Option<MessageOrigin>,
-) -> Result<(), BoxError> {
-    event_bus
-        .emit(BusEvent::Thread {
-            thread_id,
-            event: change.event(instance),
-            meta: EventMeta::with_actor(actor),
-        })
-        .await
-        .map_err(|e| format!("recording the widget change: {e}"))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::AppReveal;
     use serde_json::json;
-
-    fn row(n: u128, event_type: &str, app_id: &str) -> WidgetEventRow {
-        WidgetEventRow {
-            event_id: Uuid::from_u128(n),
-            event_type: event_type.to_string(),
-            app_id: app_id.to_string(),
-            params: None,
-            label: None,
-            shown_event_id: None,
-        }
-    }
 
     fn params(value: Value) -> WidgetParams {
         serde_json::from_value(value).unwrap()
-    }
-
-    fn row_with(
-        n: u128,
-        event_type: &str,
-        app_id: &str,
-        p: Value,
-        label: Option<&str>,
-    ) -> WidgetEventRow {
-        WidgetEventRow {
-            params: Some(params(p)),
-            label: label.map(str::to_string),
-            ..row(n, event_type, app_id)
-        }
-    }
-
-    #[test]
-    fn thread_widgets_keep_first_shown_order_and_the_newest_showing() {
-        let widgets = fold_thread_widgets(&[
-            row(1, "WidgetShown", "fare-grid"),
-            row(2, "WidgetShown", "currency"),
-            row(3, "WidgetShown", "fare-grid"),
-        ]);
-        assert_eq!(
-            widgets,
-            vec![
-                FoldedWidget {
-                    app_id: "fare-grid".into(),
-                    params: None,
-                    label: None,
-                    pinned: false,
-                    shown_event_id: Some(Uuid::from_u128(3)),
-                },
-                FoldedWidget {
-                    app_id: "currency".into(),
-                    params: None,
-                    label: None,
-                    pinned: false,
-                    shown_event_id: Some(Uuid::from_u128(2)),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn a_shown_widget_is_not_pinned() {
-        let widgets = fold_thread_widgets(&[row(1, "WidgetShown", "fare-grid")]);
-        assert!(!widgets[0].pinned);
-    }
-
-    #[test]
-    fn pin_and_unpin_flip_the_chip_and_showing_again_changes_neither() {
-        let pinned = fold_thread_widgets(&[
-            row(1, "WidgetShown", "fare-grid"),
-            row(2, "WidgetPinned", "fare-grid"),
-        ]);
-        assert!(pinned[0].pinned);
-
-        let unpinned = fold_thread_widgets(&[
-            row(1, "WidgetShown", "fare-grid"),
-            row(2, "WidgetPinned", "fare-grid"),
-            row(3, "WidgetUnpinned", "fare-grid"),
-        ]);
-        assert!(!unpinned[0].pinned);
-
-        let shown_again = fold_thread_widgets(&[
-            row(1, "WidgetShown", "fare-grid"),
-            row(2, "WidgetPinned", "fare-grid"),
-            row(3, "WidgetShown", "fare-grid"),
-        ]);
-        assert!(shown_again[0].pinned);
-        assert_eq!(shown_again[0].shown_event_id, Some(Uuid::from_u128(3)));
-    }
-
-    /// Rows written before the rename read as a pin and an unpin.
-    #[test]
-    fn legacy_restored_and_hidden_rows_read_as_pin_and_unpin() {
-        let pinned = fold_thread_widgets(&[
-            row(1, "WidgetShown", "fare-grid"),
-            row(2, "WidgetRestored", "fare-grid"),
-        ]);
-        assert!(pinned[0].pinned);
-
-        let unpinned = fold_thread_widgets(&[
-            row(1, "WidgetShown", "fare-grid"),
-            row(2, "WidgetRestored", "fare-grid"),
-            row(3, "WidgetHidden", "fare-grid"),
-        ]);
-        assert!(!unpinned[0].pinned);
-    }
-
-    #[test]
-    fn the_thread_widgets_query_reads_current_and_legacy_names() {
-        let mut names = STORED_WIDGET_EVENT_TYPES.clone();
-        names.sort_unstable();
-        assert_eq!(
-            names,
-            [
-                "WidgetHidden",
-                "WidgetPinned",
-                "WidgetRestored",
-                "WidgetShown",
-                "WidgetUnpinned"
-            ]
-        );
     }
 
     async fn reusable_widget(manager: &AppManager, bus: &EventBus, id: &str, origin: Uuid) {
@@ -846,8 +452,7 @@ mod tests {
         .unwrap();
     }
 
-    /// Invariant I14: a plugin widget stays reusable, shows in any thread, and
-    /// tells the shelf it has no Stop reusing.
+    /// Invariant I14: a plugin widget stays reusable and shows in any thread.
     #[tokio::test]
     async fn a_plugin_widget_stays_reusable_and_shows_anywhere() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -892,26 +497,152 @@ mod tests {
             matches!(&refused, Err(WidgetCheckFailed::Refused(r)) if r.contains("habit-tracker")),
             "got: {refused:?}"
         );
-        let board = WidgetInstance {
-            app_id: "board".into(),
-            params: None,
+        check_widget_embed(&manager, "board", None, thread)
+            .expect("a plugin widget embeds in any thread");
+        check_widget_embed(&manager, "board", None, Uuid::new_v4())
+            .expect("even one it was never shown in");
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// I6 and I10 of the one-render plan: a card size is checked like an
+    /// embed. It refuses an undeclared size, and writes one
+    /// `InlineWidgetSized` with the instance and the size.
+    #[tokio::test]
+    async fn a_card_size_is_checked_and_written_as_one_event() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = AppManager::new(tmp.path()).unwrap();
+        let thread = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        for id in [thread, other] {
+            crate::test_support::seed_thread_event(
+                &bus,
+                id,
+                ThreadEvent::MessageReceived {
+                    provider: None,
+                    voice_session_id: None,
+                    wake_mode: None,
+                    text: "show fares".into(),
+                    user_image_hashes: vec![],
+                    device_id: None,
+                    image_description: None,
+                    parent_thread_id: None,
+                    spawning_event_id: None,
+                    mode: crate::engine::thread_events::ActorMode::Human,
+                    model: None,
+                    reasoning_effort: None,
+                    origin: None,
+                },
+            )
+            .await;
+        }
+        manager
+            .create_app(
+                &bus,
+                "fare-grid",
+                "Fare grid",
+                "",
+                "<h1>w",
+                crate::core::NewAppKind::Widget {
+                    origin_thread_id: thread,
+                    sizes: Some(vec![WidgetSize::Medium, WidgetSize::Large]),
+                },
+            )
+            .await
+            .unwrap();
+        let grid = WidgetInstance {
+            app_id: "fare-grid".into(),
+            ..Default::default()
+        };
+
+        let undeclared = check_card_size(&pool, &manager, &grid, WidgetSize::Small, thread).await;
+        assert!(
+            matches!(&undeclared, Err(Refused(r)) if r.contains("does not draw at small")),
+            "got: {undeclared:?}"
+        );
+        let elsewhere = check_card_size(&pool, &manager, &grid, WidgetSize::Large, other).await;
+        assert!(
+            matches!(&elsewhere, Err(Refused(r)) if r.contains("belongs to another thread")),
+            "got: {elsewhere:?}"
+        );
+        check_card_size(&pool, &manager, &grid, WidgetSize::Large, thread)
+            .await
+            .expect("a declared size in the widget's own thread");
+        emit_card_size(&bus, grid, WidgetSize::Large, thread, None)
+            .await
+            .unwrap();
+
+        let (event_type, payload): (String, Value) = sqlx::query_as(
+            "SELECT event_type, payload FROM events \
+             WHERE thread_id = $1 AND event_type = 'InlineWidgetSized'",
+        )
+        .bind(thread)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(event_type, "InlineWidgetSized");
+        assert_eq!(payload["app_id"], "fare-grid");
+        assert_eq!(payload["size"], "large");
+        assert!(payload.get("params").is_none(), "empty params write none");
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// I6 of the one-render plan, past the loaded page: a thread's card sizes
+    /// are the newest pick per instance, keyed by canonical params.
+    #[tokio::test]
+    async fn card_sizes_are_the_newest_pick_per_instance() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let instance = |params: Option<Value>| WidgetInstance {
+            app_id: "player".into(),
+            params: params.map(|p| serde_json::from_value(p).unwrap()),
             label: None,
         };
-        let pin = |shown_event_id| WidgetChange::Pin { shown_event_id };
-        check_widget_change(&pool, &manager, pin(None), &board, thread)
-            .await
-            .expect("a plugin widget pins in any thread");
-        let stray =
-            check_widget_change(&pool, &manager, pin(Some(Uuid::new_v4())), &board, thread).await;
-        assert!(
-            matches!(&stray, Err(WidgetCheckFailed::Refused(r)) if r.starts_with("No event")),
-            "a pin's reply event must be in the thread, got: {stray:?}"
-        );
-        let widgets = thread_widgets(&pool, &manager, thread).await.unwrap();
+        let picks = [
+            (thread, None, WidgetSize::Medium),
+            (
+                thread,
+                Some(serde_json::json!({"clip": "a.mp3", "loop": true})),
+                WidgetSize::Small,
+            ),
+            (thread, None, WidgetSize::Large),
+            (
+                thread,
+                Some(serde_json::json!({"loop": true, "clip": "a.mp3"})),
+                WidgetSize::Medium,
+            ),
+            (other, None, WidgetSize::Small),
+        ];
+        for (tid, params, size) in picks {
+            emit_card_size(&bus, instance(params), size, tid, None)
+                .await
+                .unwrap();
+        }
+
+        let sizes = thread_card_sizes(&pool, thread).await.unwrap();
+        let read: Vec<(Option<String>, WidgetSize)> = sizes
+            .iter()
+            .map(|s| (s.params.as_ref().map(canonical_widget_params), s.size))
+            .collect();
         assert_eq!(
-            widgets[0].origin_plugin_id.as_deref(),
-            Some("habit-tracker")
+            read,
+            vec![
+                (None, WidgetSize::Large),
+                (
+                    Some(r#"{"clip":"a.mp3","loop":true}"#.into()),
+                    WidgetSize::Medium
+                ),
+            ],
+            "the newest pick per instance, in sequence order, and no other thread's"
         );
+        assert!(sizes[0].sequence < sizes[1].sequence);
+        assert!(thread_card_sizes(&pool, Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_empty());
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
@@ -970,117 +701,7 @@ mod tests {
             Err(WidgetCheckFailed::Refused(_))
         ));
 
-        // The read returns the event, with the manifest's name and reveal.
-        let widgets = thread_widgets(&pool, &manager, living).await.unwrap();
-        assert_eq!(widgets.len(), 1);
-        assert_eq!(widgets[0].name, "Fare grid");
-        assert_eq!(widgets[0].reveal, AppReveal::OnLoad);
-        assert!(widgets[0].reusable);
-
         crate::test_support::teardown_test_db(&db_name).await;
-    }
-
-    #[test]
-    fn a_pin_from_a_reply_names_where_show_in_thread_lands() {
-        let reply = Uuid::from_u128(40);
-        let widgets = fold_thread_widgets(&[
-            row(1, "WidgetShown", "fare-grid"),
-            WidgetEventRow {
-                shown_event_id: Some(reply),
-                ..row(2, "WidgetPinned", "fare-grid")
-            },
-            row(3, "WidgetPinned", "player"),
-        ]);
-        assert_eq!(widgets[0].shown_event_id, Some(reply));
-        assert_eq!(widgets[1].shown_event_id, None);
-    }
-
-    /// An embed records no showing, so its pin alone adds the instance. An
-    /// unpin of an instance never seen still changes nothing (ADR 0415).
-    #[test]
-    fn a_pin_alone_adds_the_instance_and_a_stray_unpin_is_ignored() {
-        let pinned = fold_thread_widgets(&[row(1, "WidgetPinned", "fare-grid")]);
-        assert_eq!(pinned.len(), 1);
-        assert!(pinned[0].pinned);
-        assert_eq!(pinned[0].shown_event_id, None);
-
-        assert!(fold_thread_widgets(&[row(1, "WidgetUnpinned", "fare-grid")]).is_empty());
-    }
-
-    /// Identity compares canonical params: the same set in any key order, at
-    /// any depth, is one instance.
-    #[test]
-    fn reordered_params_are_one_instance() {
-        let widgets = fold_thread_widgets(&[
-            row_with(
-                1,
-                "WidgetShown",
-                "chart",
-                json!({"a": 1, "b": {"x": 1, "y": 2}}),
-                None,
-            ),
-            row_with(
-                2,
-                "WidgetPinned",
-                "chart",
-                json!({"b": {"y": 2, "x": 1}, "a": 1}),
-                None,
-            ),
-        ]);
-        assert_eq!(widgets.len(), 1);
-        assert!(widgets[0].pinned);
-    }
-
-    /// Two param sets of one widget are two instances, each with its own pin.
-    #[test]
-    fn two_instances_of_one_widget_pin_apart() {
-        let widgets = fold_thread_widgets(&[
-            row_with(1, "WidgetShown", "player", json!({"clip": "a.mp3"}), None),
-            row_with(2, "WidgetShown", "player", json!({"clip": "b.mp3"}), None),
-            row_with(3, "WidgetPinned", "player", json!({"clip": "b.mp3"}), None),
-        ]);
-        assert_eq!(widgets.len(), 2);
-        assert!(!widgets[0].pinned);
-        assert!(widgets[1].pinned);
-    }
-
-    /// A row from before params existed reads as `{}`. So it is the same
-    /// instance as a new event with empty params, and legacy pins stay.
-    #[test]
-    fn a_legacy_row_with_no_params_reads_as_empty_params() {
-        let widgets = fold_thread_widgets(&[
-            row(1, "WidgetShown", "fare-grid"),
-            row(2, "WidgetPinned", "fare-grid"),
-            row_with(3, "WidgetShown", "fare-grid", json!({}), None),
-        ]);
-        assert_eq!(widgets.len(), 1);
-        assert!(widgets[0].pinned);
-        assert_eq!(widgets[0].params, None);
-        assert_eq!(widgets[0].shown_event_id, Some(Uuid::from_u128(3)));
-    }
-
-    /// The label is not part of the key, and the newest one given wins.
-    #[test]
-    fn the_newest_label_wins_and_never_splits_an_instance() {
-        let widgets = fold_thread_widgets(&[
-            row_with(
-                1,
-                "WidgetShown",
-                "player",
-                json!({"clip": "a.mp3"}),
-                Some("Marin"),
-            ),
-            row_with(
-                2,
-                "WidgetPinned",
-                "player",
-                json!({"clip": "a.mp3"}),
-                Some("Marin, calm"),
-            ),
-            row_with(3, "WidgetShown", "player", json!({"clip": "a.mp3"}), None),
-        ]);
-        assert_eq!(widgets.len(), 1);
-        assert_eq!(widgets[0].label.as_deref(), Some("Marin, calm"));
     }
 
     /// A legacy `WidgetShown { app_id }` still parses as it did.
@@ -1164,6 +785,26 @@ mod tests {
         assert_eq!(
             canonical_widget_params(&params(json!({"rate": 1.0, "n": [2.0, 2.5]}))),
             canonical_widget_params(&params(json!({"rate": 1, "n": [2, 2.5]})))
+        );
+    }
+
+    /// Identity compares canonical params: the same set in any key order, at
+    /// any depth, is one instance.
+    #[test]
+    fn reordered_params_are_one_instance() {
+        assert_eq!(
+            InstanceKey::new(
+                "chart",
+                Some(&params(json!({"a": 1, "b": {"x": 1, "y": 2}})))
+            ),
+            InstanceKey::new(
+                "chart",
+                Some(&params(json!({"b": {"y": 2, "x": 1}, "a": 1})))
+            ),
+        );
+        assert_eq!(
+            InstanceKey::new("chart", None),
+            InstanceKey::new("chart", Some(&params(json!({}))))
         );
     }
 

@@ -14,6 +14,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INSTALL="$PROJECT_DIR/install.sh"
 
+python3 "$SCRIPT_DIR/linux_dev_install_test.py" || exit 1
+
 bash "$SCRIPT_DIR/stage_runtime_test.sh" || exit 1
 python3 "$SCRIPT_DIR/stage_runtime_linux_test.py" || exit 1
 bash "$SCRIPT_DIR/headless_tarball_test.sh" || exit 1

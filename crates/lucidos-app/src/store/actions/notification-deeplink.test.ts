@@ -132,6 +132,7 @@ describe('parseDeepLinkFromUrl', () => {
     );
     expect(parseDeepLinkFromUrl(url)).toEqual({
       notification: 'n-1',
+      restoreGeneration: 'unknown',
       thread: 't-9',
       event: 'e-7',
       tap: null,
@@ -144,6 +145,7 @@ describe('parseDeepLinkFromUrl', () => {
     const url = new URL('https://localhost:5174/?notification=n-1&thread=t-9');
     expect(parseDeepLinkFromUrl(url)).toEqual({
       notification: 'n-1',
+      restoreGeneration: 'unknown',
       thread: 't-9',
       event: null,
       tap: null,
@@ -159,6 +161,7 @@ describe('parseDeepLinkFromUrl', () => {
     );
     expect(parseDeepLinkFromUrl(url)).toMatchObject({
       notification: 'fresh',
+      restoreGeneration: 'unknown',
       thread: 't-9',
     });
   });
@@ -173,6 +176,7 @@ describe('parseDeepLinkFromUrl', () => {
     );
     expect(parseDeepLinkFromUrl(url)).toEqual({
       notification: 'n-1',
+      restoreGeneration: 'unknown',
       thread: 't-9',
       event: 'e-7',
       tap,
@@ -188,6 +192,7 @@ describe('parseDeepLinkFromUrl', () => {
     const target = parseDeepLinkFromUrl(url);
     expect(target).toEqual({
       notification: 'n-1',
+      restoreGeneration: 'unknown',
       thread: null,
       event: null,
       tap: null,
@@ -203,6 +208,7 @@ describe('parseDeepLinkFromUrl', () => {
     const url = new URL('https://localhost:5174/');
     expect(parseDeepLinkFromUrl(url)).toEqual({
       notification: null,
+      restoreGeneration: 'unknown',
       thread: null,
       event: null,
       tap: null,
@@ -238,6 +244,7 @@ describe('parseDeepLinkFromSwMessage', () => {
       }),
     ).toEqual({
       notification: 'n-1',
+      restoreGeneration: 'unknown',
       thread: 't-9',
       event: 'e-7',
       tap: { kind: 'navigate', to: { target: 'thread', id: 't-9', event_id: 'e-7' } },
@@ -258,6 +265,7 @@ describe('parseDeepLinkFromSwMessage', () => {
   it('fills in nulls for missing keys', () => {
     expect(parseDeepLinkFromSwMessage({ notification_id: 'n-1' })).toEqual({
       notification: 'n-1',
+      restoreGeneration: 'unknown',
       thread: null,
       event: null,
       tap: null,
@@ -306,6 +314,7 @@ describe('parseDeepLinkFromSwMessage', () => {
       }),
     ).toEqual({
       notification: null,
+      restoreGeneration: 'unknown',
       thread: null,
       event: null,
       tap: null,
@@ -473,5 +482,36 @@ describe('parseDeepLinkFromInboxRow', () => {
       type: 'view-notification',
       id: 'n-3',
     });
+  });
+});
+
+describe('restore notification taps', () => {
+  const tap = { kind: 'restore-snapshot' as const, workspace_id: 'demo', handle: 'snap_00000000000000000000000000' };
+  it('preserves Undo through URL, push and inbox routes as confirmation intent', () => {
+    const targets = [
+      parseDeepLinkFromUrl(new URL('https://example.com/?notification=n&tap=' + encodeURIComponent(JSON.stringify(tap)))),
+      parseDeepLinkFromSwMessage({ notification_id: 'n', tap })!,
+      parseDeepLinkFromInboxRow({ id: 'n', tap }),
+    ];
+    for (const target of targets) {
+      expect(resolveDeepLink(target)).toEqual({ type: 'restore-snapshot', tap, notification: 'n' });
+    }
+  });
+  it.each(['../x', 'snap_80000000000000000000000000', 'snap_0000000000000000000000000I'])('rejects malformed handle %s', (handle) => {
+    expect(parseDeepLinkFromSwMessage({ notification_id: 'n', tap: { ...tap, handle } })?.tap).toBeNull();
+  });
+});
+
+describe('push source provenance', () => {
+  it('preserves UUID, original and unknown provenance in both transports', () => {
+    for (const source of ['11111111-1111-4111-8111-111111111111', 'none', 'unknown']) {
+      const url = new URL('https://example.com/?notification=n&restore_generation=' + source);
+      expect(parseDeepLinkFromUrl(url).restoreGeneration).toBe(source);
+      expect(parseDeepLinkFromSwMessage({ notification_id: 'n',
+        restore_generation: source === 'none' ? null : source })?.restoreGeneration).toBe(source);
+      expect(stripDeepLinkFromUrl(url).searchParams.has('restore_generation')).toBe(false);
+    }
+    expect(parseDeepLinkFromUrl(new URL('https://example.com/?notification=n')).restoreGeneration).toBe('unknown');
+    expect(parseDeepLinkFromSwMessage({ notification_id: 'n' })?.restoreGeneration).toBe('unknown');
   });
 });

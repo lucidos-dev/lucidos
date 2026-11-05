@@ -1010,6 +1010,53 @@ fn the_idle_arm_proposes_before_it_idles() {
     );
 }
 
+/// **A clean idle covers its polled tasks before anything reads its waits.**
+/// An idle agent polls nothing, so the turn end arms one wait over every
+/// running task. It must come first. The live wait holds the idle proposal
+/// (ADR 0395) and keeps a waiting child unfinished (ADR 0254). It also feeds
+/// the turn-end gate's wake decision. It runs only at a clean end, so a user
+/// Stop is never overridden.
+#[test]
+fn the_idle_arm_covers_polled_tasks_before_it_idles() {
+    const RUN_SRC: &str = include_str!("../run_session/run.rs");
+
+    let classify = RUN_SRC
+        .find("let (terminal_kind, emit_idle) = classify_result(")
+        .expect("run.rs must still classify the Result before acting on it");
+    let arm = &RUN_SRC[classify..];
+    let gate = arm
+        .find("let ended_cleanly = turn_ended_cleanly(&last_terminal_kind, is_resolution_session, keep_alive_turn);")
+        .expect("the Result arm must still decide whether the turn ended cleanly");
+    let arming = arm
+        .find("self.arm_wait_for_running_background_tasks(thread_id, OwnerTurn::Ended)")
+        .expect("the Result arm must arm with the turn ended");
+    const CLEAN_END: &str = "if ended_cleanly {";
+    let opens = arm[..arming]
+        .rfind(CLEAN_END)
+        .expect("the arming must sit inside the clean-end gate");
+    assert!(
+        gate < opens,
+        "the gate must open after the clean-end decision"
+    );
+    assert!(
+        arm[opens + CLEAN_END.len()..arming].trim().is_empty(),
+        "the arming must be the clean-end gate's first statement"
+    );
+    for later in [
+        "let holds_live_wait =",
+        "self.gate_coding_agent_turn_end(",
+        "self.emit_coding_agent_idled(",
+    ] {
+        let at = arm
+            .find(later)
+            .unwrap_or_else(|| panic!("the Result arm must still reach {later}"));
+        assert!(
+            arming < at,
+            "the turn-end arming must run BEFORE {later}, which reads the thread's waits"
+        );
+    }
+}
+
 /// The turn-end gate brackets the idle (ADR 0417). The forced read and wake
 /// decisions run before `CodingAgentIdled`, so the turn's decisions are
 /// recorded before its end, where the fan-in reads them. The re-entries run after it, so each opens its own exchange.

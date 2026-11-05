@@ -48,8 +48,8 @@ pub fn grants_dir(workspace_path: &Path) -> PathBuf {
 
 /// One of the three persisted allowlists. Each gates a different caller, so the
 /// pattern languages are unrelated and a single merged file would be ambiguous:
-/// `Bash(git:*)` is a chat command-guard pattern, `Bash` on its own is also a
-/// Claude Code `--allowedTools` entry, and `Mcp(slack:*)` is neither.
+/// `Bash(git:*)` grants a command head, bare `Bash` grants every command
+/// after the engine's unconditional floor, and `Mcp(slack:*)` grants MCP tools.
 ///
 /// Serializes as its own [`GrantFile::file_name`], so the `grant_file` on a
 /// `PermissionGrantsChanged` event reads as the name the Settings editor shows.

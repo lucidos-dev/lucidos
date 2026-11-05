@@ -13,10 +13,10 @@ import { topOverlay } from '../../store/overlayStack';
 import type { App } from '../../store/types';
 
 const device = vi.hoisted(() => ({ coarse: false, narrow: false }));
-vi.mock('../../utils/viewport', async (original) => ({
-  ...(await original<typeof import('../../utils/viewport')>()),
+vi.mock('../../utils/layoutMedia', async (original) => ({
+  ...(await original<typeof import('../../utils/layoutMedia')>()),
   hasCoarsePointer: () => device.coarse,
-  isMobile: () => device.narrow,
+  viewportGetsPhoneLayout: () => device.narrow,
 }));
 
 const options = [
@@ -80,7 +80,7 @@ function mount(kind: string, onPick = vi.fn()) {
       appsList.value = { status: 'loaded', data: options.map((o) => ({
         id: o.value, name: o.label, description: o.description, kind: 'app',
       } as App)) };
-      render(<WidgetPickerItems target={{ dashboard: 'desktop' }} run={(fn) => () => { onPick(); fn(); }} />, host);
+      render(<WidgetPickerItems dashboard="desktop" run={(fn) => () => { onPick(); fn(); }} />, host);
     }
   });
   const root = kind === 'dropdown' ? document.body.querySelector('.dropdown-menu')! : host;

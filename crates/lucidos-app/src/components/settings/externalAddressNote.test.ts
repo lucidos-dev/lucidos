@@ -6,7 +6,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { h, render } from 'preact';
-import { ExternalAddressSection, externalAddressNote } from './ExternalAddressSection';
+import { ExternalAddressSection, externalAddressNote, publicListenerNote } from './ExternalAddressSection';
 import type { ExternalAddressInfo } from '../../api/client/control';
 
 const TAILNET = 'http://mymac.tailnet-name.ts.net:5252';
@@ -18,6 +18,7 @@ const unset: ExternalAddressInfo = {
   env_var: 'LUCIDOS_EXTERNAL_ADDRESS',
   suggestions: [],
   probe: null,
+  public_port: 5282,
 };
 const set: ExternalAddressInfo = { ...unset, external_address: 'https://lucidos.example.com', source: 'file' };
 
@@ -69,5 +70,15 @@ describe('externalAddressNote', () => {
     expect(
       externalAddressNote({ ...set, probe: { verdict: 'unknown', detail: 'HTTP 401' } }, TAILNET),
     ).toMatch(/could not be checked \(HTTP 401\)/);
+  });
+});
+
+describe('publicListenerNote', () => {
+  it('names the loopback port a tunnel should point at', () => {
+    expect(publicListenerNote(unset)).toContain('http://127.0.0.1:5282');
+  });
+
+  it('says nothing when the public listener is off', () => {
+    expect(publicListenerNote({ ...unset, public_port: null })).toBeNull();
   });
 });

@@ -240,26 +240,27 @@ const BUILD_SLOT_RULE: &str = "\n\nHEAVY BUILDS TAKE A BUILD SLOT: Sessions run 
 /// thread instead (ADR 0511).
 const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN: When your turn \
     ends (you go idle), the Lucidos engine terminates you and every process you started, \
-    whatever process group it runs in. A job you detach (`&`, `nohup`, any detached job) is therefore KILLED \
-    the instant you end the turn, and nothing re-invokes you when it would have finished. Under \
+    whatever process group it runs in. A detached job (`&`, `nohup`) is therefore KILLED \
+    the instant you end the turn, and nothing re-invokes you when it finishes. Under \
     Claude Code, Lucidos switches background mode OFF: the `Bash` and `Agent` tools have no \
-    `run_in_background` parameter, passing one fails, and a command that outruns its timeout is \
+    `run_in_background` parameter, passing one fails, and a command past its timeout is \
     killed rather than moved to the background. KEEP EVERY BLOCKING CALL INSIDE YOUR PROMPT \
-    CACHE: your SESSION CONTEXT says how long it lives, and a longer gap re-bills your whole \
+    CACHE: your SESSION CONTEXT says how long it lives, and a longer gap re-bills your \
     context. Three shapes. \
     FOREGROUND, for what surely finishes in about 3 minutes: set `timeout: 240000` EXPLICITLY \
-    (the 120000 ms DEFAULT cuts a build off at 2 minutes). Overrunning it kills the command. POLLED BACKGROUND TASK, for longer work: `lucidos background-task \
+    (the 120000 ms DEFAULT cuts a build at 2 minutes). Overrunning it kills the command. POLLED BACKGROUND TASK, for longer work: `lucidos background-task \
     run --poll --description \"<what it is>\" -- '<cmd>'` runs it in your worktree. Then \
     `lucidos background-task wait <id>` (foreground, `timeout: 240000`) returns within 230 s \
-    with the new output; re-issue it until finished. WATCHED BACKGROUND TASK, for an open-ended \
+    with the new output; re-issue it until finished. If your turn ends first, its finish \
+    re-opens the thread. WATCHED BACKGROUND TASK, for an open-ended \
     wait such as a held lock: the same `run` without `--poll` arms an event wait. Name the work in the \
     user's words (\"the full e2e suite\"): the waiting row shows it. On `watched`, say what you \
     wait for and END YOUR TURN: the thread re-opens with the exit status and output tail. On \
     `unwatched` nothing will wake you: stop it and poll instead. REDIRECT \
     a chatty command's output to a log file \
-    (`<cmd> > \"${TMPDIR:-/tmp}/$(basename \"$PWD\").log\" 2>&1`) and `tail` it, so a long log \
+    (`<cmd> > \"${TMPDIR:-/tmp}/$(basename \"$PWD\").log\" 2>&1`) and `tail` it, so it \
     never floods your context. SUBAGENTS ARE \
-    BACKGROUND WORK TOO: a subagent dies with your process group, so its report must come back \
+    BACKGROUND WORK TOO: a subagent dies with your process group, so its report must return \
     inside the turn. Under Claude Code every `Agent` call blocks, so it counts against the cap. \
     Put a fan-out in a single assistant message: its agents run in parallel, and it lasts as long \
     as its slowest agent. Longer delegated work goes to a child thread (`lucidos spawn-thread \

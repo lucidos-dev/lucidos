@@ -60,8 +60,7 @@ export function useWidgetEmbedSlots(host: HTMLElement | null, html: string, fina
 }
 
 /** Reply HTML whose widget embeds mount as inline widgets once the text is
- *  final. `eventId` is the turn's starter, where a pin's "Show in thread"
- *  lands. */
+ *  final. `eventId` is the turn's starter. */
 export function ReplyHtml({ html, final, threadId, eventId, class: className, textSeq }: {
   html: string;
   final: boolean;

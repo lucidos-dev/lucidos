@@ -96,8 +96,9 @@ pub enum CompletionDelivery {
     /// An event wait re-opens the owning thread on its completion.
     EventWait,
     /// The owner polls with `lucidos background-task wait`, so no engine wait
-    /// may arm for it. A wake after the agent already read the result would
-    /// re-open the thread for nothing.
+    /// arms for it while the owner's turn runs. A wake after the agent already
+    /// read the result would re-open the thread for nothing. Once the turn
+    /// ends cleanly, nobody polls, and the turn tail arms for it.
     Poll,
 }
 
@@ -117,6 +118,40 @@ pub struct TaskSpec<'a> {
 #[derive(Clone)]
 pub struct BackgroundBashRegistry {
     tasks: Arc<Mutex<HashMap<String, BackgroundTask>>>,
+    /// Per owning thread, the polled results that finished and that nobody
+    /// delivered yet (ADR 0619). Outside the task entry, because the sweep
+    /// drops a finished entry after [`FINISHED_RETENTION_SECS`]. Always taken
+    /// after `tasks`, never before, and never held across an await.
+    unread_results: Arc<std::sync::Mutex<HashMap<Uuid, Vec<UnreadResult>>>>,
+}
+
+/// A polled task that finished, and whose owner has neither read the result
+/// nor had it delivered by a wait. A clean turn end arms a wait over it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadResult {
+    pub task_id: String,
+    pub description: Option<String>,
+    /// Redacted and cut by [`command_prefix`]: safe to show the user.
+    pub command: String,
+}
+
+type UnreadResults = HashMap<Uuid, Vec<UnreadResult>>;
+
+/// The unread map, even after a panic poisoned it: every write to it is one
+/// whole insert or removal, so no half-done state can be left behind.
+fn unread(map: &std::sync::Mutex<UnreadResults>) -> std::sync::MutexGuard<'_, UnreadResults> {
+    map.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Drop `task_ids` from one thread's unread results.
+fn forget_unread(results: &mut UnreadResults, thread_id: Uuid, task_ids: &[&str]) {
+    if let Some(list) = results.get_mut(&thread_id) {
+        list.retain(|r| !task_ids.contains(&r.task_id.as_str()));
+        if list.is_empty() {
+            results.remove(&thread_id);
+        }
+    }
 }
 
 /// How the watchdog ends a task that is told to stop. Either way it signals
@@ -502,6 +537,7 @@ impl BackgroundBashRegistry {
     pub fn new() -> Self {
         BackgroundBashRegistry {
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            unread_results: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -653,6 +689,7 @@ impl BackgroundBashRegistry {
         ));
 
         let tasks = self.tasks.clone();
+        let unread_results = self.unread_results.clone();
         let id = task_id.clone();
         // Moved into the watchdog, which every exit path goes through: a
         // natural exit, the timeout, a kill, and the runtime dropping it.
@@ -708,7 +745,8 @@ impl BackgroundBashRegistry {
                 task.timed_out = timed_out;
                 task.killed = killed;
                 task.finished_at = Some(Utc::now());
-                task.kill_signal = None;
+                // A stop, a Discard or the teardown took the signal earlier.
+                let stop_taken = task.kill_signal.take().is_none();
                 // Wakes every parked waiter. A finish that lands before a
                 // waiter registers is NOT lost: `read_output_in_memory_wait`
                 // registers first and re-checks `is_finished()` under the
@@ -718,6 +756,21 @@ impl BackgroundBashRegistry {
                 // rescue exactly one of them and strand the rest for their
                 // full budget on an already-finished task.
                 task.finish_notify.notify_waiters();
+                // Under the task lock, so a drain that sees the task finished
+                // also sees it unread, and its read removes it.
+                // Before the completion is emitted, so the wait that delivers
+                // it always finds the entry to remove.
+                let unread_result = task.delivery == CompletionDelivery::Poll && !stop_taken;
+                if let Some(owner) = task.thread_id.filter(|_| unread_result) {
+                    unread(&unread_results)
+                        .entry(owner)
+                        .or_default()
+                        .push(UnreadResult {
+                            task_id: id.clone(),
+                            description: task.description.clone(),
+                            command: task.command.clone(),
+                        });
+                }
             }
             // Ignore send error: receiver drop just means nobody's listening.
             let _ = finish_tx.send(());
@@ -954,6 +1007,7 @@ impl BackgroundBashRegistry {
     /// still records its completion through its own watcher.
     pub async fn kill_for_thread(&self, thread_id: Uuid) -> usize {
         let mut tasks = self.locked().await;
+        unread(&self.unread_results).remove(&thread_id);
         tasks
             .values_mut()
             .filter(|t| t.thread_id == Some(thread_id) && !t.is_finished())
@@ -962,6 +1016,22 @@ impl BackgroundBashRegistry {
                 let _ = tx.send(Stop::Graceful);
             })
             .count()
+    }
+
+    /// The polled results this thread's tasks left that nobody read or
+    /// delivered yet, oldest finish first.
+    pub fn unread_results_for_thread(&self, thread_id: Uuid) -> Vec<UnreadResult> {
+        unread(&self.unread_results)
+            .get(&thread_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// `reader` now holds this task's finished result: it read the output, or
+    /// one of its waits delivered the completion. A read by any other thread
+    /// leaves the owner's result unread.
+    pub fn mark_result_read(&self, reader: Uuid, task_id: &str) {
+        forget_unread(&mut unread(&self.unread_results), reader, &[task_id]);
     }
 
     /// Hand the teardown every task whose completion nobody has written yet,
@@ -3096,6 +3166,97 @@ mod tests {
 
         reg.kill(&polled).await;
         reg.kill(&watched).await;
+    }
+
+    /// One short task of `thread`, with `before_finish` run while it runs.
+    async fn unread_case(
+        reg: &BackgroundBashRegistry,
+        thread: Uuid,
+        delivery: CompletionDelivery,
+        before_finish: impl AsyncFnOnce(&BackgroundBashRegistry, &str),
+    ) -> String {
+        let spec = TaskSpec {
+            timeout_secs: 60,
+            description: Some("the gates"),
+            delivery,
+            inherited: crate::core::InheritedSecrets::Keep,
+        };
+        let (task_id, _rx) = reg
+            .spawn_task(
+                "sleep 0.3",
+                std::path::Path::new("/tmp"),
+                &[],
+                Some(thread),
+                spec,
+            )
+            .await
+            .expect("spawn");
+        before_finish(reg, &task_id).await;
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(10)).await);
+        task_id
+    }
+
+    fn unread_ids(reg: &BackgroundBashRegistry, thread: Uuid) -> Vec<String> {
+        reg.unread_results_for_thread(thread)
+            .into_iter()
+            .map(|r| r.task_id)
+            .collect()
+    }
+
+    /// ADR 0619: a polled task that finished with nobody covering it leaves
+    /// an unread result, and the owner's read removes it.
+    #[tokio::test]
+    async fn a_polled_finish_is_unread_until_its_owner_reads_it() {
+        let reg = BackgroundBashRegistry::new();
+        let (owner, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let id = unread_case(&reg, owner, CompletionDelivery::Poll, async |_, _| {}).await;
+        let results = reg.unread_results_for_thread(owner);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].task_id, id);
+        assert_eq!(results[0].description.as_deref(), Some("the gates"));
+
+        reg.mark_result_read(other, &id);
+        assert_eq!(unread_ids(&reg, owner), vec![id.clone()]);
+        reg.mark_result_read(owner, &id);
+        assert!(unread_ids(&reg, owner).is_empty());
+    }
+
+    /// An event wait delivers a watched task's completion. Only a polled
+    /// task can be unread.
+    #[tokio::test]
+    async fn a_watched_finish_is_never_unread() {
+        let reg = BackgroundBashRegistry::new();
+        let owner = Uuid::new_v4();
+        unread_case(&reg, owner, CompletionDelivery::EventWait, async |_, _| {}).await;
+        assert!(unread_ids(&reg, owner).is_empty());
+    }
+
+    /// A stopped task is no news to anyone (ADR 0369).
+    #[tokio::test]
+    async fn a_stopped_polled_task_is_never_unread() {
+        let reg = BackgroundBashRegistry::new();
+        let owner = Uuid::new_v4();
+        unread_case(&reg, owner, CompletionDelivery::Poll, async |reg, id| {
+            assert!(reg.kill(id).await);
+        })
+        .await;
+        assert!(unread_ids(&reg, owner).is_empty());
+    }
+
+    /// Reading one result leaves the others unread, and a Discard clears the
+    /// whole thread's.
+    #[tokio::test]
+    async fn a_read_and_a_discard_clear_unread_results() {
+        let reg = BackgroundBashRegistry::new();
+        let owner = Uuid::new_v4();
+        let first = unread_case(&reg, owner, CompletionDelivery::Poll, async |_, _| {}).await;
+        let second = unread_case(&reg, owner, CompletionDelivery::Poll, async |_, _| {}).await;
+        assert_eq!(unread_ids(&reg, owner), vec![first.clone(), second.clone()]);
+
+        reg.mark_result_read(owner, &first);
+        assert_eq!(unread_ids(&reg, owner), vec![second]);
+        reg.kill_for_thread(owner).await;
+        assert!(unread_ids(&reg, owner).is_empty());
     }
 
     /// `lucidos background-task wait` reads through the timed drain. When the

@@ -46,30 +46,78 @@ pub(crate) fn is_safe_subpath(parent: &Path, child: &Path) -> bool {
     child_canon.starts_with(&parent_canon) && child_canon != parent_canon
 }
 
-/// Free space on the filesystem hosting `path`, in bytes.
+/// Free and total space on a volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiskReading {
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+}
+
+/// The free-space levels that count as pressure on one volume. A fixed number
+/// puts a small, empty volume under pressure. So each level is the smaller of
+/// its cap and a share of the volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiskThresholds {
+    pub soft_bytes: u64,
+    pub hard_bytes: u64,
+}
+
+impl DiskThresholds {
+    /// Soft is a quarter of the volume, hard a tenth, each capped.
+    pub(crate) fn for_volume(total_bytes: u64, soft_cap_bytes: u64, hard_cap_bytes: u64) -> Self {
+        Self {
+            soft_bytes: soft_cap_bytes.min(total_bytes / 4),
+            hard_bytes: hard_cap_bytes.min(total_bytes / 10),
+        }
+    }
+
+    /// The levels for one reading. With no reading, the caps.
+    pub(crate) fn for_reading(
+        reading: Option<DiskReading>,
+        soft_cap_bytes: u64,
+        hard_cap_bytes: u64,
+    ) -> Self {
+        let total_bytes = reading.map_or(u64::MAX, |r| r.total_bytes);
+        Self::for_volume(total_bytes, soft_cap_bytes, hard_cap_bytes)
+    }
+}
+
+/// Free and total space on the filesystem hosting `path`.
 ///
 /// Returns `None` when the path doesn't exist or the platform call fails.
 /// We call this on `<workspace>/.lucidos/worktrees/` (or the workspace root
 /// when the worktrees dir is missing) — both live on the same volume.
-pub(crate) fn available_disk_bytes(path: &Path) -> Option<u64> {
-    fs2::available_space(path).ok()
+/// On ZFS the OS total shrinks as the pool fills, so [`zfs::volume_size_bytes`]
+/// gives it.
+pub(crate) fn disk_reading(path: &Path) -> Option<DiskReading> {
+    let free_bytes = fs2::available_space(path).ok()?;
+    let os_total_bytes = fs2::total_space(path).ok()?;
+    let total_bytes = if zfs::is_zfs(path) {
+        zfs::volume_size_bytes(path, os_total_bytes)
+    } else {
+        os_total_bytes
+    };
+    Some(DiskReading {
+        free_bytes,
+        total_bytes,
+    })
 }
 
-/// Free space on the volume hosting the workspace's worktrees. Falls back to
+/// Reading of the volume hosting the workspace's worktrees. Falls back to
 /// the workspace root when the worktrees dir is missing: both share a volume.
-pub(crate) fn volume_free_bytes(worktrees_dir: &Path, workspace_root: &Path) -> Option<u64> {
-    available_disk_bytes(worktrees_dir).or_else(|| available_disk_bytes(workspace_root))
+pub(crate) fn volume_reading(worktrees_dir: &Path, workspace_root: &Path) -> Option<DiskReading> {
+    disk_reading(worktrees_dir).or_else(|| disk_reading(workspace_root))
 }
 
-/// Reads free bytes on the workspace volume. Every caller probes again at the
-/// moment it decides, because free space can change by hundreds of GB while a
-/// cycle waits on the database. Tests script the readings.
-pub(crate) type FreeDiskProbe = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+/// Reads the workspace volume. Every caller probes again at the moment it
+/// decides, because free space can change by hundreds of GB while a cycle
+/// waits on the database. Tests script the readings.
+pub(crate) type FreeDiskProbe = Arc<dyn Fn() -> Option<DiskReading> + Send + Sync>;
 
 /// The worktrees path is resolved once here, so a probe never creates it.
 pub(crate) fn os_free_disk_probe(workspace_root: PathBuf) -> FreeDiskProbe {
     let dir = worktrees_dir(&workspace_root);
-    Arc::new(move || volume_free_bytes(&dir, &workspace_root))
+    Arc::new(move || volume_reading(&dir, &workspace_root))
 }
 
 /// How tight free disk is, ordered so that a worsening compares greater.
@@ -90,11 +138,17 @@ pub(crate) struct DiskPressure {
 
 impl DiskPressure {
     /// A failed probe reads as no pressure: it never opens the retention gate.
-    pub(crate) fn classify(free_bytes: Option<u64>, soft_bytes: u64, hard_bytes: u64) -> Self {
+    pub(crate) fn classify(
+        reading: Option<DiskReading>,
+        soft_cap_bytes: u64,
+        hard_cap_bytes: u64,
+    ) -> Self {
+        let thresholds = DiskThresholds::for_reading(reading, soft_cap_bytes, hard_cap_bytes);
+        let free_bytes = reading.map(|r| r.free_bytes);
         Self {
             free_bytes,
-            under_soft: free_bytes.is_some_and(|b| b < soft_bytes),
-            under_hard: free_bytes.is_some_and(|b| b < hard_bytes),
+            under_soft: free_bytes.is_some_and(|free| free < thresholds.soft_bytes),
+            under_hard: free_bytes.is_some_and(|free| free < thresholds.hard_bytes),
         }
     }
 

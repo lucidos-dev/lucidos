@@ -66,3 +66,15 @@ describe('workspaceFaultNote', () => {
     expect(workspaceFaultNote(ws('booting'))).toBeNull();
   });
 });
+
+it('treats restore as in progress without offering an unhealthy retry', () => {
+  expect(workspaceState(ws('restoring'))).toBe('booting');
+  expect(workspaceStateLabel(ws('restoring'))).toBe('Restoring…');
+  expect(workspaceFaultNote(ws('restoring'))).toBeNull();
+});
+
+it('explains a blocked restore failure while keeping restore actions disabled', () => {
+  const workspace = ws('restoring', 'Snapshot restore needs attention.');
+  expect(workspaceState(workspace)).toBe('booting');
+  expect(workspaceStateLabel(workspace)).toBe('Snapshot restore needs attention.');
+});

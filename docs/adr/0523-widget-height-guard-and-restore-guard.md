@@ -1,6 +1,6 @@
 # 0523: A widget height guard bounds a frame's height, and a restore guard keeps a launch off the thread the last session died on
 
-- **Status**: Accepted
+- **Status**: Accepted. Amended by [ADR 0621](0621-widgets-one-box-no-pin.md): the height guard covers the option place only
 - **Date**: 2026-10-18
 - **Related**: [0411](0411-every-workspace-has-home.md) (the no-stored-focus path
   a withheld launch takes).

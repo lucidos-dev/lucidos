@@ -4611,6 +4611,8 @@ dependencies = [
  "lucidos-build-slot",
  "lucidos-capabilities",
  "lucidos-claude-code-managed",
+ "lucidos-engine-socket",
+ "lucidos-gateway-constants",
  "lucidos-home",
  "lucidos-installs",
  "lucidos-local-token",
@@ -4687,9 +4689,11 @@ dependencies = [
  "lucidos-frame-capability",
  "lucidos-gateway-constants",
  "lucidos-home",
+ "lucidos-installs",
  "lucidos-local-token",
  "lucidos-owner-lock",
  "lucidos-pg-url",
+ "lucidos-secret-store",
  "lucidos-tailscale",
  "mail-parser",
  "native-tls",
@@ -4702,7 +4706,6 @@ dependencies = [
  "regex",
  "reqwest 0.12.28",
  "rustls",
- "security-framework",
  "semver",
  "serde",
  "serde_bytes",
@@ -4806,6 +4809,7 @@ dependencies = [
  "lucidos-local-token",
  "lucidos-owner-lock",
  "lucidos-pg-url",
+ "lucidos-secret-store",
  "lucidos-tailscale",
  "lucidos-update-address",
  "mach2",
@@ -4868,6 +4872,20 @@ name = "lucidos-pg-url"
 version = "0.1.0"
 dependencies = [
  "urlencoding",
+]
+
+[[package]]
+name = "lucidos-secret-store"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm 0.10.3",
+ "base64 0.22.1",
+ "log",
+ "lucidos-file-backup-exclusion",
+ "lucidos-home",
+ "security-framework",
+ "sha2 0.10.9",
+ "tempfile",
 ]
 
 [[package]]

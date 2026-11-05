@@ -14,15 +14,13 @@
 //   click and the bare visible↔hidden transitions reaching them are already
 //   covered by visibilitychange
 // - heartbeat every 30s while visible → refresh `visible_at` so the row stays fresh
-// - `beforeunload` → best-effort hidden via sendBeacon
+// - `beforeunload` → best-effort hidden via guarded keepalive fetch
 //
 // Feeds the backend's PresenceCheck candidate index — see
 // system-knowhow/notifications.md §3.
 
-import { API } from '../../api/client';
+import { API, mutatingFetch } from '../../api/client';
 import { getDeviceId } from './devices';
-import { deviceIdHeader } from '../../utils/deviceIdHeader';
-import { registrationToAwait } from '../../utils/deviceRegistration';
 import { isPageActive } from '../../utils/pageActive';
 import { startNativeWindowActiveTracking } from '../../utils/nativeWindow';
 
@@ -33,22 +31,21 @@ let lastReported: boolean | null = null;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let cleanupFns: Array<() => void> = [];
 
-async function postDevicePresence(visible: boolean): Promise<void> {
-  const registration = registrationToAwait(ENDPOINT, 'POST');
-  if (registration) await registration;
-  fetch(ENDPOINT, {
+function postDevicePresence(visible: boolean): Promise<void> {
+  // Capture generation inside mutatingFetch before registration or admission waits.
+  return mutatingFetch(ENDPOINT, {
     method: 'POST',
     // The header as well as the body id. This emits `DeviceVisible`, so it is
     // a mutation `api::mutating_gate` refuses without one (ADR 0169). The body
     // id names the SUBJECT of the event; the header says who is calling, and
     // the engine reads only the header.
-    headers: { 'Content-Type': 'application/json', ...deviceIdHeader() },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       device_id: getDeviceId(),
       visible,
     }),
     keepalive: true,
-  }).catch((e) => {
+  }).then(() => {}, (e) => {
     // Telemetry carve-out (.claude/rules/frontend.md): heartbeat runs on a
     // 30s interval without user intent. Failure just means a redundant push
     // notification next time — engine treats absent presence as "not active".
@@ -111,15 +108,8 @@ export function startDevicePresenceTracking(): () => void {
 
   const onBeforeUnload = () => {
     if (lastReported !== true) return;
-    try {
-      const blob = new Blob([JSON.stringify({
-        device_id: getDeviceId(),
-        visible: false,
-      })], { type: 'application/json' });
-      navigator.sendBeacon(ENDPOINT, blob);
-    } catch {
-      // Falls back to the regular onBlur which fires alongside unload anyway.
-    }
+    // sendBeacon cannot carry the authoritative generation and device headers.
+    void postDevicePresence(false);
   };
   window.addEventListener('beforeunload', onBeforeUnload);
   cleanupFns.push(() => window.removeEventListener('beforeunload', onBeforeUnload));

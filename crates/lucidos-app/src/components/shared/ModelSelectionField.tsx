@@ -2,7 +2,7 @@ import { useRef, useState } from 'preact/hooks';
 import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from './Overlay';
-import { DropdownChevron, dropdownPanelStyle } from './Dropdown';
+import { DropdownChevron, dropdownPanelStyle } from './dropdownPresentation';
 import { ModelSelectionPicker, type PickerLink } from './ModelSelectionPicker';
 import { useModelSelection, type ModelSelectionPatch } from '../../hooks/useModelSelection';
 import type { ModelChoice, TierChoice } from '../../store/modelSelection';

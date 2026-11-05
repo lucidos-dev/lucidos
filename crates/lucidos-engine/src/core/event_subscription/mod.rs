@@ -687,6 +687,7 @@ pub async fn event_type_catalog(
 /// neither run writes a terminal row today.
 fn transient_terminal_hint(name: &str) -> Option<&'static str> {
     match name {
+        "SnapshotProgress" => Some("SnapshotCreated, SnapshotCaptureFailed or SnapshotChecked"),
         "BackupProgress" => Some("BackupCompleted or BackupFailed"),
         "RecommendedCleanupProgress" => {
             Some("RecommendedCleanupCompleted or RecommendedCleanupFailed")

@@ -857,7 +857,7 @@ The ceiling on the *first-paint set*, `FIRST_PAINT_BUDGET` (1400 kB raw) in `vit
 What one change adds to the *first-paint set*: the set at HEAD minus the set at the change's merge base with main, raw with gzip beside it. `crates/lucidos-app/first-paint-growth.mjs check` builds both through `vite/chunkBudget.ts`, the merge base from `git archive`. Growth over `GROWTH_THRESHOLD_BYTES` (2 kB raw) fails unless a commit of the change carries a **growth trailer**, `First-paint-growth: <why>`. A shrink needs nothing and prints negative. `report` ranks main's changes from its reflog for the nightly. `/harden` runs it as the `first-paint` suite (ADR 0454).
 
 ### Touched spec
-A browser spec the branch's diff can break, as `scripts/lib/touched_specs.sh` selects it. Any of three things selects one: the branch changes the spec, the *coverage map* records a changed file in its run, or it names a *vanished literal*. That is a string literal that left `crates/lucidos-app/src/`, named directly or through an e2e helper export. `/harden` runs them as the `e2e-touched` suite on this host, without mobile-webkit. The `e2e-touched-webkit` suite sends the ones mobile-webkit runs to GitHub (ADRs 0502, 0536).
+A browser spec the branch's diff can break, as `scripts/lib/touched_specs.sh` selects it. Any of three things selects one: the branch changes the spec, the *coverage map* records a changed file in its run, or it names a *vanished literal*. That is a string literal that left `crates/lucidos-app/src/`, named directly or through an e2e helper export. `/harden` runs them as the `e2e-touched` suite on this host, without mobile-webkit. The `e2e-touched-webkit` suite runs the ones mobile-webkit runs after it. A macOS host runs them itself, and a Linux host sends them to GitHub (ADRs 0502, 0536, 0616).
 
 ### Coverage map
 Which source files each browser spec ran, as the last complete *main check* measured it: `<git common dir>/lucidos/e2e-coverage-map.json`, one map for every worktree. The main check's run builds with hidden sourcemaps (`LUCIDOS_E2E_COVERAGE=1`), and `e2e/coverage.ts` maps each executed function on Chromium to its file. The map is replaced only when every Chromium shard reported. `/harden` adds every spec whose files meet the diff to the *touched specs*. It ignores a startup file, one that 90% of specs run, and a missing map adds nothing (ADR 0502, as amended).
@@ -1121,7 +1121,7 @@ A thread's one-shot subscription to an event, registered by the `await_event` LL
 
 **The agent owns all three verbs on its own subscriptions** (`engine/event_wait/agent_surface.rs`): `await_event` arms, `list_event_waits` reads, `cancel_event_wait` stands down, mirrored as `lucidos await-event` / `lucidos event-waits list` / `lucidos event-waits cancel`. All three are scoped to the CALLING thread and take no thread argument, which is what stops one thread reading or ending another's; it is also why the family is a deliberate non-domain in the *capability parity manifest*, whose generators would have to make the thread id an ordinary flag. The read exists because an agent cannot otherwise know: a subscription is spent when it fires and can expire or be stopped while the agent is not running, and one told its user twice that a watch was armed when it had been dead for two hours.
 
-**Ending one is never silent, and a thread-level Stop is not one of the ways.** Stop ends the turn only (removed 2026-08-07; `EventWaitCancelCause::ThreadCanceled` is retired but still deserialized for old rows). The live causes are `UserStop` (the **Stop waiting** button), `AgentStandDown`, `ThreadArchived` and `ThreadDiscarded`. `AgentStandDown` also covers a thread stopping a background task it watched, through `bash_kill`, `lucidos background-task stop` or `lucidos hardened mark` (ADR 0369). The archive confirms first, naming every subscription the cascade would stop, and every stop leaves a mark in the transcript when it happens.
+**Ending one is never silent, and a thread-level Stop is not one of the ways.** Stop ends the turn only (removed 2026-08-07; `EventWaitCancelCause::ThreadCanceled` is retired but still deserialized for old rows). The live causes are `UserStop` (the **Stop waiting** button), `AgentStandDown`, `ThreadArchived`, `ThreadDiscarded` and `SnapshotRestored`. A workspace restore writes the last for every subscription the snapshot carried in. `AgentStandDown` also covers a thread stopping a background task it watched, through `bash_kill`, `lucidos background-task stop` or `lucidos hardened mark` (ADR 0369). The archive confirms first, naming every subscription the cascade would stop, and every stop leaves a mark in the transcript when it happens.
 
 A `UserStop` leaves a **turn**, drawn as a headerless event row like *Response canceled* and *Paused by restart*. The device that pressed the button shows in its origin popover: a person did something to this thread, and the moment is the point. Every other cause is somebody acting inside a turn, most sharply an agent's mid-turn stand-down, so it leaves an *event row* where it happened.
 
@@ -3333,12 +3333,10 @@ What makes it dismissable is the **announced engine version id**, the identity o
 
 Until 2026-08-13 the pending case had no id, so its X hid the toast and the 4s poll drew it again. The poll may now CREATE the toast only when it has not been deferred. Otherwise it only UPDATES one already on screen, the rule *background activity* follows, so it never resurrects what the user closed. The pending row in the *activity group* is how they ask for it back.
 
-### Wedged rebuild
-A *pending engine version* that rebuilding has been PROVED unable to deliver: a build for the checkout's current HEAD already finished successfully and produced nothing switchable, so re-running it compiles the same source and lands in the same place. Reported as **`rebuild_wedged`** on `version_status` and derived by one pure predicate, `rebuild_is_wedged` (`engine_version.rs`), which the self-heal driver's own give-up is also expressed in terms of so the wire and the driver cannot disagree.
+### Verified engine build
+A source build whose published executable has been probed uncached and proved to differ from the running engine and cover HEAD. Only that proof produces `BuildState::Ready`. Script exit success first produces **Verifying**, a progress state that offers no Switch yet.
 
-**The verdict is the engine's to make, and it is scoped to a HEAD.** `BuildState::Ready` carries the `built_head` the build was STARTED from (started-from, or an Apply landing mid-build would make the finished build claim a commit it never compiled), and that is the only reason the question is answerable: a frontend deriving it from `build_state === 'ready'` alone would call a workspace wedged when a build merely predates newer commits, and refuse the rebuild that would in fact help. Commits landing after that build therefore re-arm it, and an unknown on either side is not a proof, so it falls to false and keeps the escape hatch offered.
-
-What it changes is the advice. The pending toast normally carries *Rebuild*; a wedged one withholds it, turns `warning`, and names the relaunch instead, because pressing the button runs a few-second no-op build and puts the same toast straight back (the loop reported on 2026-08-13). The badge tints amber for the same reason: this one will not clear on its own. The chat agent's ENGINE BUILD prompt section carries the case too, so it stops advising a Switch or a Rebuild that cannot work. The canonical cause is ADR 0063's one-shot transition, where the running engine watches a launch path nothing will write again; see `docs/plans/2026-08-13-pending-engine-version-is-a-first-class-surface.md`.
+An undelivered executable gets one fresh retry per HEAD in a build attempt, then a named failure with **Retry build**. HEAD movement asks for an incremental build only when the artifact already covers the starting HEAD. A manual retry starts another attempt. This replaces the retired dead-end verdict; see [ADR 0617](adr/0617-engine-build-delivery-proof.md).
 
 ### Joined build
 An engine background build that an Apply or a self-heal tick arrived at while it was running (`engine::background_build`, ADR 0412). The request leaves the build alone, sets no state and emits no `EngineBuildStateChanged`. When the build finishes, the task asks whether its result covers HEAD: the published binary's commit for a success, the started-from commit otherwise. If a restart-requiring change sits between that commit and HEAD, the same task builds once more, still `Building`. So any number of joins costs at most one follow-up.
@@ -3528,6 +3526,9 @@ The record of what built an e2e engine: every file cargo read, with its git blob
 ### Retry round
 A `/harden` suite run that covers only what the previous round failed, as `.lucidos/harden-retry` records it: engine-lib tests and browser specs by name, any other suite whole (`hs_retry_plan`, `scripts/lib/harden_suites.sh`). Its pass reads RERUN and clears the record, so the full set runs once more. A retry round never passes the harden (ADR 0536).
 
+### Carried verdict
+A *touched spec*'s pass that the next `/harden` round reuses instead of running the spec again. `.lucidos/harden-carried` records each one as suite, spec and commit, with the untracked fingerprint the run started on (`hs_record_carry`, `scripts/lib/harden_suites.sh`). A source change since that commit voids it, tracked or untracked. A suite whose specs all carry prints `PASS carried from <commit>`. A *retry round* carries nothing (ADR 0616).
+
 ### Per-spec memory sample
 One line the Playwright reporter `crates/lucidos-app/e2e/memSampleReporter.ts` appends at each test end, macOS only. It records the macOS compressor pages, their limit, the change since the previous test in the same worker slot, and the live WebKit GPU processes. The lines go to the run's `mem-samples.log` and to its *mirror*, `~/.lucidos/e2e-mem/<run id>.log`, named for the *e2e run marker* so it outlives worktree cleanup. `report_e2e_mem_top_deltas` ranks them at the end of a run. Format and rationale: `docs/e2e-test-decisions.md` § "Per-spec compressor sampling".
 
@@ -3715,6 +3716,9 @@ It is not a sort key. It drives the thread-row tooltip's "Agent ·" line (fronte
 
 ### last_user_action
 `thread_summaries` column (`TIMESTAMPTZ NOT NULL`) holding when the USER last drove a thread forward: a human `MessageReceived`, `CodingAgentUserMessageSent`, a human `PromptInjected`, `UserQuestionAnswered`, a `*PermissionResolved`, or a `ChangeApplied`/`ChangeDiscarded`. The drawer's recency sort key — `get_saved_threads`/`get_recent_threads`/`get_older_threads` and the `/threads/older` cursor ORDER BY it, so background agent churn (streaming, idle) no longer reshuffles the list. Frontend `meta.lastUserAction` (the `recencyKey` / `byRecent` comparator + the pagination cursor). Distinct from `last_activity` (max-of-both, still used for facets, the family-extension cap, and the LLM/script list surface) and *last_agent_action*. Attention bubbling (REVIEW sectioning) is unchanged — it never keyed off recency.
+
+### Local browser
+A browser whose TCP connection to the gateway facing it started on that machine: a loopback peer, or a peer whose address is the local address it reached. So it runs on a computer running Lucidos. The gateway reads the peer address of the socket it accepted, never a header, and stamps `x-lucidos-local-browser: 1` on the request to the engine. Over the relay it travels as `x-lucidos-relay-local-browser`, an HMAC keyed by the pairing credential, and B strips any copy it cannot verify. The engine sends a local browser the loopback *OAuth redirect URI*, and any other browser a *web redirect URI* (ADR 0622). An SSH port-forward makes a remote browser look local, and is unsupported.
 
 ### Local token
 The machine-local secret that proves an HTTP caller is a process on this machine running as this user: 32 random bytes at `~/.lucidos/local-token`, mode 0600, minted by the *workspace gateway* at startup and re-permissioned on every boot. Sent as `x-lucidos-local-token` by the `lucidos` CLI, the engine's gateway-bound calls (`gateway_auth::client_builder`) and the desktop app. Owned by the dependency-free `lucidos-local-token` crate, which all four crates take, for the reason `lucidos-tailscale` exists: four hand-copies of a header name and a secret path drift, and a stale copy is a caller that silently cannot authenticate.
@@ -5345,12 +5349,12 @@ The frontend as served by `vite serve` rather than built (`import.meta.env.DEV`,
 ### Worktree
 An isolated git worktree under `<workspace>/.lucidos/worktrees/` where an *agent session* runs. All edits, builds, and test runs stay inside it. Scripts resolve paths via `SCRIPT_DIR`, so they pick up the worktree's code automatically. It is cleaned up by Apply, by the `ExitWorktree` CC tool, or by the background `worktree_cleanup` worker.
 
-That worker's reclamation is **retention-gated**. While free disk stays above `FREE_DISK_SOFT_BYTES`, a non-archived thread's worktree is never removed. Its build artifacts go after 1h idle only when the thread has *nothing pending* (ADR 0311). An *archived* thread's worktree goes through the *archived removal* an hour after it idles, whatever it holds (ADR 0458). Live sessions and *stranded worktrees* are handled outside the gate.
+That worker's reclamation is **retention-gated**. While free disk stays above the soft threshold (a quarter of the volume, capped at `FREE_DISK_SOFT_BYTES`), a non-archived thread's worktree is never removed. Its build artifacts go after 1h idle only when the thread has *nothing pending* (ADR 0311). An *archived* thread's worktree goes through the *archived removal* an hour after it idles, whatever it holds (ADR 0458). Live sessions and *stranded worktrees* are handled outside the gate.
 
 For *app coding-agent threads*, the worktree is a sparse checkout (cone mode) of the workspace git, narrowed to `data/apps/<id>/` (see *app worktree*). For Lucidos-internal and external-repo sessions, it is a full checkout of the relevant git.
 
 ### Disk monitor
-The engine task that owns the "Low disk space on your machine" notification (`DiskMonitor`, beside the `worktree_cleanup` worker). It never waits on the database, because a full disk is what stalls Postgres. It probes free space on the workspace volume every minute and alerts once per crossing below `FREE_DISK_SOFT_BYTES`. Each time the pressure level worsens (to soft, then to hard), it wakes the cleanup worker through an in-memory `Notify` (ADR 0311). It re-probes right before the emit, and a stalled emit is dropped and retried with a fresh reading (ADR 0302). Distinct from *worktree reclamation*, which reads free disk at each of its own decisions but needs the database to act.
+The engine task that owns the "Low disk space on your machine" notification (`DiskMonitor`, beside the `worktree_cleanup` worker). It never waits on the database, because a full disk is what stalls Postgres. It probes free space on the workspace volume every minute and alerts once per crossing below the soft threshold. Each time the pressure level worsens (to soft, then to hard), it wakes the cleanup worker through an in-memory `Notify` (ADR 0311). It re-probes right before the emit, and a stalled emit is dropped and retried with a fresh reading (ADR 0302). Distinct from *worktree reclamation*, which reads free disk at each of its own decisions but needs the database to act.
 
 ### Worktree reclamation
 Freeing the disk a *worktree* occupies once it is spent. **Exactly one subsystem owns it: the background `worktree_cleanup` worker** (ADR 0035). It weighs retention on evidence it gathers while nothing is racing it:
@@ -6009,6 +6013,19 @@ The database role behind `LUCIDOS_DATABASE_URL`: `<database>_agent` (shortened w
 
 ### ONNX Runtime mirror
 The Lucidos-owned copy of the static ONNX Runtime archives that `fastembed` links, kept as release assets on `lucidos-dev/onnxruntime-mirror`. The vendored `ort-sys` build script (`crates/vendor/ort-sys/`) fetches from it first, then from `parcel.pyke.io`. It checks every download against the SHA-256 in the unchanged upstream `dist.txt`. It holds only the archives for the four shipped triples. It is not the *public mirror* of this repository. A *temporary measure* (ADR 0595).
+
+### Resource publication lock
+The host-wide filesystem lock cooperating gateways take while publishing or
+removing workspace resources. Cleanup uses it to keep a peer gateway from
+claiming a database between ownership observation and deletion. This is distinct
+from an engine lock, which excludes writers in one workspace.
+
+### Cleanup fingerprint
+The digest of a reviewed resource's identity and observed state. A frozen cleanup
+batch carries it and confirmation observes the resource again. A changed
+fingerprint or an observation that cannot be obtained refuses deletion. Registry,
+filesystem and database observations retain their independent ownership checks;
+a digest is a change detector, not authority to delete.
 
 ## When to add a term
 

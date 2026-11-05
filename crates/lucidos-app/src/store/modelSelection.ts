@@ -1,5 +1,5 @@
 import { filterListItems } from '../utils/listFilter';
-import { REASONING_LEVELS, availableReasoningLevels } from './models';
+import { REASONING_LEVELS, availableReasoningLevels } from './reasoningLevels';
 
 /** A *model selection* is a model id paired with a reasoning effort, resolved
  *  together for one surface. On the Lucidos Agent's surfaces it carries a

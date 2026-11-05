@@ -211,3 +211,31 @@ async fn a_page_carries_the_pair_stamped_behind_it() {
     let unpaged = snapshot(thread_id, &[]).await;
     assert!(unpaged.get("pairStamps").is_none(), "unpaged sends none");
 }
+
+/// A card size picked behind the page still sizes a later card of that widget
+/// instance, so the snapshot carries the thread's card sizes. An unpaged read
+/// sends none.
+#[tokio::test]
+async fn a_page_carries_the_card_size_picked_behind_it() {
+    let pool = pool().await;
+    let thread_id = seed_thread(&pool, 12).await;
+    sqlx::query(
+        "UPDATE events SET event_type = 'InlineWidgetSized', \
+         payload = '{\"app_id\":\"player\",\"params\":{\"clip\":\"a.mp3\"},\"size\":\"large\"}'::jsonb \
+         WHERE thread_id = $1 AND payload->>'text' = 'message 0'",
+    )
+    .bind(thread_id)
+    .execute(&pool)
+    .await
+    .expect("turn the oldest event into a card size");
+
+    let body = snapshot(thread_id, &[("limit", "4".into())]).await;
+    let sizes = body["cardSizes"].as_array().expect("cardSizes on a page");
+    assert_eq!(sizes.len(), 1);
+    assert_eq!(sizes[0]["app_id"], "player");
+    assert_eq!(sizes[0]["params"]["clip"], "a.mp3");
+    assert_eq!(sizes[0]["size"], "large");
+
+    let unpaged = snapshot(thread_id, &[]).await;
+    assert!(unpaged.get("cardSizes").is_none(), "unpaged sends none");
+}

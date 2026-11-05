@@ -46,9 +46,9 @@
  */
 
 import { workspaceDisplayName } from '../store';
-import { listWorkspaces, type WorkspaceStatus } from '../../api/client/control';
+import { listRemoteWorkspaces, listWorkspaces, type WorkspaceStatus } from '../../api/client/control';
 import { getWorkspaceLabel } from '../../api/client';
-import { IS_PICKER, WORKSPACE_ID } from '../../utils/basePath';
+import { IS_PICKER, WORKSPACE_ID, parseWorkspaceRoute } from '../../utils/basePath';
 
 /** Adopt the label for THIS workspace out of a control listing someone else
  *  already fetched (the in-app workspace switcher fetches one every time its row
@@ -69,7 +69,14 @@ export async function loadWorkspaceDisplayName(): Promise<void> {
   if (IS_PICKER) return;
   try {
     if (WORKSPACE_ID !== null) {
-      adoptWorkspaceDisplayName(await listWorkspaces());
+      const route = parseWorkspaceRoute(WORKSPACE_ID);
+      if (route?.gateway) {
+        const listing = (await listRemoteWorkspaces()).find((g) => g.gateway === route.gateway);
+        if (listing?.state === 'reachable') {
+          const entry = listing.workspaces.find((w) => w.id === route.slug);
+          if (entry) workspaceDisplayName.value = entry.name;
+        }
+      } else adoptWorkspaceDisplayName(await listWorkspaces());
       return;
     }
     // Direct engine port. The engine answers `null` when it has no gateway to

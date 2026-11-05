@@ -9,6 +9,13 @@ describe('pairingCodeFromText', () => {
     expect(pairingCodeFromText('  https://mac.ts.net/~/?pair=01234567\n')).toBe('01234567');
   });
 
+  it('takes a long secret, bare or in its link', () => {
+    const secret = 'ldp_abcdefghijklmnopqrstuvwxyz';
+    expect(pairingCodeFromText(` ${secret}\n`)).toBe(secret);
+    expect(pairingCodeFromText(`https://lucidos.example.com/~/?pair=${secret}`)).toBe(secret);
+    expect(pairingCodeFromText('lgp_abcdefghijklmnopqrstuvwxyz')).toBeNull();
+  });
+
   it('takes a bare code, however the user spaced it', () => {
     expect(pairingCodeFromText('01234567')).toBe('01234567');
     expect(pairingCodeFromText(' 4711 8899 ')).toBe('47118899');

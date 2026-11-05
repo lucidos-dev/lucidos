@@ -51,6 +51,17 @@ describe('the fake Claude Code', () => {
     expect(lines[0].response.response.models.map((m: Line) => m.value)).toContain('haiku');
   });
 
+  it('runs the read-only origin probe without returning credentials or spawn errors', () => {
+    const out = execFileSync(process.execPath, [FAKE], {
+      input: `${JSON.stringify(user('Session instructions\nProbe snapshot restore origin.\nAdditional context'))}\n`,
+      encoding: 'utf8',
+      env: { ...NO_DELAY, LUCIDOS_AGENT_ORIGIN_TOKEN: '' },
+    });
+    const lines = out.trim().split('\n').map(l => JSON.parse(l));
+    expect(lines.at(-1)?.result).toBe('{"verified":false}');
+    expect(lines.find(l => l.type === 'assistant')?.message.content).toEqual([{ type: 'text', text: '{"verified":false}' }]);
+  });
+
   it('runs a Say exactly turn: init, replay, the text, then result', () => {
     const lines = runFake(['--model', 'haiku'], [user('Say exactly: "hello X" and nothing else.')]);
     const init = lines[0];

@@ -1,6 +1,6 @@
 # 0407: Inline widget cards fit their content and never scroll; the shelf holds only pinned widgets
 
-- **Status**: Accepted
+- **Status**: Superseded by [ADR 0621](0621-widgets-one-box-no-pin.md): one widget box for the card and the tile, and no shelf
 - **Date**: 2026-10-09
 
 ## Context

@@ -9,7 +9,7 @@
  * while a morph runs.
  */
 import { EASING_DISCLOSURE } from '../utils/disclosureMotion';
-import { isReducedMotion, scaledDurationMs } from '../utils/motion';
+import { isReducedMotion, scaledDurationMs } from '@lucidos/motion';
 
 /** Carried by the root of each step's content, naming the step. */
 export const SURFACE_STEP_ATTR = 'data-surface-step';

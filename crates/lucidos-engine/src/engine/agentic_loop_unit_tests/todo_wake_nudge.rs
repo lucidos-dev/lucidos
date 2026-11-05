@@ -92,6 +92,15 @@ mod todo_wake_nudge_tests {
         );
     }
 
+    /// A live child reports back on its own, and the wake check counts it.
+    /// The text must say so, or it tells an orchestrator to `await_event` its
+    /// own child, against the FAN-OUT rule.
+    #[test]
+    fn the_instruction_names_child_threads_among_what_re_opens_a_thread() {
+        let text = todo_wake_nudge_instruction(1, false);
+        assert!(text.contains("child thread"), "names child threads: {text}");
+    }
+
     /// The mode withdraws `todo_write` whole, so the nudge may not name it.
     /// An offered action the model cannot take is a round spent on a refusal.
     #[test]

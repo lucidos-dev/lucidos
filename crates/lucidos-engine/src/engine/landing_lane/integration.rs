@@ -11,8 +11,8 @@ use super::LaneMember;
 use crate::engine::claude_code::{WORKTREE_EXCLUDE_PATHS, WORKTREE_WORKSPACE_MARKER};
 use crate::engine::git_ops::{
     add_paths_to_worktree_exclude, clear_stranded_worktree_dir, consume_harden_marker,
-    consume_plan_marker, git_answer, git_answer_when_ok, git_cmd, landing_base, lane_branch,
-    lane_branch_batch, parse_worktree_list, push_to_origin_main, worktree_add,
+    consume_plan_marker, git_answer, git_answer_when_ok, git_cmd, has_unmerged_paths, landing_base,
+    lane_branch, lane_branch_batch, parse_worktree_list, push_to_origin_main, worktree_add,
     worktree_current_branch, worktree_liveness, worktrees_dir, BaseRefusal, GitAnswer,
     LandingOrder, MainLocks, PushOutcome, LANE_BRANCH_PREFIX,
 };
@@ -154,11 +154,7 @@ pub(crate) async fn verify_integration(
         GitAnswer::Yes => return Err("a merge is still in progress".into()),
         GitAnswer::Unknown => return Err("git could not say whether a merge is open".into()),
     }
-    let unmerged = git_answer_when_ok(&["diff", "--name-only", "--diff-filter=U"], worktree, |o| {
-        !o.stdout.is_empty()
-    })
-    .await;
-    match unmerged {
+    match has_unmerged_paths(worktree).await {
         GitAnswer::No => {}
         GitAnswer::Yes => return Err("some files are still unmerged".into()),
         GitAnswer::Unknown => return Err("git could not list unmerged files".into()),

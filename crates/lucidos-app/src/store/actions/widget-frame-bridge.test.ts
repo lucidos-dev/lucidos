@@ -84,9 +84,9 @@ describe('handleWidgetFrameMessage', () => {
     expect(frame.dispatchEvent).not.toHaveBeenCalled();
   });
 
-  it('takes a menu request from a frame inside the top panel, as the open shelf widget is', () => {
-    pushOverlay({ id: 'the shelf drop', dismiss: () => {}, hasPanel: true });
-    panel = 'the shelf drop';
+  it('takes a menu request from a frame inside the top panel', () => {
+    pushOverlay({ id: 'the top panel', dismiss: () => {}, hasPanel: true });
+    panel = 'the top panel';
     handleWidgetFrameMessage(message({ type: WIDGET_MENU_MESSAGE_TYPE, at: { x: 40, y: 24 } }));
     expect(dispatched().type).toBe(APP_FRAME_MENU_EVENT);
   });

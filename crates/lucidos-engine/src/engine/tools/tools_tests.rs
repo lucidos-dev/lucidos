@@ -575,7 +575,8 @@ fn tap_thread_id(args: &serde_json::Value, caller: Uuid) -> Option<String> {
     let parsed = parse_send_notification_args(args, caller).expect("args must parse");
     match parsed.tap {
         crate::scheduler::notifications::Tap::Navigate { to } => to.id,
-        crate::scheduler::notifications::Tap::Modal => None,
+        crate::scheduler::notifications::Tap::Modal
+        | crate::scheduler::notifications::Tap::RestoreSnapshot { .. } => None,
     }
 }
 
@@ -647,6 +648,24 @@ fn the_derived_tap_still_passes_the_guard() {
         tap_thread_id(&bare, caller),
         None,
         "no event means the card"
+    );
+}
+
+/// Only the engine writes an "Undo restore" tap. A model that could write one
+/// would put any snapshot behind the undo confirmation.
+#[test]
+fn a_restore_snapshot_tap_is_refused() {
+    let args = json!({
+        "title": "Undo the restore",
+        "message": "Tap to undo.",
+        "tap": {"kind": "restore-snapshot", "workspace_id": "example",
+                "handle": "snap_00000000000000000000000000"}
+    });
+    let out = parse_send_notification_args(&args, Uuid::new_v4());
+    assert!(
+        matches!(&out, Err(msg) if msg.contains("restore-snapshot")),
+        "{:?}",
+        out.err()
     );
 }
 

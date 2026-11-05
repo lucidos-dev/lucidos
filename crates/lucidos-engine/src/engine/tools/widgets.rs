@@ -1,19 +1,20 @@
 //! Handler for the grouped `widgets` tool: the agent's path to every action
-//! on a thread's widgets, its shelf and the dashboards (ADRs 0402, 0407,
-//! 0496). The schema is built from the capability parity manifest; the HTTP
+//! on reusable widgets, a thread's widget cards and the dashboards (ADRs
+//! 0402, 0496). The schema is built from the capability parity manifest; the HTTP
 //! routes in `api/widgets.rs` share the same checks.
 
 use uuid::Uuid;
 
 use super::LucidosEngine;
+use crate::core::apps::WidgetSize;
 use crate::engine::dashboard::{self, DashboardChange, DashboardTile, DashboardView};
 use crate::engine::thread_events::{ArrangedTile, Dashboard};
-use crate::engine::widgets::{self, WidgetChange, WidgetInstance};
+use crate::engine::widgets::{self, WidgetInstance};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-const ACTIONS: &str = "list, thread, pin, unpin, make_reusable, stop_reusing, dashboard, \
-                       add_to_dashboard, remove_from_dashboard, arrange";
+const ACTIONS: &str = "list, size, make_reusable, stop_reusing, dashboard, add_to_dashboard, \
+                       remove_from_dashboard, arrange";
 
 impl LucidosEngine {
     pub(crate) async fn execute_widgets(
@@ -25,16 +26,7 @@ impl LucidosEngine {
         let action = args["action"].as_str().map(str::trim).unwrap_or("");
         match action {
             "list" => self.widgets_list(),
-            "thread" => self.widgets_thread(args, thread_id).await,
-            "pin" => {
-                let shown_event_id = super::parse_optional_uuid(args, "shown_event_id")?;
-                self.widgets_change(WidgetChange::Pin { shown_event_id }, args, thread_id)
-                    .await
-            }
-            "unpin" => {
-                self.widgets_change(WidgetChange::Unpin, args, thread_id)
-                    .await
-            }
+            "size" => self.widgets_card_size(args, thread_id).await,
             "make_reusable" => self.widgets_set_reusable(args, thread_id, true).await,
             "stop_reusing" => self.widgets_set_reusable(args, thread_id, false).await,
             "dashboard" => {
@@ -43,8 +35,14 @@ impl LucidosEngine {
                 Ok(describe_dashboard(&view))
             }
             "add_to_dashboard" => {
-                self.widgets_dashboard_change(DashboardChange::Add, args, thread_id, device_id)
-                    .await
+                let size = optional_size(args)?;
+                self.widgets_dashboard_change(
+                    DashboardChange::Add { size },
+                    args,
+                    thread_id,
+                    device_id,
+                )
+                .await
             }
             "remove_from_dashboard" => {
                 self.widgets_dashboard_change(DashboardChange::Remove, args, thread_id, device_id)
@@ -68,70 +66,30 @@ impl LucidosEngine {
             .join("\n"))
     }
 
-    async fn widgets_thread(
+    async fn widgets_card_size(
         &self,
         args: &serde_json::Value,
         caller: Uuid,
     ) -> Result<String, BoxError> {
-        let thread_id = target_thread(args, caller)?;
-        let shown = widgets::thread_widgets(&self.pool, &self.app_manager, thread_id).await?;
-        if shown.is_empty() {
-            return Ok("No widget was shown or pinned in this thread.".to_string());
-        }
-        Ok(shown
-            .iter()
-            .map(|w| {
-                let mut line = format!(
-                    "- {} (id: `{}`)",
-                    w.label.as_ref().unwrap_or(&w.name),
-                    w.app_id
-                );
-                if let Some(params) = &w.params {
-                    line.push_str(&format!(
-                        ", params {}",
-                        widgets::canonical_widget_params(params)
-                    ));
-                }
-                if w.pinned {
-                    line.push_str(", pinned to the shelf");
-                }
-                if w.reusable {
-                    line.push_str(", reusable");
-                }
-                line
-            })
-            .collect::<Vec<_>>()
-            .join("\n"))
-    }
-
-    async fn widgets_change(
-        &self,
-        change: WidgetChange,
-        args: &serde_json::Value,
-        caller: Uuid,
-    ) -> Result<String, BoxError> {
+        let size = optional_size(args)?.ok_or("size is required (small, medium or large)")?;
         let instance = WidgetInstance::from_args(args)?;
         let app_id = instance.app_id.clone();
         let thread_id = target_thread(args, caller)?;
-        widgets::check_widget_change(&self.pool, &self.app_manager, change, &instance, thread_id)
+        widgets::check_card_size(&self.pool, &self.app_manager, &instance, size, thread_id)
             .await
             .map_err(|e| e.to_string())?;
-        widgets::emit_widget_change(
+        widgets::emit_card_size(
             &self.event_bus,
-            change,
             instance,
+            size,
             thread_id,
             Some(super::agent_tool_actor(caller)),
         )
         .await?;
-        Ok(match change {
-            WidgetChange::Pin { .. } => {
-                format!("Pinned widget '{app_id}' to thread {thread_id}'s shelf.")
-            }
-            WidgetChange::Unpin => {
-                format!("Unpinned widget '{app_id}' from thread {thread_id}'s shelf.")
-            }
-        })
+        Ok(format!(
+            "Widget '{app_id}' cards in thread {thread_id} are {} now.",
+            size.as_str()
+        ))
     }
 
     async fn widgets_set_reusable(
@@ -206,11 +164,11 @@ impl LucidosEngine {
         .await?;
         let name = which.as_str();
         Ok(match change {
-            DashboardChange::Add if made_reusable => format!(
+            DashboardChange::Add { .. } if made_reusable => format!(
                 "Made widget '{app_id}' reusable and added it to the {name} dashboard, \
                  so it stays there if its thread is deleted."
             ),
-            DashboardChange::Add => format!("Added '{app_id}' to the {name} dashboard."),
+            DashboardChange::Add { .. } => format!("Added '{app_id}' to the {name} dashboard."),
             DashboardChange::Remove => {
                 format!("Removed '{app_id}' from the {name} dashboard.")
             }
@@ -288,6 +246,17 @@ fn app_id(args: &serde_json::Value) -> Result<&str, BoxError> {
         .ok_or_else(|| "app_id is required".into())
 }
 
+/// The `size` argument, when one is given.
+fn optional_size(args: &serde_json::Value) -> Result<Option<WidgetSize>, BoxError> {
+    match &args["size"] {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(raw) => WidgetSize::parse(raw.trim())
+            .map(Some)
+            .ok_or_else(|| format!("unknown size '{raw}'. Use small, medium or large.").into()),
+        other => Err(format!("size must be a string, not {other}").into()),
+    }
+}
+
 /// The thread a widget action targets: the caller's own unless named.
 fn target_thread(args: &serde_json::Value, caller: Uuid) -> Result<Uuid, BoxError> {
     match &args["thread_id"] {
@@ -319,27 +288,6 @@ mod tests {
         assert_eq!(
             manifest, handled,
             "widgets handler drifted from the manifest"
-        );
-    }
-
-    /// Invariant: a new pin starts at its widget's default size, so a pin
-    /// takes no size on any surface (ADR 0432).
-    #[test]
-    fn no_pin_surface_takes_a_size() {
-        let domain = domain_for_tool("widgets").expect("widgets domain");
-        let op = domain
-            .operations
-            .iter()
-            .find(|o| o.action == "pin")
-            .expect("the op exists");
-        assert!(op.args.iter().all(|a| !a.name.contains("size")));
-        assert!(op.llm_schema.is_none(), "pin derives from its args");
-        let instance =
-            WidgetInstance::from_args(&serde_json::json!({"app_id": "clock", "size": "large"}))
-                .unwrap();
-        assert_eq!(
-            instance.app_id, "clock",
-            "a stray size is ignored, never stored"
         );
     }
 

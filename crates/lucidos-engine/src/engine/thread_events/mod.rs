@@ -36,7 +36,7 @@ pub use capture::CaptureFormat;
 pub use cause::{AbortCause, CancelCause, EventWaitCancelCause, UnproposedReason, UnqueueReason};
 pub use channel::{EventChannel, FireRetry, RetryOf, RetrySkipReason, TriggerInvocation};
 pub use dashboard::{ArrangedTile, Dashboard, LegacyArrangedTile};
-pub use event::ThreadEvent;
+pub use event::{RecoveredCompose, ThreadEvent};
 pub use event_impl::{
     not_a_keep_alive_idle_sql, KEEP_ALIVE_ENDING_EVENT_TYPES, KEEP_ALIVE_IDLE_REASON,
 };

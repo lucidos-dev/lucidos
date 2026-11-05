@@ -99,6 +99,10 @@ describe('lucidos.sse dispatch', () => {
  * do to the SDK: open, drop, and deliver a frame. A reopen is an open after a
  * drop.
  */
+const hello = JSON.stringify({ type: 'StreamHello', data: {
+  restore_generation: '11111111-1111-4111-8111-111111111111',
+} });
+
 interface Transport {
   name: string;
   install(): void;
@@ -119,6 +123,7 @@ const direct: Transport = {
   open: () => {
     vi.advanceTimersByTime(EVENT_STREAM_RETRY_MS);
     FakeEventSource.last!.onopen!();
+    deliver(hello);
   },
   drop: () => FakeEventSource.last!.onerror!(),
   frame: (data) => FakeEventSource.last!.onmessage!({ data }),
@@ -139,7 +144,10 @@ const shared: Transport = {
     vi.stubGlobal('SharedWorker', class { port = port; });
   },
   // The worker also sends this to a port that joins a stream already up.
-  open: () => port.onmessage!({ data: { t: 'open' } }),
+  open: () => {
+    port.onmessage!({ data: { t: 'open' } });
+    port.onmessage!({ data: { t: 'frame', data: hello } });
+  },
   drop: () => port.onmessage!({ data: { t: 'error' } }),
   frame: (data) => port.onmessage!({ data: { t: 'frame', data } }),
 };
@@ -258,6 +266,7 @@ describe('lucidos.sse over a direct EventSource that gave up', () => {
     const off = sse.onOpen(opened);
     const first = FakeEventSource.last!;
     first.onopen!();
+    deliver(hello);
     first.onerror!();
 
     vi.advanceTimersByTime(EVENT_STREAM_RETRY_MS - 1);
@@ -266,6 +275,7 @@ describe('lucidos.sse over a direct EventSource that gave up', () => {
     expect(FakeEventSource.last).not.toBe(first);
 
     FakeEventSource.last!.onopen!();
+    deliver(hello);
     expect(opened).toHaveBeenCalledTimes(2);
     off();
   });
@@ -364,5 +374,33 @@ describe('lucidos.sse tells a relaying host what it listens to', () => {
     offPinned();
     await Promise.resolve();
     expect(host.calls[host.calls.length - 1]).toEqual({ op: 'sse.types', args: { types: [] } });
+  });
+});
+
+describe('direct stream restore provenance', () => {
+  it('applies hello before listeners and never reopens a changed page', async () => {
+    const { directRestoreGeneration: fence } = await import('./_restoreGeneration');
+    vi.stubGlobal('EventSource', FakeEventSource);
+    vi.stubGlobal('SharedWorker', undefined);
+    const first = '11111111-1111-4111-8111-111111111111';
+    const next = '22222222-2222-4222-8222-222222222222';
+    const seen: string[] = [];
+    const off = sse.on('StreamHello', () => seen.push(fence.capture().header));
+    try {
+      sse.connect();
+      deliver(JSON.stringify({ type: 'StreamHello', data: { restore_generation: first } }));
+      expect(seen).toEqual([first]);
+      const pending = fence.capture();
+      deliver(JSON.stringify({ type: 'StreamHello', data: { restore_generation: next } }));
+      expect(() => pending.assertCurrent()).toThrow(/restored/i);
+      sse.disconnect();
+      sse.connect();
+      deliver(JSON.stringify({ type: 'StreamHello', data: { restore_generation: first } }));
+      expect(() => fence.capture().assertCurrent()).toThrow(/restored/i);
+    } finally {
+      off();
+      sse.disconnect();
+      vi.unstubAllGlobals();
+    }
   });
 });

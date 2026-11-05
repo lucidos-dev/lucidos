@@ -902,7 +902,10 @@ impl EventBus {
                 }
                 Vec::new()
             }
-            ThreadEvent::ThreadStarted { mode, .. } => {
+            ThreadEvent::ThreadStarted { mode, recovered_compose, .. } => {
+                let text = recovered_compose.as_ref().map_or("", |r| r.text.as_str());
+                let images = serde_json::json!(recovered_compose.as_ref().map(|r| &r.image_hashes).cloned().unwrap_or_default());
+                let selection = recovered_compose.as_ref().and_then(|r| r.selection.as_ref());
                 // Compose-time thread creation — the row appears in
                 // `thread_summaries` with `state='composing'` so the frontend
                 // can render it as a draft via cross-device SSE. Default
@@ -915,13 +918,17 @@ impl EventBus {
                 sqlx::query(&format!(
                     r#"INSERT INTO thread_summaries
                         (thread_id, initiator, source, created_at, last_activity, message_count,
-                         state, compose_mode, status)
-                       VALUES ($1, 'user', $3, NOW(), NOW(), 0, 'composing', $2, {IDLE})
+                         state, compose_mode, status, compose_text, compose_images, compose_selection, compose_updated_at)
+                       VALUES ($1, 'user', $3, NOW(), NOW(), 0, 'composing', $2, {IDLE}, $4, $5, $6, CASE WHEN $7 THEN NOW() ELSE NULL END)
                        ON CONFLICT (thread_id) DO NOTHING"#
                 ))
                 .bind(thread_id)
                 .bind(mode)
                 .bind(source)
+                .bind(text)
+                .bind(images)
+                .bind(selection)
+                .bind(recovered_compose.is_some())
                 .execute(&mut **tx)
                 .await?;
                 Vec::new()
@@ -1951,6 +1958,7 @@ impl EventBus {
             | ThreadEvent::WidgetShown { .. }
             | ThreadEvent::WidgetPinned { .. }
             | ThreadEvent::WidgetUnpinned { .. }
+            | ThreadEvent::InlineWidgetSized { .. }
             // The dashboards' legacy seed, folded on read (ADR 0496).
             | ThreadEvent::HomeBoardArranged { .. }
             // The end of a call says nothing a column holds. Persisted so a

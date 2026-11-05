@@ -193,7 +193,19 @@ impl Refreshed {
 /// withdrawn first, and the kept copy serves only when its name matches.
 pub async fn refresh(store: &CertStore, tailnet: Arc<dyn Tailnet>, dir: &Path) -> Refreshed {
     let asked = tailnet.clone();
-    let node = match blocking(move || certifiable(&asked.state())).await {
+    let node = match blocking(move || {
+        let state = asked.state();
+        let addresses = state
+            .node()
+            .map(|n| n.addresses.clone())
+            .unwrap_or_default();
+        Ok((addresses, certifiable(&state)))
+    })
+    .await
+    .and_then(|(addresses, node)| {
+        store.set_tailnet_addresses(addresses);
+        node
+    }) {
         Ok(node) => node,
         Err(reason) => {
             store.withdraw();

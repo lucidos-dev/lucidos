@@ -161,6 +161,10 @@ test.describe('The dashboard panel on a phone', () => {
         await ensureOnThreadPane(page);
         await expect(toggle(page)).toBeVisible({ timeout: 15_000 });
 
+        // The hash router strips `#thread=` once the landing settles (hash-deeplink-router.ts).
+        // Read the hash only after that, or the panel gets blamed for the router's strip.
+        await expect.poll(() => page.evaluate(() => location.hash)).toBe('');
+        await expect.poll(() => page.evaluate(() => localStorage.getItem('lucidos-focused-thread'))).toBe(threadId);
         const hash = await page.evaluate(() => location.hash);
         await openPanel(page);
         expect(await panelTop(page)).toBeCloseTo(await headerBottom(page), 0);
@@ -240,7 +244,7 @@ test.describe('The dashboard panel on a phone', () => {
     await expect(tile(page, b)).toHaveAttribute('data-size', 'small');
 
     await panel(page).locator('.dashboard-edit').click();
-    await tile(page, a).locator('.dashboard-size-pill button[aria-label="small"]').click();
+    await tile(page, a).locator('.widget-size-pill button[aria-label="small"]').click();
     await expect.poll(async () => (await dashboardTiles(page, 'phone')).find((t) => t.app_id === a)?.size).toBe('small');
     expect(await dashboardTiles(page, 'desktop')).toEqual(desktopBefore);
   });

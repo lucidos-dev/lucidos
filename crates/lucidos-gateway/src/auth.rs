@@ -24,7 +24,6 @@
 use axum::http::HeaderMap;
 use lucidos_local_token as local_token;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -100,12 +99,6 @@ impl<'a> PresentedCredential<'a> {
         !self.own_name
     }
 }
-
-/// How long a pairing code stays redeemable. Long enough to walk to another
-/// device, short enough that a code read over a shoulder goes stale.
-const PAIRING_CODE_TTL: Duration = Duration::from_secs(300);
-
-pub(crate) use lucidos_gateway_constants::PAIRING_CODE_DIGITS;
 
 /// What a request proved about itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,133 +318,6 @@ pub fn digest(value: &str) -> String {
     s
 }
 
-/// Wrong guesses this gateway will answer in one window.
-///
-/// `/~/api/v1/auth/pair` is public by necessity, so on a wide bind it is
-/// reachable from the LAN or the tailnet. Without a cap, a caller may work
-/// through the code space as fast as the socket accepts connections. Ten a
-/// minute leaves brute force hopeless against eight digits, and forgives the
-/// handful of typos a real person makes.
-const FAILED_REDEMPTIONS_PER_WINDOW: u32 = 10;
-
-/// How long that budget takes to refill.
-const FAILED_REDEMPTION_WINDOW: Duration = Duration::from_secs(60);
-
-/// Pairing codes that have been minted and not yet redeemed.
-///
-/// In memory only, and deliberately so. A code lives five minutes, so surviving
-/// a restart buys nothing. Persisting it would put a credential-minting secret
-/// on disk for no gain.
-#[derive(Debug, Default)]
-pub struct PendingPairings {
-    codes: HashMap<String, PendingPairing>,
-    /// Wrong guesses answered since [`Self::window_opened`].
-    failed: u32,
-    /// When the current window opened. `None` means no guess has failed yet.
-    window_opened: Option<Instant>,
-}
-
-/// What one redemption attempt produced.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Redemption {
-    /// The code was good, carrying the label suggested when it was minted.
-    Redeemed(Option<String>),
-    /// Wrong, or expired.
-    Rejected,
-    /// Too many wrong guesses lately, so this one was not even compared.
-    ///
-    /// Refusing before the compare is what makes the cap mean anything. A
-    /// throttle that still checks the code slows nobody down.
-    Throttled,
-}
-
-/// One outstanding code, with the label whoever minted it suggested.
-#[derive(Debug)]
-struct PendingPairing {
-    minted: Instant,
-    /// What `lucidos pair --label` asked this device to be called. Carried
-    /// through redemption so the flag does what it says, rather than only
-    /// printing a name into the terminal.
-    label: Option<String>,
-}
-
-impl PendingPairings {
-    /// Mint a code and remember it until it is redeemed or expires.
-    pub fn mint(&mut self, label: Option<String>) -> std::io::Result<String> {
-        self.drop_expired();
-        let code = mint_numeric_code()?;
-        self.codes.insert(
-            code.clone(),
-            PendingPairing {
-                minted: Instant::now(),
-                label,
-            },
-        );
-        Ok(code)
-    }
-
-    /// Redeem a code, consuming it.
-    ///
-    /// A code works once: a second redemption of an observed code must not
-    /// enrol a second device.
-    ///
-    /// A CORRECT code clears the failure budget, so the throttle can never
-    /// stand between a person and a code they typed right. Only wrong guesses
-    /// spend it. That keeps this a brute-force defence, rather than a way for
-    /// an attacker to lock the user out of pairing.
-    pub fn redeem(&mut self, presented: &str) -> Redemption {
-        self.drop_expired();
-        if self.guessing_is_throttled() {
-            return Redemption::Throttled;
-        }
-        // Found by constant-time compare rather than `HashMap::remove`, so a
-        // wrong code cannot be narrowed down by how long the lookup took.
-        let key = self
-            .codes
-            .keys()
-            .find(|k| ct_eq(k, presented.trim()))
-            .cloned();
-        match key.and_then(|k| self.codes.remove(&k)) {
-            Some(pending) => {
-                self.failed = 0;
-                self.window_opened = None;
-                Redemption::Redeemed(pending.label)
-            }
-            None => {
-                self.record_failed_guess();
-                Redemption::Rejected
-            }
-        }
-    }
-
-    /// Has this gateway already answered its budget of wrong guesses?
-    fn guessing_is_throttled(&self) -> bool {
-        match self.window_opened {
-            Some(opened) if opened.elapsed() < FAILED_REDEMPTION_WINDOW => {
-                self.failed >= FAILED_REDEMPTIONS_PER_WINDOW
-            }
-            // No window yet, or the last one has rolled. Nothing is owed.
-            _ => false,
-        }
-    }
-
-    /// Spend one of the budget, opening a fresh window when the last has rolled.
-    fn record_failed_guess(&mut self) {
-        match self.window_opened {
-            Some(opened) if opened.elapsed() < FAILED_REDEMPTION_WINDOW => self.failed += 1,
-            _ => {
-                self.window_opened = Some(Instant::now());
-                self.failed = 1;
-            }
-        }
-    }
-
-    fn drop_expired(&mut self) {
-        self.codes
-            .retain(|_, pending| pending.minted.elapsed() < PAIRING_CODE_TTL);
-    }
-}
-
 /// How often the gateway will say that it turned a device away.
 ///
 /// A refusal is not rare: an unpaired browser makes one per asset. One line a
@@ -518,12 +384,6 @@ pub fn mint_credential() -> std::io::Result<String> {
     local_token::mint_hex(32)
 }
 
-/// How long a minted pairing code stays redeemable, in seconds. Reported to the
-/// client so the pairing screen can say it rather than guess.
-pub fn pairing_code_ttl_secs() -> u64 {
-    PAIRING_CODE_TTL.as_secs()
-}
-
 /// Render the `Set-Cookie` value that hands a device its credential.
 ///
 /// `name` is this gateway's own ([`device_cookie_name`]), never the legacy one:
@@ -567,33 +427,6 @@ pub fn request_is_secure(headers: &HeaderMap, connection_is_tls: bool) -> bool {
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.split(',').next().is_some_and(|p| p.trim() == "https"))
-}
-
-/// `raw` if it is a pairing code exactly as minted, trimmed.
-///
-/// The reader for what [`mint_numeric_code`] writes, so one grammar governs
-/// both. Its strictness is load-bearing. A caller-supplied code is echoed into
-/// the PWA manifest's `start_url`, and that is a JSON document the browser
-/// reads. Decimal digits cannot escape any context they land in.
-pub fn valid_pairing_code(raw: &str) -> Option<&str> {
-    let code = raw.trim();
-    let well_formed =
-        code.len() == PAIRING_CODE_DIGITS as usize && code.bytes().all(|b| b.is_ascii_digit());
-    well_formed.then_some(code)
-}
-
-/// A zero-padded decimal pairing code, drawn from the same entropy source as
-/// every other secret here.
-fn mint_numeric_code() -> std::io::Result<String> {
-    use std::io::Read as _;
-    let mut buf = [0u8; 8];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
-    let modulus = 10u64.pow(PAIRING_CODE_DIGITS);
-    let value = u64::from_be_bytes(buf) % modulus;
-    Ok(format!(
-        "{value:0width$}",
-        width = PAIRING_CODE_DIGITS as usize
-    ))
 }
 
 /// Read the local token, minting it on first use. A gateway-less engine mints
@@ -1203,146 +1036,6 @@ mod tests {
         assert!(request_is_secure(&chain, false));
         let plain = headers(&[("x-forwarded-proto", "http")]);
         assert!(!request_is_secure(&plain, false));
-    }
-
-    #[test]
-    fn a_pairing_code_redeems_once_and_then_never_again() {
-        let mut pending = PendingPairings::default();
-        let code = pending.mint(None).unwrap();
-        assert_eq!(code.len(), PAIRING_CODE_DIGITS as usize);
-        assert!(code.chars().all(|c| c.is_ascii_digit()));
-        assert_eq!(
-            pending.redeem(&code),
-            Redemption::Redeemed(None),
-            "the first redemption must work"
-        );
-        assert_eq!(
-            pending.redeem(&code),
-            Redemption::Rejected,
-            "an observed code must not enrol a second device"
-        );
-    }
-
-    #[test]
-    fn an_unminted_code_never_redeems() {
-        let mut pending = PendingPairings::default();
-        pending.mint(None).unwrap();
-        assert_eq!(pending.redeem("00000000"), Redemption::Rejected);
-        assert_eq!(pending.redeem(""), Redemption::Rejected);
-    }
-
-    #[test]
-    fn a_code_reader_accepts_exactly_what_the_minter_writes() {
-        let mut pending = PendingPairings::default();
-        let minted = pending.mint(None).unwrap();
-        assert_eq!(valid_pairing_code(&minted), Some(minted.as_str()));
-        assert_eq!(valid_pairing_code("01234567"), Some("01234567"));
-        assert_eq!(valid_pairing_code("  01234567  "), Some("01234567"));
-    }
-
-    #[test]
-    fn a_code_reader_refuses_anything_that_could_escape_a_json_string() {
-        // This value is echoed into the manifest's `start_url`, so the grammar
-        // is the whole defence. Each of these is a caller's to send.
-        for raw in [
-            "",
-            "   ",
-            "0123456",
-            "012345678",
-            "0123456a",
-            "0123 567",
-            "0123456\"",
-            "01234567\"}",
-            "0123456\n",
-            "../../etc",
-            "01234567&x=1",
-            "%30%31%32%33%34%35%36%37",
-        ] {
-            assert_eq!(valid_pairing_code(raw), None, "accepted {raw:?}");
-        }
-    }
-
-    #[test]
-    fn the_label_given_at_mint_survives_redemption() {
-        // `lucidos pair --label` printed a name and attached it to nothing, so
-        // the device landed under the default. The label rides the code now.
-        let mut pending = PendingPairings::default();
-        let code = pending.mint(Some("My iPhone".into())).unwrap();
-        assert_eq!(
-            pending.redeem(&code),
-            Redemption::Redeemed(Some("My iPhone".into()))
-        );
-    }
-
-    #[test]
-    fn a_code_minted_without_a_label_redeems_to_no_label() {
-        let mut pending = PendingPairings::default();
-        let code = pending.mint(None).unwrap();
-        assert_eq!(pending.redeem(&code), Redemption::Redeemed(None));
-    }
-
-    // ── Guessing is rate limited ────────────────────────────────────────────
-
-    #[test]
-    fn wrong_guesses_run_out_and_then_are_not_even_compared() {
-        // The public reachability of `/~/api/v1/auth/pair` is the whole reason.
-        // Unthrottled, eight digits fall to a caller on the LAN who can guess
-        // as fast as the socket accepts.
-        let mut pending = PendingPairings::default();
-        pending.mint(None).unwrap();
-        for i in 0..FAILED_REDEMPTIONS_PER_WINDOW {
-            assert_eq!(
-                pending.redeem("00000000"),
-                Redemption::Rejected,
-                "guess {i} is within the budget"
-            );
-        }
-        assert_eq!(
-            pending.redeem("00000000"),
-            Redemption::Throttled,
-            "the budget must run out"
-        );
-    }
-
-    #[test]
-    fn a_throttled_gateway_stops_answering_even_a_correct_code() {
-        // The cost of the cap, stated so nobody removes it by surprise. A
-        // throttle that still compared would slow an attacker down by nothing,
-        // so the refusal has to come first.
-        let mut pending = PendingPairings::default();
-        let code = pending.mint(None).unwrap();
-        for _ in 0..FAILED_REDEMPTIONS_PER_WINDOW {
-            pending.redeem("00000000");
-        }
-        assert_eq!(pending.redeem(&code), Redemption::Throttled);
-    }
-
-    #[test]
-    fn a_correct_code_clears_the_budget_so_a_typo_costs_the_next_person_nothing() {
-        // A person mistyping their code must not leave the next attempt, or the
-        // next device, throttled.
-        let mut pending = PendingPairings::default();
-        let first = pending.mint(None).unwrap();
-        for _ in 0..FAILED_REDEMPTIONS_PER_WINDOW - 1 {
-            assert_eq!(pending.redeem("00000000"), Redemption::Rejected);
-        }
-        assert_eq!(pending.redeem(&first), Redemption::Redeemed(None));
-
-        let second = pending.mint(None).unwrap();
-        for _ in 0..FAILED_REDEMPTIONS_PER_WINDOW - 1 {
-            assert_eq!(pending.redeem("00000000"), Redemption::Rejected);
-        }
-        assert_eq!(
-            pending.redeem(&second),
-            Redemption::Redeemed(None),
-            "the budget must have been cleared by the first success"
-        );
-    }
-
-    #[test]
-    fn a_fresh_gateway_owes_nothing() {
-        let pending = PendingPairings::default();
-        assert!(!pending.guessing_is_throttled());
     }
 
     #[test]

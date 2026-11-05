@@ -1184,3 +1184,54 @@ fn inflight_followup_completion_after_cancel_is_generated_not_double_cancel() {
          follow-ups must be ResponseGenerated, not a second ResponseCanceled"
     );
 }
+
+/// Only the user's own finished turn decides anything at its end, the wait
+/// over running background tasks included. A user Stop must never be
+/// overridden by a completion re-opening the thread.
+#[test]
+fn only_a_clean_turn_end_arms_the_background_wait() {
+    use crate::engine::thread_events::{AbortCause, CancelCause};
+
+    let generated = Some(TerminalKind::Generated);
+    assert!(turn_ended_cleanly(&generated, false, false));
+    assert!(
+        !turn_ended_cleanly(&generated, true, false),
+        "merge resolution"
+    );
+    assert!(!turn_ended_cleanly(&generated, false, true), "keep-alive");
+
+    let stopped = classify_result(true, None, false, None, false).0;
+    let redirected = classify_result(
+        true,
+        Some(CancelCause::SupersededByFollowup),
+        false,
+        None,
+        false,
+    )
+    .0;
+    let shut_down = classify_result(false, None, true, None, false).0;
+    let failed = classify_result(false, None, false, Some("stream interrupted".into()), false).0;
+    let unfinished = [stopped, redirected, shut_down, failed]
+        .into_iter()
+        .chain(CancelCause::ALL.map(TerminalKind::Canceled))
+        .chain(
+            [
+                AbortCause::EngineShutdown,
+                AbortCause::SafetyNet,
+                AbortCause::RecoveryAfterRestart,
+                AbortCause::ProcessKilled,
+                AbortCause::StaleSettle,
+                AbortCause::SessionDropped,
+                AbortCause::SnapshotRestored,
+                AbortCause::Unknown,
+            ]
+            .map(TerminalKind::Aborted),
+        );
+    for terminal in unfinished {
+        assert!(
+            !turn_ended_cleanly(&Some(terminal.clone()), false, false),
+            "{terminal:?} must arm nothing"
+        );
+    }
+    assert!(!turn_ended_cleanly(&None, false, false));
+}

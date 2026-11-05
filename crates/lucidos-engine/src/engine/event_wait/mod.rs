@@ -30,7 +30,7 @@ mod remembered_requests;
 mod wait_durations;
 
 pub(crate) use agent_surface::CancelEventWaitOutcome;
-pub(crate) use background_task::StoppedTask;
+pub(crate) use background_task::{OwnerTurn, StoppedTask};
 pub(crate) use keep_alive::KeepAliveBeats;
 /// Re-exported so the expected wake decision's tests can build a pending wake.
 #[cfg(test)]
@@ -250,20 +250,33 @@ pub fn is_awaitable_event(event: &ThreadEvent) -> bool {
 /// such call writes a permanent row whose `aggregate_id` is that literal, and
 /// an unscoped cast then fails the whole query. Events are append-only, so that
 /// would break the boot rebuild forever and leave the cache empty.
-const LIVE_WAITS_SQL: &str = "\
-    SELECT e.aggregate_id::uuid, e.payload, e.sequence, e.created \
-    FROM events e \
-    WHERE e.aggregate = 'thread' \
-      AND e.event_type = 'EventWaitStarted' \
-      AND NOT EXISTS ( \
-          SELECT 1 FROM events r \
-          WHERE r.aggregate_id = e.aggregate_id \
-            AND r.sequence > e.sequence \
-            AND r.event_type IN \
-                ('EventWaitDelivered','EventWaitExpired','EventWaitCanceled') \
-            AND r.payload->>'wait_id' = e.payload->>'wait_id' \
-      ) \
-    ORDER BY e.sequence";
+macro_rules! unresolved_waits_sql {
+    ($($bound:tt)+) => {
+        concat!(
+            "SELECT e.aggregate_id::uuid, e.payload, e.sequence, e.created \
+             FROM events e \
+             WHERE e.aggregate = 'thread' \
+               AND e.event_type = 'EventWaitStarted' \
+               AND ",
+            $($bound)+,
+            " AND NOT EXISTS ( \
+                 SELECT 1 FROM events r \
+                 WHERE r.aggregate_id = e.aggregate_id \
+                   AND r.sequence > e.sequence \
+                   AND r.event_type IN \
+                       ('EventWaitDelivered','EventWaitExpired','EventWaitCanceled') \
+                   AND r.payload->>'wait_id' = e.payload->>'wait_id' \
+             ) \
+             ORDER BY e.sequence"
+        )
+    };
+}
+const LIVE_WAITS_SQL: &str = unresolved_waits_sql!(concat!(
+    "e.sequence > ",
+    crate::core::snapshot::boundary::restore_floor_sql!()
+));
+/// The unresolved waits a restored snapshot carried in, at or before `$1`.
+const ARCHIVED_WAITS_SQL: &str = unresolved_waits_sql!("e.sequence <= $1");
 
 /// Rebuild the live-waits cache from the event store (I3). Runs at boot, and is
 /// the reason no table is needed.
@@ -294,6 +307,40 @@ pub async fn rebuild_live_waits(
         }
     }
     Ok(loaded)
+}
+
+/// Cancel every subscription a restored snapshot carried in (ADR 0612). They
+/// never load into the live cache, so nothing else could end them. Runs before
+/// dispatch, and a crash retry finds the cancels already written.
+pub(crate) async fn settle_restored_waits(
+    pool: &sqlx::PgPool,
+    bus: &crate::engine::event_bus::EventBus,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(boundary) = crate::core::snapshot::boundary::read(pool).await? else {
+        return Ok(());
+    };
+    let rows: Vec<(Uuid, Value, i64, DateTime<Utc>)> = sqlx::query_as(ARCHIVED_WAITS_SQL)
+        .bind(boundary.event_sequence)
+        .fetch_all(pool)
+        .await?;
+    for (thread_id, payload, sequence, created) in rows {
+        let Some(wait) = live_wait_from_payload(thread_id, &payload, sequence, created) else {
+            crate::log!(
+                "[EventWait] Skipped malformed archived EventWaitStarted on thread {} (seq {})",
+                thread_id,
+                sequence,
+            );
+            continue;
+        };
+        emit_cancel(
+            bus,
+            &wait,
+            crate::engine::thread_events::EventWaitCancelCause::SnapshotRestored,
+            None,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Parse a persisted `EventWaitStarted` payload back into a [`LiveWait`].
@@ -896,7 +943,7 @@ pub const DEADLINE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::fr
 pub async fn lost_wait_reentries(
     pool: &sqlx::PgPool,
 ) -> Result<Vec<WaitReentryRequest>, Box<dyn std::error::Error + Send + Sync>> {
-    let rows: Vec<(String, Uuid, Option<String>)> = sqlx::query_as(
+    let rows: Vec<(String, Uuid, Option<String>)> = sqlx::query_as(concat!(
         "SELECT e.aggregate_id, anchor.id, anchor.payload->>'text' \
          FROM events e \
          JOIN thread_summaries t ON t.thread_id = e.aggregate_id::uuid \
@@ -910,6 +957,9 @@ pub async fn lost_wait_reentries(
          ) anchor ON TRUE \
          WHERE e.aggregate = 'thread' \
            AND e.event_type IN ('EventWaitDelivered','EventWaitExpired') \
+           AND e.sequence > ",
+        crate::core::snapshot::boundary::restore_floor_sql!(),
+        " \
            AND t.state IS DISTINCT FROM 'discarded' \
            AND anchor.event_type = 'PromptInjected' \
            AND NOT EXISTS ( \
@@ -919,8 +969,8 @@ pub async fn lost_wait_reentries(
                  AND later.sequence > anchor.sequence \
                  AND later.event_type <> ALL($1) \
            ) \
-         ORDER BY e.sequence",
-    )
+         ORDER BY e.sequence"
+    ))
     .bind(crate::engine::thread_events::ThreadEvent::SIDE_QUESTION_EVENT_TYPES)
     .fetch_all(pool)
     .await?;

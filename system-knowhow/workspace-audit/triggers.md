@@ -20,6 +20,9 @@ scan tap-strings "[\\\"']*tap[\\\"']*[[:space:]]*:[[:space:]]*[\\\"']+(modal|non
 
 ## Checks
 
+Model selectors in trigger-management apps follow `system-knowhow/js-sdk.md`'s
+`lucidos.ui.ModelPicker` contract. App selections do not change a trigger's stored configuration automatically.
+
 For each finding, capture: **location**, **what's wrong**, **which reference owns the rule** (link, don't quote), **suggested fix**.
 
 **Start from the live projection (`triggers(action="list")` / the trigger registry the scheduler uses), not from `TriggerCreated` events.** Anything off the live list was deleted (`TriggerDeleted`) or no longer fires, so walking events alone invents phantom "broken" triggers. Use `TriggerCreated`/`TriggerUpdated` only to rebuild `run` fields the projection hides (intent text, stale `run.knowhow:[...]`, slug) for live triggers.
@@ -27,6 +30,8 @@ For each finding, capture: **location**, **what's wrong**, **which reference own
 Per the engine prompt's taxonomy section and the worked example in `docs/taxonomy.md` (mirrored in best-practices). Trigger threads discover knowhow at fire time via `load_knowhow`, as chat does, with no per-trigger allow-list. For each *live* trigger, reduce its `TriggerCreated` and later `TriggerUpdated` events to the *latest* `run` (most recent payload by sequence), then apply these checks:
 
 - **Knowhow promising unlimited restart replays or no interruption report.** Read each trigger's knowhow against `system-knowhow/triggers.md` § "A fire due while the engine restarts". Flag instructions that assume scripts always requeue, or that tell a run to duplicate the engine's interruption notification. Severity: **stale**, since the recovery contract bounds retries and owns that report.
+
+- **Knowhow saying the `claude-gateway` proxy serves chat only.** Read each trigger's proxy instructions against `system-knowhow/js-sdk.md` § `lucidos.proxy`, which owns the supported callers and wire contract. Severity: **stale**.
 
 - **Imperative verbs about *how* in `run.intent`** (hit, parse, scan, fall back, retry, GET, POST, scrape) → procedure leaked into intent.
 
@@ -52,6 +57,13 @@ Per the engine prompt's taxonomy section and the worked example in `docs/taxonom
   **`retired` says a name is dead, not what replaced it.** For the successor, search `thread-events.md` for the old name. It sits on its successor's row, as a `Legacy alias:` note or in the row's prose. The whole `ClaudeCode*` family became `CodingAgent*`, as `system-knowhow/coding-agent-events.md` states. If neither resolves it, report the finding without a replacement. A guessed successor arms a second subscription that never fires.
 
   The engine now refuses a new subscription on a dead name, so this check finds rows armed before that.
+
+- **A durable wait or trigger subscription on snapshot progress.**
+  `SnapshotProgress` is transient activity, not a persisted completion event.
+  Flag a trigger's `on` list or a durable `await_event` waiting for it as
+  **broken**. Use the terminal snapshot events documented in
+  `system-knowhow/thread-events.md` and read the durable job for the result;
+  do not infer success from a progress frame.
 
 - **Retired event names in workspace code.** Same list, different surface, because a stale recipe keeps minting dead subscriptions and the finding above returns after the fix. Grep for retired names in `await_event` calls, `on_event` payloads, and `lucidos triggers` invocations. Search `data/knowhow/**/*.md` (fenced `python` / `bash` / `js` / `ts` blocks), `data/scripts/**`, `data/apps/**`, and `data/triggers/**/scripts/**`. Surface path, line, the retired name and its current name, at severity **stale**.
 

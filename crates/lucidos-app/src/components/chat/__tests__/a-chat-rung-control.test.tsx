@@ -9,6 +9,7 @@
  */
 import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
+import estimates from '../../../../../lucidos-engine/src/llm/rung_estimates.json';
 import type { ChatSettingsPick, SwitchEstimate } from '../../../api/client';
 import type { IntelligenceLadder, ModelInfo, ServedIntelligenceRung } from '../../../api/types';
 
@@ -68,7 +69,7 @@ const { RungControl } = await import('../RungControl');
 const { ConfirmDialog } = await import('../../shared/ConfirmDialog');
 const { controlMenuParts } = await import('../controlMenuParts');
 const {
-  confirmState, settleConfirm, threadMap, toasts, currentModel, chatModels, chatLadder,
+  confirmState, settleConfirm, threadMap, toasts, currentModel, chatModels, chatLadder, preferences,
 } = await import('../../../store/store');
 const { ApiError } = await import('../../../api/client');
 const { rungLockedReason } = await import('../rungLockedReason');
@@ -89,6 +90,7 @@ const REBUILD: SwitchEstimate = { context_tokens: 300_000, rebuilds_cache: 'yes'
 const KEEPS_CACHE: SwitchEstimate = { context_tokens: 300_000, rebuilds_cache: 'no', extra_cost_usd: null };
 
 let host: HTMLDivElement;
+let previousPreferences: typeof preferences.value;
 
 async function settle(): Promise<void> {
   for (let i = 0; i < 40; i++) await new Promise(r => setTimeout(r, 0));
@@ -146,6 +148,7 @@ function renderControl(props: { threadId?: string; composeContext: boolean }): v
 
 beforeEach(() => {
   vi.clearAllMocks();
+  previousPreferences = preferences.value;
   currentModel.value = OPUS;
   // A failed registry read is still an answer: the pill draws from the fallback list.
   chatModels.value = { status: 'failed', error: 'test' };
@@ -156,6 +159,8 @@ beforeEach(() => {
 
 afterEach(() => {
   render(null, host);
+  preferences.value = previousPreferences;
+  clearComposeSelection(null);
   host.remove();
   settleConfirm(false);
   threadMap.value = new Map();
@@ -407,6 +412,41 @@ describe('the chat rows', () => {
       'Haiku 5.5 · low', 'Opus 5.5 · medium', 'Opus 5.5 · high', 'Edit the intelligence ladder',
     ]);
     expect(rowNote('Edit the intelligence ladder')).toContain('Settings › Intelligence');
+  });
+
+  for (const context of [
+    { composeContext: true },
+    { threadId: 'd1', composeContext: true },
+    { threadId: 't1', composeContext: false },
+  ]) {
+    it(`shows the shipped default band with unset preferences (${JSON.stringify(context)})`, async () => {
+      preferences.value = { status: 'loaded', data: {} };
+      const ladder = servedChatLadder();
+      ladder.rungs = ladder.rungs.map((rung) => ({
+        ...rung,
+        on: estimates.surfaces.chat.some((p) => p.model === rung.model && p.effort === rung.effort && p.on),
+        intelligence: { label: '1.0×', multiple: 1 },
+      }));
+      chatLadder.value = { status: 'loaded', data: ladder };
+      renderControl(context);
+      await settle();
+      expect(host.querySelector('.rung-intelligence')?.textContent).toBe('1.0×');
+      await openList();
+      expect(checkedRow()).toBe('Opus 5.5 · medium');
+      expect(rowNote(checkedRow()!)).not.toBe(OFF_LADDER_NOTE);
+    });
+  }
+
+  it('keeps a disabled default pair plain', async () => {
+    const ladder = servedChatLadder();
+    ladder.rungs = ladder.rungs.map((rung) => ({ ...rung, on: false }));
+    chatLadder.value = { status: 'loaded', data: ladder };
+    renderControl({ composeContext: true });
+    await settle();
+    expect(host.querySelector('.rung-intelligence')).toBeNull();
+    expect(host.querySelector('.rung-name')?.textContent).toContain('Opus 5.5');
+    await openList();
+    expect(rowNote(checkedRow()!)).toBe(OFF_LADDER_NOTE);
   });
 
   it('check the default rung while the draft follows the account default', async () => {

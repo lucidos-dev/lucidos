@@ -6,7 +6,7 @@ import {
 import type { ModelSelection } from '../../hooks/useModelSelection';
 import { useEscapeStep } from '../../hooks/useEscapeStep';
 import { useFocusWhenPlaced } from '../../hooks/useFocusWhenPlaced';
-import { hasCoarsePointer } from '../../utils/viewport';
+import { hasCoarsePointer } from '../../utils/layoutMedia';
 import {
   ControlOptionList, selectedOptionIndex, wrapHighlight, type ControlOption,
 } from './ControlOptionList';

@@ -49,6 +49,8 @@ pub(crate) fn path_is_in_cc_worktree(path: &Path) -> bool {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Health {
+    /// Offline snapshot restore owns the workspace.
+    Restoring,
     /// Spawned/adopted but not yet answering `/api/v1/health`.
     Booting,
     /// Answering `/api/v1/health`.
@@ -1255,6 +1257,7 @@ mod tests {
             dir: "/ws/dev".into(),
             port: 5173,
             database_url: None,
+            cleanup: Default::default(),
             autostart: true,
         };
         let stack = StackRuntime {
@@ -1399,6 +1402,7 @@ mod tests {
             dir: "/ws/dev".into(),
             port: 5173,
             database_url: None,
+            cleanup: Default::default(),
             autostart: false,
         };
         let stack = StackRuntime {
@@ -1434,6 +1438,7 @@ mod tests {
                 dir: "/ws/dev".into(),
                 port: 5173,
                 database_url: None,
+                cleanup: Default::default(),
                 autostart: false,
             },
             resolved_dir: PathBuf::from("/ws/dev"),
@@ -1664,6 +1669,7 @@ mod tests {
             dir: "/ws/dev".into(),
             port: 5173,
             database_url: None,
+            cleanup: Default::default(),
             autostart: false,
         };
         let overrides =
@@ -1701,6 +1707,7 @@ mod tests {
             dir: "/ws/dev".into(),
             port: 5173,
             database_url: None,
+            cleanup: Default::default(),
             autostart: false,
         };
         let overrides =
@@ -1811,6 +1818,7 @@ mod tests {
             dir: dir.display().to_string(),
             port: 42000,
             database_url: None,
+            cleanup: Default::default(),
             autostart: false,
         };
 

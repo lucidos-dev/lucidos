@@ -493,13 +493,19 @@ impl PendingHandoff {
 /// any outer alias: the subqueries use their own.
 pub(crate) fn pending_handoff_sql(thread: &str) -> String {
     format!(
-        "EXISTS (SELECT 1 FROM events pending_handoff \
+        concat!(
+            "EXISTS (SELECT 1 FROM events pending_handoff \
                   WHERE pending_handoff.thread_id = {thread} \
                     AND pending_handoff.event_type = 'SessionHandedOff' \
+                    AND pending_handoff.sequence > ",
+            crate::core::snapshot::boundary::restore_floor_sql!(),
+            " \
                     AND NOT EXISTS (SELECT 1 FROM events handoff_end \
                           WHERE handoff_end.thread_id = {thread} \
-                            AND {}))",
-        ends_handoff_sql("handoff_end", "pending_handoff")
+                            AND {}))"
+        ),
+        ends_handoff_sql("handoff_end", "pending_handoff"),
+        thread = thread
     )
 }
 
@@ -525,15 +531,21 @@ pub(crate) fn pending_handoff_threads_sql() -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "SELECT pending_handoff.thread_id FROM events pending_handoff \
-           LEFT JOIN LATERAL (SELECT 1 AS ended FROM events handoff_end \
-                 WHERE handoff_end.thread_id = pending_handoff.thread_id \
-                   AND handoff_end.event_type IN ({lifecycle}) \
-                   AND {} LIMIT 1) handoff_ended ON TRUE \
-          WHERE pending_handoff.event_type = 'SessionHandedOff' \
-            AND pending_handoff.thread_id IS NOT NULL \
-            AND handoff_ended.ended IS NULL",
-        ends_handoff_sql("handoff_end", "pending_handoff")
+        concat!(
+            "SELECT pending_handoff.thread_id FROM events pending_handoff \
+               LEFT JOIN LATERAL (SELECT 1 AS ended FROM events handoff_end \
+                     WHERE handoff_end.thread_id = pending_handoff.thread_id \
+                       AND handoff_end.event_type IN ({lifecycle}) \
+                       AND {} LIMIT 1) handoff_ended ON TRUE \
+              WHERE pending_handoff.event_type = 'SessionHandedOff' \
+                AND pending_handoff.thread_id IS NOT NULL \
+                AND pending_handoff.sequence > ",
+            crate::core::snapshot::boundary::restore_floor_sql!(),
+            " \
+                AND handoff_ended.ended IS NULL"
+        ),
+        ends_handoff_sql("handoff_end", "pending_handoff"),
+        lifecycle = lifecycle
     )
 }
 
@@ -566,11 +578,16 @@ pub(crate) async fn pending_handoff(
     thread_id: Uuid,
 ) -> Result<Option<PendingHandoff>, sqlx::Error> {
     let payload: Option<serde_json::Value> = sqlx::query_scalar(&format!(
-        "SELECT handoff.payload FROM events handoff \
+        concat!(
+            "SELECT handoff.payload FROM events handoff \
          WHERE handoff.thread_id = $1 AND handoff.event_type = 'SessionHandedOff' \
+           AND handoff.sequence > ",
+            crate::core::snapshot::boundary::restore_floor_sql!(),
+            " \
            AND NOT EXISTS (SELECT 1 FROM events handoff_end \
                  WHERE handoff_end.thread_id = $1 AND {}) \
-         ORDER BY handoff.sequence DESC LIMIT 1",
+         ORDER BY handoff.sequence DESC LIMIT 1"
+        ),
         ends_handoff_sql("handoff_end", "handoff")
     ))
     .bind(thread_id)

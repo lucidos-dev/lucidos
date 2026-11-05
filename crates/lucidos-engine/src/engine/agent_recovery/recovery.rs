@@ -493,6 +493,16 @@ impl LucidosEngine {
         }
 
         let t0 = std::time::Instant::now();
+        let restored_branches = match restored_recovery_branches(self.pool()).await {
+            Ok(branches) => branches,
+            Err(e) => {
+                log!(
+                    "[Recovery] Restore boundary unavailable, refusing worktree recovery: {}",
+                    e
+                );
+                return Vec::new();
+            }
+        };
         let lucidos_repo_root = main_worktree().await;
         let ws_id = self.workspace_path.to_string_lossy().to_string();
         // Trailing separator avoids false-positive prefix matches against sibling
@@ -700,6 +710,14 @@ impl LucidosEngine {
                 .collect();
         for (br, tid) in change_branches_list {
             branch_to_thread.entry(br).or_insert(tid);
+        }
+
+        // Before any missing-worktree recreation, pending-change withdrawal or
+        // synthetic recovery event. Keep every archived worktree on disk.
+        if let Some(eligible) = &restored_branches {
+            actively_running_branches.retain(|branch| eligible.contains_key(branch));
+            to_recover.retain(|(_, branch, _, _)| eligible.contains_key(branch));
+            branch_to_thread = eligible.clone();
         }
 
         let t_classified = t0.elapsed();
@@ -1686,6 +1704,58 @@ pub(crate) const THREAD_START_EVENTS_SQL: &str = "'MessageReceived',\
     'CodingAgentUserMessageSent','TriggerStarted','ContinuationStarted',\
     'OrphanRecoveryStarted'";
 
+/// SQL shared by branch discovery and classification: automatic recovery never
+/// certifies its own admission after a restore.
+fn restore_request_after_sql(id: &str, floor: &str, automatic_reason: &str) -> String {
+    format!("EXISTS (SELECT 1 FROM events r WHERE r.aggregate_id = {id} \
+        AND r.sequence > {floor} \
+        AND (r.event_type IN ('MessageReceived','CodingAgentUserMessageSent','TriggerStarted','ChildThreadCompleted') \
+          OR (r.event_type = 'ContinuationStarted' AND r.payload->>'reason' IS DISTINCT FROM {automatic_reason})))")
+}
+
+/// Only a fresh request can admit branch recovery after a restore. `None`
+/// preserves the normal (non-restore) orphan recovery behaviour.
+pub(crate) async fn restored_recovery_branches(
+    pool: &sqlx::PgPool,
+) -> Result<Option<std::collections::HashMap<String, Uuid>>, sqlx::Error> {
+    let Some(boundary) = crate::core::snapshot::boundary::read(pool).await? else {
+        return Ok(None);
+    };
+    let fresh_request = restore_request_after_sql("s.aggregate_id", "$1", "$2");
+    let branches: Vec<(String, Uuid)> = sqlx::query_as(&format!(
+        "SELECT DISTINCT ON (s.payload->>'branch') s.payload->>'branch', s.aggregate_id::uuid FROM \
+           (SELECT DISTINCT ON (aggregate_id) aggregate_id, payload, sequence FROM events \
+            WHERE event_type = 'SessionStarted' ORDER BY aggregate_id, sequence DESC) s \
+         WHERE s.payload->>'branch' IS NOT NULL \
+         AND {fresh_request} \
+         ORDER BY s.payload->>'branch', s.sequence DESC"
+    ))
+    .bind(boundary.event_sequence)
+    .bind(AUTO_RESUME_AFTER_SWITCH_REASON)
+    .fetch_all(pool)
+    .await?;
+    Ok(Some(branches.into_iter().collect()))
+}
+
+/// A restore's settlement terminals are observations of archived work, not
+/// fresh child completions. A real post-restore turn must precede a callback.
+pub(crate) async fn thread_turn_after_restore(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let Some(boundary) = crate::core::snapshot::boundary::read(pool).await? else {
+        return Ok(true);
+    };
+    sqlx::query_scalar(&format!(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE aggregate_id = $1 \
+         AND event_type IN ({THREAD_START_EVENTS_SQL},'ChildThreadCompleted') AND sequence > $2)"
+    ))
+    .bind(thread_id.to_string())
+    .bind(boundary.event_sequence)
+    .fetch_one(pool)
+    .await
+}
+
 /// SQL boolean: the event at `seq_expr` is newer than every
 /// [`THREAD_START_EVENTS_SQL`] event on the thread at `id_expr`, so it belongs
 /// to that thread's **current** turn.
@@ -1730,6 +1800,10 @@ fn after_latest_thread_start_sql(id_expr: &str, seq_expr: &str) -> String {
 /// what stops an auto-resume that dies before emitting anything else from being
 /// resumed again on the next boot, forever.
 ///
+/// Archived switch aborts cannot authorize a resume after a restore, even if
+/// they are still the latest event on the thread. The durable floor is part of
+/// this shared gate, including on every later boot.
+///
 /// The abort must also be the thread's newest `ResponseAborted`. The boot floor
 /// withdraws an unkept promise with a newer abort, and that is not a start
 /// event. Without this clause a later crash boot would still resume the thread.
@@ -1737,11 +1811,15 @@ fn after_latest_thread_start_sql(id_expr: &str, seq_expr: &str) -> String {
 /// [`after_latest_thread_start_sql`].
 pub(crate) fn switch_abort_unsuperseded_sql(id_expr: &str, seq_expr: &str) -> String {
     format!(
-        "{current_turn} AND {seq} = ( \
+        concat!(
+            "{current_turn} AND {seq} > ",
+            crate::core::snapshot::boundary::restore_floor_sql!(),
+            " AND {seq} = ( \
              SELECT MAX(ra.sequence) FROM events ra \
              WHERE ra.aggregate_id = {id} \
                AND ra.event_type = 'ResponseAborted' \
-         )",
+         )"
+        ),
         current_turn = after_latest_thread_start_sql(id_expr, seq_expr),
         seq = seq_expr,
         id = id_expr,
@@ -1822,7 +1900,9 @@ pub(crate) static BRANCH_CLASSIFICATION_SQL: std::sync::LazyLock<String> =
             ORDER BY thread_id, sequence DESC \
          ) \
          SELECT sb.branch, \
-                CASE WHEN COALESCE(ts.keep_alive_turn, FALSE) THEN 'idle' \
+                CASE WHEN EXISTS (SELECT 1 FROM snapshot_restore_boundary WHERE singleton) \
+                       AND NOT ({fresh_request}) THEN 'idle' \
+                     WHEN COALESCE(ts.keep_alive_turn, FALSE) THEN 'idle' \
                      WHEN ll.event_type = 'SessionStarted' \
                        OR EXISTS ( \
                            SELECT 1 FROM events e3 \
@@ -1837,6 +1917,11 @@ pub(crate) static BRANCH_CLASSIFICATION_SQL: std::sync::LazyLock<String> =
             turn_ended = TURN_ENDED_EVENT_TYPES_SQL,
             mid_turn_ends = SESSION_ENDED_MID_TURN_REASONS_SQL,
             progression = TURN_PROGRESSION_EVENT_TYPES_SQL,
+            fresh_request = restore_request_after_sql(
+                "ll.thread_id::text",
+                "(SELECT event_sequence FROM snapshot_restore_boundary WHERE singleton)",
+                &format!("'{AUTO_RESUME_AFTER_SWITCH_REASON}'")
+            ),
         )
     });
 

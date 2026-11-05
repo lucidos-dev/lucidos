@@ -84,6 +84,8 @@ export interface ElapsedAnchor {
 }
 
 export interface EngineBuildDetail extends ElapsedAnchor {
+  /** Delivery is being checked after the build script succeeded. */
+  verifying?: boolean;
   /** The commits this build will bring, or `null` when git couldn't say. Those
    *  are different answers: `{ total: 0 }` is "nothing pending", `null` is "we
    *  don't know", and only the first may be stated out loud. */
@@ -174,7 +176,7 @@ export function backgroundActivities(
     const queuedBehind = buildDetail?.queuedBehind;
     activities.push({
       kind: 'engine-build',
-      label: queuedBehind ? 'New version queued' : 'Building new version',
+      label: buildDetail?.verifying ? 'Verifying new version' : queuedBehind ? 'New version queued' : 'Building new version',
       // A cargo build reports no percentage, and inventing one would be worse
       // than the spinner the row falls back to. What it CAN say honestly is
       // how long it has been going and what it will bring.

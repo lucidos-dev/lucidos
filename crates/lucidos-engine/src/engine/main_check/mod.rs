@@ -19,7 +19,7 @@ mod runner;
 mod snapshot;
 mod state;
 
-pub(crate) use driver::MainCheckMsg;
+pub(crate) use driver::{settle_restored_checks, MainCheckMsg};
 pub(crate) use runner::RunnerSlot;
 pub(crate) use snapshot::MainCheckSnapshot;
 pub(crate) use state::CloseRefusal;

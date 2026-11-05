@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 /**
  * A widget's frame IS an app frame (ADR 0402, plan invariant 1). An inline one
- * mounts once it comes on screen and stays a while after it scrolls off; a
- * shelf one mounts at once.
+ * fills its widget box, mounts once it comes on screen and stays a while after
+ * it scrolls off. An option one takes its widget's height.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { WIDGET_PARAMS_QUERY } from '@lucidos/sdk';
@@ -18,7 +18,7 @@ vi.mock('../../../hooks/useOnScreenInTranscript', () => ({
   },
 }));
 
-import { WidgetFrame, DEFAULT_WIDGET_HEIGHT_PX, OFF_SCREEN_HOLD_MS, _resetWidgetHeightsForTesting } from '../WidgetFrame';
+import { WidgetFrame, OPTION_WIDGET_HEIGHT_PX, OFF_SCREEN_HOLD_MS, _resetWidgetHeightsForTesting } from '../WidgetFrame';
 import { APP_FRAME_SANDBOX, APP_FRAME_ALLOW } from '../../apps/appFrameSandbox';
 import { APP_FRAME_SIZE_EVENT } from '../../../store/actions/widget-frame-bridge';
 import { appFrameFor, appIdForFrame, isCanvasAppFrame } from '../../../utils/appFrame';
@@ -45,18 +45,10 @@ const frames = () => host.querySelectorAll<HTMLIFrameElement>('iframe');
 const frameBox = () => host.querySelector<HTMLElement>('.widget-frame')!;
 
 describe('WidgetFrame', () => {
-  it('mounts a shelf frame at once, at the default height', () => {
-    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="shelf" />, host); });
-    expect(frames()).toHaveLength(1);
-    expect(frameBox().classList.contains('widget-frame-shelf')).toBe(true);
-    expect(frameBox().style.height).toBe(`${DEFAULT_WIDGET_HEIGHT_PX}px`);
-  });
-
   it('holds no inline iframe before it first comes on screen', () => {
-    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="inline" />, host); });
+    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="inline" size="medium" />, host); });
     expect(frames()).toHaveLength(0);
     expect(frameBox().classList.contains('widget-frame-inline')).toBe(true);
-    expect(frameBox().style.height).toBe(`${DEFAULT_WIDGET_HEIGHT_PX}px`);
 
     act(() => { reportOnScreen?.(true); });
     expect(frames()).toHaveLength(1);
@@ -67,7 +59,7 @@ describe('WidgetFrame', () => {
     afterEach(() => { vi.useRealTimers(); });
 
     function seenThenScrolledOff(): HTMLIFrameElement {
-      act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="inline" />, host); });
+      act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="inline" size="medium" />, host); });
       act(() => { reportOnScreen?.(true); });
       const frame = frames()[0];
       act(() => { reportOnScreen?.(false); });
@@ -96,7 +88,8 @@ describe('WidgetFrame', () => {
   });
 
   it('draws the app frame itself: same role, sandbox, allow and app id', () => {
-    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="shelf" />, host); });
+    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="option" />, host); });
+    act(() => { reportOnScreen?.(true); });
     const frame = frames()[0];
     expect(frame.getAttribute('data-role')).toBe('app-ui-frame');
     expect(frame.getAttribute('sandbox')).toBe(APP_FRAME_SANDBOX);
@@ -108,19 +101,20 @@ describe('WidgetFrame', () => {
     expect(appFrameFor(frame.contentWindow)).toBe(frame);
   });
 
-  it('sizes to the height the widget reports, and keeps it as the inline placeholder', () => {
+  it('sizes to the height the widget reports, and keeps it as a remount\'s placeholder', () => {
     const heights: number[] = [];
     act(() => {
-      render(<WidgetFrame appId="fare-grid" reveal="on-load" place="shelf" onHeight={(px) => heights.push(px)} />, host);
+      render(<WidgetFrame appId="fare-grid" reveal="on-load" place="option" onHeight={(px) => heights.push(px)} />, host);
     });
+    act(() => { reportOnScreen?.(true); });
     act(() => {
       frames()[0].dispatchEvent(new CustomEvent(APP_FRAME_SIZE_EVENT, { detail: { height: 312 }, bubbles: true }));
     });
     expect(frameBox().style.height).toBe('312px');
-    expect(heights).toEqual([DEFAULT_WIDGET_HEIGHT_PX, 312]);
+    expect(heights).toEqual([OPTION_WIDGET_HEIGHT_PX, 312]);
 
     act(() => { render(null, host); });
-    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="inline" />, host); });
+    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="option" />, host); });
     expect(frames(), 'off screen after the remount').toHaveLength(0);
     expect(frameBox().style.height).toBe('312px');
   });
@@ -129,24 +123,27 @@ describe('WidgetFrame', () => {
     const report = (px: number) => frames()[0].dispatchEvent(
       new CustomEvent(APP_FRAME_SIZE_EVENT, { detail: { height: px }, bubbles: true }),
     );
-    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="shelf" />, host); });
+    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="option" />, host); });
+    act(() => { reportOnScreen?.(true); });
     // A `100vh` body with an 8px margin each side reports 16px past the frame.
-    for (let px = DEFAULT_WIDGET_HEIGHT_PX + 16; px < 1200; px += 16) act(() => { report(px); });
-    expect(frameBox().style.height, 'back where the creep began').toBe(`${DEFAULT_WIDGET_HEIGHT_PX}px`);
+    for (let px = OPTION_WIDGET_HEIGHT_PX + 16; px < 1200; px += 16) act(() => { report(px); });
+    expect(frameBox().style.height, 'back where the creep began').toBe(`${OPTION_WIDGET_HEIGHT_PX}px`);
 
     act(() => { render(null, host); });
-    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="shelf" />, host); });
-    expect(frameBox().style.height).toBe(`${DEFAULT_WIDGET_HEIGHT_PX}px`);
+    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="option" />, host); });
+    act(() => { reportOnScreen?.(true); });
+    expect(frameBox().style.height).toBe(`${OPTION_WIDGET_HEIGHT_PX}px`);
   });
 
   it('releases a lock when the widget reloads, so a fixed widget sizes again', () => {
     const report = (px: number) => frames()[0].dispatchEvent(
       new CustomEvent(APP_FRAME_SIZE_EVENT, { detail: { height: px }, bubbles: true }),
     );
-    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="shelf" />, host); });
-    for (let px = DEFAULT_WIDGET_HEIGHT_PX + 16; px < 1200; px += 16) act(() => { report(px); });
+    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="option" />, host); });
+    act(() => { reportOnScreen?.(true); });
+    for (let px = OPTION_WIDGET_HEIGHT_PX + 16; px < 1200; px += 16) act(() => { report(px); });
     act(() => { report(312); });
-    expect(frameBox().style.height, 'still locked').toBe(`${DEFAULT_WIDGET_HEIGHT_PX}px`);
+    expect(frameBox().style.height, 'still locked').toBe(`${OPTION_WIDGET_HEIGHT_PX}px`);
 
     act(() => { reloadWidgetFrames('fare-grid'); });
     act(() => { report(312); });
@@ -155,25 +152,46 @@ describe('WidgetFrame', () => {
 
   it('carries its params in the src, and remembers a height per instance', () => {
     act(() => {
-      render(<WidgetFrame appId="lucidos-sound-player" params={{ clip: 'a.mp3' }} reveal="on-load" place="shelf" />, host);
+      render(<WidgetFrame appId="lucidos-sound-player" params={{ clip: 'a.mp3' }} reveal="on-load" place="option" />, host);
     });
+    act(() => { reportOnScreen?.(true); });
     const src = new URL(frames()[0].src);
     expect(JSON.parse(src.searchParams.get(WIDGET_PARAMS_QUERY)!)).toEqual({ clip: 'a.mp3' });
     act(() => {
-      frames()[0].dispatchEvent(new CustomEvent(APP_FRAME_SIZE_EVENT, { detail: { height: 48 }, bubbles: true }));
+      frames()[0].dispatchEvent(new CustomEvent(APP_FRAME_SIZE_EVENT, { detail: { height: 96 }, bubbles: true }));
     });
 
     act(() => { render(null, host); });
     act(() => {
-      render(<WidgetFrame appId="lucidos-sound-player" params={{ clip: 'b.mp3' }} reveal="on-load" place="shelf" />, host);
+      render(<WidgetFrame appId="lucidos-sound-player" params={{ clip: 'b.mp3' }} reveal="on-load" place="option" />, host);
     });
-    expect(frameBox().style.height, 'another instance starts at the default').toBe(`${DEFAULT_WIDGET_HEIGHT_PX}px`);
+    act(() => { reportOnScreen?.(true); });
+    expect(frameBox().style.height, 'another instance starts at the default').toBe(`${OPTION_WIDGET_HEIGHT_PX}px`);
 
     act(() => { render(null, host); });
     act(() => {
-      render(<WidgetFrame appId="lucidos-sound-player" params={{ clip: 'a.mp3' }} reveal="on-load" place="shelf" />, host);
+      render(<WidgetFrame appId="lucidos-sound-player" params={{ clip: 'a.mp3' }} reveal="on-load" place="option" />, host);
     });
-    expect(frameBox().style.height).toBe('48px');
+    act(() => { reportOnScreen?.(true); });
+    expect(frameBox().style.height).toBe('96px');
+  });
+
+  it('fills the box of an inline frame given a size, and a report only feeds the fade (I4)', () => {
+    const sizes: Array<[number, boolean]> = [];
+    act(() => {
+      render(
+        <WidgetFrame appId="fare-grid" reveal="on-load" place="inline" size="medium" onSize={(s, fromReport) => sizes.push([s.height, fromReport])} />,
+        host,
+      );
+    });
+    act(() => { reportOnScreen?.(true); });
+    expect(frameBox().style.height, 'the box sets the height, never the frame').toBe('');
+
+    act(() => {
+      frames()[0].dispatchEvent(new CustomEvent(APP_FRAME_SIZE_EVENT, { detail: { height: 900 }, bubbles: true }));
+    });
+    expect(frameBox().style.height).toBe('');
+    expect(sizes[sizes.length - 1]).toEqual([900, true]);
   });
 });
 
@@ -201,39 +219,25 @@ describe('WidgetFrame in the transcript', () => {
   it('holds the reader still when a widget crossing their line changes height', () => {
     const { scroller, layOut } = transcript(300);
     host.append(scroller);
-    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="inline" />, scroller); });
+    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="option" />, scroller); });
     act(() => { reportOnScreen?.(true); });
     // Its top is 100px above the line, so the reader reads what follows it.
     layOut(frameBox(), 200, boxHeight);
 
     report(600);
-    expect(scroller.scrollTop, 'grown by 360px above the reader').toBe(660);
+    expect(scroller.scrollTop, 'grown by 552px above the reader').toBe(852);
     report(80);
-    expect(scroller.scrollTop, 'shrunk by 520px above the reader').toBe(140);
+    expect(scroller.scrollTop, 'shrunk by 520px above the reader').toBe(332);
     render(null, scroller);
-  });
-
-  it('holds what follows an inline card, whose clip box caps the frame', () => {
-    const { scroller, layOut } = transcript(300);
-    host.append(scroller);
-    const clip = document.createElement('div');
-    clip.className = 'inline-widget-clip';
-    scroller.append(clip);
-    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="inline" />, clip); });
-    act(() => { reportOnScreen?.(true); });
-    layOut(clip, 200, () => Math.min(boxHeight(), 400));
-
-    report(600);
-    expect(scroller.scrollTop, 'the card grew to its 400px cap').toBe(460);
-    render(null, clip);
   });
 
   it('leaves a widget the reader is using where it is', () => {
     const { scroller, layOut } = transcript(300);
     host.append(scroller);
-    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="inline" />, scroller); });
+    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="option" />, scroller); });
     act(() => { reportOnScreen?.(true); });
-    layOut(frameBox(), 200, boxHeight);
+    // Across the reader's line, so the reader is using it in view.
+    layOut(frameBox(), 280, boxHeight);
     // A tap inside the widget focuses its frame.
     frames()[0].tabIndex = 0;
     frames()[0].focus();
@@ -247,7 +251,7 @@ describe('WidgetFrame in the transcript', () => {
     // A frame stays loaded off screen, and scrolling never blurs it.
     const { scroller, layOut } = transcript(300);
     host.append(scroller);
-    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="inline" />, scroller); });
+    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="option" />, scroller); });
     act(() => { reportOnScreen?.(true); });
     frames()[0].tabIndex = 0;
     frames()[0].focus();
@@ -255,14 +259,14 @@ describe('WidgetFrame in the transcript', () => {
     layOut(frameBox(), 0, boxHeight);
 
     report(600);
-    expect(scroller.scrollTop, 'grown by 360px above the reader').toBe(660);
+    expect(scroller.scrollTop, 'grown by 552px above the reader').toBe(852);
     render(null, scroller);
   });
 
   it('leaves the reader alone when nothing after the widget is on screen', () => {
     const { scroller, layOut } = transcript(300);
     host.append(scroller);
-    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="inline" />, scroller); });
+    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="option" />, scroller); });
     act(() => { reportOnScreen?.(true); });
     // 100px above the line and 800px tall, so it runs past the 600px band.
     act(() => {
@@ -278,7 +282,7 @@ describe('WidgetFrame in the transcript', () => {
   it('leaves the reader alone when the widget sits below their line', () => {
     const { scroller, layOut } = transcript(300);
     host.append(scroller);
-    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="inline" />, scroller); });
+    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="option" />, scroller); });
     act(() => { reportOnScreen?.(true); });
     layOut(frameBox(), 500, boxHeight);
 

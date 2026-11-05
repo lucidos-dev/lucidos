@@ -478,6 +478,17 @@ fn the_refusal_names_the_terminal_event_where_one_exists() {
     assert!(err.contains("BackupCompleted"), "{err}");
     assert!(err.contains("BackupFailed"), "{err}");
 
+    let err = awaitable("SnapshotProgress").unwrap_err();
+    for name in [
+        "SnapshotCreated",
+        "SnapshotCaptureFailed",
+        "SnapshotChecked",
+    ] {
+        assert!(err.contains(name), "{err}");
+        assert!(awaitable(name).is_ok());
+    }
+    assert!(awaitable("SnapshotDeleted").is_ok());
+
     // A frame with no terminal twin simply gets the shorter message.
     let err = awaitable("Toast").unwrap_err();
     assert!(err.contains("transient"), "{err}");

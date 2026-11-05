@@ -1,10 +1,14 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   EMPTY_REMOTE_GATEWAY_DRAFT,
   remoteGatewayBlocker,
   shortNameInput,
+  submitRemoteGateway,
 } from './remoteGatewayForm';
 import { gatewayPairingAddress } from './GatewayPairingSections';
+
+import { addRemoteGateway } from '../../api/client/control';
+vi.mock('../../api/client/control', async original => ({ ...await original<typeof import('../../api/client/control')>(), addRemoteGateway: vi.fn() }));
 
 const READY = { address: 'https://cloud.example.com', code: '12345678', name: 'cloud' };
 
@@ -43,4 +47,10 @@ describe('gatewayPairingAddress', () => {
     expect(gatewayPairingAddress({ kind: 'none' })).toBeNull();
     expect(gatewayPairingAddress({ kind: 'resolving' })).toBeNull();
   });
+});
+
+
+it('sends proxy headers with the initial pairing request, preserving secret whitespace', () => {
+  submitRemoteGateway({ ...READY, headers: [{ name: 'Proxy-Token', value: ' secret ' }] });
+  expect(addRemoteGateway).toHaveBeenCalledWith({ ...READY, headers: { 'proxy-token': ' secret ' } });
 });

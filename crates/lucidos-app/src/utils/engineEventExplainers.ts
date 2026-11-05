@@ -57,6 +57,8 @@ export function describeAbortCause(cause: AbortCause | undefined): string {
       return 'The agent’s process ended unexpectedly: it crashed, ran out of memory, or was closed from outside Lucidos.';
     case 'stale_settle':
       return 'This reply was still marked as running, but nothing was working on it. Lucidos cleared the mark. No work was lost.';
+    case 'snapshot_restored':
+      return 'The workspace was restored from a snapshot that recorded this reply as running. Lucidos stopped the reply and did not replay it.';
     case 'session_dropped':
       return 'Whatever started the agent went away while it was working, most often a closed connection. The agent stopped where it was. Send a message to carry on.';
     case 'unknown':

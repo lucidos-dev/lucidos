@@ -119,6 +119,23 @@ Read help for the CLI or any command path. `lucidos help events query` and
 Every command group provides this generated help route. It mirrors the
 subcommands documented below and performs no action.
 
+### `lucidos workspaces`
+
+Read-only workspace cleanup information from this machine's gateway. This group
+has no delete command. Manual cleanup uses the picker's device-confirmed review.
+
+### `lucidos workspaces review [--port <port>]`
+
+Print the gateway's cleanup review as JSON, including registered workspaces and
+discovered cleanup candidates. Requires the machine-local token. When several
+gateways are running, pass `--port` to choose one; their registries stay separate.
+
+The review is a cached observation. If `scanned_at` is null, the initial scan is
+pending: empty rows do not mean no workspaces exist. The CLI prints that warning
+to stderr. Run it again after the scan finishes. `refreshing` indicates a scan
+is still running; unknown sizes or failed observations never authorize deletion.
+This command does not freeze or confirm a batch and does not mutate workspaces.
+
 ### Hidden: `lucidos coding-agent-diff-hook`
 
 A git `post-commit` hook in Lucidos-managed coding-agent worktrees. When the
@@ -688,6 +705,107 @@ The claude-code intelligence ladder, least to most intelligent. Intelligence, co
 7. Opus 5.5, medium (`--coding-agent-model claude-opus-5-5 --reasoning-effort medium`): intelligence 1.0×, cost 1.0×, time 1.0× [default, this thread]
 ```
 
+### `lucidos snapshot`
+
+Local workspace snapshots capture the database and backup-scope workspace files
+under an opaque snapshot handle. Keys remain in the engine's key store. Chat
+agents and scripts both use this CLI family; workflow and safety rules live in
+`system-knowhow/backups/workspace-snapshots`. Every command
+accepts `--workspace <name-or-absolute-path>` to target a workspace and `--json`
+for compact JSON; otherwise it prints formatted JSON. Every caller must identify
+itself through the ordinary device or local-process credentials.
+
+Create/check share an archive slot with backups. Busy returns exit 75; a refused
+HTTP request returns 2; a failed job or server operation returns 4. Successful
+requests return 0. Restore commands are described below.
+
+`restore` takes an exact `--workspace` gateway slug, a matching
+`--expected-workspace-id`, the handle, and an optional `--reason`. It refuses
+the calling agent's own workspace. The target
+checks the source through the gateway and enforces its restore policy and any
+source-thread owner approval. Never retry a lost restore response.
+
+`restore-status` takes the restore id and `--workspace`, and reads the gateway's
+journal projection. Its subsection below has the details.
+
+#### `lucidos snapshot create`
+
+`lucidos snapshot create [--label <text>] [--keep] [--wait] [--json]`
+starts a durable capture and returns `{job_id, handle}`. `--wait` polls until the
+job completes and prints the job with its safe manifest or typed failure.
+`--keep` protects the snapshot from retention. Files may be newer than the
+database capture; the manifest records the live capture window.
+
+#### `lucidos snapshot list`
+
+`lucidos snapshot list [--json]` lists authenticated safe manifests: handles,
+labels, kinds, timestamps, component sizes and kept flags. Capture/list/get/check
+use the archive slot, so a list can be busy during a capture.
+
+#### `lucidos snapshot get`
+
+`lucidos snapshot get <handle> [--json]` reads one authenticated safe manifest.
+It does not verify every archived byte; use check for that.
+
+#### `lucidos snapshot check`
+
+`lucidos snapshot check <handle> [--json]` starts verification and waits for the
+result. It checks the manifest MAC, component hashes, dump contents and file
+index, and restores nothing.
+
+#### `lucidos snapshot status`
+
+`lucidos snapshot status <job-id> [--wait] [--json]` reads a durable capture or
+check job. Status needs no archive slot or snapshot key, and remains readable
+during captures. A lost CLI connection does not cancel the job; run status again
+with the returned job id. `--wait` polls to a terminal result.
+
+#### `lucidos snapshot restore`
+
+`lucidos snapshot restore <handle> --workspace <gateway-slug>
+--expected-workspace-id <same-slug> [--reason <text>] [--port <gateway-port>]
+[--wait] [--json]` requests restore of another workspace as the issuing agent. It requires
+the thread-bound subprocess credential and obtains source identity from the
+issuing engine's Unix socket, never from a directory basename. It refuses its
+own workspace before probing the gateway, and refuses ambiguous gateway
+discovery. The target enforces registry binding, agent policy and any required
+owner approval. A terminal without an issuing agent must use the owner UI.
+
+The restore POST is sent once, without redirects or retries, including after
+refusal or a lost reply. A lost reply reports delivery unknown: inspect restore
+status rather than retrying admission or spending approval again. Conflict
+returns exit code 75; other client refusals return 2, and server failures return
+4. The JSON response preserves target refusal details and any restore identity.
+
+`--wait` polls that exact restore journal through the gateway until completion
+or terminal failure. It waits past the offline file swap for boot verification.
+Success returns 0; rollback, refusal, unchanged failure or needs-attention
+returns 4. The wait performs only status GETs and never resubmits admission.
+If a status read fails, use `restore-status` with the admitted restore id printed
+on stderr; do not request another restore.
+
+#### `lucidos snapshot restore-status`
+
+`lucidos snapshot restore-status <restore-id> --workspace <gateway-slug>
+[--port <gateway-port>] [--json]` reads the gateway's independent restore journal
+projection, including while the target engine is stopped. It refuses ambiguous
+gateway discovery and mismatched journal or workspace identities. The CLI asks
+for that exact retained journal, including older completed restores; an absent
+requested journal is reported unavailable rather than replaced with another.
+Terminal failure or needs-attention phases return exit code 4. This read never
+starts or retries a restore.
+
+#### `lucidos snapshot delete`
+
+`lucidos snapshot delete <handle> [--json]` deletes a snapshot and announces it.
+Recovery snapshots require a device actor; a local subprocess cannot delete
+them. Open restore references and the newest recovery snapshot are protected.
+
+After successful captures, `snapshot_retention` keeps 5 unkept manual snapshots
+by default and `snapshot_recovery_retention` keeps 3 recovery snapshots. Kept
+snapshots and open restore references remain protected. Set these global
+preferences through the ordinary preferences surface.
+
 ### `lucidos model-prices`
 
 Prints the *price table* as JSON: the reply of `GET /api/v1/model-prices`. That is the cards Lucidos ships, merged card by card with the workspace override in `data/config/model-prices.json`. Each card carries its `origin` (`shipped` or `override`), and `override.error` says why an override was ignored. The shipped cards live inside the engine, so a script reads prices here rather than from a file. The price check writes the override, as `model-price-check.md` describes.
@@ -827,7 +945,9 @@ should take:
 - **Longer, the usual case:** `run --poll`, then `wait <task_id>` in the
   foreground. Each `wait` blocks until the task finishes or 230 s pass, then
   prints the new output. Re-issue it until it reports `finished`. No event
-  wait is armed, so nothing re-opens the thread later.
+  wait is armed while your turn runs. If your turn ends first, the engine arms
+  one, and re-opens this thread when the task finishes. The same holds for a
+  task that finished before you read its result. A user Stop arms nothing.
 - **An open-ended wait**, such as a run queued behind a held lock: `run`
   without `--poll`, then **end your turn**. The
   engine arms an event wait on the task's `BackgroundBashCompleted` before
@@ -853,7 +973,7 @@ its timeout is killed.
   thread waits on. Without it the row shows the command line.
 - `--timeout-secs` kills a task still running after that long. Default and
   maximum: 3600.
-- `run` prints a `status`. `polled` means call `wait` now. `watched` means end
+- `run` prints a `status`. `polled` means call `wait` now, in this turn. `watched` means end
   your turn now. `unwatched` means the thread hit a subscription limit and
   nothing will wake it: stop the task and poll it instead. `finished` means it
   was quick, and the output is already in the response.
@@ -1449,23 +1569,19 @@ The routes answer in any workspace, from whatever summary trees exist; a
 Classic workspace has none. The Lucidos Agent reaches the same four through its
 `recall` tool, offered only once a Tree workspace's trees are ready.
 
-### `lucidos widgets list | thread [--thread-id T] | pin --app-id <ID> [--thread-id T] [--params JSON] [--label L] [--shown-event-id E] | unpin … | make-reusable --app-id <ID> | stop-reusing --app-id <ID> | dashboard [--dashboard D] | dashboard-add --app-id <ID> [--dashboard D] [--params JSON] [--label L] | dashboard-remove --app-id <ID> [--dashboard D] [--params JSON] | arrange [--dashboard D] --tiles JSON`
+### `lucidos widgets list | size --app-id <ID> --size S [--thread-id T] [--params JSON] | make-reusable --app-id <ID> | stop-reusing --app-id <ID> | dashboard [--dashboard D] | dashboard-add --app-id <ID> [--dashboard D] [--params JSON] [--label L] [--size S] | dashboard-remove --app-id <ID> [--dashboard D] [--params JSON] | arrange [--dashboard D] --tiles JSON`
 
-A thread's widgets, the *widget shelf* in its title row, *reusable widgets*,
-and the two *dashboards*. A widget is an app folder whose app manifest says
-`"kind": "widget"`. A reply embeds it, `![Name](app:<id>)`, and it shows there
-as an *inline widget*, never in the apps list. Only a pinned widget has a chip
-on the shelf. Home draws no shelf and takes no pins: a widget the user wants in
-view goes on a dashboard.
-`--thread-id` defaults to `$LUCIDOS_THREAD_ID`, the session's own thread.
+*Reusable widgets*, a thread's widget card sizes, and the two *dashboards*. A
+widget is an app folder whose app manifest says `"kind": "widget"`. A reply
+embeds it, `![Name](app:<id>)`, and it shows there as an *inline widget*, never
+in the apps list. A widget the user wants in view goes on a dashboard.
+`size --thread-id` defaults to `$LUCIDOS_THREAD_ID`, the session's own thread.
 
 ```bash
-$ lucidos widgets thread
-$ lucidos widgets pin --app-id fare-grid
-$ lucidos widgets unpin --app-id fare-grid
+$ lucidos widgets size --app-id fare-grid --size large
+$ lucidos widgets size --app-id lucidos-sound-player \
+    --params '{"clip":"artifacts/voices/marin.mp3"}' --size medium
 $ lucidos widgets make-reusable --app-id fare-grid
-$ lucidos widgets pin --app-id lucidos-sound-player \
-    --params '{"clip":"artifacts/voices/marin.mp3"}' --label Marin
 $ lucidos widgets list
 $ lucidos widgets dashboard --dashboard desktop
 $ lucidos widgets dashboard-add --app-id clock --dashboard phone
@@ -1474,23 +1590,18 @@ $ lucidos widgets arrange --dashboard phone \
     --tiles '[{"app_id":"clock","size":"small"},{"app_id":"inbox","size":"medium"}]'
 ```
 
-- `pin`, `unpin`, `dashboard-add` and `dashboard-remove` name a *widget
-  instance*: the widget plus `--params`, a JSON object of the names its
-  manifest declares (ADR 0415). Two param sets are two instances, each with its
-  own chip or tile. `--label` names the instance's chip or tile; it is not part
-  of the instance.
-- `thread` lists the *thread widgets*: every instance pinned in the thread, or
-  shown there by an old `WidgetShown`, and which are pinned.
-- `pin` puts the instance's chip on the shelf, and `unpin` takes it off. Each
-  writes one thread event (`WidgetPinned`, `WidgetUnpinned`). No file and no
-  commit change, and the inline widget stays. A pin needs no earlier showing,
-  since a *widget embed* records none. Another thread's widget must be
-  reusable first. `--shown-event-id` names an event of the turn that draws the
-  widget, so "Show in thread" lands there. It must be an event in that thread.
-  Both are refused on the home thread, which has no shelf. A pin answers
-  `{"ok": true}`.
-- There is no `show`: a widget shows in a thread by an embed in a reply
-  (ADR 0466).
+- `size`, `dashboard-add` and `dashboard-remove` name a *widget instance*: the
+  widget plus `--params`, a JSON object of the names its manifest declares
+  (ADR 0415). Two param sets are two instances, each with its own card size and
+  tile. `--label` names the instance's tile; it is not part of the instance.
+- There is no `show`, and no `pin`: a widget shows in a thread by an embed in
+  a reply (ADR 0466), and a thread holds no pinned widgets.
+- `size` sets the size of the instance's cards in the thread: `small`,
+  `medium` or `large`, one its manifest declares. It writes one
+  `InlineWidgetSized`, and the newest one wins, with no file or commit change.
+  A card with none starts at the widget's default size. Another thread's
+  widget must be reusable first, and set one only when the user named it.
+  `POST /api/v1/widgets/size`, which answers `{"ok": true}`.
 - `make-reusable` and `stop-reusing` flip the `reusable` flag in the app
   manifest and commit it. A widget that stops being reusable belongs to its
   origin thread again, so Delete (a thread) on that thread removes it. When
@@ -1502,8 +1613,9 @@ $ lucidos widgets arrange --dashboard phone \
   dashboard means the calling device's. The CLI sends no device, so name one.
 - `dashboard` reads one dashboard: its tiles in order, each with its `kind`
   (`widget` or `app`), its size and the sizes it takes. `GET /api/v1/dashboard?dashboard=`.
-- `dashboard-add` adds the instance as a tile, at its widget's default size,
-  and writes one `DashboardTileAdded`. A widget that belongs to its thread
+- `dashboard-add` adds the instance as a tile, at `--size` when given (one
+  its manifest declares), else at its widget's default size. It writes one
+  `DashboardTileAdded`. A widget that belongs to its thread
   becomes reusable first, in the same action, and the answer says
   `"made_reusable": true`. `POST /api/v1/widgets/dashboard-add`.
 - `dashboard-add` and `dashboard-remove` also take the id of an app that is
@@ -2165,7 +2277,7 @@ The engine also validates the upstream's certificate, and refuses a credential o
 
 #### Builtin provider proxies (no `apis.json` entry)
 
-Every model provider the engine holds auth for is also a proxy, with no `apis.json` entry and no credential to request. The names are `anthropic`, `local`, `openai`, `openrouter`, `typesafe`, `vertex` and `xai`. The engine injects the key it already uses for chat. So never ask the user for a key these already cover.
+Every model provider the engine holds auth for is also a proxy, with no `apis.json` entry and no credential to request. The names are `anthropic`, `claude-gateway`, `local`, `openai`, `openrouter`, `typesafe`, `vertex` and `xai`. The engine injects the key it already uses for chat. So never ask the user for a key these already cover.
 
 **Each default base URL already includes `/v1`.** Send the path after it. A `local` base you configure may lack it, and the agent's context says which. `/v1/models` against `openai` reaches `https://api.openai.com/v1/v1/models` and answers 404.
 
@@ -2183,7 +2295,8 @@ lucidos proxy anthropic /messages -X POST \
 - **An `apis.json` entry with the same name wins**, so you can still point `openai` at a gateway.
 - **`vertex` takes only the suffix**, `/publishers/<publisher>/models/<model>:<method>`. The engine owns the project and region prefix, and any other path answers 400.
 - **`opencode-free` has no proxy.** The keyless free tier serves chat only, so nothing may build on it (ADR 0104).
-- **`claude-gateway` has no proxy.** The Claude gateway sign-in is the user's own, granted for chat, so no script may spend it.
+- **`claude-gateway` shares the engine's sign-in.** Use only `POST /messages` with the Anthropic JSON body and `anthropic-version: 2023-06-01`.
+  The engine supplies its configured origin plus `/v1`, applies managed model policy, and records gateway usage.
 - The Lucidos Agent reaches the same proxies with `proxy_request`, and its context lists each one with its base and whether it is configured.
 - **A model call through the proxy records what it cost.** A builtin proxy, or an `apis.json` entry pointing at a model provider's host, writes a `ContextCaptured` with `purpose: "proxy"` from the usage block the reply carries. It lands on the thread that ran the script, else on the home thread. A call made during a trigger fire also names the trigger in `emitting_trigger_id`, the only link for a script fire, which has no thread. So a script never reports its own model spend, and the Token Cost app counts it like any other call. The engine asks a model provider for an uncompressed reply, so it can read that usage block.
 - **OpenAI speech (`/audio/speech`) records too.** OpenAI reports speech usage only on an SSE stream. So for `mp3`, `aac`, `pcm` and `wav` the engine asks for one and hands you plain audio. `tts-1` records its input's character count, which is what it is billed by. **`flac` and `opus` are refused with a 400**, because neither can report its cost: ask for another format (ADR 0423).
@@ -2241,7 +2354,7 @@ A `script_handshake` proxy looks the same to the caller (`lucidos proxy comfort-
 | Want to … | Use |
 |---|---|
 | Call a backend the workspace will reuse | `lucidos proxy` (configure once in `apis.json`, then no auth in script) |
-| Call a model provider (OpenAI, Anthropic, OpenRouter, xAI, Vertex, local, TypeSafe) | `lucidos proxy <builtin> <path>`, no `apis.json` entry and no credential request |
+| Call a model provider (OpenAI, Anthropic, Claude gateway, OpenRouter, xAI, Vertex, local, TypeSafe) | `lucidos proxy <builtin> <path>`, no `apis.json` entry and no credential request |
 | One-off `curl` to a service the workspace will never reuse | Plain `curl` (no proxy entry needed) |
 | Emit a domain event, or query the event store (domain AND engine events) | `lucidos events …` |
 | Write a file under `data/` | `lucidos data write …` |
@@ -2401,19 +2514,23 @@ Lucidos authenticates every caller that reaches it over the network. A device is
 paired once and then remembered, so a stranger who reaches the port is refused.
 
 ```bash
-lucidos pair                        # print a code, and where to enter it.
+lucidos pair                        # print a code, a secret, and where to use them.
 lucidos pair --qr                   # draw it as a QR to scan.
 lucidos pair --host mac.ts.net      # pick the hostname the QR points at.
 lucidos pair --label "My iPhone"    # name the device in the paired list.
 lucidos pair --port 5300            # a gateway on an unusual port.
-lucidos pair --gateway              # a code for another gateway instead.
+lucidos pair --gateway              # a secret for another gateway instead.
 ```
 
 Run it in a terminal on the machine Lucidos runs on, then type the code into the
 device you want to let in. It works once and expires in five minutes.
 
+**The typed code works only from another device on the LAN or the tailnet.** On
+this machine, and through a tunnel or proxy, Lucidos refuses it. Open the printed
+link or paste the printed *pairing secret* there instead (ADR 0615).
+
 **`--gateway` lets another gateway in, not a device.** It mints a *gateway
-pairing code*, which never pairs a device (ADR 0590). Enter it on the other
+pairing secret*, which never pairs a device (ADR 0590). Paste it on the other
 gateway under **Settings → Access**, in **Add a remote gateway**, with the
 `https` address this command prints. Gateways pair over `https` only, so with no such
 address it says what to set up: `tailscale serve`, or an external address.

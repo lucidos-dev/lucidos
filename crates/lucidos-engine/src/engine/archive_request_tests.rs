@@ -254,6 +254,35 @@ async fn a_new_message_closes_the_request() {
     teardown_test_db(&db).await;
 }
 
+/// Restored history never renews archive authority, including after a settle.
+#[tokio::test]
+async fn restore_expires_archived_requests_but_accepts_fresh_requests() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    message(&bus, thread).await;
+    request(&bus, thread).await;
+    reply(&bus, thread, EventChannel::Chat).await;
+    assert!(request_is_open(&pool, thread).await.unwrap());
+    sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, $2, now(), MAX(sequence) FROM events")
+        .bind(Uuid::new_v4()).bind(crate::core::snapshot::handle::Handle::generate().as_str())
+        .execute(&pool).await.unwrap();
+    assert!(!request_is_open(&pool, thread).await.unwrap());
+    assert!(threads_with_open_requests(&pool).await.unwrap().is_empty());
+    assert_eq!(verdict(&pool, thread).await, RequestVerdict::Closed);
+    // An unrelated new event must not resurrect the old request.
+    reply(&bus, thread, EventChannel::Chat).await;
+    assert!(!request_is_open(&pool, thread).await.unwrap());
+    request(&bus, thread).await;
+    assert!(request_is_open(&pool, thread).await.unwrap());
+    assert_eq!(
+        threads_with_open_requests(&pool).await.unwrap(),
+        HashSet::from([thread])
+    );
+    assert_eq!(verdict(&pool, thread).await, RequestVerdict::Archive);
+    teardown_test_db(&db).await;
+}
+
 /// Once the archive lands, the request is spent.
 #[tokio::test]
 async fn an_archive_closes_the_request() {

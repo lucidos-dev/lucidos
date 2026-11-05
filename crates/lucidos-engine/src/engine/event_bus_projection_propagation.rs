@@ -209,7 +209,7 @@ async fn lock_parent_recount(
 ) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
         .bind(PARENT_RECOUNT_LOCK_CLASS)
-        .bind(parent_id)
+        .bind(parent_id.to_string())
         .execute(&mut **tx)
         .await?;
     Ok(())

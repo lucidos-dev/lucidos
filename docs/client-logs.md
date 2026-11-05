@@ -75,7 +75,7 @@ messages, one frame each:
 
 - **`slow load`** comes 3 s after the frame mounted, if it is still covered or
   unloaded. It names the `app` and `place` (`canvas`, `dashboard`, `inline`,
-  `shelf`, `option`), says whether `load` and `ready` arrived, and gives
+  `option`), says whether `load` and `ready` arrived, and gives
   `sinceResumeMs` and the `eventStream` state. It also gives the frame
   document's resource timing (`frameDocument`, `null` when the browser hides
   it), the bridged-fetch `lanes`, and the shell's own `requests` in flight.

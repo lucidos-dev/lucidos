@@ -15,7 +15,7 @@ import {
   type WorkspaceOpenMode,
 } from '../../utils/workspaceWindow';
 import { workspaceFaultNote, workspaceState, workspaceStateLabel } from '../../utils/workspaceState';
-import { remoteWorkspaceRoute, type RemoteGatewayView } from './remoteWorkspaces';
+import { remoteWorkspaceOpenable, remoteWorkspaceRoute, type RemoteGatewayView } from './remoteWorkspaces';
 
 interface RemoteWorkspaceRowsProps {
   views: readonly RemoteGatewayView[];
@@ -62,7 +62,7 @@ function remoteRow(
   const fault = workspaceFaultNote(w);
   // Nothing here can restart a remote engine, so an unhealthy row stays shut
   // rather than dropping the user into a page that cannot connect.
-  const openable = view.unreachable === null && state !== 'unhealthy';
+  const openable = remoteWorkspaceOpenable(view, w);
   const open = (mode: WorkspaceOpenMode | null) => {
     if (openable && mode !== null) onOpen(route, mode);
   };

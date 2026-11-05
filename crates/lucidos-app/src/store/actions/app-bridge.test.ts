@@ -11,6 +11,8 @@
  * about what it REFUSES: a path outside the SDK's surface, a header that would
  * forge the actor, and a sender that is not a mounted app frame.
  */
+import { observeSourceGeneration } from '../../utils/restoreSourceGeneration';
+import { installRestoreAdmission } from '../../utils/restoreAdmission';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync, readdirSync } from 'node:fs';
@@ -160,6 +162,10 @@ describe('the engine table covers the SDK', () => {
    *  `/events/emit` are ordinary bridged calls and must stay covered here. */
   const NOT_BRIDGED_EXACT = ['/events'];
 
+  // Provider-native paths built by modelRequest travel through the proxy,
+  // whose bridged route is checked separately, rather than the engine router.
+  const PROXY_UPSTREAM_PATHS = ['/messages', '/responses', '/chat/completions', '/publishers/anthropic/models/', '/publishers/google/models/'];
+
   /** Reachable by SOME method, since a literal carries no verb.
    *
    *  A literal ending in `/` is a template prefix (`'/data/' + segments`)
@@ -179,6 +185,7 @@ describe('the engine table covers the SDK', () => {
       .filter((p) => /[a-zA-Z]/.test(p))
       .filter((p) => !NOT_BRIDGED.some((n) => p.startsWith(n)))
       .filter((p) => !NOT_BRIDGED_EXACT.includes(p))
+      .filter((p) => !PROXY_UPSTREAM_PATHS.includes(p))
       .filter((p) => !reachableSomehow(p));
     expect(refused, 'the SDK names these and the engine would refuse them').toEqual([]);
   });
@@ -219,6 +226,8 @@ describe('the installed router', () => {
 
   afterEach(() => {
     stop();
+    observeSourceGeneration(null);
+    installRestoreAdmission({ ready: () => true, wait: async () => {} });
     frame.remove();
     vi.unstubAllGlobals();
   });
@@ -454,6 +463,57 @@ describe('the installed router', () => {
 
     /** Let every queued microtask and the dispatch it triggers run. */
     const settleTick = () => new Promise((r) => setTimeout(r, 0));
+
+    it('never sends a queued app invocation after a generation change', async () => {
+      const posted: any[] = [];
+      vi.spyOn(frame.contentWindow!, 'postMessage').mockImplementation((m: unknown) => { posted.push(m); });
+      for (let i = 0; i < 4; i++) deliver(frame.contentWindow, callWith(`/threads/list?n=${i}`));
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+      observeSourceGeneration('00000000-0000-4000-8000-000000000001');
+      held[0].resolve();
+      await vi.waitFor(() => expect(posted.some((m) => m.id === '/threads/list?n=3')).toBe(true));
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(posted.find((m) => m.id === '/threads/list?n=3').error).toContain('Workspace restored');
+    });
+
+    it('holds app invocations until restore admission and stamps their original generation', async () => {
+      let ready = false;
+      let release!: () => void;
+      const wait = new Promise<void>((resolve) => { release = resolve; });
+      installRestoreAdmission({ ready: () => ready, wait: () => wait });
+      deliver(frame.contentWindow, callWith('/threads/list'));
+      await settleTick();
+      expect(fetchMock).not.toHaveBeenCalled();
+      ready = true;
+      release();
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      expect(new Headers(fetchMock.mock.calls[0][1].headers).get('x-lucidos-restore-generation')).toBe('none');
+      held[0].resolve();
+    });
+
+    it('holds a completed response body behind restore admission', async () => {
+      const posted: any[] = [];
+      vi.spyOn(frame.contentWindow!, 'postMessage').mockImplementation((m: unknown) => { posted.push(m); });
+      let finishBody!: (body: ArrayBuffer) => void;
+      const body = new Promise<ArrayBuffer>((resolve) => { finishBody = resolve; });
+      const readBody = vi.fn(() => body);
+      fetchMock.mockResolvedValue({ status: 200, statusText: 'OK', headers: new Headers(), arrayBuffer: readBody });
+      let ready = true;
+      let release!: () => void;
+      const admission = new Promise<void>((resolve) => { release = resolve; });
+      installRestoreAdmission({ ready: () => ready, wait: () => admission });
+      deliver(frame.contentWindow, callWith('/threads/list'));
+      await vi.waitFor(() => expect(readBody).toHaveBeenCalledOnce());
+      ready = false;
+      finishBody(new ArrayBuffer(0));
+      await settleTick();
+      expect(posted).toHaveLength(0);
+      observeSourceGeneration('00000000-0000-4000-8000-000000000001');
+      ready = true;
+      release();
+      await vi.waitFor(() => expect(posted).toHaveLength(1));
+      expect(posted[0].error).toContain('Workspace restored');
+    });
 
     it('sends three at a time, and the next one when a slot frees', async () => {
       for (let i = 0; i < 10; i++) deliver(frame.contentWindow, callWith(`/threads/list?n=${i}`));

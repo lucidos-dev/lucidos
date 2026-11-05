@@ -24,6 +24,30 @@ use axum::response::{IntoResponse, Response};
 
 use crate::engine_hop::{self, Credential, EngineAddress};
 
+/// Trusted hop provenance, consumed by the engine's restore generation fence.
+/// Every inbound value is stripped, including on WebSocket upgrades.
+const HEADER_CALLER_KIND: &str = "x-lucidos-caller-kind";
+
+fn caller_kind(headers: &HeaderMap, extensions: &axum::http::Extensions) -> &'static str {
+    if extensions
+        .get::<crate::auth::AuthenticatedDevice>()
+        .is_some()
+        || headers.contains_key(header::ORIGIN)
+        || headers
+            .keys()
+            .any(|name| name.as_str().starts_with("sec-fetch-"))
+    {
+        "browser"
+    } else if extensions
+        .get::<crate::auth::AuthenticatedLocalProcess>()
+        .is_some()
+    {
+        "local-process"
+    } else {
+        "external"
+    }
+}
+
 /// Headers that are connection-specific and must not be forwarded by a proxy.
 const HOP_BY_HOP: &[&str] = &[
     "connection",
@@ -43,12 +67,12 @@ pub(crate) fn is_hop_by_hop(name: &HeaderName) -> bool {
 
 /// Does the gateway own this request header, rather than forwarding it?
 ///
-/// The trust boundary, and one definition for every hop. Nine names are the
+/// The trust boundary, and one definition for every hop. Eleven names are the
 /// gateway's: `x-forwarded-prefix`, `x-forwarded-host`, the device id and label,
-/// the two engine credentials, the gateway credential and the relay claim and
-/// its signature. A client-supplied one must never reach the engine, nor
-/// another gateway. The caller re-injects the prefix, the device headers and
-/// the local token with its own values. Whoever sends the upstream request
+/// the two engine credentials, the gateway credential, the relay claim, its
+/// signature, and the local-browser stamp in both its forms. A client-supplied
+/// one must never reach the engine, nor another gateway. The caller re-injects
+/// the prefix, the device headers, the stamp and the local token itself. Whoever sends the upstream request
 /// re-frames `HOST` and `CONTENT_LENGTH`.
 ///
 /// The two credentials are here for the reason the device id is, one step
@@ -69,6 +93,7 @@ pub(crate) fn gateway_owns_header(name: &HeaderName, keep_handover: bool) -> boo
         || name == header::CONTENT_LENGTH
         || n.eq_ignore_ascii_case("x-forwarded-prefix")
         || n.eq_ignore_ascii_case("x-forwarded-host")
+        || n.eq_ignore_ascii_case(HEADER_CALLER_KIND)
         || n.eq_ignore_ascii_case(crate::stack::HEADER_DEVICE_ID)
         || n.eq_ignore_ascii_case(crate::stack::HEADER_DEVICE_LABEL)
         || n.eq_ignore_ascii_case(crate::auth::HEADER_LOCAL_TOKEN)
@@ -76,6 +101,8 @@ pub(crate) fn gateway_owns_header(name: &HeaderName, keep_handover: bool) -> boo
         || n.eq_ignore_ascii_case(crate::gateway_protocol::HEADER_GATEWAY_CREDENTIAL)
         || n.eq_ignore_ascii_case(crate::relay::HEADER_RELAY_CLAIM)
         || n.eq_ignore_ascii_case(crate::relay::HEADER_RELAY_SIGNATURE)
+        || n.eq_ignore_ascii_case(crate::relay::HEADER_RELAY_LOCAL_BROWSER)
+        || n.eq_ignore_ascii_case(crate::oauth_callback::HEADER_LOCAL_BROWSER)
     {
         return true;
     }
@@ -295,6 +322,10 @@ pub async fn proxy(
     let (parts, body) = req.into_parts();
     let origin_vouched = vouches_for_origin(&parts.headers);
     let mut upstream = Request::builder().method(parts.method).uri(rest);
+    upstream = upstream.header(
+        HEADER_CALLER_KIND,
+        caller_kind(&parts.headers, &parts.extensions),
+    );
     for (name, value) in &parts.headers {
         let consumed = origin_vouched && name == header::ORIGIN;
         if !consumed && !gateway_owns_header(name, false) {
@@ -302,6 +333,13 @@ pub async fn proxy(
         }
     }
     upstream = upstream.header("x-forwarded-prefix", prefix);
+    if parts
+        .extensions
+        .get::<crate::oauth_callback::LocalBrowser>()
+        .is_some()
+    {
+        upstream = upstream.header(crate::oauth_callback::HEADER_LOCAL_BROWSER, "1");
+    }
     if let Some(device) = parts.extensions.get::<crate::auth::AuthenticatedDevice>() {
         for (name, value) in device.forwarded_headers() {
             upstream = upstream.header(name, value);
@@ -423,12 +461,23 @@ async fn proxy_upgrade(
     };
 
     let mut upstream = Request::builder().method(req.method().clone()).uri(rest);
+    upstream = upstream.header(
+        HEADER_CALLER_KIND,
+        caller_kind(req.headers(), req.extensions()),
+    );
     for (name, value) in req.headers() {
         if !gateway_owns_header(name, true) {
             upstream = upstream.header(name, value);
         }
     }
     upstream = upstream.header("x-forwarded-prefix", prefix);
+    if req
+        .extensions()
+        .get::<crate::oauth_callback::LocalBrowser>()
+        .is_some()
+    {
+        upstream = upstream.header(crate::oauth_callback::HEADER_LOCAL_BROWSER, "1");
+    }
     if let Some(device) = req.extensions().get::<crate::auth::AuthenticatedDevice>() {
         for (name, value) in device.forwarded_headers() {
             upstream = upstream.header(name, value);
@@ -1401,6 +1450,54 @@ mod proxy_tests {
             .uri(uri)
             .body(body)
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn restore_provenance_survives_consumed_origin_and_replaces_forgery() {
+        for local in [false, true] {
+            let (_dir, target, captured) = capturing_upstream().await;
+            let mut req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/dev/api/v1/chat/stream")
+                .header("host", "gateway.example:5252")
+                .header("origin", "http://gateway.example:5252")
+                .header(HEADER_CALLER_KIND, "local-process")
+                .body(Body::empty())
+                .unwrap();
+            if local {
+                req.extensions_mut()
+                    .insert(crate::auth::AuthenticatedLocalProcess);
+            }
+            let response = proxy(
+                &target,
+                "dev",
+                "/dev/",
+                DEFAULT_LABEL,
+                TEST_LOCAL_TOKEN,
+                req,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let got = captured.lock().await.to_lowercase();
+            assert!(!got.contains("\r\norigin:"));
+            assert!(got.contains("x-lucidos-caller-kind: browser\r\n"));
+            assert!(!got.contains("x-lucidos-caller-kind: local-process"));
+        }
+    }
+
+    #[test]
+    fn restore_provenance_is_owned_on_both_transports_and_requires_authentication() {
+        let name = HeaderName::from_static(HEADER_CALLER_KIND);
+        assert!(gateway_owns_header(&name, false));
+        assert!(gateway_owns_header(&name, true));
+        let mut extensions = axum::http::Extensions::new();
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_CALLER_KIND, "local-process".parse().unwrap());
+        assert_eq!(caller_kind(&headers, &extensions), "external");
+        extensions.insert(crate::auth::AuthenticatedLocalProcess);
+        assert_eq!(caller_kind(&headers, &extensions), "local-process");
+        extensions.insert(test_device("paired"));
+        assert_eq!(caller_kind(&headers, &extensions), "browser");
     }
 
     #[tokio::test]

@@ -26,20 +26,21 @@ const MAX_ORIGIN_LEN: usize = 255;
 
 pub use lucidos_gateway_constants::PAIR_PARAM;
 
-/// The pairing code a query string carries, or `None`.
+/// The device pairing secret, or an older gateway's short code, a query string
+/// carries. `None` when it carries neither.
 ///
 /// The reader for what [`pair_url`] writes. Two callers: the manifest, which
-/// stamps the code into `start_url` so a freshly installed home-screen app
+/// stamps the token into `start_url` so a freshly installed home-screen app
 /// pairs itself, and the shell, which points its manifest link here.
 ///
-/// Nothing is percent-decoded. A code is eight digits, and those encode to
+/// Nothing is percent-decoded. Digits and lowercase base32 encode to
 /// themselves, so a value needing decoding is not a value we wrote.
-pub fn pairing_code_in_query(query: Option<&str>) -> Option<&str> {
+pub fn pairing_token_in_query(query: Option<&str>) -> Option<&str> {
     query?
         .split('&')
         .filter_map(|pair| pair.split_once('='))
         .find(|(key, _)| *key == PAIR_PARAM)
-        .and_then(|(_, value)| crate::auth::valid_pairing_code(value))
+        .and_then(|(_, value)| crate::pairing::valid_device_pairing_token(value))
 }
 
 /// Accept `raw` only if it is a bare `http(s)` origin, and hand it back
@@ -72,11 +73,13 @@ pub fn valid_origin(raw: &str) -> Option<&str> {
 
 /// The URL that pairs a device, for an origin [`valid_origin`] accepted.
 ///
-/// `code` is our own eight digits, so it needs no escaping. `/~/` is the
+/// `secret` is our own device pairing secret, so it needs no escaping. A link
+/// carries the long secret, never the short code: it works on every channel,
+/// and no flood can guess it. `/~/` is the
 /// reserved sigil namespace the picker is served from, and the picker is the
 /// one surface an unpaired device may reach.
-pub fn pair_url(origin: &str, code: &str) -> String {
-    format!("{origin}/~/?{PAIR_PARAM}={code}")
+pub fn pair_url(origin: &str, secret: &str) -> String {
+    format!("{origin}/~/?{PAIR_PARAM}={secret}")
 }
 
 /// `data` as an SVG QR code, or `None` when it does not fit in a QR at all.
@@ -247,15 +250,24 @@ mod tests {
         );
     }
 
+    const SECRET: &str = "ldp_abcdefghijklmnopqrstuvwxyz";
+
     #[test]
-    fn the_query_reader_finds_the_code_the_pair_url_wrote() {
+    fn the_query_reader_finds_the_secret_the_pair_url_wrote() {
+        let url = pair_url("https://mac.ts.net", SECRET);
+        let query = url.split_once('?').map(|(_, q)| q);
+        assert_eq!(pairing_token_in_query(query), Some(SECRET));
+    }
+
+    #[test]
+    fn the_query_reader_still_takes_an_older_gateways_short_code() {
         let url = pair_url("https://mac.ts.net", "01234567");
         let query = url.split_once('?').map(|(_, q)| q);
-        assert_eq!(pairing_code_in_query(query), Some("01234567"));
+        assert_eq!(pairing_token_in_query(query), Some("01234567"));
 
         // Among siblings, and in either order.
         assert_eq!(
-            pairing_code_in_query(Some("x=1&pair=01234567&y=2")),
+            pairing_token_in_query(Some("x=1&pair=01234567&y=2")),
             Some("01234567")
         );
     }
@@ -273,8 +285,10 @@ mod tests {
             Some("other=01234567"),
             // Percent-encoded digits are not digits. We never write these.
             Some("pair=%30%31%32%33%34%35%36%37"),
+            Some("pair=lgp_abcdefghijklmnopqrstuvwxyz"),
+            Some("pair=ldp_ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
         ] {
-            assert_eq!(pairing_code_in_query(query), None, "accepted {query:?}");
+            assert_eq!(pairing_token_in_query(query), None, "accepted {query:?}");
         }
     }
 
@@ -282,11 +296,11 @@ mod tests {
     fn the_svg_renders_and_leaks_neither_the_origin_nor_the_code() {
         // The whole reason a caller-supplied string is safe to encode: it
         // becomes squares, never text.
-        let url = pair_url("https://mac.tail1234.ts.net", "01234567");
+        let url = pair_url("https://mac.tail1234.ts.net", SECRET);
         let svg = qr_svg(&url).expect("a pairing URL fits in a QR");
         assert!(svg.starts_with("<?xml"), "{svg}");
         assert!(!svg.contains("mac.tail1234.ts.net"));
-        assert!(!svg.contains("01234567"));
+        assert!(!svg.contains(SECRET));
         assert!(svg.contains("#000000") && svg.contains("#ffffff"));
     }
 

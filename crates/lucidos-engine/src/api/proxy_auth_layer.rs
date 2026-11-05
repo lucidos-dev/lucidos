@@ -130,6 +130,12 @@ pub trait AuthLayer: Send + Sync {
     /// Default: no-op for stateless layers.
     async fn invalidate_cache(&self) {}
 
+    /// Engine-owned policy layers inspect JSON even above the signing threshold.
+    /// The proxy already buffers these bytes; this grants no module capability.
+    fn requires_raw_body(&self) -> bool {
+        false
+    }
+
     /// The actual work: read from `LayerInput`, return mutations. Set
     /// `AuthMutation.cache_was_hit = true` if the layer returned a cached
     /// value — the pipeline uses that with `retry_on_401()` to decide

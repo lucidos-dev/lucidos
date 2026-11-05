@@ -671,13 +671,9 @@ impl LucidosEngine {
             // The lane lands, keeps or fails the batch from this report. Same
             // rule as a conflict resolution: an unanswered probe counts as
             // unmerged.
-            let has_unmerged = crate::engine::git_ops::git_answer_when_ok(
-                &["diff", "--name-only", "--diff-filter=U"],
-                &cwd,
-                |o| !o.stdout.is_empty(),
-            )
-            .await
-            .or_unknown(true);
+            let has_unmerged = crate::engine::git_ops::has_unmerged_paths(&cwd)
+                .await
+                .or_unknown(true);
             let continuation_pending = net_action == SafetyNetAction::EmitContinuationRequested
                 || external_continuation_requested.load(std::sync::atomic::Ordering::Acquire);
             *lane_answered = true;
@@ -699,19 +695,12 @@ impl LucidosEngine {
             // `or_unknown(true)` (assume conflicts REMAIN when git could not be
             // asked): a `false` here is what lets `conflict_resolution_cleanup_action`
             // return `Apply` and ff-merge this tree into main, so an unanswered
-            // probe must not produce it (`.claude/rules/rust.md`). Via
-            // `git_answer_when_ok`, a non-zero exit is Unknown too, not a "no":
-            // `git diff` exits non-zero when the path is not a work tree or a
-            // filter blew up, which says nothing about unresolved conflicts.
-            // Assuming conflicts remain costs an Abort, and the change stays
-            // pending for the user to retry.
-            let has_unmerged = crate::engine::git_ops::git_answer_when_ok(
-                &["diff", "--name-only", "--diff-filter=U"],
-                &cwd,
-                |o| !o.stdout.is_empty(),
-            )
-            .await
-            .or_unknown(true);
+            // probe must not produce it (`.claude/rules/rust.md`). A non-zero
+            // exit is Unknown too, not a "no". Assuming conflicts remain costs
+            // an Abort, and the change stays pending for the user to retry.
+            let has_unmerged = crate::engine::git_ops::has_unmerged_paths(&cwd)
+                .await
+                .or_unknown(true);
 
             let wt_str = cwd.to_string_lossy();
 

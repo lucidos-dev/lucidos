@@ -613,6 +613,40 @@ mod db {
         teardown_test_db(&db).await;
     }
 
+    #[tokio::test]
+    async fn restore_floor_excludes_archived_handoffs_from_lookup_and_boot_scan() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let old = coding_thread(&bus, None).await;
+        emit(&bus, old, session_handed_off(None)).await;
+        assert!(pending_handoff(&pool, old).await.unwrap().is_some());
+        sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, $2, now(), MAX(sequence) FROM events")
+            .bind(Uuid::new_v4())
+            .bind(crate::core::snapshot::handle::Handle::generate().as_str())
+            .execute(&pool).await.unwrap();
+        let new = coding_thread(&bus, None).await;
+        emit(&bus, new, session_handed_off(None)).await;
+        for _ in 0..2 {
+            assert!(pending_handoff(&pool, old).await.unwrap().is_none());
+            assert!(pending_handoff(&pool, new).await.unwrap().is_some());
+            let pending: Vec<Uuid> = sqlx::query_scalar(&format!(
+                "SELECT s.thread_id FROM thread_summaries s WHERE {}",
+                pending_handoff_sql("s.thread_id")
+            ))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(pending, vec![new]);
+            let from_set: Vec<Uuid> = sqlx::query_scalar(&pending_handoff_threads_sql())
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            assert_eq!(from_set, vec![new], "the set query keeps the same floor");
+        }
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
     /// A user's Stop withdraws a pending handoff, and so does a successor
     /// turn that failed before its session started. A follow-up that only
     /// redirected the turn, or a failure of the turn that handed off, does not.

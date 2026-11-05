@@ -1731,13 +1731,19 @@ impl ThreadQueue {
             status: String,
             queued_at: DateTime<Utc>,
             requeued: bool,
+            archived: bool,
         }
         let rows: Vec<Row> = match sqlx::query_as(
             "SELECT q.id, q.kind, q.trigger_id, q.trigger_name, q.thread_id, q.summary, \
              q.request, q.status, q.queued_at, COALESCE((SELECT \
                (e.payload->'data'->>'requeued')::boolean FROM events e \
                WHERE e.event_type = 'ThreadQueued' AND e.payload->'data'->>'entry_id' = q.id::text \
-               ORDER BY e.sequence DESC LIMIT 1), false) AS requeued \
+               ORDER BY e.sequence DESC LIMIT 1), false) AS requeued, \
+             EXISTS (SELECT 1 FROM snapshot_restore_boundary b WHERE b.singleton AND \
+               NOT EXISTS (SELECT 1 FROM events origin WHERE origin.event_type = 'ThreadQueued' \
+                 AND origin.payload->'data'->>'entry_id' = q.id::text \
+                 GROUP BY origin.payload->'data'->>'entry_id' \
+                 HAVING MIN(origin.sequence) > b.event_sequence)) AS archived \
              FROM thread_queue q ORDER BY q.sequence",
         )
         .fetch_all(&self.pool)
@@ -1772,6 +1778,15 @@ impl ThreadQueue {
         let mut seen_cron: HashSet<String> = HashSet::new();
 
         for row in rows {
+            // Queue sequence is its own counter. Only the FIRST originating
+            // event authorizes recovery: a later requeue cannot renew archived
+            // authority. Missing provenance after restore also fails closed.
+            // Announce the cancellation so its projection disappears durably;
+            // an unsuccessful emit never puts the entry in this boot's queue.
+            if row.archived {
+                self.emit_dropped(row.id, "snapshot-restored", None).await;
+                continue;
+            }
             let request: ThreadQueueRequest = match serde_json::from_value(row.request) {
                 Ok(r) => r,
                 Err(e) => {

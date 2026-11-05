@@ -1,5 +1,6 @@
 import { useRef, useState, useLayoutEffect } from 'preact/hooks';
 import { visibleWorkspaceName } from '../../store/store';
+import { REMOTE_GATEWAY } from '../../utils/basePath';
 import { getRemPx } from '../../utils/dom';
 
 /** The workspace name beside the desktop mark, shown while the pane can hold it.
@@ -70,7 +71,7 @@ export function WorkspaceNameLabel() {
   if (!name) return null;
   return (
     <span ref={labelRef} class={`workspace-name-label${hidden ? ' is-hidden' : ''}`}>
-      {name}
+      {name}{REMOTE_GATEWAY && <> <span class="remote-workspace-gateway">@{REMOTE_GATEWAY}</span> <small>remote</small></>}
     </span>
   );
 }

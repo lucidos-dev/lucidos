@@ -484,6 +484,7 @@ describe('EventWaitRow', () => {
     ['thread_archived', 'stopped when the thread was archived'],
     ['thread_discarded', 'stopped when the thread was discarded'],
     ['thread_canceled', 'stopped by Stop'],
+    ['snapshot_restored', 'stopped by a workspace restore'],
   ] as const)('names %s as "%s"', (cause, note) => {
     expect(vnodeText(step(wait_({ state: 'canceled', cause })))).toContain(note);
   });

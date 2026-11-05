@@ -1,21 +1,27 @@
 // @vitest-environment jsdom
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { capture } from './capture';
+import * as rasterizer from './rasterize';
 import {
   CAPTURE_MAX_HEIGHT, CAPTURE_MAX_WIDTH, CAPTURE_QUALITY, CAPTURE_TYPE, SAVED_MAX_EDGE, SAVED_MAX_PIXEL_RATIO,
   SAVED_QUALITY, StyleSheetBuilder, renderingFor,
 } from './rasterize';
 
+afterEach(() => vi.restoreAllMocks());
+
 describe('capture', () => {
   it('degrades to the DOM snapshot when the screenshot fails, never rejecting', async () => {
-    // jsdom paints nothing, so the rasterizer fails here exactly as it would
-    // on an image that will not decode.
+    // Inject the failure explicitly: jsdom has no pseudo-element style or
+    // image decoding support, neither of which is the fallback contract.
+    const render = vi.spyOn(rasterizer, 'rasterize').mockRejectedValueOnce(new Error('image decode failed'));
     document.body.innerHTML = '<div class="card"><h1>Hello</h1></div>';
     const result = await capture();
     expect(result.screenshot).toBe('');
     expect(result.dom).toMatch(/^\[screenshot unavailable: /);
     expect(result.dom).toContain('<div class="card"');
     expect(result.dom).toContain('Hello');
+    expect(result.dom).toContain('image decode failed');
+    expect(render).toHaveBeenCalledWith(document, undefined);
   });
 });
 

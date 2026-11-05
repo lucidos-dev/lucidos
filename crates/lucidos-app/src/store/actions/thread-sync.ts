@@ -1,15 +1,16 @@
 import { API } from '../../api/client';
+import { beginRestoreConnection, acceptRestoreHello, hasRestoreRuntime } from '../restoreRuntime';
+import { flushUndeliveredComposeDrafts } from './compose';
 import { isChosenByPreference, isChosenForThread } from '../windowPeers';
-import { forgetThreadWidgets, onWidgetEvent } from './widgets';
 import type { ApplyEstimates, Change, LandingLane, MainCheck } from '../../api/client';
 import { EVENT_STREAM_RETRY_MS, eventStreamTargets, openEventStream, type EventStreamTargets, type StreamDrop } from '@lucidos/event-stream';
 import { postClientLog } from '../../utils/clientLog';
 import { getEventStream, noteEventFrame, setEventStream } from './event-stream';
 import { fanOutEventFrame, fanOutEventStreamStatus } from './app-bridge';
 import { threadMap, focusedThreadId, changes, appliedChanges, setAsideChanges, applyingChangeIds, landingLane, applyAllInProgress, applyAllBatch, applyAllCanceling, APPLY_ALL_SUMMARY_TOAST_KEY, applyEstimates, applyPhases, standingApplyThreadIds, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, removingQueuedMessageIds, queuedMessageRemovalKey, UNREAD_HOLD_EVENT_TYPES } from '../store';
-import { backgroundModelsVersion, chatModels, findChangeById, memoryRebuildProgress, summaryTreesVersion, backupProgress, backupStatusVersion, backupPreferencesVersion, backupRecipientVersion, intelligenceLadderVersion, recommendedCleanupProgress, diskUsageVersion, promptFootprintVersion, responseStylesVersion, recoveryProgress, showConfirm, showToast, dismissToast, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
+import { snapshotsVersion, backgroundModelsVersion, chatModels, findChangeById, memoryRebuildProgress, summaryTreesVersion, backupProgress, backupStatusVersion, backupPreferencesVersion, backupRecipientVersion, intelligenceLadderVersion, recommendedCleanupProgress, diskUsageVersion, promptFootprintVersion, responseStylesVersion, recoveryProgress, showConfirm, showToast, dismissToast, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
 import { describeRecommendedCleanupOutcome } from '../../utils/recommendedCleanup';
-import { isFormRequest, isWidgetEvent } from '../thread-events/thread-event-types';
+import { isFormRequest } from '../thread-events/thread-event-types';
 import { rereadLoadedDashboards } from './dashboards';
 import { liftRowIntent, overlayRowIntent } from '../rowIntents';
 import { handleEvent, isChannelDefiningEvent, isSummaryCurrent, makeOptimisticThreadState, PENDING_TITLE_PLACEHOLDER, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
@@ -236,34 +237,73 @@ export function connectThreadEvents(): void {
   if (getEventStream()) return;
 
   const gen = ++sseGeneration;
+  let restoreEpoch = beginRestoreConnection();
+  let admitted = !hasRestoreRuntime();
+  let frames: Promise<void> = Promise.resolve();
   markEventStreamStatus('connecting');
 
+  const admittedOpen = () => {
+    if (gen !== sseGeneration) return;
+    markEventStreamStatus('connected');
+    fanOutEventStreamStatus('open');
+    const reopenedAfterError = needsResyncOnOpen;
+    needsResyncOnOpen = false;
+    if (reopenedAfterError) reconcileAfterEventGap();
+    else readStateMissedBeforeOpen();
+  };
+  const dispatchFrame = (data: string) => {
+    handleHostFrame(data);
+    fanOutEventFrame(data);
+  };
   const handlers = {
     onFrame: (data: string) => {
       // Stale handler: a newer connection replaced this one. The old transport
       // was closed, but its queued message handler can still fire.
       if (gen !== sseGeneration) return;
       noteEventFrame();
-      handleHostFrame(data);
-      // An isolated app frame can open no stream of its own, so it reads this
-      // one. Verbatim, and after the shell's own handling, so a slow app never
-      // delays the shell's repaint.
-      fanOutEventFrame(data);
+      if (!hasRestoreRuntime()) { dispatchFrame(data); return; }
+      const frameEpoch = restoreEpoch;
+      frames = frames.then(async () => {
+        if (gen !== sseGeneration || frameEpoch !== restoreEpoch) return;
+        const frame = JSON.parse(data) as { type?: string; data?: { restore_generation?: unknown } };
+        if (frame.type === 'StreamHello') {
+          const generation = frame.data?.restore_generation;
+          if (generation !== null && (typeof generation !== 'string'
+            || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(generation))) {
+            throw new Error('The event stream did not identify its restore generation');
+          }
+          const accepted = await acceptRestoreHello(frameEpoch, generation);
+          if (!accepted || gen !== sseGeneration || frameEpoch !== restoreEpoch) return;
+          admitted = true;
+          flushUndeliveredComposeDrafts();
+          admittedOpen();
+        } else if (admitted) dispatchFrame(data);
+      }).catch((err: unknown) => {
+        if (gen !== sseGeneration || frameEpoch !== restoreEpoch) return;
+        showToast(`Workspace restore recovery could not finish: ${errorDetail(err)}`, 'error', { title: 'Workspace recovery' });
+        // A connection sends one hello, so only a new one can retry admission.
+        // Without it every gated request would wait forever.
+        disconnectThreadEvents();
+        // This connection dropped every frame it held back, so the retry
+        // reconciles the gap. The disconnect above cleared the flag.
+        needsResyncOnOpen = true;
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null;
+          connectThreadEvents();
+        }, EVENT_STREAM_RETRY_MS);
+      });
     },
 
     onOpen: () => {
       if (gen !== sseGeneration) return;
-      markEventStreamStatus('connected');
-      fanOutEventStreamStatus('open');
       // The first open reads what a frame emitted while no stream was up
       // would have refreshed. A reopen after an error reads it through the gap
       // reconcile, so it never runs both. On the first open startup.ts already
       // loads thread state, and a resync there would double-fetch every page
       // load.
-      const reopenedAfterError = needsResyncOnOpen;
-      needsResyncOnOpen = false;
-      if (reopenedAfterError) reconcileAfterEventGap();
-      else readStateMissedBeforeOpen();
+      restoreEpoch = beginRestoreConnection();
+      admitted = !hasRestoreRuntime();
+      if (admitted) admittedOpen();
     },
 
     onError: (drop: StreamDrop) => {
@@ -272,6 +312,8 @@ export function connectThreadEvents(): void {
       // old handler closes the NEW connection, via the module-scoped
       // `eventStream`, costing a 3s SSE gap on every iOS Safari PWA resume.
       if (gen !== sseGeneration) return;
+      restoreEpoch = beginRestoreConnection();
+      admitted = !hasRestoreRuntime();
 
       // A plain error is routine: every engine restart causes one. Every other
       // drop is a failure only the client can see, so it reports it.
@@ -418,8 +460,6 @@ async function resyncPass(): Promise<void> {
   const refreshFocused = !!focused && !!threadMap.value.get(focused)?.eventsLoaded;
   if (refreshFocused) {
     await refreshThreadEvents(focused, { coalesce: true });
-    // A widget event missed in the gap changed the thread's widgets too.
-    onWidgetEvent(focused);
   }
   // The dashboards decide Add to dashboard in every widget menu, so a
   // dashboard event missed in the gap matters there too.
@@ -437,6 +477,7 @@ function resyncChangesAndQueue(): void {
 }
 
 export function disconnectThreadEvents(): void {
+  beginRestoreConnection();
   // Bump generation BEFORE closing, so any onerror handler queued by the
   // close() call sees a stale generation and bails out.
   sseGeneration++;
@@ -473,7 +514,6 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     ? (data.aggregate as ThreadAggregate)
     : undefined;
   if (!threadId || !event || typeof event !== 'object' || !('type' in event)) return;
-  if (isWidgetEvent(event)) onWidgetEvent(threadId);
   // Live persisted events MUST carry an aggregate — its absence here (vs.
   // historical-replay where applyEventRows applies one snapshot at the end)
   // means the backend missed populating EmittedEvent.aggregate.
@@ -854,7 +894,6 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // holding them is now wrong about what exists.
       const ids = Array.isArray(data.thread_ids) ? (data.thread_ids as string[]) : [];
       dropDeletedThreads(ids);
-      forgetThreadWidgets(ids);
       // Idempotent on the device that made the delete, which already dropped
       // them, and it is what corrects every other one.
       //
@@ -1222,6 +1261,16 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       }, 300);
       break;
     }
+
+    case 'SnapshotCreated':
+    case 'SnapshotDeleted':
+    case 'SnapshotKeepChanged':
+      snapshotsVersion.value++;
+      break;
+    case 'SnapshotCaptureFailed':
+      snapshotsVersion.value++;
+      showToast('Snapshot capture failed. Review snapshot status before trying again.', 'error', { title: 'Workspace snapshots' });
+      break;
 
     case 'BackupProgress': {
       const phase = (data.phase as string) ?? '';

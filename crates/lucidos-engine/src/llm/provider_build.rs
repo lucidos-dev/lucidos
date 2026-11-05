@@ -68,14 +68,6 @@ pub const PROVIDER_PREFERENCE_KEYS: [&str; 10] = [
     PROVIDER_ENABLED_SWITCHES[6].key(),
 ];
 
-/// Whether `LUCIDOS_BOOT_WITHOUT_PROVIDER` is truthy — a packaged build lets the
-/// engine boot (into `UnconfiguredProvider`) before any provider is configured,
-/// instead of the dev/docker fail-fast panic. Read in both `main.rs` (boot) and
-/// the subscriber (so a runtime swap-back to unconfigured mirrors boot).
-pub fn boot_without_provider_enabled() -> bool {
-    std::env::var("LUCIDOS_BOOT_WITHOUT_PROVIDER").is_ok_and(|v| parse_flag(&v) == Some(true))
-}
-
 /// The per-provider enable switches, resolved from the `provider_enabled_*`
 /// preferences (Settings → Models → Providers).
 ///
@@ -128,7 +120,7 @@ pub(crate) async fn read_provider_switches(pool: &PgPool) -> ProviderSwitches {
 
 /// Inputs the active-provider build needs beyond the DB pool. Fixed at boot
 /// (default model, mock flag, Vertex project id / region handle / token cache,
-/// the shared model→provider registry, and the boot-without-provider gate) and
+/// and the shared model→provider registry) and
 /// reused verbatim by the runtime credential subscriber so a hot-swap is
 /// identical to a fresh boot. `vertex_location`, `vertex_token_cache`, and
 /// `model_registry` are shared handles (cloning shares state), so a rebuilt
@@ -147,32 +139,19 @@ pub struct ProviderBuildContext {
     /// The not-found answers the router has seen. A shared handle, so a
     /// rebuilt router keeps the window.
     pub not_served: crate::llm::not_served::NotServedLedger,
-    pub boot_without_provider: bool,
     /// Makes the Claude gateway access. `None` at boot, before the
     /// event bus exists: a signed-in gateway then counts as configured but is
     /// left out, and the engine rebuilds once it can supply one.
     pub claude_gateway_access: Option<GatewayAccessFactory>,
 }
 
-/// Why a boot stops when [`ProviderBuildOutcome::FailFast`] comes back.
-pub const NO_PROVIDER_AT_BOOT: &str = "No LLM provider configured. Set VERTEX_PROJECT_ID (Claude/Gemini via Vertex), configure an OpenAI / Anthropic / OpenRouter / xAI credential (Settings → Models → Providers) or OPENAI_API_KEY / ANTHROPIC_API_KEY / LUCIDOS_OPENROUTER_API_KEY / LUCIDOS_XAI_API_KEY, set a local OpenAI-compatible base URL (Settings → Models → Providers or LUCIDOS_LOCAL_BASE_URL), turn on the keyless OpenCode Free tier (Settings → Models → Providers or LUCIDOS_OPENCODE_FREE=1), LUCIDOS_BOOT_WITHOUT_PROVIDER=1 (boot into provider onboarding), or LUCIDOS_MODEL=mock (for testing).";
-
-/// What [`build_active_provider`] resolved to.
-pub enum ProviderBuildOutcome {
-    /// The providers to install. `selection` is carried for logging.
-    ///
-    /// `web_search` is built and swapped in lockstep with `llm` so adding a
-    /// provider credential in Settings enables search without an engine
-    /// restart — the same hot-swap guarantee the LLM provider already has.
-    Install {
-        llm: Arc<dyn LlmProvider>,
-        web_search: Arc<WebSearchChain>,
-        selection: ProviderSelection,
-    },
-    /// No real provider and the boot-without-provider gate is off. Boot panics
-    /// with the configuration message; the runtime subscriber keeps the current
-    /// provider in place (never panics on a credential delete).
-    FailFast,
+/// Providers installed together at boot and on runtime configuration changes.
+pub struct ProviderBuildOutcome {
+    pub llm: Arc<dyn LlmProvider>,
+    /// Search uses the same credentials and swaps in lockstep with chat.
+    pub web_search: Arc<WebSearchChain>,
+    /// The selected provider kind, carried for logging.
+    pub selection: ProviderSelection,
 }
 
 /// The direct providers resolved from credentials + env, plus the web-search
@@ -621,9 +600,7 @@ fn openai_search_backend(
 /// hot-swap. `pool == None` is the degraded (DB-down) boot path — see
 /// [`resolve_direct_providers`].
 ///
-/// Returns [`ProviderBuildOutcome::FailFast`] (rather than panicking) when no
-/// provider is configured and the gate is off, so the caller decides: boot
-/// panics, the subscriber keeps the current provider.
+/// With no provider configured, installs the unconfigured sentinel.
 ///
 /// **Mock isolation:** returns [`ProviderSelection::Mock`] iff
 /// `ctx.model_is_mock` is true. The subscriber always passes `false`, so a
@@ -633,7 +610,7 @@ pub async fn build_active_provider(
     ctx: &ProviderBuildContext,
 ) -> Result<ProviderBuildOutcome, Box<dyn std::error::Error + Send + Sync>> {
     if ctx.model_is_mock {
-        return Ok(ProviderBuildOutcome::Install {
+        return Ok(ProviderBuildOutcome {
             llm: Arc::new(crate::llm::mock::MockProvider::new(
                 ctx.default_model.clone(),
             )),
@@ -714,7 +691,6 @@ pub async fn build_active_provider(
         has_opencode_free: opencode_free.is_some(),
         has_local: local.is_some(),
         has_claude_gateway: claude_gateway_signed_in,
-        boot_without_provider: ctx.boot_without_provider,
     });
 
     // Vertex leads the chain so an existing Vertex workspace keeps the exact
@@ -766,7 +742,7 @@ pub async fn build_active_provider(
         // Unreachable: `model_is_mock` is false here, and `select_provider` only
         // returns Mock when that input is true. Guarded above regardless.
         ProviderSelection::Mock => {
-            return Ok(ProviderBuildOutcome::Install {
+            return Ok(ProviderBuildOutcome {
                 llm: Arc::new(crate::llm::mock::MockProvider::new(
                     ctx.default_model.clone(),
                 )),
@@ -792,10 +768,9 @@ pub async fn build_active_provider(
             .observing(ctx.not_served.clone()),
         ),
         ProviderSelection::Unconfigured => Arc::new(UnconfiguredProvider::new()),
-        ProviderSelection::FailFast => return Ok(ProviderBuildOutcome::FailFast),
     };
 
-    Ok(ProviderBuildOutcome::Install {
+    Ok(ProviderBuildOutcome {
         llm,
         web_search,
         selection,
@@ -1189,10 +1164,9 @@ mod tests {
         setup_test_db, teardown_test_db,
     };
 
-    /// Build a non-mock context with no Vertex and the boot-without-provider gate
-    /// on — the packaged first-run shape. `model_is_mock: false` is the load-
+    /// Build a non-mock context with no Vertex. `model_is_mock: false` is the load-
     /// bearing bit: it proves the rebuild can never reach `MockProvider`.
-    fn unconfigured_ctx(boot_without_provider: bool) -> ProviderBuildContext {
+    fn unconfigured_ctx() -> ProviderBuildContext {
         ProviderBuildContext {
             default_model: prefs::CHAT_MODEL.default_text().to_string(),
             model_is_mock: false,
@@ -1201,24 +1175,17 @@ mod tests {
             vertex_token_cache: None,
             model_registry: crate::llm::model_registry::empty(),
             not_served: Default::default(),
-            boot_without_provider,
             claude_gateway_access: None,
         }
     }
 
     fn install(outcome: ProviderBuildOutcome) -> (Arc<dyn LlmProvider>, ProviderSelection) {
-        match outcome {
-            ProviderBuildOutcome::Install { llm, selection, .. } => (llm, selection),
-            ProviderBuildOutcome::FailFast => panic!("expected Install, got FailFast"),
-        }
+        (outcome.llm, outcome.selection)
     }
 
-    /// The web-search chain from an `Install` outcome.
+    /// The installed web-search chain.
     fn installed_search(outcome: ProviderBuildOutcome) -> Arc<WebSearchChain> {
-        match outcome {
-            ProviderBuildOutcome::Install { web_search, .. } => web_search,
-            ProviderBuildOutcome::FailFast => panic!("expected Install, got FailFast"),
-        }
+        outcome.web_search
     }
 
     fn stored_local_key(scope: &[&str]) -> Option<StoredLocalKey> {
@@ -1308,7 +1275,7 @@ mod tests {
     /// Every non-credential source belongs here, not just the obvious env vars.
     /// A developer logged into Codex, or one exporting `ANTHROPIC_API_KEY`,
     /// would otherwise see `build_active_provider` return `Real` while this gate
-    /// reported false, breaking the `Unconfigured`/`FailFast` assertions.
+    /// reported false, breaking the `Unconfigured` assertions.
     fn ambient_provider_env() -> bool {
         std::env::var("ANTHROPIC_API_KEY").is_ok()
             || std::env::var(crate::llm::OPENAI_API_KEY_ENV).is_ok()
@@ -1320,7 +1287,7 @@ mod tests {
             || crate::llm::openai::codex_detect::load().is_some()
     }
 
-    /// The core fix: with the boot-without-provider gate on, no credentials →
+    /// The core fix: with no credentials →
     /// `Unconfigured`; adding the first provider credential → `Real` (configured,
     /// NOT mock); removing it → back to `Unconfigured`. Mirrors what the runtime
     /// credential subscriber does, proving the rebuild swaps the active provider
@@ -1328,7 +1295,7 @@ mod tests {
     #[tokio::test]
     async fn rebuild_swaps_unconfigured_to_real_and_back() {
         let (pool, db) = setup_test_db().await;
-        let ctx = unconfigured_ctx(true);
+        let ctx = unconfigured_ctx();
         let ambient = ambient_provider_env();
 
         // No credentials → Unconfigured (only when no ambient env provider).
@@ -1491,24 +1458,23 @@ mod tests {
         );
     }
 
-    /// With the gate OFF and nothing configured, the rebuild reports `FailFast`
-    /// (boot panics; the runtime subscriber keeps the current provider) — it must
-    /// NOT silently install a provider. Skipped when ambient env would configure
-    /// one (then `Real` is correct, not `FailFast`).
+    /// Disable every provider source, including ambient env and Codex auth.
     #[tokio::test]
-    async fn no_provider_gate_off_is_failfast() {
-        if ambient_provider_env() {
-            return;
-        }
+    async fn no_provider_boots_unconfigured_without_opt_in() {
         let (pool, db) = setup_test_db().await;
-        let ctx = unconfigured_ctx(false);
-        assert!(
-            matches!(
-                build_active_provider(Some(&pool), &ctx).await.unwrap(),
-                ProviderBuildOutcome::FailFast
-            ),
-            "no provider + gate off must be FailFast, never a silent install"
+        for pref in PROVIDER_ENABLED_SWITCHES {
+            seed_preference(&pool, pref.key(), "false").await.unwrap();
+        }
+        seed_preference(&pool, prefs::OPENCODE_FREE_ENABLED.key(), "false")
+            .await
+            .unwrap();
+        let (provider, selection) = install(
+            build_active_provider(Some(&pool), &unconfigured_ctx())
+                .await
+                .unwrap(),
         );
+        assert_eq!(selection, ProviderSelection::Unconfigured);
+        assert!(!provider.is_configured());
         teardown_test_db(&db).await;
     }
 
@@ -1522,7 +1488,7 @@ mod tests {
         let ctx = ProviderBuildContext {
             vertex_project_id: "my-gcp-project".to_string(),
             vertex_token_cache: Some(std::sync::Arc::new(std::sync::Mutex::new(None))),
-            ..unconfigured_ctx(true)
+            ..unconfigured_ctx()
         };
         let (provider, selection) =
             install(build_active_provider(Some(&pool), &ctx).await.unwrap());
@@ -1542,7 +1508,7 @@ mod tests {
     #[tokio::test]
     async fn an_xai_credential_configures_and_reports_the_xai_backend() {
         let (pool, db) = setup_test_db().await;
-        let ctx = unconfigured_ctx(true);
+        let ctx = unconfigured_ctx();
         seed_credential(
             &pool,
             "xai",
@@ -1571,7 +1537,7 @@ mod tests {
     #[tokio::test]
     async fn the_free_tier_is_configured_by_its_preference_and_never_a_credential() {
         let (pool, db) = setup_test_db().await;
-        let ctx = unconfigured_ctx(true);
+        let ctx = unconfigured_ctx();
 
         // Default (unset) leaves it out of the configured set.
         let (provider, _) = install(build_active_provider(Some(&pool), &ctx).await.unwrap());
@@ -1645,7 +1611,7 @@ mod tests {
         let ctx = ProviderBuildContext {
             // Routes to OpenRouter, which has no search tool of its own.
             default_model: "z-ai/glm-5.2".to_string(),
-            ..unconfigured_ctx(true)
+            ..unconfigured_ctx()
         };
         seed_credential(
             &pool,
@@ -1906,7 +1872,7 @@ mod tests {
         let ctx = ProviderBuildContext {
             vertex_project_id: "my-gcp-project".to_string(),
             vertex_token_cache: Some(std::sync::Arc::new(std::sync::Mutex::new(None))),
-            ..unconfigured_ctx(true)
+            ..unconfigured_ctx()
         };
         seed_credential(
             &pool,
@@ -1944,7 +1910,7 @@ mod tests {
             return;
         }
         let (pool, db) = setup_test_db().await;
-        let ctx = unconfigured_ctx(true);
+        let ctx = unconfigured_ctx();
         seed_credential(
             &pool,
             "local",
@@ -2003,7 +1969,7 @@ mod tests {
     fn gateway_ctx() -> ProviderBuildContext {
         ProviderBuildContext {
             claude_gateway_access: Some(Arc::new(|_| Arc::new(FixedTokens))),
-            ..unconfigured_ctx(true)
+            ..unconfigured_ctx()
         }
     }
 
@@ -2030,14 +1996,11 @@ mod tests {
         let outcome = build_active_provider(Some(&pool), &gateway_ctx())
             .await
             .unwrap();
-        let ProviderBuildOutcome::Install {
+        let ProviderBuildOutcome {
             llm,
             web_search,
             selection,
-        } = outcome
-        else {
-            panic!("expected Install");
-        };
+        } = outcome;
         assert_eq!(selection, ProviderSelection::Real);
         let providers = llm.configured_providers().expect("a provider set");
         assert!(providers.contains(&crate::llm::ProviderKind::ClaudeGateway));
@@ -2114,7 +2077,7 @@ mod tests {
         seed_claude_gateway_sign_in(&pool, GATEWAY).await;
 
         let (provider, selection) = install(
-            build_active_provider(Some(&pool), &unconfigured_ctx(false))
+            build_active_provider(Some(&pool), &unconfigured_ctx())
                 .await
                 .unwrap(),
         );

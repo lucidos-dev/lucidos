@@ -30,8 +30,8 @@ const confirmedImage = (page: Page) => page.locator('.image-preview-item:visible
 const uploadNotice = (page: Page) => page.locator('[data-role="upload-send-notice"]:visible');
 const sendButton = (page: Page) => page.locator('button[aria-label="Send message"]:visible').first();
 
-/** How many records one store of the pending-upload database holds. */
-function storedCount(page: Page, storeName: 'uploads' | 'queued-upload-sends'): Promise<number> {
+/** Count live uploads or active queued sends, excluding retained source history. */
+function storedCount(page: Page, storeName: 'uploads' | 'queued-source-history'): Promise<number> {
   return page.evaluate(async (storeName) => {
     let count = 0;
     for (const { name } of await indexedDB.databases()) {
@@ -41,7 +41,8 @@ function storedCount(page: Page, storeName: 'uploads' | 'queued-upload-sends'): 
         open.onerror = () => reject(open.error);
         open.onsuccess = () => {
           const db = open.result;
-          const req = db.transaction(storeName, 'readonly').objectStore(storeName).count();
+          const active = storeName === 'queued-source-history' ? IDBKeyRange.bound('active:', 'active;') : undefined;
+          const req = db.transaction(storeName, 'readonly').objectStore(storeName).count(active);
           req.onsuccess = () => { db.close(); resolve(req.result); };
           req.onerror = () => { db.close(); reject(req.error); };
         };
@@ -110,7 +111,7 @@ test.describe('A pending image upload survives a page reload', () => {
     await sendButton(page).click();
     await expect(uploadNotice(page)).toHaveText('Sends when the image finishes uploading');
     await expect.poll(() => storedCount(page, 'uploads')).toBe(1);
-    await expect.poll(() => storedCount(page, 'queued-upload-sends')).toBe(1);
+    await expect.poll(() => storedCount(page, 'queued-source-history')).toBe(1);
 
     await page.reload();
     await waitForVisibleInput(page);
@@ -120,6 +121,6 @@ test.describe('A pending image upload survives a page reload', () => {
     release();
     await expect(userMessageBody(page).filter({ hasText: message })).toHaveCount(1, { timeout: 15_000 });
     await expect(pendingChip(page)).toHaveCount(0);
-    await expect.poll(() => storedCount(page, 'queued-upload-sends')).toBe(0);
+    await expect.poll(() => storedCount(page, 'queued-source-history')).toBe(0);
   });
 });

@@ -1,34 +1,34 @@
 import type { ComponentChildren } from 'preact';
 import { useLayoutEffect, useState } from 'preact/hooks';
-import { WIDGET_SIZES } from '@lucidos/engine-constants';
 import type { AppDashboardTile, DashboardTile as Tile, WidgetDashboardTile } from '../../api/client/widgets';
 import type { Dashboard } from '../../generated/thread-event-wire';
 import { openAppById, openEditApp } from '../../store/actions/apps';
 import { removeFromDashboard } from '../../store/actions/dashboards';
 import type { TileSize, WidgetSize } from '../../store/types';
 import { dashboardTileKey } from '../../store/widgets';
-import { DASHBOARD_STEPS_PER_CELL } from '../../utils/dashboardGeometry';
+import { DASHBOARD_STEPS_PER_CELL, WIDGET_SIZE_CELLS } from '../../utils/dashboardGeometry';
 import { AppIcon } from '../shared/AppIcon';
 import { OverflowMenu, type OverflowMenuContext } from '../shared/OverflowMenu';
 import { SkBlock } from '../shared/Skeleton';
 import { useObjectMenu } from '../shared/useObjectMenu';
-import { WidgetFrame } from '../widgets/WidgetFrame';
+import { WidgetBox } from '../widgets/WidgetBox';
+import { WidgetSizePill } from '../widgets/WidgetSizePill';
 import type { FrameState } from '../widgets/widgetFrameState';
 import { dashboardTileMenuItems, type DashboardTileTarget } from '../widgets/WidgetMenu';
 
 /** How many grid steps each tile size spans, a step being a quarter cell: a
  *  widget's cells times the steps per cell, and one step for an app shortcut
  *  (ADR 0432). */
-const STEPS = DASHBOARD_STEPS_PER_CELL;
+function widgetSpan(size: WidgetSize) {
+  const { columns, rows } = WIDGET_SIZE_CELLS[size];
+  return { columns: columns * DASHBOARD_STEPS_PER_CELL, rows: rows * DASHBOARD_STEPS_PER_CELL };
+}
 export const SIZE_SPANS: Record<TileSize, { columns: number; rows: number }> = {
   quarter: { columns: 1, rows: 1 },
-  small: { columns: STEPS, rows: STEPS },
-  medium: { columns: 2 * STEPS, rows: STEPS },
-  large: { columns: 2 * STEPS, rows: 2 * STEPS },
+  small: widgetSpan('small'),
+  medium: widgetSpan('medium'),
+  large: widgetSpan('large'),
 };
-
-/** The size pill's letter for each size. */
-const SIZE_LETTERS: Record<WidgetSize, string> = { small: 'S', medium: 'M', large: 'L' };
 
 function gridPlace(size: TileSize, order?: number) {
   const span = SIZE_SPANS[size];
@@ -76,29 +76,6 @@ function tileMenuItems(ctx: OverflowMenuContext, target: DashboardTileTarget, on
         </>
       )}
     </>
-  );
-}
-
-/** The S · M · L pill. Only the sizes the widget declares are offered. */
-function SizePill({ tile, onResize }: { tile: WidgetDashboardTile; onResize: (size: WidgetSize) => void }) {
-  const offered = WIDGET_SIZES.filter((s) => tile.sizes.includes(s));
-  if (offered.length < 2) return null;
-  return (
-    <div class="dashboard-size-pill" role="radiogroup" aria-label={`Size of ${tile.label ?? tile.name}`}>
-      {offered.map((size) => (
-        <button
-          key={size}
-          type="button"
-          role="radio"
-          aria-checked={tile.size === size}
-          aria-label={size}
-          class={tile.size === size ? 'is-current' : undefined}
-          onClick={() => onResize(size)}
-        >
-          {SIZE_LETTERS[size]}
-        </button>
-      ))}
-    </div>
   );
 }
 
@@ -225,32 +202,18 @@ function AppShortcutTile({ tile, order, actions, editing }: TileProps<AppDashboa
   );
 }
 
-/** A widget: it fills a box its size class sets. Content past the box
- *  is clipped under a fade, and the tile never scrolls inside. A right-click
- *  or a finger held on it opens the tile menu, which ends in Edit dashboard.
- *  In edit mode a shield covers the frame, so a drag moves the tile instead of
- *  reaching the widget, and a press opens no menu. */
+/** A widget: the *widget box* its size sets, drawn as the tile itself. A
+ *  right-click or a finger held on it opens the tile menu, which ends in Edit
+ *  dashboard. In edit mode a shield covers the frame, so a drag moves the tile
+ *  instead of reaching the widget, and a press opens no menu. */
 function WidgetTile({ tile, order, dashboardHidden, actions, editing, onFrameState }: TileProps<WidgetDashboardTile>) {
   const [box, setBox] = useState<HTMLDivElement | null>(null);
-  const [contentHeight, setContentHeight] = useState(0);
-  const [clipped, setClipped] = useState(false);
   const key = dashboardTileKey(tile);
   const name = tile.label ?? tile.name;
   const register = editing?.register;
   const menu = useObjectMenu();
 
   useRegisteredTile(register, key, box);
-
-  useLayoutEffect(() => {
-    if (!box) return undefined;
-    // One pixel of slack absorbs `clientHeight` rounding a fractional report.
-    const measure = () => setClipped(contentHeight - box.clientHeight > 1);
-    measure();
-    if (typeof ResizeObserver !== 'function') return undefined;
-    const observer = new ResizeObserver(measure);
-    observer.observe(box);
-    return () => observer.disconnect();
-  }, [box, contentHeight]);
 
   const onEdit = actions.onEdit;
   const target: DashboardTileTarget = {
@@ -260,38 +223,31 @@ function WidgetTile({ tile, order, dashboardHidden, actions, editing, onFrameSta
     label: tile.label,
     name,
   };
-  const classes = [
-    'dashboard-tile',
-    tile.transparent && 'is-transparent',
-    editing && 'is-editing',
-    editing?.dragging && 'is-dragging',
-  ].filter(Boolean).join(' ');
+  const classes = ['dashboard-tile', editing && 'is-editing', editing?.dragging && 'is-dragging']
+    .filter(Boolean).join(' ');
   return (
-    <div
-      ref={setBox}
+    <WidgetBox
+      boxRef={setBox}
       class={classes}
       data-dashboard-tile={key}
       data-kind="widget"
-      data-size={tile.size}
       style={gridPlace(tile.size, order)}
       {...(editing ? {} : menu.press)}
       onClickCapture={editing ? undefined : menu.onClick}
+      appId={tile.app_id}
+      params={tile.params}
+      reveal={tile.reveal}
+      place="dashboard"
+      size={tile.size}
+      transparent={tile.transparent}
+      visible={!dashboardHidden}
+      hideFade={editing !== null}
+      onFrameState={(state) => onFrameState(key, state)}
+      onMenu={(at) => { if (box && !editing) menu.open(box, at); }}
     >
-      <WidgetFrame
-        appId={tile.app_id}
-        params={tile.params}
-        reveal={tile.reveal}
-        place="dashboard"
-        size={tile.size}
-        visible={!dashboardHidden}
-        onSize={(size) => setContentHeight(size.height)}
-        onFrameState={(state) => onFrameState(key, state)}
-        onMenu={(at) => { if (box && !editing) menu.open(box, at); }}
-      />
-      {clipped && !editing && <div class="dashboard-tile-fade" />}
       {editing && (
         <EditControls name={name} editing={editing}>
-          <SizePill tile={tile} onResize={editing.onResize} />
+          <WidgetSizePill name={name} sizes={tile.sizes} current={tile.size} onPick={editing.onResize} />
         </EditControls>
       )}
       <OverflowMenu
@@ -299,14 +255,14 @@ function WidgetTile({ tile, order, dashboardHidden, actions, editing, onFrameSta
         hostOpener={{ ref: menu.opener, trigger: false }}
         items={(ctx) => tileMenuItems(ctx, target, onEdit)}
       />
-    </div>
+    </WidgetBox>
   );
 }
 
 /** The skeleton drawn from the tile's own box, at a typical first dashboard. */
 export function TileSkeleton({ size }: { size: TileSize }) {
   return (
-    <div class="dashboard-tile" data-size={size} style={gridPlace(size)}>
+    <div class="dashboard-tile widget-box" data-size={size} style={gridPlace(size)}>
       <SkBlock w="100%" h="100%" />
     </div>
   );

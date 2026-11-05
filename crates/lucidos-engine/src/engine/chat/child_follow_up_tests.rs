@@ -432,6 +432,7 @@ async fn the_home_thread_cannot_follow_up_an_unsent_draft() {
     bus.emit(BusEvent::Thread {
         thread_id: draft,
         event: ThreadEvent::ThreadStarted {
+            recovered_compose: None,
             mode: "lucidos".into(),
             actor: None,
         },
@@ -1031,6 +1032,87 @@ async fn follow_up_to_a_question_parked_child_reports_waiting() {
         "an agent follow-up must never consume the child's open question"
     );
 
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn snapshot_settlement_does_not_create_a_parent_completion() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut rx) = EventBus::new(pool.clone());
+    let (parent, child) = parent_and_child(&bus).await;
+    sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, 'snapshot', now(), MAX(sequence) FROM events")
+        .bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    while rx.try_recv().is_ok() {}
+    crate::engine::thread_events::emit_response_aborted(
+        &bus,
+        child,
+        crate::engine::thread_events::AbortCause::SnapshotRestored,
+        "Stopped by restore".into(),
+        vec![],
+        None,
+        None,
+        EventMeta::NONE,
+        "[test] restore",
+    )
+    .await;
+    assert_eq!(cards_on(&pool, parent).await, 0);
+    assert_eq!(bus.refire_unprocessed_child_completions().await, 0);
+    idle_the_child(&bus, child).await;
+    assert_eq!(
+        cards_on(&pool, parent).await,
+        0,
+        "recovery idle must not report archived work"
+    );
+    // A new explicit turn still reports normally.
+    deliver_follow_up(&bus, parent, child, "new work").await;
+    sqlx::query("ALTER TABLE snapshot_restore_boundary RENAME TO hidden_restore_boundary")
+        .execute(&pool)
+        .await
+        .unwrap();
+    idle_the_child(&bus, child).await;
+    assert_eq!(
+        cards_on(&pool, parent).await,
+        0,
+        "unknown generation refuses callback"
+    );
+    sqlx::query("ALTER TABLE hidden_restore_boundary RENAME TO snapshot_restore_boundary")
+        .execute(&pool)
+        .await
+        .unwrap();
+    idle_the_child(&bus, child).await;
+    assert_eq!(cards_on(&pool, parent).await, 1);
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn restored_child_completion_never_refires_but_fresh_completion_does() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut rx) = EventBus::new(pool.clone());
+    let (_, archived_child) = parent_and_child(&bus).await;
+    idle_the_child(&bus, archived_child).await;
+    while rx.try_recv().is_ok() {}
+    sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, 'snapshot', now(), MAX(sequence) FROM events")
+        .bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    for _ in 0..2 {
+        assert_eq!(bus.refire_unprocessed_child_completions().await, 0);
+        assert!(rx.try_recv().is_err());
+    }
+    let (_, fresh_child) = parent_and_child(&bus).await;
+    idle_the_child(&bus, fresh_child).await;
+    while rx.try_recv().is_ok() {}
+    assert_eq!(bus.refire_unprocessed_child_completions().await, 1);
+    assert!(rx.try_recv().is_ok());
+    sqlx::query("ALTER TABLE snapshot_restore_boundary RENAME TO hidden_restore_boundary")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(bus.refire_unprocessed_child_completions().await, 0);
+    sqlx::query("ALTER TABLE hidden_restore_boundary RENAME TO snapshot_restore_boundary")
+        .execute(&pool)
+        .await
+        .unwrap();
     pool.close().await;
     teardown_test_db(&db_name).await;
 }

@@ -34,7 +34,7 @@ source "$SCRIPT_DIR/lib/preflight.sh"
 
 cd "$PROJECT_DIR"
 
-parse_dev_args "$@"
+parse_dev_args "$@" || exit 1
 
 # A coding-agent worktree carries a full scripts/ tree, so PROJECT_DIR above
 # resolves there when this script is invoked from one — pinning the whole stack
@@ -88,9 +88,9 @@ fi
 allocate_ports "$WORKSPACE"
 detect_tls
 setup_postgres
-kill_stale_processes
 build_or_find_engine
 generate_build_outputs
+kill_stale_processes
 swap_ports
 
 # Gateway model by default (ADR 0014): the standalone lucidos-gateway binary
@@ -120,19 +120,24 @@ trap 'cleanup_processes; exit 0' SIGINT SIGTERM
 if [ -n "$FOLLOW_LOG" ]; then
     echo "Press Ctrl+C to stop"
     tail -n 20 -f "$ENGINE_LOG"
-elif [ -t 1 ]; then
+elif [ -n "$EXIT_AFTER_READY" ] || [ -t 1 ]; then
     # Print the listening line for confirmation, then exit
     tail -n 100 "$ENGINE_LOG" | grep -m 1 "API server listening"
     echo ""
     echo "Tail log:  tail -f $ENGINE_LOG"
     echo "Stop:      ./scripts/stop.sh -w $WORKSPACE"
 else
-    # Spawned by restart API — keep web-dev.sh alive while the engine is
-    # alive so the spawned process isn't orphaned. Prefer waiting on the
-    # supervisor (our direct child, survives engine restarts); otherwise wait
-    # for whichever engine owns the workspace to exit, on its lock. Only when
-    # the lock file exists: opening it creates it, which would hide an engine
-    # from before the lock from every reader.
+    # A service owns the gateway lifetime, including times with no engine.
+    # The gateway daemon may not be our child, so wait by liveness.
+    if [ -n "${GATEWAY_PID:-}" ] && kill -0 "$GATEWAY_PID" 2>/dev/null; then
+        while kill -0 "$GATEWAY_PID" 2>/dev/null; do
+            sleep 1
+        done
+        echo "Gateway stopped unexpectedly" >&2
+        exit 1
+    fi
+    # A restart-API spawn without a gateway follows the engine lifetime.
+    # Opening a missing lock would hide an engine from before the lock.
     if [ -n "${ENGINE_SUPERVISOR_PID:-}" ]; then
         wait "$ENGINE_SUPERVISOR_PID"
     elif [ -e "$(engine_lock_path "$WORKSPACE")" ] \

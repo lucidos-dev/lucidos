@@ -1686,8 +1686,9 @@ pub(crate) fn todo_wake_nudge_instruction(open_items: usize, curated: bool) -> S
     };
     format!(
         "STOP, do not finish this turn yet. Your todo list still has {open_items} unfinished \
-         item(s), and NOTHING will re-open this thread: you hold no event-wait subscription and \
-         no background task is running. No wake is scheduled, whatever your answer says. Do one \
+         item(s), and NOTHING will re-open this thread: you hold no event-wait subscription, no \
+         background task is running, and no child thread still owes you a report. No wake is \
+         scheduled, whatever your answer says. Do one \
          of these three now, then finish: (1) call `await_event` if that work is waiting on \
          something happening in Lucidos, so the thread re-opens when it does; (2) \
          {update_the_list}; (3) hand back to the user, deciding for yourself how to say that you \
@@ -1704,10 +1705,11 @@ pub(crate) fn todo_wake_nudge_instruction(open_items: usize, curated: bool) -> S
 /// The direction is the one that rule asks for. A database blip must not add a
 /// round to every chat turn, and the settle asks again at the terminator.
 ///
-/// `covered` is true when a live *event wait* or an unfinished background task
-/// will re-open the thread. Either means the agent parked rather than walked
-/// away, the same split `settle_open_todos` makes between `Waiting` and
-/// `Abandoned`.
+/// `covered` is true when something will re-open the thread or report to it: a
+/// live *event wait*, an unfinished background task, or a live child thread.
+/// Each means the agent parked
+/// rather than walked away, the same split `settle_open_todos` makes between
+/// `Waiting` and `Abandoned`.
 ///
 /// Pure so every arm is testable without an engine behind it.
 pub(crate) fn should_nudge_unwatched_turn(

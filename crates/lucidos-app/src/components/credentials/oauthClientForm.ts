@@ -1,11 +1,12 @@
 /**
  * The decisions behind the `oauth_client` half of the credential form.
  *
- * Its own module (importing only types) so each is unit-testable without
+ * Its own module (importing no API or store code) so each is unit-testable without
  * mounting `CredentialModal`, which pulls in the credential API, the inline-form
  * store and the secret loader.
  */
-import type { CredentialFields } from './credentialSecret';
+import { webRedirectUriLines, type CredentialFields } from './credentialSecret';
+import { OAUTH_WEB_CALLBACK_PATH } from '../../generated/gateway-constants';
 import type { KnownOAuthProvider } from '../../store/types';
 
 /** Why a submit was refused, or null when it may proceed.
@@ -23,6 +24,9 @@ export function oauthClientSubmitError(
   fields: CredentialFields,
   editing: boolean,
 ): string | null {
+  const webRefusal = webRedirectUrisError(fields);
+  if (webRefusal) return webRefusal;
+
   const missing = [
     !fields.authUrl.trim() && 'Authorization URL',
     !fields.tokenUrl.trim() && 'Token URL',
@@ -47,6 +51,38 @@ export function oauthClientSubmitError(
     return `${missing[0]} is required: an OAuth flow cannot run without both endpoints.`;
   }
   return null;
+}
+
+/** Why the web redirect URIs cannot be saved, or null.
+ *
+ *  A provider redirects only to an https web address, and only a Web client
+ *  takes one. A Web client always has a secret, so a secret-less credential
+ *  with a web redirect URI would fail at Connect, far from its cause. */
+function webRedirectUrisError(fields: CredentialFields): string | null {
+  const uris = webRedirectUriLines(fields.webRedirectUris);
+  const malformed = uris.find((uri) => !isWebRedirectUri(uri));
+  if (malformed) {
+    return `${malformed} is not a web redirect URI. It must be https://<address>${OAUTH_WEB_CALLBACK_PATH}.`;
+  }
+  if (uris.length > 0 && !fields.clientSecret.trim()) {
+    return 'A web redirect URI needs a Web client, which has a client secret. Add the secret, or remove the web redirect URIs.';
+  }
+  return null;
+}
+
+function isWebRedirectUri(uri: string): boolean {
+  try {
+    const url = new URL(uri);
+    return (
+      url.protocol === 'https:' &&
+      url.pathname === OAUTH_WEB_CALLBACK_PATH &&
+      !url.search &&
+      !url.hash &&
+      `${url.origin}${url.pathname}` === uri
+    );
+  } catch {
+    return false;
+  }
 }
 
 const MISSING_FIELD_LABELS: Record<string, string> = {

@@ -52,10 +52,10 @@ pub(crate) async fn provider_for(
         route_to(&registry, candidate.model, provider)?;
     }
     let context = judge_context(candidate.model, &registry);
-    let provider = match build_active_provider(None, &context).await? {
-        ProviderBuildOutcome::Install { llm, .. } => llm,
-        ProviderBuildOutcome::FailFast => return Err("no provider is configured here".into()),
-    };
+    let ProviderBuildOutcome { llm: provider, .. } = build_active_provider(None, &context).await?;
+    if !provider.is_configured() {
+        return Err("no provider is configured here".into());
+    }
     let configured = provider.configured_providers().unwrap_or_default();
     let served_by = resolve_provider(&registry, candidate.model, pinned, &configured)?;
     eprintln!("[eval] {} on {}", candidate.spec, served_by.as_str());

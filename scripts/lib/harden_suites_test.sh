@@ -15,8 +15,8 @@
 # default wait budget; a run still setting up; start refusals; stop reaching
 # a grandchild and sparing a recycled pid; the run staying in the caller's
 # process group; a slow, a failing and a stopped touched-spec selection; the
-# WebKit specs sent to GitHub; the tests a failed log names; a retry round of
-# what failed, and the full run it still owes; the timings JSON; test-only
+# WebKit specs sent to GitHub or run here on macOS, after the local specs; the tests a failed log names; a retry round of
+# what failed, and the full run it still owes; carried touched-spec verdicts; the timings JSON; test-only
 # includes selecting their test rather than the crate; a dead engine filter;
 # the crate graph, the owners of each path and the crates a diff reaches, with
 # the suites and commands that follow them; the TEST_CRATES pin.
@@ -632,7 +632,11 @@ expect_eq "each touched spec is one -f" "./scripts/e2e-browser.sh -f chat.spec.t
     "$(command_for e2e-touched normal)"
 if hs_is_cargo_suite e2e-touched; then fail "e2e-touched gets its own lane"; else pass "e2e-touched gets its own lane"; fi
 
-echo "the touched specs mobile-webkit runs go to GitHub"
+echo "the touched specs mobile-webkit runs go to GitHub, or run here on macOS"
+for os in Linux Darwin; do
+    printf '#!/bin/bash\necho %s\n' "$os" > "$TMP/uname-$os.sh"
+    chmod +x "$TMP/uname-$os.sh"
+done
 printf '%s\n' chat.spec.ts nav-mobile.spec.ts rail-all.spec.ts > "$TMP/touched-phone"
 expect_eq "a phone spec selects the WebKit suite too" "ts first-paint e2e-touched e2e-touched-webkit" \
     "$(select_touched "$TMP/touched-phone" full crates/lucidos-app/src/a.ts)"
@@ -641,9 +645,18 @@ expect_eq "the fast tier drops the WebKit suite" "ts" \
 expect_eq "only the specs mobile-webkit runs" "nav-mobile.spec.ts rail-all.spec.ts" \
     "$(hs_webkit_specs < "$TMP/touched-phone" | tr '\n' ' ' | sed 's/ $//')"
 cp "$TMP/touched-phone" "$CMD_STATE/touched-specs"
-expect_eq "the WebKit suite runs on GitHub, pinned to the start commit" \
+expect_eq "a Linux host sends the WebKit suite to GitHub, pinned to the start commit" \
     "./scripts/e2e-browser.sh --github --webkit --commit abc123 -f nav-mobile.spec.ts -f rail-all.spec.ts" \
-    "$(command_for e2e-touched-webkit normal)"
+    "$(HS_UNAME_CMD="$TMP/uname-Linux.sh" command_for e2e-touched-webkit normal)"
+expect_eq "a macOS host runs the WebKit suite itself, on the e2e profile" \
+    "ENGINE_CARGO_PROFILE=e2e ./scripts/e2e-browser.sh --webkit -f nav-mobile.spec.ts -f rail-all.spec.ts" \
+    "$(HS_UNAME_CMD="$TMP/uname-Darwin.sh" command_for e2e-touched-webkit normal)"
+case "$(HS_UNAME_CMD="$TMP/uname-Darwin.sh" command_for e2e-touched-webkit normal)" in
+    *--github*) fail "a macOS host never passes --github" ;;
+    *) pass "a macOS host never passes --github" ;;
+esac
+if HS_UNAME_CMD="$TMP/uname-Darwin.sh" hs_runs_webkit_here; then pass "macOS runs WebKit here"; else fail "macOS runs WebKit here"; fi
+if HS_UNAME_CMD="$TMP/uname-Linux.sh" hs_runs_webkit_here; then fail "Linux sends WebKit to GitHub"; else pass "Linux sends WebKit to GitHub"; fi
 expect_eq "the local suite still runs every touched spec" \
     "./scripts/e2e-browser.sh -f chat.spec.ts -f nav-mobile.spec.ts -f rail-all.spec.ts" \
     "$(command_for e2e-touched normal)"
@@ -661,12 +674,105 @@ expect_eq "a filtered engine suite reruns by name too" \
 echo rail-all.spec.ts > "$CMD_STATE/e2e-touched.retry"
 expect_eq "the local specs that failed" "./scripts/e2e-browser.sh -f rail-all.spec.ts" "$(command_for e2e-touched normal)"
 echo rail-all.spec.ts > "$CMD_STATE/e2e-touched-webkit.retry"
-expect_eq "the WebKit specs that failed" "./scripts/e2e-browser.sh --github --webkit --commit abc123 -f rail-all.spec.ts" \
-    "$(command_for e2e-touched-webkit normal)"
+expect_eq "the WebKit specs that failed, on Linux" "./scripts/e2e-browser.sh --github --webkit --commit abc123 -f rail-all.spec.ts" \
+    "$(HS_UNAME_CMD="$TMP/uname-Linux.sh" command_for e2e-touched-webkit normal)"
+expect_eq "the WebKit specs that failed, on macOS" "ENGINE_CARGO_PROFILE=e2e ./scripts/e2e-browser.sh --webkit -f rail-all.spec.ts" \
+    "$(HS_UNAME_CMD="$TMP/uname-Darwin.sh" command_for e2e-touched-webkit normal)"
 echo whatever > "$CMD_STATE/ts.retry"
 expect_eq "a suite with no named tests reruns whole" \
     "cd crates/lucidos-app && npx tsc --noEmit && npm test --ignore-scripts && npx vite build" "$(command_for ts normal)"
 rm -f "$CMD_STATE"/*.retry
+
+echo "a passing touched-spec verdict carries into the next round"
+CARRY_REPO="$TMP/carry-repo"
+git init -q -b main "$CARRY_REPO"
+git -C "$CARRY_REPO" config user.email "t@t"
+git -C "$CARRY_REPO" config user.name "t"
+mkdir -p "$CARRY_REPO/crates/lucidos-app/src" "$CARRY_REPO/docs"
+carry_commit() { # <relpath> <content>
+    echo "$2" > "$CARRY_REPO/$1"
+    git -C "$CARRY_REPO" add -A && git -C "$CARRY_REPO" commit -qm "$1"
+    git -C "$CARRY_REPO" rev-parse HEAD
+}
+: > "$TMP/carry-inputs"
+C0="$(carry_commit crates/lucidos-app/src/a.ts one)"
+carried() { # <record> [<disabled>]
+    hs_carried_valid "$CARRY_REPO" "$1" "$TMP/carry-inputs" "${2:-0}" | tr '\n' ';' | sed 's/;$//'
+}
+fingerprint() { # <commit>: the untracked fingerprint a run at <commit> started on
+    mkdir -p "$TMP/record.untracked"
+    hs_untracked_fingerprint "$CARRY_REPO" > "$TMP/record.untracked/$1"
+}
+printf 'e2e-touched a.spec.ts %s\n' "$C0" > "$TMP/record"
+expect_eq "a record with no fingerprint never carries" "" "$(carried "$TMP/record")"
+fingerprint "$C0"
+expect_eq "a record at the same commit carries" "e2e-touched a.spec.ts $C0" "$(carried "$TMP/record")"
+echo helper > "$CARRY_REPO/crates/lucidos-app/src/helper.ts"
+expect_eq "a new untracked source file refuses the carry" "" "$(carried "$TMP/record")"
+fingerprint "$C0"
+expect_eq "an untracked file the run started on still carries" "e2e-touched a.spec.ts $C0" "$(carried "$TMP/record")"
+echo edited > "$CARRY_REPO/crates/lucidos-app/src/helper.ts"
+expect_eq "an edit to that untracked file refuses the carry" "" "$(carried "$TMP/record")"
+rm "$CARRY_REPO/crates/lucidos-app/src/helper.ts"
+fingerprint "$C0"
+C1="$(carry_commit docs/note.md docs)"
+expect_eq "a docs-only commit since still carries" "e2e-touched a.spec.ts $C0" "$(carried "$TMP/record")"
+expect_eq "a disabled allowlist carries nothing across a commit" "" "$(carried "$TMP/record" 1)"
+C2="$(carry_commit crates/lucidos-app/src/a.ts two)"
+expect_eq "a source commit since refuses the carry" "" "$(carried "$TMP/record")"
+printf '%s\n' "e2e-touched a.spec.ts $C0" "e2e-touched b.spec.ts $C2" "e2e-touched-webkit c.spec.ts $C2" > "$TMP/record"
+fingerprint "$C2"
+C3="$(carry_commit docs/note.md docs2)"
+expect_eq "a partial carry keeps only the specs still valid" "e2e-touched b.spec.ts $C2;e2e-touched-webkit c.spec.ts $C2" "$(carried "$TMP/record")"
+git -C "$CARRY_REPO" checkout -q -b other "$C1"
+OTHER="$(carry_commit docs/other.md x)"
+git -C "$CARRY_REPO" checkout -q main
+printf '%s\n' "e2e-touched a.spec.ts $OTHER" "e2e-touched b.spec.ts not-a-commit" > "$TMP/record"
+expect_eq "a commit off this branch, or no commit, never carries" "" "$(carried "$TMP/record")"
+expect_eq "no record carries nothing" "" "$(carried "$TMP/no-such-record")"
+
+rm -rf "$TMP/record" "$TMP/record.untracked"
+printf '%s\n' a.spec.ts b.spec.ts > "$TMP/ran-specs"
+printf 'abc\tscratch.txt\n' > "$TMP/run-untracked"
+hs_record_carry "$TMP/record" e2e-touched "$C0" "$TMP/ran-specs" "$TMP/run-untracked"
+expect_eq "a pass records each spec with its commit" "e2e-touched a.spec.ts $C0;e2e-touched b.spec.ts $C0" \
+    "$(tr '\n' ';' < "$TMP/record" | sed 's/;$//')"
+expect_eq "a pass records the run's untracked fingerprint" "$(cat "$TMP/run-untracked")" \
+    "$(cat "$TMP/record.untracked/$C0")"
+printf '%s\n' b.spec.ts > "$TMP/ran-specs"
+hs_record_carry "$TMP/record" e2e-touched "$C3" "$TMP/ran-specs" "$TMP/run-untracked"
+hs_record_carry "$TMP/record" e2e-touched "$C3" "$TMP/ran-specs" "$TMP/run-untracked"
+expect_eq "a later pass replaces the spec's commit, once" "e2e-touched a.spec.ts $C0;e2e-touched b.spec.ts $C3" \
+    "$(sort "$TMP/record" | tr '\n' ';' | sed 's/;$//')"
+hs_record_carry "$TMP/record" e2e-touched-webkit "$C3" "$TMP/ran-specs" "$TMP/run-untracked"
+expect_eq "each suite keeps its own record" "e2e-touched b.spec.ts $C3;e2e-touched-webkit b.spec.ts $C3" \
+    "$(grep ' b.spec.ts ' "$TMP/record" | sort | tr '\n' ';' | sed 's/;$//')"
+printf '%s\n' a.spec.ts > "$TMP/ran-specs"
+hs_record_carry "$TMP/record" e2e-touched "$C3" "$TMP/ran-specs" "$TMP/run-untracked"
+expect_eq "a fingerprint no line names is dropped" "$(basename "$C3")" "$(ls "$TMP/record.untracked")"
+
+echo "a carried spec is left out of the suite's command"
+cp "$TMP/touched-phone" "$CMD_STATE/touched-specs"
+printf '%s\n' "e2e-touched chat.spec.ts abc1234567" "e2e-touched-webkit nav-mobile.spec.ts abc1234567" > "$CMD_STATE/carried"
+expect_eq "the local suite drops its carried spec" \
+    "./scripts/e2e-browser.sh -f nav-mobile.spec.ts -f rail-all.spec.ts" "$(command_for e2e-touched normal)"
+expect_eq "the specs it runs are recorded for the verdict" "nav-mobile.spec.ts rail-all.spec.ts" \
+    "$(tr '\n' ' ' < "$CMD_STATE/e2e-touched.specs" | sed 's/ $//')"
+expect_eq "the WebKit suite drops its own carried spec" \
+    "./scripts/e2e-browser.sh --github --webkit --commit abc123 -f rail-all.spec.ts" \
+    "$(HS_UNAME_CMD="$TMP/uname-Linux.sh" command_for e2e-touched-webkit normal)"
+printf '%s\n' "e2e-touched chat.spec.ts abc1234567" "e2e-touched nav-mobile.spec.ts abc1234567" "e2e-touched rail-all.spec.ts abc1234567" > "$CMD_STATE/carried"
+expect_has "every spec carried runs nothing" "carried" "$(command_for e2e-touched normal)"
+if [ -f "$CMD_STATE/e2e-touched.all-carried" ]; then pass "every spec carried is marked"; else fail "every spec carried is marked"; fi
+case "$(command_for e2e-touched normal)" in
+    *e2e-browser*) fail "every spec carried starts no browser run" ;;
+    *) pass "every spec carried starts no browser run" ;;
+esac
+rm -f "$CMD_STATE/e2e-touched.all-carried"
+echo chat.spec.ts > "$CMD_STATE/e2e-touched.retry"
+expect_eq "a retry round carries nothing" "./scripts/e2e-browser.sh -f chat.spec.ts" "$(command_for e2e-touched normal)"
+if [ -f "$CMD_STATE/e2e-touched.all-carried" ]; then fail "a retry round is never marked carried"; else pass "a retry round is never marked carried"; fi
+rm -f "$CMD_STATE"/*.retry "$CMD_STATE/carried" "$CMD_STATE"/*.specs "$CMD_STATE"/*.all-carried
 
 echo "the tests a failed suite names"
 cat > "$TMP/cargo.log" << 'EOF'
@@ -824,7 +930,7 @@ export HS_MEMORY_GATE_CMD="$STUB_DIR/gate.sh"
 hs() { (cd "$REPO" && bash "$CLI" "$@"); }
 reset_stub() { rm -f "$STUB_DIR"/*.rc "$STUB_DIR"/*.sleep "$STUB_DIR"/*.child "$STUB_DIR"/*.ran \
     "$STUB_DIR"/*.pgid "$STUB_DIR"/*.childpid "$STUB_DIR"/*.killlane "$STUB_DIR"/driver.notests "$STUB_DIR"/gate.calls "$STUB_DIR"/*.say \
-    "$STUB_DIR"/select.fail "$STUB_DIR"/select.out "$STUB_DIR"/events "$TMP"/repo*/.lucidos/harden-retry; }
+    "$STUB_DIR"/select.fail "$STUB_DIR"/select.out "$STUB_DIR"/events "$TMP"/repo*/.lucidos/harden-retry "$TMP"/repo*/.lucidos/harden-carried; }
 commit_file() { # <relpath> <content>
     mkdir -p "$REPO/$(dirname "$1")"
     echo "$2" > "$REPO/$1"
@@ -1372,6 +1478,78 @@ expect_eq "each suite ran once" "ran" "$(cat "$STUB_DIR/engine.ran")"
 out="$(hs2 wait --budget 20)"
 expect_eq "the verdict passes" 0 "$?"
 expect_has "e2e-touched passes" "e2e-touched PASS" "$out"
+
+echo "on macOS the WebKit suite starts after the local touched specs"
+# Both take every e2e slot (ADR 0536), so overlapping runs would find one held.
+# A failing WebKit suite still fails the verdict, on either OS.
+printf '%s\n' board.spec.ts nav-mobile.spec.ts > "$STUB_DIR/select.out.both"
+for os in Darwin Linux; do
+    reset_stub
+    cp "$STUB_DIR/select.out.both" "$STUB_DIR/select.out"
+    echo 2 > "$STUB_DIR/e2e-touched.sleep"
+    echo 1 > "$STUB_DIR/e2e-touched-webkit.rc"
+    HS_UNAME_CMD="$TMP/uname-$os.sh" hs2 start > "$TMP/out" 2>&1
+    out="$(HS_UNAME_CMD="$TMP/uname-$os.sh" hs2 wait --budget 30)"
+    expect_has "$os: both touched-spec suites are selected" "e2e-touched e2e-touched-webkit" "$(cat "$TMP/out")"
+    expect_has "$os: a failing WebKit suite fails the verdict" "e2e-touched-webkit FAIL" "$out"
+    expect_eq "$os: the local suite passed" 1 "$(printf '%s\n' "$out" | grep -c 'e2e-touched PASS')"
+    first_end="$(grep -n -x 'end e2e-touched' "$STUB_DIR/events" | cut -d: -f1)"
+    web_start="$(grep -n -x 'start e2e-touched-webkit' "$STUB_DIR/events" | cut -d: -f1)"
+    if [ "$os" = Darwin ]; then
+        if [ -n "$first_end" ] && [ -n "$web_start" ] && [ "$first_end" -lt "$web_start" ]; then
+            pass "Darwin: the WebKit suite starts after e2e-touched ended"
+        else
+            fail "Darwin: the WebKit suite starts after e2e-touched ended (end line $first_end, start line $web_start)"
+        fi
+    elif [ -n "$web_start" ] && [ -n "$first_end" ] && [ "$web_start" -lt "$first_end" ]; then
+        pass "Linux: the WebKit suite runs beside e2e-touched"
+    else
+        fail "Linux: the WebKit suite runs beside e2e-touched (end line $first_end, start line $web_start)"
+    fi
+done
+rm -f "$STUB_DIR/select.out" "$STUB_DIR/select.out.both"
+
+echo "carried verdicts, through the CLI"
+reset_stub
+echo board.spec.ts > "$STUB_DIR/select.out"
+CARRY2="$REPO2/.lucidos/harden-carried"
+hs2 start > /dev/null 2>&1
+out="$(hs2 wait --budget 20)"
+expect_eq "the first round passes" 0 "$?"
+expect_eq "a pass records its spec at the start commit" "e2e-touched board.spec.ts $(git -C "$REPO2" rev-parse HEAD)" "$(cat "$CARRY2")"
+START_SHA="$(git -C "$REPO2" rev-parse HEAD)"
+mkdir -p "$REPO2/docs"
+echo notes > "$REPO2/docs/notes.md"
+git -C "$REPO2" add -A && git -C "$REPO2" commit -qm docs
+rm -f "$STUB_DIR/e2e-touched.ran"
+hs2 start > /dev/null 2>&1
+out="$(hs2 wait --budget 20)"
+expect_eq "a docs-only round passes" 0 "$?"
+expect_has "the row says it carried" "e2e-touched PASS carried from ${START_SHA:0:10}" "$out"
+if [ -f "$STUB_DIR/e2e-touched.ran" ]; then fail "a carried suite runs nothing"; else pass "a carried suite runs nothing"; fi
+expect_eq "the record is unchanged by a carried round" "e2e-touched board.spec.ts $START_SHA" "$(cat "$CARRY2")"
+echo 'export const label = "Open canvas again";' > "$REPO2/crates/lucidos-app/src/a.ts"
+git -C "$REPO2" commit -qam "source change"
+hs2 start > /dev/null 2>&1
+out="$(hs2 wait --budget 20)"
+expect_eq "a source commit runs the spec again" 0 "$?"
+if [ -f "$STUB_DIR/e2e-touched.ran" ]; then pass "a source commit runs the spec again"; else fail "a source commit runs the spec again"; fi
+expect_has "and the row is a plain pass" "e2e-touched PASS" "$out"
+expect_eq "the new pass moves the record to the new commit" "e2e-touched board.spec.ts $(git -C "$REPO2" rev-parse HEAD)" "$(cat "$CARRY2")"
+reset_stub
+echo board.spec.ts > "$STUB_DIR/select.out"
+echo 1 > "$STUB_DIR/e2e-touched.rc"
+hs2 start > /dev/null 2>&1
+out="$(hs2 wait --budget 20)"
+expect_eq "a failing spec still fails" 1 "$?"
+if [ -s "$CARRY2" ]; then fail "a FAIL records no carry"; else pass "a FAIL records no carry"; fi
+reset_stub
+echo board.spec.ts > "$STUB_DIR/select.out"
+echo "$E2E_LOCK_BUSY_EXIT" > "$STUB_DIR/e2e-touched.rc"
+hs2 start > /dev/null 2>&1
+hs2 wait --budget 20 > /dev/null
+if [ -s "$CARRY2" ]; then fail "a SKIP records no carry"; else pass "a SKIP records no carry"; fi
+reset_stub
 
 echo "a failing touched-spec selection"
 reset_stub

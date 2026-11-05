@@ -4,7 +4,6 @@ use uuid::Uuid;
 
 use crate::core::devices::DeviceStore;
 use crate::engine::home_thread::ensure_home_thread;
-use crate::engine::widgets::WidgetChange;
 use crate::test_support::{setup_test_db, teardown_test_db};
 use Dashboard::{Desktop, Phone};
 use WidgetSize::{Large, Medium, Small};
@@ -24,6 +23,23 @@ fn unpin(app_id: &str) -> ThreadEvent {
         params: None,
         label: None,
     }
+}
+
+/// I9: the seed reads every name a legacy pin or unpin was stored under.
+#[test]
+fn the_seed_reads_current_and_legacy_pin_names() {
+    let mut names = SEED_EVENT_TYPES.clone();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "HomeBoardArranged",
+            "WidgetHidden",
+            "WidgetPinned",
+            "WidgetRestored",
+            "WidgetUnpinned"
+        ]
+    );
 }
 
 fn legacy_tile(app_id: &str, size: WidgetSize) -> LegacyArrangedTile {
@@ -64,6 +80,7 @@ fn added(dashboard: Dashboard, app_id: &str) -> SystemEvent {
         app_id: app_id.into(),
         params: None,
         label: None,
+        size: None,
         actor: None,
     }
 }
@@ -229,6 +246,7 @@ fn two_instances_of_one_widget_are_two_tiles() {
         app_id: "player".into(),
         params: Some(serde_json::from_value(json!({ "clip": clip })).unwrap()),
         label: None,
+        size: None,
         actor: None,
     };
     let folded = fold_dashboards(&[], &[with("a.mp3"), with("b.mp3"), with("a.mp3")]);
@@ -299,13 +317,10 @@ fn a_user_agent_picks_its_dashboard() {
     }
 }
 
-/// The widget id and size of a tile that must be a widget, pinned.
+/// The widget id and size of a tile that must be a widget.
 fn widget_tile(tile: &DashboardTile) -> (&str, WidgetSize) {
     match tile {
-        DashboardTile::Widget { widget, size } => {
-            assert!(widget.pinned);
-            (widget.app_id.as_str(), *size)
-        }
+        DashboardTile::Widget { widget, size } => (widget.app_id.as_str(), *size),
         DashboardTile::App(app) => panic!("'{}' is a shortcut, not a widget", app.app_id),
     }
 }
@@ -337,7 +352,7 @@ async fn add(
     let plan = check_dashboard_change(
         pool,
         manager,
-        DashboardChange::Add,
+        DashboardChange::Add { size: None },
         which,
         &instance(app_id),
     )
@@ -347,7 +362,7 @@ async fn add(
         manager,
         bus,
         plan,
-        DashboardChange::Add,
+        DashboardChange::Add { size: None },
         which,
         instance(app_id),
         None,
@@ -509,7 +524,7 @@ async fn adding_a_threads_widget_makes_it_reusable_and_guards_stop_reusing() {
         check_dashboard_change(
             &pool,
             &manager,
-            DashboardChange::Add,
+            DashboardChange::Add { size: None },
             Phone,
             &instance("fares"),
         )
@@ -558,11 +573,10 @@ async fn adding_a_threads_widget_makes_it_reusable_and_guards_stop_reusing() {
     teardown_test_db(&db).await;
 }
 
-/// Invariant: nothing writes a legacy board event. A pin or an unpin on the
-/// Home thread is refused, so Home's old pins stay the seed. The dashboard
-/// events land on no thread, so Home starts no turn.
+/// Invariant: Home's old pins stay the seed. The dashboard events land on no
+/// thread, so Home starts no turn.
 #[tokio::test]
-async fn the_home_thread_takes_no_pins_and_dashboard_events_land_on_no_thread() {
+async fn dashboard_events_land_on_no_thread() {
     let (pool, db) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let tmp = tempfile::tempdir().unwrap();
@@ -574,18 +588,6 @@ async fn the_home_thread_takes_no_pins_and_dashboard_events_land_on_no_thread() 
         json!({"name": "Clock", "kind": "widget", "reusable": true}),
     );
     emit(&bus, home, pin("clock")).await;
-
-    for change in [
-        WidgetChange::Pin {
-            shown_event_id: None,
-        },
-        WidgetChange::Unpin,
-    ] {
-        assert_refused(
-            widgets::check_widget_change(&pool, &manager, change, &instance("clock"), home).await,
-            "Home has no shelf",
-        );
-    }
 
     let plan = check_dashboard_change(
         &pool,
@@ -736,6 +738,7 @@ async fn a_widget_instance_with_params_drops_off_once_the_manifest_says_app() {
             app_id: "player".into(),
             params: Some(params),
             label: None,
+            size: None,
             actor: None,
         }))
         .await
@@ -823,14 +826,21 @@ async fn an_app_add_refuses_params_an_unknown_id_and_a_repeat_and_a_deleted_app_
         ..instance("notes")
     };
     assert_refused(
-        check_dashboard_change(&pool, &manager, DashboardChange::Add, Desktop, &with_params).await,
+        check_dashboard_change(
+            &pool,
+            &manager,
+            DashboardChange::Add { size: None },
+            Desktop,
+            &with_params,
+        )
+        .await,
         "takes no params",
     );
     assert_refused(
         check_dashboard_change(
             &pool,
             &manager,
-            DashboardChange::Add,
+            DashboardChange::Add { size: None },
             Desktop,
             &instance("missing"),
         )
@@ -843,7 +853,7 @@ async fn an_app_add_refuses_params_an_unknown_id_and_a_repeat_and_a_deleted_app_
         check_dashboard_change(
             &pool,
             &manager,
-            DashboardChange::Add,
+            DashboardChange::Add { size: None },
             Desktop,
             &instance("notes"),
         )
@@ -870,4 +880,52 @@ fn an_old_arranged_tile_reads_into_the_tile_size() {
         assert_eq!(tile.size, TileSize::from(size));
     }
     assert_eq!(TileSize::Quarter.widget_size(), None);
+}
+
+/// I7 of the one-render plan: an add at a size starts the tile there, and an
+/// add with none at the widget's default size.
+#[test]
+fn an_add_at_a_size_starts_the_tile_there() {
+    let sized = SystemEvent::DashboardTileAdded {
+        dashboard: Desktop,
+        app_id: "clock".into(),
+        params: None,
+        label: None,
+        size: Some(Large),
+        actor: None,
+    };
+    let folded = fold_dashboards(&[], &[sized, added(Desktop, "notes")]);
+    let sizes: Vec<Option<TileSize>> = folded.tiles(Desktop).iter().map(|t| t.size).collect();
+    assert_eq!(sizes, vec![Some(TileSize::Large), None]);
+}
+
+/// I7: an add refuses a size the widget does not declare, and any size for an
+/// app shortcut.
+#[tokio::test]
+async fn an_add_refuses_an_undeclared_size_and_a_sized_app() {
+    let (pool, db) = setup_test_db().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let manager = AppManager::new(tmp.path()).unwrap();
+    write_widget(
+        tmp.path(),
+        "clock",
+        json!({"name": "Clock", "kind": "widget", "reusable": true, "sizes": ["small", "medium"]}),
+    );
+    write_app(tmp.path(), "notes");
+    let add_at = |size| DashboardChange::Add { size: Some(size) };
+
+    assert_refused(
+        check_dashboard_change(&pool, &manager, add_at(Large), Desktop, &instance("clock")).await,
+        "does not draw at large",
+    );
+    assert!(
+        check_dashboard_change(&pool, &manager, add_at(Medium), Desktop, &instance("clock"))
+            .await
+            .is_ok()
+    );
+    assert_refused(
+        check_dashboard_change(&pool, &manager, add_at(Small), Desktop, &instance("notes")).await,
+        "takes no size",
+    );
+    teardown_test_db(&db).await;
 }

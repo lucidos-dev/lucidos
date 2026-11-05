@@ -496,7 +496,7 @@ fn workspaces_root(
     home.map(|h| h.join("workspaces"))
 }
 
-fn resolve_target(name_or_path: &str) -> Result<PathBuf, BoxError> {
+pub(crate) fn resolve_target(name_or_path: &str) -> Result<PathBuf, BoxError> {
     let p = PathBuf::from(name_or_path);
     if p.is_absolute() {
         return Ok(p);

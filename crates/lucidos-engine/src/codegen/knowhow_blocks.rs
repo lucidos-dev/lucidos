@@ -45,7 +45,7 @@ pub(super) fn render(root: &Path) -> String {
     }
     block!(SessionEndReason; Shutdown, Panic, Closed, StaleResume, LegacyNonTerminal);
     block!(CancelCause; UserStop, UserAction, SupersededByFollowup, EffortRestart, Unknown);
-    block!(AbortCause; EngineShutdown, SafetyNet, RecoveryAfterRestart, ProcessKilled, StaleSettle, SessionDropped, Unknown);
+    block!(AbortCause; EngineShutdown, SafetyNet, RecoveryAfterRestart, ProcessKilled, StaleSettle, SessionDropped, SnapshotRestored, Unknown);
     block!(UnproposedReason; PlanMissing, PlanAwaitingApproval, OutsideBound, HardeningMissing,
         TurnIncomplete, AwaitingLanding, IntegratedIntoParent, CarriedBySuccessor);
     block!(EngineReason;
@@ -96,6 +96,10 @@ mod tests {
             (
                 "AbortCause",
                 serde_json::to_value(events::AbortCause::SessionDropped).unwrap(),
+            ),
+            (
+                "AbortCause",
+                serde_json::to_value(events::AbortCause::SnapshotRestored).unwrap(),
             ),
             (
                 "UnproposedReason",

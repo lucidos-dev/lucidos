@@ -32,6 +32,7 @@ mod probe;
 mod read_decision;
 mod replay;
 mod results;
+mod snapshot;
 mod wake_decision;
 mod workspace;
 
@@ -109,6 +110,9 @@ enum Command {
         /// task, or none, continues the repeat without reseeding.
         #[arg(long)]
         stop_after: Option<String>,
+        /// Retain completed arm workspaces after publishing durable inputs.
+        #[arg(long)]
+        keep_workspaces: bool,
     },
     /// Resolve every probe for a finished run and append the probe rows.
     Score {
@@ -292,6 +296,7 @@ async fn dispatch() -> Fallible<()> {
             window,
             run_id,
             stop_after,
+            keep_workspaces,
         } => {
             let paths = Paths::resolve()?;
             let fixture = Fixture::load(&paths.fixture_root)?;
@@ -311,6 +316,7 @@ async fn dispatch() -> Fallible<()> {
                 tasks,
                 run_id,
                 stop_after,
+                keep_workspaces,
             )
             .await
         }
@@ -617,14 +623,14 @@ async fn seed_repeat(
     for arm in arms.iter().copied() {
         let slug = workspace::arm_workspace_name(run_label(), arm, repeat);
         let ws = workspace::arm_workspace_path(&paths.eval_root, run_label(), arm, repeat);
-        workspace::checked_eval_workspace(&ws)?;
-        std::fs::create_dir_all(&ws)?;
+        gateway::check_seed_registration(&slug).await?;
+        workspace::create_seed_workspace(&ws)?;
         let database = workspace::arm_database_name(run_label(), arm, repeat);
         let url = workspace::arm_database_url(&paths.pg_base, run_label(), arm, repeat);
         // Both names, because the knowhow tells an operator to open the
         // database by hand and the label makes them run-specific.
         println!("[eval] {slug} seeds into database \"{database}\"");
-        workspace::recreate_database(&paths.pg_base, &database, &ws)?;
+        workspace::create_database(&paths.pg_base, &database)?;
         // The tree goes in BEFORE the first boot. The engine adopts `data/`
         // into the workspace repo as it comes up. Replacing the directory
         // afterwards would leave every fixture file an uncommitted delete.
@@ -675,6 +681,7 @@ async fn run_command(
     tasks: Option<Vec<String>>,
     run_id: Option<String>,
     stop_after: Option<String>,
+    keep_workspaces: bool,
 ) -> Fallible<()> {
     let run_id = run_id.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
     let file = ResultsFile::open(&paths.results_dir, &run_id)?;
@@ -771,6 +778,52 @@ async fn run_command(
             break;
         }
     }
+    if stop_after.is_none() {
+        capture_run_inputs(paths, fixture, &run_id).await?;
+        if !keep_workspaces {
+            // Validate the entire batch before the first DELETE, including retries
+            // where some arms have already been removed.
+            for repeat in 1..=shape.repeats {
+                for arm in &shape.arms {
+                    if snapshot::Snapshot::read(
+                        &paths.results_dir,
+                        &run_id,
+                        run_label().as_str(),
+                        *arm,
+                        repeat,
+                    )?
+                    .is_none()
+                    {
+                        return Err("completed arm has no durable snapshot; cleanup refused".into());
+                    }
+                    let ws =
+                        workspace::arm_workspace_path(&paths.eval_root, run_label(), *arm, repeat);
+                    let slug = workspace::arm_workspace_name(run_label(), *arm, repeat);
+                    gateway::pin_run_owner(&paths.results_dir, &run_id, &ws, &slug, true)?;
+                }
+            }
+            let mut failures = Vec::new();
+            for repeat in 1..=shape.repeats {
+                for arm in &shape.arms {
+                    let ws =
+                        workspace::arm_workspace_path(&paths.eval_root, run_label(), *arm, repeat);
+                    let slug = workspace::arm_workspace_name(run_label(), *arm, repeat);
+                    if let Err(error) =
+                        gateway::cleanup_arm(&paths.results_dir, &run_id, &ws, &slug).await
+                    {
+                        failures.push(format!("{slug}: {error}"));
+                    }
+                }
+            }
+            if !failures.is_empty() {
+                return Err(format!(
+                    "run inputs saved; cleanup incomplete: {}",
+                    failures.join("; ")
+                )
+                .into());
+            }
+        }
+    }
     println!("[eval] results at {}", file.path().display());
     Ok(())
 }
@@ -808,14 +861,20 @@ async fn run_repeat(
             remaining[0].id
         ),
     }
+    // Bind before any engine can drive a task. Resumes may only read the
+    // original binding, never the credential of a later registration.
+    for arm in &shape.arms {
+        let ws = workspace::arm_workspace_path(&paths.eval_root, run_label(), *arm, repeat);
+        let slug = workspace::arm_workspace_name(run_label(), *arm, repeat);
+        gateway::pin_run_owner(&paths.results_dir, run_id, &ws, &slug, progress.reached > 0)?;
+    }
     let mut engines = Vec::new();
     let mut endpoints = Vec::new();
     let booted = boot_arms(paths, repeat, &shape.arms, &mut engines, &mut endpoints).await;
 
     // The engines are stopped whichever way the repeat ends, a half-boot
     // included. A manipulation failure aborts the repeat by design. A leaked
-    // engine keeps writing to a workspace the next seed clears, and holds a
-    // database that seed force-drops.
+    // engine keeps writing to a workspace that a resumed run will reuse.
     let outcome = match booted {
         Ok(()) => {
             async {
@@ -1403,7 +1462,7 @@ fn thread_row(
     }
 }
 
-/// Resolve every probe of a finished run against the arms' databases.
+/// Resolve probes from preserved inputs, or legacy live arm databases.
 async fn score_command(
     paths: &Paths,
     fixture: &Fixture,
@@ -1483,7 +1542,7 @@ async fn score_command(
         .cloned()
         .collect();
     let census = fixture.census_probes(HANDOVER_PATH);
-    // Read off the file, so scoring opens the databases this run wrote.
+    // Read off the file, so scoring selects this run's saved or live inputs.
     let labels = RunLabels::read(paths, &[run_id.to_string()])?;
     let mut skipped_judge = 0usize;
     let mut judged: Vec<judge::JudgedProbe> = Vec::new();
@@ -1499,10 +1558,6 @@ async fn score_command(
             continue;
         }
         let label = labels.of(&thread.run_id);
-        let pool = arm_pool(paths, label, thread.arm, thread.repeat).await?;
-        let data_dir =
-            workspace::arm_workspace_path(&paths.eval_root, label, thread.arm, thread.repeat)
-                .join("data");
         let mut applicable: Vec<Probe> = fixture.probes_for(&thread.task).cloned().collect();
         if thread.task == analyse::CENSUS_TASK {
             applicable.extend(census.iter().cloned());
@@ -1515,7 +1570,29 @@ async fn score_command(
                 .task(&thread.task)
                 .is_some_and(|task| task.followup.is_some()),
         );
-        let world = ThreadWorld::load(&pool, thread.thread_id, turn_two).await?;
+        let saved = snapshot::Snapshot::read(
+            &paths.results_dir,
+            run_id,
+            label.as_str(),
+            thread.arm,
+            thread.repeat,
+        )?;
+        let saved_data;
+        let (world, data_dir) = if let Some(mut saved) = saved {
+            saved_data = saved.data_dir()?;
+            let inputs = saved
+                .threads
+                .remove(&thread.thread_id)
+                .ok_or("snapshot is missing the scored thread")?;
+            (inputs.world, saved_data.path().to_path_buf())
+        } else {
+            let pool = arm_pool(paths, label, thread.arm, thread.repeat).await?;
+            (
+                ThreadWorld::load(&pool, thread.thread_id, turn_two).await?,
+                workspace::arm_workspace_path(&paths.eval_root, label, thread.arm, thread.repeat)
+                    .join("data"),
+            )
+        };
         let scoring = ScoringContext {
             fixture,
             world: &world,
@@ -1656,7 +1733,58 @@ impl TurnTwo {
     }
 }
 
+/// Publish all post-run read inputs before any arm can be removed. Engines
+/// have stopped; a capture error leaves every arm available for inspection.
+async fn capture_run_inputs(paths: &Paths, fixture: &Fixture, run_id: &str) -> Fallible<()> {
+    let ids = vec![run_id.to_string()];
+    let labels = RunLabels::read(paths, &ids)?;
+    let label = labels.of(run_id);
+    let mut groups: BTreeMap<(Arm, u32), Vec<ThreadRow>> = BTreeMap::new();
+    for thread in threads_of(paths, &ids)? {
+        groups
+            .entry((thread.arm, thread.repeat))
+            .or_default()
+            .push(thread);
+    }
+    for ((arm, repeat), threads) in groups {
+        if let Some(saved) =
+            snapshot::Snapshot::read(&paths.results_dir, run_id, label.as_str(), arm, repeat)?
+        {
+            if threads
+                .iter()
+                .any(|t| !saved.threads.contains_key(&t.thread_id))
+            {
+                return Err("published snapshot is missing run threads; arms retained".into());
+            }
+            continue;
+        }
+        let pool = arm_pool(paths, label, arm, repeat).await?;
+        let data = workspace::arm_workspace_path(&paths.eval_root, label, arm, repeat).join("data");
+        let mut saved = snapshot::Snapshot::new(run_id, label.as_str(), arm, repeat, &data)?;
+        for thread in threads {
+            let turn_two = TurnTwo::of(
+                thread.followup_sequence,
+                fixture
+                    .task(&thread.task)
+                    .is_some_and(|task| task.followup.is_some()),
+            );
+            let world = ThreadWorld::load(&pool, thread.thread_id, turn_two).await?;
+            let rounds = replay::rounds(&pool, thread.thread_id).await?;
+            saved
+                .threads
+                .insert(thread.thread_id, snapshot::ThreadInputs { world, rounds });
+        }
+        saved.calls = calls::by_purpose(&pool, &fixture.prices).await?;
+        if arm.expects_tree_memory() {
+            saved.tree = Some(calls::tree_nodes(&pool).await?);
+        }
+        saved.publish(&paths.results_dir)?;
+    }
+    Ok(())
+}
+
 /// One thread's rows, read once and shared by every probe on it.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ThreadWorld {
     tool_calls: Vec<assertions::ToolCall>,
     events: Vec<assertions::EventRow>,
@@ -1861,17 +1989,15 @@ fn print_report(analysis: &analyse::Analysis, trims: &Trims, calls: &[ArmCalls])
 struct ArmCalls {
     arm: Arm,
     repeat: u32,
-    /// `None` once a later run has re-seeded the database.
+    /// `None` when a legacy run has no readable database.
     by_purpose: Option<Vec<calls::PurposeCalls>>,
     /// A Tree arm's nodes. `None` on a Classic arm.
     tree: Option<calls::TreeNodes>,
 }
 
-/// Every model call each arm database of the named runs made.
-///
-/// A database still holding none of its run's threads was re-seeded by a later
-/// run. Its calls belong to that run, so it is reported unreadable rather than
-/// counted here.
+/// Every model call each arm of the named runs made. Snapshots survive arm
+/// removal. For legacy runs, a database missing its expected thread belongs
+/// to a different run and is reported unreadable rather than counted here.
 async fn calls_by_arm(
     paths: &Paths,
     run_ids: &[String],
@@ -1892,7 +2018,19 @@ async fn calls_by_arm(
             by_purpose: None,
             tree: None,
         };
-        if let Ok(pool) = arm_pool(paths, labels.of(&run_id), arm, repeat).await {
+        if let Some(saved) = snapshot::Snapshot::read(
+            &paths.results_dir,
+            &run_id,
+            labels.of(&run_id).as_str(),
+            arm,
+            repeat,
+        )? {
+            if !saved.threads.contains_key(&thread_id) {
+                return Err("snapshot is missing the reported thread".into());
+            }
+            found.by_purpose = Some(saved.calls);
+            found.tree = saved.tree;
+        } else if let Ok(pool) = arm_pool(paths, labels.of(&run_id), arm, repeat).await {
             if metrics::highest_sequence(&pool, thread_id).await? > 0 {
                 found.by_purpose = Some(calls::by_purpose(&pool, &fixture.prices).await?);
                 if arm.expects_tree_memory() {
@@ -2288,8 +2426,8 @@ fn engine_commit(repo_root: &Path) -> String {
 
 /// Every captured round's trim passes, pooled over the runs being reported.
 ///
-/// A run whose arm database is unreachable contributes nothing rather than
-/// failing the report. An older run contributes nothing either: its rows carry
+/// Snapshots survive arm removal. A legacy run whose database is unreachable
+/// contributes nothing. An older run contributes nothing either: its rows carry
 /// no `trim_passes`, and reading that as "no pass fired" would be a claim they
 /// never made.
 async fn trims_by_pass(paths: &Paths, run_ids: &[String]) -> Fallible<Trims> {
@@ -2298,11 +2436,26 @@ async fn trims_by_pass(paths: &Paths, run_ids: &[String]) -> Fallible<Trims> {
     let labels = RunLabels::read(paths, run_ids)?;
     for thread in threads_of(paths, run_ids)? {
         trims.threads += 1;
-        let Ok(pool) = arm_pool(paths, labels.of(&thread.run_id), thread.arm, thread.repeat).await
-        else {
-            continue;
+        let rounds = if let Some(mut saved) = snapshot::Snapshot::read(
+            &paths.results_dir,
+            &thread.run_id,
+            labels.of(&thread.run_id).as_str(),
+            thread.arm,
+            thread.repeat,
+        )? {
+            saved
+                .threads
+                .remove(&thread.thread_id)
+                .ok_or("snapshot is missing trim inputs")?
+                .rounds
+        } else {
+            let Ok(pool) =
+                arm_pool(paths, labels.of(&thread.run_id), thread.arm, thread.repeat).await
+            else {
+                continue;
+            };
+            replay::rounds(&pool, thread.thread_id).await?
         };
-        let rounds = replay::rounds(&pool, thread.thread_id).await?;
         if rounds.is_empty() {
             continue;
         }
@@ -2316,10 +2469,8 @@ async fn trims_by_pass(paths: &Paths, run_ids: &[String]) -> Fallible<Trims> {
 
 /// Which trim passes fired, and over how much of the run the reader could see.
 ///
-/// The coverage is not decoration. An arm's database is force-dropped and
-/// re-seeded by the NEXT run, and every run of one arm and repeat uses the same
-/// database name. So pooling a sweep leaves only the last run's threads in
-/// place, and the counts silently cover one run out of four.
+/// Coverage makes missing threads visible when an arm was cleaned up, or a
+/// historical run's database was reseeded.
 #[derive(Default)]
 struct Trims {
     by_pass: BTreeMap<u64, usize>,
@@ -2421,8 +2572,22 @@ async fn replay_command(
             .into())
         }
     };
-    let pool = arm_pool(paths, labels.of(&row.run_id), row.arm, row.repeat).await?;
-    let rounds = replay::rounds(&pool, row.thread_id).await?;
+    let rounds = if let Some(mut saved) = snapshot::Snapshot::read(
+        &paths.results_dir,
+        &row.run_id,
+        labels.of(&row.run_id).as_str(),
+        row.arm,
+        row.repeat,
+    )? {
+        saved
+            .threads
+            .remove(&row.thread_id)
+            .ok_or("snapshot is missing replay inputs")?
+            .rounds
+    } else {
+        let pool = arm_pool(paths, labels.of(&row.run_id), row.arm, row.repeat).await?;
+        replay::rounds(&pool, row.thread_id).await?
+    };
     let label = format!("{} {} repeat {}", row.arm, row.task, row.repeat);
     replay::print_rounds(&label, &rounds, options);
     Ok(())

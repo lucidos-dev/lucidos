@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { parseSecret, buildSecret, emptyFields, isSecretReference } from './credentialSecret';
+import {
+  parseSecret,
+  buildSecret,
+  emptyFields,
+  isSecretReference,
+  webRedirectUriFor,
+  webRedirectUriLines,
+} from './credentialSecret';
 
 describe('parseSecret', () => {
   it('returns the raw value for single-value types', () => {
@@ -159,5 +166,32 @@ describe('isSecretReference', () => {
     expect(isSecretReference('op://Engineering/Stripe/credential')).toBe(true);
     expect(isSecretReference('sk-live-value')).toBe(false);
     expect(isSecretReference('')).toBe(false);
+  });
+});
+
+describe('web redirect URIs', () => {
+  const uri = 'https://host.example/~/oauth/callback';
+
+  it('round-trips as a list, one per line', () => {
+    const stored = JSON.stringify({
+      client_id: 'id',
+      client_secret: 'sec',
+      web_redirect_uris: [uri, 'https://other.example/~/oauth/callback'],
+    });
+    const f = parseSecret('oauth_client', stored);
+    expect(f.webRedirectUris).toBe(`${uri}\nhttps://other.example/~/oauth/callback`);
+    expect(JSON.parse(buildSecret('oauth_client', f))).toEqual(JSON.parse(stored));
+  });
+
+  it('stores trimmed lines with no blanks or repeats, and no key when empty', () => {
+    const f = { ...emptyFields(), clientId: 'id', webRedirectUris: ` ${uri}\n\n${uri} \n` };
+    expect(JSON.parse(buildSecret('oauth_client', f)).web_redirect_uris).toEqual([uri]);
+    const none = { ...emptyFields(), clientId: 'id', webRedirectUris: '\n ' };
+    expect(JSON.parse(buildSecret('oauth_client', none))).toEqual({ client_id: 'id' });
+  });
+
+  it('names the gateway web callback on the page origin', () => {
+    expect(webRedirectUriFor('https://host.example')).toBe(uri);
+    expect(webRedirectUriLines(` a \n\nb\na`)).toEqual(['a', 'b']);
   });
 });

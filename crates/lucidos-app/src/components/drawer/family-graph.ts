@@ -1,6 +1,6 @@
 import { computed } from '@preact/signals';
 import { effectiveThreadStatus, getThreadDisplaySection, threadMap, threadIsBlocked, threadInReview, changeAwaitsApply, ONGOING_GROUPS, selectedOngoingGroup, ongoingFilterChoice, setOngoingFilterChoice, ONGOING_PARTS, isSplitOngoingGroup, type OngoingFilter, type OngoingGroup, type OngoingPart, type SplitOngoingGroup, type ThreadChannel } from '../../store/store';
-import { threadVisualStatus } from '../shared/threadVisualStatus';
+import { visualStatusFor } from '../shared/threadVisualStatus';
 import { byRecent, byCreated, recencyKey, reviewTier, isExcludedFromSections } from '../../store/thread-events';
 import type { ThreadState } from '../../store/thread-events';
 import type { DisplaySection } from '../../generated/thread-lifecycle';
@@ -703,20 +703,23 @@ export function reviewThreads(threads: ReadonlyMap<string, ThreadState>): Thread
 }
 
 /** Whether a thread is in flight: it sits in the Current or Saved section and
- *  its status dot reads `running` or `waiting`. That is a running turn, its own
- *  event wait, or sub-threads that have not finished.
+ *  its status dot, read past any read request, is `running` or `waiting`. That
+ *  is a running turn, its own event wait, or sub-threads that have not finished.
  *
- *  Reading the dot keeps In flight apart from the other ongoing groups. The
- *  dot puts a question, a failure and a pause ahead of `waiting`, and Blocked
- *  owns those. A change awaiting Apply with only sub-threads reads `changes`,
- *  which is Review's. A stopped sub-thread needs the user even while its own children
- *  run, so Blocked keeps it. */
+ *  Reading the dot keeps In flight apart from Blocked and from a change in
+ *  Review. The dot puts a question, a failure and a pause ahead of `waiting`,
+ *  and Blocked owns those. A change awaiting Apply with only sub-threads reads
+ *  `changes`, which is Review's. A stopped sub-thread needs the user even while
+ *  its own children run, so Blocked keeps it.
+ *
+ *  A read request marks the reply, not the work. So an unread thread whose
+ *  work runs on lists in Review and In flight both (ADR 0424). */
 export function threadIsInFlight(thread: ThreadState): boolean {
     if (isExcludedFromSections(thread)) return false;
     const section = getThreadDisplaySection(thread);
     if (section !== 'current' && section !== 'saved') return false;
     if (threadIsBlocked(thread)) return false;
-    const dot = threadVisualStatus(thread);
+    const dot = visualStatusFor(effectiveThreadStatus(thread), { ...thread.meta, readRequested: false });
     return dot === 'running' || dot === 'waiting';
 }
 
@@ -738,8 +741,8 @@ export function inFlightThreads(threads: ReadonlyMap<string, ThreadState>): Nest
 
 /** The part of its split group a row belongs to. A Review row holding both a
  *  ready change and a read request counts as a change, so the parts always sum
- *  to the group. An In flight row reads only `running` or `waiting`, because
- *  `threadIsInFlight` takes only those two dots. */
+ *  to the group. An In flight row is `running` or `waiting`, because
+ *  `threadIsInFlight` takes only those two dots, read past a read request. */
 export function ongoingPartOf(group: SplitOngoingGroup, row: NestedThread): OngoingPart {
     switch (group) {
         case 'review': return changeAwaitsApply(row.thread.meta) ? 'changes' : 'unread';
@@ -772,8 +775,8 @@ export function filterOngoingRows(group: OngoingGroup, rows: NestedThread[], fil
 const flatRows = (threads: ThreadState[]): NestedThread[] => threads.map(thread => ({ thread, depth: 0 }));
 
 /** One ongoing group's rows, in the order the drawer renders them. Every group
- *  reads its own predicate, so a thread shows in each group it matches. Only
- *  In flight is disjoint from the others. Bypasses the thread-type filter. */
+ *  reads its own predicate, so a thread shows in each group it matches. In
+ *  flight never shares a thread with Blocked. Bypasses the thread-type filter. */
 export function ongoingGroupRows(threads: ReadonlyMap<string, ThreadState>, group: OngoingGroup): NestedThread[] {
     switch (group) {
         case 'blocked': return flatRows(blockedThreads(threads));

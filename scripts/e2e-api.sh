@@ -60,9 +60,26 @@ export PROTO
 # The CLI tests shell out to the `lucidos` binary. Make sure it's built and at
 # the expected target path before tests run.
 cargo build --locked -p lucidos-cli
+export E2E_SNAPSHOT_ENGINE_BIN="$ENGINE_BIN"
+E2E_SNAPSHOT_TARGET_DIR="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+export E2E_SNAPSHOT_CLI_BIN="$E2E_SNAPSHOT_TARGET_DIR/debug/lucidos"
+if [ "${E2E_SNAPSHOT_BROWSER:-}" = "chromium" ]; then
+    # Resolve before the fixture enters its private HOME; never download a
+    # second browser or expose the user's HOME to the fixture engines.
+    E2E_SNAPSHOT_BROWSER_EXECUTABLE="$(node --input-type=module -e 'import { chromium } from "@playwright/test"; process.stdout.write(chromium.executablePath());')"
+    export E2E_SNAPSHOT_BROWSER_EXECUTABLE
+fi
 
 CMD=(cargo test --locked -p lucidos-e2e --test api)
-[ -n "$FILTER" ] && CMD+=("$FILTER")
+# The bin-only gateway chain fixture is also selectable for focused iteration.
+# Do not send its name to the API binary, where it would silently run zero tests.
+if [ "$FILTER" = "chain_tests::an_app_frames_own_files_load_through_a_gateway" ] || \
+   [ "$FILTER" = "server::snapshot_roundtrip_tests::isolated_snapshot_cli_roundtrip" ]; then
+    CMD=(cargo test --locked -p lucidos-gateway "$FILTER")
+    CARGO_ARGS=(--ignored --exact "${CARGO_ARGS[@]}")
+else
+    [ -n "$FILTER" ] && CMD+=("$FILTER")
+fi
 [ ${#CARGO_ARGS[@]} -gt 0 ] && CMD+=("--" "${CARGO_ARGS[@]}")
 
 TREE_BEFORE="$(e2e_workspace_tree_status)" || {
@@ -82,14 +99,20 @@ assert_e2e_workspace_tree_clean "$TREE_BEFORE" || TREE_RC=$?
 [ "$TESTS_RC" -eq 0 ] || exit "$TESTS_RC"
 [ "$TREE_RC" -eq 0 ] || exit "$TREE_RC"
 
-# The gateway chain test, which is the only one that puts a real gateway in
-# front of a real engine. It lives in lucidos-gateway rather than lucidos-e2e
+# Real gateway/engine fixtures live in lucidos-gateway rather than lucidos-e2e
 # because that crate is bin-only, so nothing outside it can build its router.
-# `--ignored` keeps it out of `make test`, which has no engine to serve it. Run
-# by name, so a second ignored test cannot join this step by accident.
+# `--ignored` keeps them out of `make test`, which has no built engine. Run
+# each by name, so another ignored test cannot join this step by accident.
 # Skipped when a filter asked for something else.
 if [ -z "$FILTER" ]; then
+    # API tests exercise workspace-wide preferences and parked agent turns.
+    # The chain's live child needs the same clean queue and defaults as a
+    # focused chain run, rather than inheriting the preceding suite's state.
+    reset_e2e_database
     echo "Running the gateway chain test (an app's own files behind a gateway)"
     cargo test --locked -p lucidos-gateway -- --ignored --exact \
         chain_tests::an_app_frames_own_files_load_through_a_gateway
+    echo "Running isolated snapshot CLI restore and Undo (private workspaces and database)"
+    cargo test --locked -p lucidos-gateway -- --ignored --exact \
+        server::snapshot_roundtrip_tests::isolated_snapshot_cli_roundtrip
 fi

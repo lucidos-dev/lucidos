@@ -17,6 +17,11 @@ so it adds no row to the receipts.
 
 ## Checks
 
+- **Workspace cleanup is not artifact deletion.** Use Manage workspaces for frozen cleanup and Trash recovery; never substitute filesystem removal.
+
+- **Snapshot archives treated as artifacts.** Check snapshot procedures against `system-knowhow/backups/workspace-snapshots.md`.
+  Flag instructions to move archives into `data/artifacts/` as **broken**; the external snapshot store owns them.
+
 For each finding, capture: **location**, **what's wrong**, **which reference owns the rule** (link, don't quote), **suggested fix**.
 
 Don't enumerate user content. Per `system-knowhow/best-practices.md`:

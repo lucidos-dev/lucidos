@@ -25,6 +25,7 @@
  */
 
 import { useSignal } from '@preact/signals';
+import { CleanupManager } from './CleanupManager';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
@@ -64,7 +65,6 @@ import {
   listRemoteWorkspaces,
   createWorkspace,
   renameWorkspace,
-  deleteWorkspace,
   restartWorkspace,
   stopWorkspace,
   setAutostart,
@@ -114,7 +114,7 @@ import {
 } from '../settings/remoteGatewayForm';
 import { GlyphBadge } from '../shared/GlyphBadge';
 import { RemoteWorkspaceRows } from './RemoteWorkspaceRows';
-import { mergeRemoteListings, type RemoteGatewayView } from './remoteWorkspaces';
+import { mergeRemoteListings, recallRemoteListings, rememberRemoteListings, type RemoteGatewayView } from './remoteWorkspaces';
 import { singleFlight } from './singleFlight';
 
 /** Background ticks between two asks of the remote gateways. Each ask crosses
@@ -357,7 +357,7 @@ export function WorkspacePicker() {
   const renamingId = useSignal<string | null>(null);
   const renameValue = useSignal('');
   const deletingId = useSignal<string | null>(null);
-  const deleteConfirm = useSignal('');
+  const cleanupTick = useSignal(0);
   // Restore-from-backup form + flow state. The three fields travel as one draft
   // so the pure rules in `workspaceForms.ts` decide what the user is told.
   const restoreDraft = useSignal<RestoreDraft>(EMPTY_RESTORE_DRAFT);
@@ -445,8 +445,9 @@ export function WorkspacePicker() {
     const previous = remoteWorkspaces.value;
     remoteWorkspaces.value = {
       status: 'loaded',
-      data: mergeRemoteListings(previous.status === 'loaded' ? previous.data : [], listings),
+      data: mergeRemoteListings(previous.status === 'loaded' ? previous.data : recallRemoteListings(), listings),
     };
+    if (remoteWorkspaces.value.status === 'loaded') rememberRemoteListings(remoteWorkspaces.value.data);
   });
   const fetchRemoteWorkspaces = remoteAsk.current;
 
@@ -485,6 +486,7 @@ export function WorkspacePicker() {
   // surface failures via refresh(). Per frontend.md's best-effort carve-out this
   // logs rather than toasts.
   async function pollRefresh(): Promise<void> {
+    cleanupTick.value++;
     try {
       await fetchWorkspaces();
     } catch (e) {
@@ -757,15 +759,6 @@ export function WorkspacePicker() {
     });
   }
 
-  function onDelete(id: string) {
-    void withBusy(async () => {
-      await deleteWorkspace(id, deleteConfirm.value);
-      deletingId.value = null;
-      deleteConfirm.value = '';
-      await refresh();
-    });
-  }
-
   /** Apply a chosen or dropped file. An empty selection (cancelled dialog,
    *  file-less drop) leaves the draft alone: see `applyRestoreFile`. */
   function pickRestoreFile(file: File | null | undefined) {
@@ -835,7 +828,7 @@ export function WorkspacePicker() {
   // `null` mode is a gesture that is not an activation, so the row does
   // nothing: a macOS Ctrl-click, which the row menu already answers.
   function openOrRetry(w: WorkspaceStatus, state: WorkspaceState, mode: WorkspaceOpenMode | null) {
-    if (mode === null) return;
+    if (mode === null || w.health === 'restoring') return;
     if (state === 'unhealthy') {
       void withBusy(() => restartWorkspace(w.id).then(refresh));
       return;
@@ -1062,7 +1055,8 @@ export function WorkspacePicker() {
               // folded in here or it goes unread. Two can be: the fault note,
               // and the backup line.
               const rowLabel = [
-                fault ? `Retry ${w.name} · ${fault}` : `Open ${w.name}`,
+                w.health === 'restoring' ? `Restoring ${w.name}` : fault ? `Retry ${w.name} · ${fault}` : `Open ${w.name}`,
+                w.health === 'restoring' ? w.last_error : null,
                 backup?.text,
               ]
                 .filter(Boolean)
@@ -1094,23 +1088,6 @@ export function WorkspacePicker() {
                       {renameTaken && (
                         <p class="ws-picker-note ws-picker-note-warn">{nameTakenMessage(renameTaken)}</p>
                       )}
-                    </div>
-                  ) : deletingId.value === w.id ? (
-                    <div class="ws-picker-inline ws-picker-delete">
-                      <span>Type <strong>{w.name}</strong> to delete:</span>
-                      <input
-                        class="ws-picker-input"
-                        value={deleteConfirm.value}
-                        onInput={(e) => (deleteConfirm.value = (e.target as HTMLInputElement).value)}
-                        onKeyDown={(e) => e.key === 'Enter' && deleteConfirm.value === w.name && onDelete(w.id)}
-                        autoFocus
-                      />
-                      <button
-                        class="ws-picker-btn ws-picker-btn-danger"
-                        disabled={busy.value || deleteConfirm.value !== w.name}
-                        onClick={() => onDelete(w.id)}
-                      >Delete</button>
-                      <button class="ws-picker-btn" onClick={() => { deletingId.value = null; deleteConfirm.value = ''; }}>Cancel</button>
                     </div>
                   ) : (
                     <div
@@ -1162,6 +1139,7 @@ export function WorkspacePicker() {
                             row's one horizontal budget between them. */}
                         <div class="ws-picker-id">
                           <span class="ws-picker-name">{w.name}</span>
+                          {w.health === 'restoring' && <span class="ws-picker-address">{workspaceStateLabel(w)}</span>}
                           {/* The address is normally invisible, and normally that's
                               fine (it matches the name). It is shown exactly when it
                               would otherwise surprise: a rename left the name off its
@@ -1223,7 +1201,7 @@ export function WorkspacePicker() {
                             <div class="ws-picker-stop-wrap">
                               <button
                                 class="ws-picker-icon ws-picker-icon-play ws-picker-icon-stop"
-                                disabled={busy.value}
+                                disabled={busy.value || w.health === 'restoring'}
                                 data-tooltip="Stop"
                                 aria-label={`Stop ${w.name}`}
                                 aria-haspopup="dialog"
@@ -1262,7 +1240,7 @@ export function WorkspacePicker() {
                                   >Cancel</button>
                                   <button
                                     class="ws-picker-btn ws-picker-btn-danger"
-                                    disabled={busy.value}
+                                    disabled={busy.value || w.health === 'restoring'}
                                     onClick={(e) => {
                                       e.stopPropagation();
                                       stopConfirmId.value = null;
@@ -1275,7 +1253,7 @@ export function WorkspacePicker() {
                           ) : (
                             <button
                               class="ws-picker-icon ws-picker-icon-play"
-                              disabled={busy.value}
+                              disabled={busy.value || w.health === 'restoring'}
                               data-tooltip={state === 'unhealthy' ? 'Retry' : 'Start'}
                               aria-label={`${state === 'unhealthy' ? 'Retry' : 'Start'} ${w.name}`}
                               onClick={(e) => {
@@ -1288,7 +1266,7 @@ export function WorkspacePicker() {
                             <button
                               class="ws-picker-icon ws-picker-icon-more"
                               data-role="ws-row-more"
-                              disabled={busy.value}
+                              disabled={busy.value || w.health === 'restoring'}
                               data-tooltip="More"
                               aria-label={`More actions for ${w.name}`}
                               aria-haspopup="menu"
@@ -1331,7 +1309,7 @@ export function WorkspacePicker() {
                                 <button
                                   class="ws-picker-menu-item"
                                   role="menuitem"
-                                  disabled={busy.value}
+                                  disabled={busy.value || w.health === 'restoring'}
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     menuOpenId.value = null;
@@ -1351,7 +1329,7 @@ export function WorkspacePicker() {
                               <button
                                 class={`ws-picker-menu-item${w.autostart ? ' is-on' : ''}`}
                                 role="menuitem"
-                                disabled={busy.value}
+                                disabled={busy.value || w.health === 'restoring'}
                                 onClick={(e) => {
                                   e.stopPropagation();
                                   menuOpenId.value = null;
@@ -1387,7 +1365,6 @@ export function WorkspacePicker() {
                                   e.stopPropagation();
                                   menuOpenId.value = null;
                                   deletingId.value = w.id;
-                                  deleteConfirm.value = '';
                                 }}
                               >
                                 <TrashIcon />
@@ -1440,6 +1417,8 @@ export function WorkspacePicker() {
 
         {restoreBanner({ status: restore, busy: busy.value, onDismiss: onDismissRestore })}
 
+        <CleanupManager tick={cleanupTick.value} requestedWorkspace={deletingId.value} onRequestHandled={() => { deletingId.value = null; }} onChanged={refresh} />
+
         {pickerFooter({
           mode: footerMode.value,
           // Re-activating the open entry point closes its form; the draft is
@@ -1462,11 +1441,8 @@ export function WorkspacePicker() {
           onCancelRestore: closeRestore,
           blocker,
           fileNote,
-          // Route the way out of a collision through the row's existing
-          // type-the-name delete confirm (which autofocuses), rather than
-          // inventing a second, weaker destructive path: deleting a workspace
-          // drops its database.
-          onDeleteColliding: (id) => { deletingId.value = id; deleteConfirm.value = ''; },
+          // Collisions use the same frozen, named cleanup flow as the row menu.
+          onDeleteColliding: (id) => { deletingId.value = id; },
           remoteDraft: remoteDraft.value,
           onRemoteDraft: patchRemote,
           onAddRemote,

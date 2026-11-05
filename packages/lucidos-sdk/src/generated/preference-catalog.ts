@@ -684,6 +684,32 @@ export const PREF_BACKUP_RETENTION = {
   fallback: "5",
 } as const;
 
+export const PREF_SNAPSHOT_RESTORE_BY_AGENTS = {
+  key: "snapshot_restore_by_agents",
+  scope: "global",
+  type: "enum",
+  values: ["ask", "allow"],
+  fallback: "ask",
+} as const;
+
+export const PREF_SNAPSHOT_RETENTION = {
+  key: "snapshot_retention",
+  scope: "global",
+  type: "number",
+  min: 1,
+  max: 1000,
+  fallback: "5",
+} as const;
+
+export const PREF_SNAPSHOT_RECOVERY_RETENTION = {
+  key: "snapshot_recovery_retention",
+  scope: "global",
+  type: "number",
+  min: 1,
+  max: 1000,
+  fallback: "3",
+} as const;
+
 export const PREF_BACKUP_REMINDER_DISMISSED = {
   key: "backup_reminder_dismissed",
   scope: "global",
@@ -1019,6 +1045,9 @@ export const PREFERENCE_CATALOG = {
   "backup_schedule": PREF_BACKUP_SCHEDULE,
   "backup_provider": PREF_BACKUP_PROVIDER,
   "backup_retention": PREF_BACKUP_RETENTION,
+  "snapshot_restore_by_agents": PREF_SNAPSHOT_RESTORE_BY_AGENTS,
+  "snapshot_retention": PREF_SNAPSHOT_RETENTION,
+  "snapshot_recovery_retention": PREF_SNAPSHOT_RECOVERY_RETENTION,
   "backup_reminder_dismissed": PREF_BACKUP_REMINDER_DISMISSED,
   "command_guard": PREF_COMMAND_GUARD,
   "command_guard_judge": PREF_COMMAND_GUARD_JUDGE,

@@ -41,7 +41,7 @@
 # copy the user actually piped in (see the piped branch below). release.sh
 # rewrites this line in the same step that bumps RELEASE; install_test.sh and
 # version_sources_test.sh assert the two match.
-LUCIDOS_DEFAULT_VERSION="0.55.1"
+LUCIDOS_DEFAULT_VERSION="0.56.0"
 # Where a PIPED dash run re-fetches itself from. A mirror that serves this script
 # under its own domain (lucidos.dev) rewrites this line at publish time so the
 # re-fetch pulls THE SAME copy, not whatever github main happens to hold.
@@ -1235,12 +1235,12 @@ ensure_node() {
     ok "Node.js installed"
 }
 
-# ── build deps (cmake; sccache when easy) ───────────────────────────────────
+# ── build dependencies (cmake and sccache) ───────────────────────────────────
 ensure_build_deps() {
     step "Checking native build dependencies"
     if [ "$OS" = "macos" ]; then
         brew_install cmake
-        brew_install sccache || true   # speeds up rebuilds; optional (see below)
+        brew_install sccache
         have jq || brew_install jq || true
     else
         # A C/C++ toolchain + cmake + openssl headers are needed to build the
@@ -1252,12 +1252,43 @@ ensure_build_deps() {
             zypper)  pkg_install -t pattern devel_basis 2>/dev/null || true; pkg_install cmake pkg-config libopenssl-devel jq || true ;;
             *) warn "Install a C toolchain, cmake, pkg-config and OpenSSL dev headers manually." ;;
         esac
-        # sccache rarely ships in distro repos and building it from source is
-        # slow; skip it on Linux. The build falls back to an uncached compile
-        # (see ensure_sccache_or_disable).
+        # Install the wrapper separately so an unavailable cache package does
+        # not prevent the native build dependencies from being installed.
+        if ! have sccache; then
+            pkg_install sccache || warn "Install sccache manually and re-run (for example: cargo install sccache --locked)."
+        fi
     fi
     have cmake || die "cmake is required to build the engine but is not installed. Install cmake and re-run."
+    have sccache || die "sccache is required by .cargo/config.toml. Install sccache (for example: cargo install sccache --locked) and re-run."
     ok "Native build dependencies present"
+}
+
+# Source development uses PostgreSQL 18 in Docker. Client tools run on the
+# host and must be at least that major; older pg_dump cannot dump that server.
+ensure_postgres_client() {
+    [ "$OS" = "linux" ] || return 0
+    step "Checking PostgreSQL client tools (18 or newer)"
+    local tool major clients_ok=1
+    for tool in pg_dump pg_restore; do
+        major="$("$tool" --version 2>/dev/null | sed -n 's/.*PostgreSQL) \([0-9][0-9]*\).*/\1/p' || true)"
+        if ! have "$tool" || [ "${major:-0}" -lt 18 ]; then clients_ok=0; fi
+    done
+    if [ "$clients_ok" -eq 0 ]; then
+        case "$PKG" in
+            apt-get) pkg_install postgresql-client-18 || true ;;
+            dnf|yum) pkg_install postgresql18 || true ;;
+            pacman) pkg_install postgresql-libs || true ;;
+            zypper) pkg_install postgresql18 || true ;;
+            *) warn "No supported package manager found. Install PostgreSQL client tools 18 or newer manually." ;;
+        esac
+    fi
+    for tool in pg_dump pg_restore; do
+        major="$("$tool" --version 2>/dev/null | sed -n 's/.*PostgreSQL) \([0-9][0-9]*\).*/\1/p' || true)"
+        if ! have "$tool" || [ "${major:-0}" -lt 18 ]; then
+            die "$tool 18 or newer is required for the PostgreSQL 18 server. Install postgresql-client-18 on Debian/Ubuntu (enable the official PostgreSQL apt repository if unavailable), or equivalent client tools for your distro, and put them on PATH."
+        fi
+    done
+    ok "PostgreSQL client tools present"
 }
 
 # .cargo/config.toml sets `rustc-wrapper = "sccache"`. If sccache is not on
@@ -1422,7 +1453,7 @@ VERTEX_REGION=$VERTEX_REGION"
 # ── launch (source build) ───────────────────────────────────────────────────
 launch() {
     step "Starting Lucidos (PostgreSQL + engine + frontend)"
-    printf '\n%s%sFirst run builds the engine from source (a release build by default) — this can\ntake 10–20+ minutes on a clean machine. Subsequent runs reuse the build and\nstart in seconds. Set LUCIDOS_DEBUG_BUILD=1 for a faster (debug) build.%s\n\n' \
+    printf '\n%s%sFirst run builds the engine from source (a release build by default). This can\ntake 10–20+ minutes on a clean machine. Subsequent runs reuse the build and\nstart in seconds. Set LUCIDOS_DEBUG_BUILD=1 for a faster (debug) build.%s\n\n' \
         "$C_DIM" "$C_BOLD" "$C_RESET"
 
     # scripts/run.sh is the user-facing launcher: it brings up the same stack as
@@ -1436,10 +1467,10 @@ launch() {
     # configured a plain restart picks it up.
     cd "$LUCIDOS_HOME"
     if [ "$PROVIDER_MODE" = "mock" ]; then
-        LUCIDOS_MODEL=mock ./scripts/run.sh -w "$LUCIDOS_WORKSPACE" \
+        LUCIDOS_MODEL=mock ./scripts/run.sh -w "$LUCIDOS_WORKSPACE" --exit-after-ready \
             || die "scripts/run.sh failed. Check the output above and the engine log under $LUCIDOS_WORKSPACE/.lucidos/engine.log"
     else
-        ./scripts/run.sh -w "$LUCIDOS_WORKSPACE" \
+        ./scripts/run.sh -w "$LUCIDOS_WORKSPACE" --exit-after-ready \
             || die "scripts/run.sh failed. Check the output above and the engine log under $LUCIDOS_WORKSPACE/.lucidos/engine.log"
     fi
 }
@@ -1496,6 +1527,7 @@ run_dev_install() {
         ensure_rust
         ensure_node
         ensure_build_deps
+        ensure_postgres_client
         ensure_docker_installed
     fi
 

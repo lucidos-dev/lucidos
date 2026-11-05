@@ -45,6 +45,22 @@ All use aggregate `ops` and `aggregate_id` `global`.
 - **`ModelNotServedObserved`** is emitted by `aux_purpose::not_served_report` at most once per provider, model and purpose within six hours. At boot `aux_purpose::reach::seed_not_served` seeds the router's `NotServedLedger` from the last six hours through `idx_events_type_created` (ADRs 0403, 0519).
 - **`ThreadsDeleted` carries neither `aggregate = 'thread'` nor a `thread_id`**, so no later thread sweep can delete it (ADR 0192). It carries no content (no title, first message or summary), because a row nothing can delete must not re-file what the delete removed. `POST /api/v1/threads/delete` is the only production path that removes an `events` row, and it refuses anything but a signed-in device.
 
+## Local workspace snapshot events
+
+Aggregate `snapshot`, aggregate identity the opaque snapshot handle. The persisted
+outcomes are `SnapshotCreated`, `SnapshotCaptureFailed`, `SnapshotChecked` and
+`SnapshotDeleted`; `SnapshotProgress` is transient and projection-free. Every
+payload carries workspace identity, handle and initiating actor, with fixed
+failure/deletion reason enums rather than primitive error text.
+
+Owned capture/check workers retain the session through durable job completion,
+terminal announcement and capture retention. Retention emits one deletion with
+reason `retention` immediately after each successful removal, stopping on any
+failure. Caller cancellation cannot interrupt this sequence. Startup settles
+interrupted jobs and announces their failure under both archive locks before
+HTTP admission. A never-used snapshot store creates neither directories nor
+MAC keys at boot.
+
 ## Memory events
 
 Aggregate `memory`, `aggregate_id` `global`.
@@ -80,6 +96,7 @@ Aggregate `memory`, `aggregate_id` `global`.
 
 - **Trigger CRUD events carry `actor`.** That covers `TriggerCreated`, `TriggerUpdated`, `TriggerDeleted`, `TriggerEnabled` and `TriggerDisabled`, aggregate `trigger`. `SystemEvent::to_payload` merges it through `merge_actor`, the contract `TriggerGroup*` shares. The handlers resolve it through `require_user_actor`.
 - **`TriggerExecuted` carries no `actor`.** Its payload is `trigger_id`, `last_run` and `status` (`ok` or `failed`). `replay.rs` rebuilds `TriggerConfig.last_run_status` from it. A legacy event without `status` reads as `None`. Boot stamps an interrupted fire's failed `last_run` with its start time, not recovery time. This marks the cut cron slot as run while leaving later missed slots eligible for catch-up.
+- **`TriggerSlotsSkipped` reports cron slots that passed with no run.** Its payload is `trigger_id`, `trigger_name`, `first_slot`, `last_slot` and `count`, aggregate `trigger`, no `actor`. `scheduler/skipped_slots.rs` emits one per trigger per gap, then a `NotificationCreated` whose tap opens the trigger. It is persisted, so a trigger can fire on it. Its `last_slot` bounds the next report, so a gap is never reported twice.
 - **`plugin_id` on `TriggerCreated` and `TriggerUpdated` marks a plugin-managed trigger** (ADR 0019). Absent means user-created. Install emits them through `resync_plugin_triggers`, and uninstall emits a `TriggerDeleted` per trigger carrying the id (`delete_plugin_triggers`).
 - **Trigger groups.** `TriggerGroupCreated`, `Renamed`, `Reordered` and `Deleted` use aggregate `trigger_group` and carry `actor`. A group is a folder only. A delete is refused while members remain, and then emits nothing.
 - **Plugin events** use aggregate `plugin` with `aggregate_id` the plugin id, all persisted. `PluginInstalled` also serves updates and reinstalls. Its `payload.data.id` is top-level, and an older row carries it only inside the raw manifest. It also carries `commit`, the sha of the "Install plugin" commit. A top-level `files_removed` lists paths an update deleted.

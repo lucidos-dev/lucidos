@@ -3201,3 +3201,117 @@ async fn recovery_finishes_an_expired_requeued_retry_after_notification_before_d
     f.pool.close().await;
     teardown_test_db(&f.db).await;
 }
+
+#[tokio::test]
+async fn restored_queue_drops_archived_entries_and_preserves_new_work_on_every_boot() {
+    let f = fixture(1).await;
+    let old = emit_cron_queued(&f.bus, "trig-old", false).await;
+    sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, $2, now(), MAX(sequence) FROM events")
+        .bind(Uuid::new_v4()).bind("20261031T120000Z-0123456789abcdef")
+        .execute(&f.pool).await.unwrap();
+    let new = emit_cron_queued(&f.bus, "trig-new", false).await;
+    // The queue's own BIGSERIAL is unrelated to the event horizon.
+    sqlx::query("UPDATE thread_queue SET sequence = sequence + 1000000")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let (next, _) = restarted_queue(&f, 1);
+        next.recover_persisted_entries().await;
+        assert_eq!(row_status(&f.pool, old).await, None);
+        let state = next.state.lock().await;
+        assert_eq!(state.queued.len(), 1);
+        assert_eq!(state.queued[0].id, new);
+    }
+    assert_eq!(
+        dropped_reason(&f.pool, old).await.as_deref(),
+        Some("snapshot-restored")
+    );
+    assert_eq!(
+        entry_event_count(&f.pool, old, "ThreadQueueDropped").await,
+        1
+    );
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn restored_queue_refuses_missing_provenance_and_late_requeues() {
+    let f = fixture(1).await;
+    let old = emit_cron_queued(&f.bus, "trig-old", true).await;
+    let missing = emit_cron_queued(&f.bus, "trig-missing", false).await;
+    sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, $2, now(), MAX(sequence) FROM events")
+        .bind(Uuid::new_v4()).bind(crate::core::snapshot::handle::Handle::generate().as_str())
+        .execute(&f.pool).await.unwrap();
+    // A stale writer's late requeue must not renew the original request.
+    let archived: serde_json::Value = sqlx::query_scalar("SELECT payload FROM events WHERE event_type = 'ThreadQueued' AND payload->'data'->>'entry_id' = $1")
+        .bind(old.to_string()).fetch_one(&f.pool).await.unwrap();
+    let mut event: SystemEvent = serde_json::from_value(archived).unwrap();
+    if let SystemEvent::ThreadQueued { requeued, .. } = &mut event {
+        *requeued = true;
+    }
+    f.bus.emit(BusEvent::System(event)).await.unwrap();
+    // Model an imported projection without its source event.
+    sqlx::query("DELETE FROM events WHERE event_type = 'ThreadQueued' AND payload->'data'->>'entry_id' = $1")
+        .bind(missing.to_string()).execute(&f.pool).await.unwrap();
+    let (next, _) = restarted_queue(&f, 1);
+    next.recover_persisted_entries().await;
+    assert!(next.state.lock().await.queued.is_empty());
+    for id in [old, missing] {
+        assert_eq!(row_status(&f.pool, id).await, None);
+        assert_eq!(
+            dropped_reason(&f.pool, id).await.as_deref(),
+            Some("snapshot-restored")
+        );
+    }
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn restored_queue_cancellation_failure_never_admits_archived_work() {
+    let f = fixture(1).await;
+    let old = emit_cron_queued(&f.bus, "trig-old", true).await;
+    sqlx::query("INSERT INTO snapshot_restore_boundary (restore_id, snapshot, restored_at, event_sequence) SELECT $1, $2, now(), MAX(sequence) FROM events")
+        .bind(Uuid::new_v4()).bind(crate::core::snapshot::handle::Handle::generate().as_str())
+        .execute(&f.pool).await.unwrap();
+    crate::test_support::refuse_event_type(&f.pool, "ThreadQueueDropped").await;
+    for _ in 0..2 {
+        let (next, _) = restarted_queue(&f, 1);
+        next.recover_persisted_entries().await;
+        assert!(next.state.lock().await.queued.is_empty());
+        assert_eq!(row_status(&f.pool, old).await.as_deref(), Some("admitted"));
+    }
+    sqlx::query("DROP TRIGGER refuse_event ON events")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let (next, _) = restarted_queue(&f, 1);
+    next.recover_persisted_entries().await;
+    assert!(next.state.lock().await.queued.is_empty());
+    assert_eq!(row_status(&f.pool, old).await, None);
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn queue_recovery_refuses_an_unreadable_restore_boundary() {
+    let f = fixture(1).await;
+    let id = emit_cron_queued(&f.bus, "trig-a", false).await;
+    sqlx::query("ALTER TABLE snapshot_restore_boundary RENAME TO unavailable_restore_boundary")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let (next, _) = restarted_queue(&f, 1);
+    next.recover_persisted_entries().await;
+    assert!(next.state.lock().await.queued.is_empty());
+    assert_eq!(row_status(&f.pool, id).await.as_deref(), Some("queued"));
+    sqlx::query("ALTER TABLE unavailable_restore_boundary RENAME TO snapshot_restore_boundary")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    next.recover_persisted_entries().await;
+    assert_eq!(next.state.lock().await.queued[0].id, id);
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}

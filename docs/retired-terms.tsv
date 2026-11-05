@@ -10,3 +10,9 @@
 \bbreak-even\s+(?:budget|cap|mode|rule|point)s?\b	reread cap	docs/adr/0603-keep-alive-follows-the-expected-wake.md
 [`'"](?:break-even|workspace-data)[`'"]	cache_keep_alive_mode on (the mode is off or on)	docs/adr/0603-keep-alive-follows-the-expected-wake.md
 \bVertex\s+relay\b	nothing: Claude Code 2.1.311 asks for progress notes itself	docs/adr/0605-claude-code-notes-follow-the-claude-code-version.md
+\bgateway\s+pairing\s+codes?\b	gateway pairing secret	docs/adr/0615-pairing-secrets-are-long-and-a-typed-code-is-local-only.md
+\bwedged(?:\s+|-)rebuilds?\b	verified engine build, or a named build failure with Retry build	docs/adr/0617-engine-build-delivery-proof.md
+\bwidget\s+shelf\b	a dashboard tile, through Add to dashboard	docs/adr/0621-widgets-one-box-no-pin.md
+\b(?:un)?pin(?:ned)?\s+(?:to|from)\s+(?:the\s+)?shelf\b	Add to dashboard, or Remove from dashboard	docs/adr/0621-widgets-one-box-no-pin.md
+widgets\(action="(?:un)?pin"\)	widgets(action="add_to_dashboard"), or widgets(action="size") for a card	docs/adr/0621-widgets-one-box-no-pin.md
+\bthread\s+widgets\b	the thread's inline widgets, drawn from its replies	docs/adr/0621-widgets-one-box-no-pin.md

@@ -62,6 +62,19 @@ pub struct TriggerRunHistory {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+impl TriggerRunHistory {
+    /// The later of the stored run and the registry's replayed
+    /// [`TriggerConfig::last_run`](super::TriggerConfig). Both are engine-clock
+    /// *recorded run times*, so neither a stale config nor a lagging read can
+    /// hide a run.
+    pub fn effective_last_run(
+        &self,
+        in_memory_last_run: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        self.last_run.max(in_memory_last_run)
+    }
+}
+
 /// The *recorded run time* of a run-marker row — the instant the engine says the
 /// trigger ran, on the engine's own clock.
 ///

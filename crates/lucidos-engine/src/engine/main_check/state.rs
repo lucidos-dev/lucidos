@@ -332,6 +332,10 @@ impl MainCheck {
         }
     }
 
+    pub(super) fn expire_followup(&mut self) {
+        self.dirty = false;
+    }
+
     /// The check a restart cut off, taken out of the state.
     pub(super) fn take_interrupted(&mut self) -> Option<CheckRange> {
         let range = self.running.take()?;

@@ -32,7 +32,10 @@ pub(crate) mod handshake_scripts;
 pub(crate) mod hex;
 mod history;
 mod intelligence_ladder;
+mod snapshots;
 pub(crate) use history::{ROUTE_FRAMES, SSE_KEEPALIVE_EVENT, SSE_KEEPALIVE_INTERVAL};
+#[cfg(test)]
+pub(crate) use snapshots::assert_restore_slot_busy;
 mod images;
 pub(crate) mod internal;
 mod knowhow;
@@ -46,6 +49,7 @@ pub(crate) mod mutating_gate;
 mod notifications;
 mod onepassword;
 mod recall;
+mod restore_generation;
 #[cfg(test)]
 pub(crate) mod route_scan;
 mod side_questions;
@@ -942,6 +946,29 @@ pub struct RouteInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<i32>,
     pub reasoning_efforts: &'static [&'static str],
+    /// Runtime configuration, or null when the backend cannot report it.
+    pub configured: Option<bool>,
+    /// A supported app request protocol through a builtin proxy, independent
+    /// of whether the user has configured its credentials.
+    pub proxy: Option<ModelProxyInfo>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelProxyProtocol {
+    AnthropicMessages,
+    OpenaiResponses,
+    OpenaiChatCompletions,
+    VertexAnthropic,
+    VertexGoogle,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ModelProxyInfo {
+    pub name: String,
+    pub protocol: ModelProxyProtocol,
+    /// Wire defaults indexed by offered effort; the empty key means provider default.
+    pub request_defaults: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// A registry row as the API serves it: its own fields, with `routes` replaced
@@ -1590,6 +1617,7 @@ pub fn create_router(
         .merge(form_requests::router())
         .merge(internal::router())
         .merge(backup::router())
+        .merge(snapshots::router())
         .merge(disk_usage::router())
         .merge(voice::router())
         .merge(voice_ticket::router())
@@ -1639,6 +1667,10 @@ pub fn create_router(
             state.clone(),
             mutating_gate::enforce_caller_identified,
         ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            restore_generation::enforce,
+        ))
         // Tell a coding agent, on any call it makes, that a child report waits
         // for it (`api::threads::child_reports`).
         .layer(axum::middleware::from_fn_with_state(
@@ -1650,6 +1682,11 @@ pub fn create_router(
         // second answer: see `api::app_reach` and ADR 0231. It reads the
         // MATCHED route, so it sits inside the nest, beside the gate above.
         .layer(axum::middleware::from_fn(app_reach::enforce_app_reach))
+        // Remember the prefix each device reached us under, so an agent-started
+        // OAuth flow can route its callback back (`core::oauth_callback`).
+        .layer(axum::middleware::from_fn(
+            crate::core::oauth_callback::note_browser_context,
+        ))
         // Refuse a request that named a DIFFERENT workspace than this engine
         // serves (409). Layered here rather than per-handler because a
         // mis-aimed write is a hazard on every mutating endpoint, and a

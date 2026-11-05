@@ -1,5 +1,7 @@
-import { API, json, mutatingFetchIdempotent, throwIfNotOk } from './_core';
+import { sha256Hex } from '../../utils/sha256Hex';
+import { API, json, mutatingFetch, mutatingFetchIdempotent, throwIfNotOk } from './_core';
 import { postWithUploadProgress, type UploadObserver } from './uploadProgress';
+import type { PreservedComposeIntent } from '../../store/restoreGenerationRecords';
 import type { ComposeSelectionOverride } from '../../store/composeSelections';
 import { parseComposeReport, type ComposeReport, type ComposeReportWire } from '../../store/composeReport';
 
@@ -30,6 +32,48 @@ export async function ensureThreadStarted(id: string, mode: string): Promise<Com
   });
   await throwIfNotOk(res);
   return readComposeReport(res);
+}
+
+/** Atomically materialize a preserved composer. Durable recovery owns retries;
+ * an existing destination is never overwritten, including after a lost reply. */
+export async function createRecoveredDraft(
+  id: string,
+  generation: string,
+  source: PreservedComposeIntent['drafts'][number],
+): Promise<void> {
+  const hashes = [...new Set(source.draft.image_hashes)];
+  const images = new Map<string, { hash: string; base64: string }>();
+  const addImage = async (bytes: ArrayBuffer, base64: string, expected?: string) => {
+    const hash = await sha256Hex(bytes);
+    if (!hash) throw new Error('Image recovery requires secure image hashing');
+    if (expected && hash !== expected) throw new Error('Recovered image hash mismatch');
+    if (!hashes.includes(hash)) hashes.push(hash);
+    images.set(hash, { hash, base64 });
+  };
+  for (const upload of source.uploads ?? []) {
+    // Chunk conversion avoids argument-count limits on multi-megabyte photos.
+    const bytes = new Uint8Array(upload.bytes);
+    let binary = '';
+    for (let offset = 0; offset < bytes.length; offset += 8192) {
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
+    }
+    await addImage(upload.bytes, btoa(binary), upload.landedHash);
+  }
+  for (const image of source.unsentMessage?.body.images ?? []) {
+    const bytes = Uint8Array.from(atob(image.base64), (c) => c.charCodeAt(0));
+    await addImage(bytes.buffer, image.base64);
+  }
+  const res = await mutatingFetch(`${API}/threads`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id, mode: source.draft.mode ?? 'lucidos',
+      ...(images.size ? { recovered_images: [...images.values()] } : {}), recovered_compose: {
+      generation, text: source.draft.text, image_hashes: hashes,
+      selection: source.selection,
+    } }),
+    signal: AbortSignal.timeout(THREAD_START_TIMEOUT_MS),
+  }, true);
+  await throwIfNotOk(res);
 }
 
 /** The *compose report* a response carries, or `null` when it carries none:

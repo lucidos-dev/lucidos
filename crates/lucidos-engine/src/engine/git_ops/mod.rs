@@ -241,6 +241,11 @@ async fn run_git(
     let output = |program: &Path| {
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(args).current_dir(dir).kill_on_drop(kill_on_drop);
+        // `git status` refreshes a stale index under `index.lock`. That lock
+        // makes a concurrent `git add` or `git commit` in the same worktree
+        // die. Mandatory locks are unaffected. `git diff` ignores this
+        // setting, so a probe uses the plumbing `diff-files` instead.
+        cmd.env("GIT_OPTIONAL_LOCKS", "0");
         for (key, value) in envs {
             cmd.env(key, value);
         }
@@ -368,6 +373,16 @@ pub(crate) async fn git_answer_when_ok(
         dir,
     )
 }
+
+/// Whether `dir` holds unmerged paths. A non-zero exit means "not a work
+/// tree", never "no conflicts", so it is `Unknown`.
+pub(crate) async fn has_unmerged_paths(dir: &Path) -> GitAnswer {
+    git_answer_when_ok(&UNMERGED_PATHS_ARGS, dir, |o| !o.stdout.is_empty()).await
+}
+
+/// Lists unmerged paths without touching the index: porcelain `git diff`
+/// rewrites a stale index under `index.lock` whatever `GIT_OPTIONAL_LOCKS` says.
+const UNMERGED_PATHS_ARGS: [&str; 3] = ["diff-files", "--name-only", "--diff-filter=U"];
 
 /// Pure mapping from a [`git_cmd`] result to a [`GitAnswer`]. `on_nonzero` is
 /// what a non-zero exit means for this particular question. Split out from the

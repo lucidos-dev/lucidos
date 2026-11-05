@@ -740,6 +740,156 @@ test_a_failed_setup_is_no_verdict_and_a_failure_outranks_it() {
     if [[ "$rc" == *"shard's warm-up setup failed"* ]]; then pass "a log with no task line still gives a message"; else fail "message: $rc"; fi
 }
 
+# shellcheck disable=SC2317,SC2329 # the wait, download, report, rerun and sleep are stubbed
+test_a_run_with_no_verdict_is_rerun_once() {
+    echo "test: the driver reruns a run with no verdict once, and never after a test failure"
+    local calls="$SANDBOX/settle-calls" out
+    rm -f "$calls.reran"
+    settle_stubs() {
+        : >"$calls"
+        e2e_github_wait() { echo wait >>"$calls"; echo '{"status": "completed", "conclusion": "cancelled", "run_attempt": 1}'; }
+        e2e_github_download() { echo download >>"$calls"; }
+        e2e_github_rerun_failed() { echo "rerun $1 $2" >>"$calls"; return "${RERUN_RC:-0}"; }
+    }
+
+    out="$(
+        settle_stubs
+        e2e_github_report() { echo report >>"$calls"; return "$E2E_GITHUB_NO_VERDICT_EXIT"; }
+        e2e_github_settle_run 4242 "$SANDBOX/settle-out" >/dev/null 2>&1; echo "$?:$E2E_GITHUB_SETTLE_RC"
+        tr '\n' ' ' <"$calls"
+    )"
+    if [ "$out" = "0:$E2E_GITHUB_NO_VERDICT_EXIT
+wait download report rerun 4242 1 wait download report " ]; then
+        pass "a first miss reruns once, and a second miss stays no verdict"
+    else
+        fail "$out"
+    fi
+
+    out="$(
+        settle_stubs
+        e2e_github_report() { echo report >>"$calls"; return 1; }
+        e2e_github_settle_run 4242 "$SANDBOX/settle-out" >/dev/null 2>&1; echo "$?:$E2E_GITHUB_SETTLE_RC"
+        tr '\n' ' ' <"$calls"
+    )"
+    if [ "$out" = "0:1
+wait download report " ]; then pass "a failed test is never rerun"; else fail "$out"; fi
+
+    out="$(
+        settle_stubs
+        e2e_github_report() { [ -e "$calls.reran" ] && return 0; touch "$calls.reran"; return "$E2E_GITHUB_NO_VERDICT_EXIT"; }
+        e2e_github_settle_run 4242 "$SANDBOX/settle-out" >/dev/null 2>&1; echo "$?:$E2E_GITHUB_SETTLE_RC"
+    )"
+    if [ "$out" = "0:0" ]; then pass "the rerun's verdict is the run's verdict"; else fail "$out"; fi
+
+    out="$(
+        settle_stubs
+        RERUN_RC=1
+        e2e_github_report() { echo report >>"$calls"; return "$E2E_GITHUB_NO_VERDICT_EXIT"; }
+        e2e_github_settle_run 4242 "$SANDBOX/settle-out" >/dev/null 2>&1; echo "$?:$E2E_GITHUB_SETTLE_RC"
+        tr '\n' ' ' <"$calls"
+    )"
+    if [ "$out" = "0:$E2E_GITHUB_NO_VERDICT_EXIT
+wait download report rerun 4242 1 " ]; then
+        pass "a rerun that gh refuses leaves the first miss as the verdict"
+    else
+        fail "$out"
+    fi
+
+    out="$(
+        settle_stubs
+        RERUN_RC=2
+        e2e_github_report() { return "$E2E_GITHUB_NO_VERDICT_EXIT"; }
+        e2e_github_settle_run 4242 "$SANDBOX/settle-out" >/dev/null 2>&1; echo "$?"
+    )"
+    if [ "$out" = "$E2E_GITHUB_NO_VERDICT_EXIT" ]; then
+        pass "a rerun that never shows returns no verdict, so the caller cancels it"
+    else
+        fail "$out"
+    fi
+
+    rm -f "$calls.reran"
+    out="$(
+        settle_stubs
+        e2e_github_report() { return "$E2E_GITHUB_NO_VERDICT_EXIT"; }
+        e2e_github_download() { [ -e "$calls.reran" ] && return 1; touch "$calls.reran"; }
+        e2e_github_settle_run 4242 "$SANDBOX/settle-out" >/dev/null 2>&1; echo "$?:${E2E_GITHUB_SETTLE_DOWNLOADED:-none}"
+    )"
+    rm -f "$calls.reran"
+    if [ "$out" = "0:none" ]; then
+        pass "a download that fails after the rerun leaves the output marked not downloaded"
+    else
+        fail "$out"
+    fi
+
+    out="$(
+        settle_stubs
+        set -o pipefail
+        e2e_github_wait() { return "$E2E_GITHUB_NO_VERDICT_EXIT"; }
+        e2e_github_settle_run 4242 "$SANDBOX/settle-out" >/dev/null 2>&1; echo "$?"
+    )"
+    if [ "$out" = "$E2E_GITHUB_NO_VERDICT_EXIT" ]; then pass "a wait that gave up is no verdict, with no rerun"; else fail "$out"; fi
+}
+
+# shellcheck disable=SC2317,SC2329 # gh, the run state and sleep are stubbed
+test_a_rerun_starts_a_new_attempt_before_the_driver_waits() {
+    echo "test: a rerun waits for the new attempt, so the old completed state is never read as the verdict"
+    local calls="$SANDBOX/rerun-calls" polls="$SANDBOX/rerun-polls" rc
+    : >"$calls"
+    : >"$polls"
+    (
+        gh() { stub_gh_token "$@" && return 0; echo "gh $*" >>"$calls"; }
+        e2e_github_run_state() {
+            echo poll >>"$polls"
+            if [ "$(wc -l <"$polls" | tr -d ' ')" -lt 3 ]; then
+                echo '{"status": "completed", "run_attempt": 1}'
+            else
+                echo '{"status": "queued", "run_attempt": 2}'
+            fi
+        }
+        sleep() { :; }
+        e2e_github_rerun_failed 4242 1
+    ) >/dev/null 2>&1
+    rc=$?
+    if [ "$rc" = 0 ] && grep -q -- "gh run rerun 4242 --failed --repo $E2E_GITHUB_REPO" "$calls" \
+        && [ "$(wc -l <"$polls" | tr -d ' ')" = 3 ]; then
+        pass "it reruns only the failed jobs, and polls until the attempt advances"
+    else
+        fail "rc=$rc calls: $(cat "$calls") polls: $(wc -l <"$polls")"
+    fi
+
+    (
+        gh() { stub_gh_token "$@" && return 0; return 0; }
+        e2e_github_run_state() { echo '{"status": "completed", "run_attempt": 1}'; }
+        e2e_github_now() { cat "$SANDBOX/rerun-clock"; }
+        echo 1000 >"$SANDBOX/rerun-clock"
+        sleep() { echo $(($(cat "$SANDBOX/rerun-clock") + $1)) >"$SANDBOX/rerun-clock"; }
+        E2E_GITHUB_RERUN_START_SECS=30 e2e_github_rerun_failed 4242 1
+    ) >/dev/null 2>&1
+    rc=$?
+    if [ "$rc" = 2 ]; then pass "a rerun that never shows a new attempt returns 2"; else fail "rc=$rc"; fi
+
+    (
+        gh() { stub_gh_token "$@" && return 0; return 1; }
+        e2e_github_rerun_failed 4242 1
+    ) >/dev/null 2>&1
+    rc=$?
+    if [ "$rc" = 1 ]; then pass "a rerun gh refuses returns 1"; else fail "rc=$rc"; fi
+}
+
+test_a_rerun_report_reads_the_shards_of_both_attempts() {
+    echo "test: the report after a rerun reads the shards of both attempts together"
+    local d="$SANDBOX/report-rerun" rc
+    mkdir -p "$d/e2e-plan"
+    printf '%s\n' "chromium-1-2 browser chromium 1 2" "chromium-2-2 browser chromium 2 2" >"$d/e2e-plan/entries"
+    fake_shard "$d" chromium-1-2 - "no output: the shard was cancelled"
+    fake_shard "$d" chromium-2-2 0 "$PW_PASS_LOG"
+    e2e_github_report "$d" >/dev/null 2>&1; rc=$?
+    if [ "$rc" = "$E2E_GITHUB_NO_VERDICT_EXIT" ]; then pass "before the rerun, the cancelled shard is no verdict"; else fail "rc=$rc"; fi
+    fake_shard "$d" chromium-1-2 0 "$PW_PASS_LOG"
+    e2e_github_report "$d" >/dev/null 2>&1; rc=$?
+    if [ "$rc" = 0 ]; then pass "once the rerun shard reports, the passing shard of attempt 1 still counts"; else fail "rc=$rc"; fi
+}
+
 # fake_api_answer <remaining> <json-body>: one `gh api --include` answer.
 fake_api_answer() {
     printf 'HTTP/2.0 200 OK\r\nX-Ratelimit-Remaining: %s\r\nContent-Type: application/json\r\n\r\n%s\n' "$1" "$2"
@@ -753,6 +903,7 @@ run_state_fixture() {
         "$1" "$2" "${3:-4000}"
 }
 
+# shellcheck disable=SC2317,SC2329 # gh is stubbed, and the run state calls it
 test_the_run_state_reads_both_answers_and_the_rate_limit() {
     echo "test: the run state joins the run and its jobs, with the lower rate-limit remainder"
     local got
@@ -1001,7 +1152,10 @@ echo "coverage=${LUCIDOS_E2E_COVERAGE:-off}"
 STUB
     chmod +x "$box/scripts/e2e-api.sh"
     echo '{"coverage": true, "suites": [], "api_args": []}' >"$box/request.json"
+    git init -q -b e2e/box "$box"
+    git -C "$box" -c user.email=e2e@example.com -c user.name=e2e commit -q --allow-empty -m box
     got="$(E2E_GITHUB_REQUEST="$box/request.json" E2E_GITHUB_OUT="$box/out" LUCIDOS_E2E_COVERAGE='' \
+        GITHUB_ACTIONS=true HOME="$box/home" \
         bash "$box/scripts/e2e-github-shard.sh" run api-1 api 2>&1)"
     if [[ "$got" == *coverage=1* ]]; then pass "the api suite sees coverage"; else fail "api suite output: $got"; fi
 }
@@ -1258,6 +1412,30 @@ test_the_runner_checkout_gets_a_main_and_an_existing_one_never_moves() {
     fi
 }
 
+test_every_suite_that_spawns_a_coding_agent_prepares_the_host() {
+    echo "test: the api and browser arms of cmd_run both prepare the runner for a coding-agent thread"
+    local shard="$SCRIPT_DIR/../e2e-github-shard.sh" suite arm
+    for suite in api browser; do
+        arm="$(sed -n '/^cmd_run()/,/^}/p' "$shard" | sed -n "/^        $suite)/,/;;/p")"
+        if printf '%s' "$arm" | grep -q 'prepare_coding_agent_host'; then
+            pass "the $suite shard prepares the coding-agent host"
+        else
+            fail "the $suite shard does not call prepare_coding_agent_host"
+        fi
+    done
+}
+
+test_the_api_shard_gives_the_engine_a_gateway_identity() {
+    echo "test: the api arm of cmd_run runs the e2e engine under its own gateway"
+    local shard="$SCRIPT_DIR/../e2e-github-shard.sh" arm
+    arm="$(sed -n '/^cmd_run()/,/^}/p' "$shard" | sed -n '/^        api)/,/;;/p')"
+    if printf '%s' "$arm" | grep -q 'export LUCIDOS_E2E_GATEWAY=own'; then
+        pass "the api shard sets LUCIDOS_E2E_GATEWAY=own"
+    else
+        fail "the api shard leaves the engine without a workspace id, so a child cannot prove its source"
+    fi
+}
+
 # A 7 GB macOS runner after its engine build read 4.36 GB available with a
 # trace of swap. The build job's codegen gate refused that for 900 s, so every
 # macOS engine-cache miss failed and mobile-webkit never ran.
@@ -1505,6 +1683,25 @@ test_a_shard_that_fails_its_warm_up_records_the_setup_code() {
     fi
 }
 
+test_a_shard_that_fails_its_host_setup_records_it() {
+    echo "test: a shard whose coding-agent host setup fails writes its rc and message, so the report can name the cause"
+    local shard="$SCRIPT_DIR/../e2e-github-shard.sh" suite id out rc
+    for suite in api browser; do
+        id="$suite-1-1" out="$SANDBOX/host-setup-fail-$suite" rc=0
+        E2E_GITHUB_OUT="$out" bash -c '
+            source "$1"
+            e2e_warm_wait() { :; }
+            install_fake_claude_code() { echo "ERROR: fake Claude Code refused" >&2; return 1; }
+            cmd_run "$2" "$3" chromium 1 1' _ "$shard" "$id" "$suite" >/dev/null 2>&1 || rc=$?
+        if [ "$rc" = 1 ] && [ "$(cat "$out/$id/$id.rc" 2>/dev/null)" = 1 ] \
+            && grep -q "fake Claude Code refused" "$out/$id/$id.log" 2>/dev/null; then
+            pass "the $suite shard records the failed host setup"
+        else
+            fail "$suite: rc=$rc, file=$(cat "$out/$id/$id.rc" 2>&1)"
+        fi
+    done
+}
+
 test_a_retried_apt_attempt_leaves_the_azure_mirror() {
     echo "test: the first apt attempt keeps the image's mirror, and every retry runs against the default Ubuntu one"
     local shard="$SCRIPT_DIR/../e2e-github-shard.sh" src="$SANDBOX/apt-mirror-sources" log="$SANDBOX/apt-mirror-log" got
@@ -1618,6 +1815,9 @@ test_the_report_matches_the_local_tally_and_exit_codes
 test_the_report_counts_the_engine_suite
 test_a_refused_build_is_no_verdict_and_a_failure_outranks_it
 test_a_failed_setup_is_no_verdict_and_a_failure_outranks_it
+test_a_run_with_no_verdict_is_rerun_once
+test_a_rerun_starts_a_new_attempt_before_the_driver_waits
+test_a_rerun_report_reads_the_shards_of_both_attempts
 test_the_run_state_reads_both_answers_and_the_rate_limit
 test_the_poll_speeds_up_once_a_test_job_starts
 test_the_wait_gives_up_with_no_verdict
@@ -1637,6 +1837,8 @@ test_a_spec_file_among_playwright_args_is_a_selection
 test_the_plan_refuses_a_real_claude_code_spec
 test_the_fake_installs_only_on_a_runner_and_never_over_a_claude
 test_the_runner_checkout_gets_a_main_and_an_existing_one_never_moves
+test_every_suite_that_spawns_a_coding_agent_prepares_the_host
+test_the_api_shard_gives_the_engine_a_gateway_identity
 test_the_build_job_stands_down_the_shared_host_guards
 test_the_pinned_postgres_versions_resolve
 test_the_engine_lookup_names_the_newest_matching_build
@@ -1648,6 +1850,7 @@ test_the_apt_warm_up_bounds_every_network_wait
 test_a_stalled_apt_attempt_is_cut_off_and_retried
 test_a_stalled_apt_attempt_leaves_no_apt_get_holding_the_lock
 test_a_shard_that_fails_its_warm_up_records_the_setup_code
+test_a_shard_that_fails_its_host_setup_records_it
 test_a_retried_apt_attempt_leaves_the_azure_mirror
 test_the_apt_cache_restores_and_stashes_debs
 test_the_apt_cache_key_names_the_runner_image_and_playwright

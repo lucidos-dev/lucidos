@@ -1662,7 +1662,7 @@ pub(crate) async fn dispatch_resolved(
             let scoped = ScopedPipeline::bind(&ctx, name, base_url, layers, false).await?;
             // A builtin has no entry, so only the workspace value applies.
             let timeout = crate::api::proxy_timeout::resolve(ctx.pool, None).await?;
-            prepare_request(&Upstream::Builtin, &mut headers);
+            prepare_request(&Upstream::Builtin { name }, &mut headers);
             let response = dispatch_scoped(
                 name,
                 &scoped,
@@ -1677,7 +1677,7 @@ pub(crate) async fn dispatch_resolved(
             record_model_call(
                 engine,
                 owner.clone(),
-                Upstream::Builtin,
+                Upstream::Builtin { name },
                 &path,
                 &body,
                 response,

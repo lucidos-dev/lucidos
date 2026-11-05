@@ -3,13 +3,8 @@
  * own. The menu opens only once it is in memory (ADR 0436).
  */
 import type { ComponentChildren } from 'preact';
-import { useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { OverflowMenuContext } from './OverflowMenu';
-import { CopyIcon, DownloadIcon, ArchiveIcon, CheckIcon, ChevronLeftIcon, EditIcon, CurrentIcon, LocateIcon, MoveToTopIcon, PinIcon, SearchIcon, SetAsideIcon, StandingApplyIcon, TrashIcon, WidgetIcon } from './icons';
-import { useEscapeStep } from '../../hooks/useEscapeStep';
-import { isHomeThread } from '../../store/actions/homeThread';
-import { loadReusableWidgets } from '../../store/actions/widgets';
-import { WidgetPickerItems } from '../widgets/WidgetPickerItems';
+import { CopyIcon, DownloadIcon, ArchiveIcon, CheckIcon, EditIcon, CurrentIcon, LocateIcon, MoveToTopIcon, PinIcon, SearchIcon, SetAsideIcon, StandingApplyIcon, TrashIcon } from './icons';
 import { canRenameThread, promptRenameThread } from '../../store/actions/threadRename';
 import { copyThreadRef, copyThreadTitle } from '../../utils/threadRef';
 import { exportThread } from '../../utils/exportThread';
@@ -49,27 +44,6 @@ export function ThreadOverflowItems({ threadId, title, run, onShowInFolders, onF
   const standingApplyArmed = standingApplyThreadIds.value.has(threadId);
   const movable = canMoveToTopLevel(threadId);
   const exits = exitItems(threadId);
-  // A pin needs a sent thread. Home takes no pins: its Add is the dashboard's own.
-  const addsWidgets = !!liveThread && liveThread.meta.state !== 'composing' && !isHomeThread(threadId);
-  const [addingWidget, setAddingWidget] = useState(false);
-  const back = useRef<HTMLButtonElement>(null);
-  useEscapeStep(addingWidget ? () => setAddingWidget(false) : null);
-  // The row that opened the step is gone, so focus moves to its Back row.
-  useLayoutEffect(() => {
-    if (addingWidget) back.current?.focus();
-  }, [addingWidget]);
-  if (addingWidget) {
-    return (
-      <div data-surface-step="add-widget">
-        <button ref={back} type="button" class="thread-overflow-item" role="menuitem" onClick={() => setAddingWidget(false)}>
-          <ChevronLeftIcon size="1rem" />
-          Add widget
-        </button>
-        <div class="thread-overflow-divider" role="separator" />
-        <WidgetPickerItems run={run} target={{ threadId }} />
-      </div>
-    );
-  }
   return (
     <div data-surface-step="thread-menu">
       {(onShowInFolders || onFindInThread) && (
@@ -104,16 +78,6 @@ export function ThreadOverflowItems({ threadId, title, run, onShowInFolders, onF
           <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void promptRenameThread(threadId); })}>
             <EditIcon />
             Rename…
-          </button>
-          <div class="thread-overflow-divider" role="separator" />
-        </>
-      )}
-      {addsWidgets && (
-        <>
-          <button type="button" class="thread-overflow-item" role="menuitem" data-add-widget-step
-            onClick={() => { void loadReusableWidgets(); setAddingWidget(true); }}>
-            <WidgetIcon />
-            Add widget…
           </button>
           <div class="thread-overflow-divider" role="separator" />
         </>

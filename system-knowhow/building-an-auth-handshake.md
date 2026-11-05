@@ -7,6 +7,10 @@ description: Authenticating an external API when a static header is not enough: 
 
 The proxy auth pipeline runs on every outbound `/api/v1/proxy/<api>/...` call. A provider's `auth` block in `data/config/apis.json` is a list of **layers** that run in declared order. Each layer can attach headers, append query params, or (with explicit consent) replace the body. Then the engine forwards the request. On a 401 from upstream, layers that opted into `InvalidateAndRetry` lose their caches and the pipeline runs once more.
 
+Model route metadata reports public protocol defaults without resolving credentials
+or refreshing tokens. SDK `modelRequest` builds a payload; sending it through
+`lucidos.proxy` still uses the ordinary proxy authentication path.
+
 | Layer | Use for | Per-request work |
 |---|---|---|
 | `static_credential` (kind: `bearer` / `api_key` / `basic` / `query_param`) | A header or query param that doesn't rotate. | None: value baked in. |
@@ -19,6 +23,14 @@ For a single static header, use `static_credential` (see `system-knowhow/lucidos
 **Don't know the API's shape yet?** If the user is logged into a site with no
 public API, derive one: see `system-knowhow/deriving-an-api-from-a-site.md`.
 Then come back here to pick the layer.
+
+## Builtin provider sign-in
+
+Before authoring a handshake, check the builtin catalog in
+`system-knowhow/js-sdk.md` § `lucidos.proxy`.
+The `claude-gateway` builtin uses the engine's issuer-bound sign-in and managed model policy.
+It accepts only `POST /messages`; apps never export or supply its bearer.
+An explicit `apis.json` entry still overrides a builtin.
 
 ## Decision tree
 

@@ -16,6 +16,8 @@ use crate::engine::thread_events::MessageOrigin;
 /// LLM tool uses, so any UI surface reachable by `navigate_ui` is reachable by
 /// a notification tap with no per-target wrapper variant. Every notification is
 /// openable — there is no passive/button-less kind.
+/// `RestoreSnapshot` is the engine's Undo restore target. It requests the normal
+/// target admission and confirmation flow, never an immediate destructive action.
 ///
 /// The old passive `None` kind (`{"kind":"none"}`) is RETIRED: nothing produces
 /// it anymore, and the custom `Deserialize` below coerces any historical
@@ -65,6 +67,12 @@ pub enum Tap {
     Navigate {
         to: Box<NavigateUi>,
     },
+    /// Opens normal restore admission and confirmation; never executes a restore.
+    #[serde(rename = "restore-snapshot")]
+    RestoreSnapshot {
+        workspace_id: String,
+        handle: crate::core::snapshot::handle::Handle,
+    },
 }
 
 // Custom Deserialize (not derived) so the RETIRED `{"kind":"none"}` kind coerces
@@ -90,11 +98,25 @@ impl<'de> Deserialize<'de> for Tap {
         enum TapWire {
             Modal,
             None,
-            Navigate { to: Box<NavigateUi> },
+            Navigate {
+                to: Box<NavigateUi>,
+            },
+            #[serde(rename = "restore-snapshot")]
+            RestoreSnapshot {
+                workspace_id: String,
+                handle: crate::core::snapshot::handle::Handle,
+            },
         }
         Ok(match TapWire::deserialize(deserializer)? {
             TapWire::Modal | TapWire::None => Tap::Modal,
             TapWire::Navigate { to } => Tap::Navigate { to },
+            TapWire::RestoreSnapshot {
+                workspace_id,
+                handle,
+            } => Tap::RestoreSnapshot {
+                workspace_id,
+                handle,
+            },
         })
     }
 }
@@ -246,6 +268,18 @@ pub fn resolve_thread_tap_id(tap: &mut Tap, caller: Option<Uuid>) -> Result<(), 
     };
     to.id = Some(crate::api::resolve_thread_id_arg(raw, caller)?.to_string());
     Ok(())
+}
+
+/// Refuse a tap kind that only the engine may write. A caller-written
+/// `RestoreSnapshot` would put any snapshot behind the "Undo restore"
+/// confirmation. The engine emits its own straight to the bus after a restore.
+pub fn refuse_engine_only_tap(tap: &Tap) -> Result<(), String> {
+    match tap {
+        Tap::RestoreSnapshot { .. } => Err(
+            "a `restore-snapshot` tap is written only by the engine after a restore.".to_string(),
+        ),
+        Tap::Modal | Tap::Navigate { .. } => Ok(()),
+    }
 }
 
 /// Refuse a notification that points at an event its thread does not hold.
@@ -664,6 +698,21 @@ mod tests {
     use crate::test_support::{setup_test_db, teardown_test_db};
 
     #[test]
+    fn restore_tap_is_a_validated_recovery_target() {
+        let wire = serde_json::json!({
+            "kind": "restore-snapshot", "workspace_id": "example",
+            "handle": "snap_00000000000000000000000000",
+        });
+        let tap: Tap = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(tap).unwrap(), wire);
+        for handle in ["../keys", "snap_invalid", ""] {
+            let mut invalid = wire.clone();
+            invalid["handle"] = handle.into();
+            assert!(serde_json::from_value::<Tap>(invalid).is_err());
+        }
+    }
+
+    #[test]
     fn tap_modal_serializes_with_kind_only() {
         let v = serde_json::to_value(Tap::Modal).unwrap();
         assert_eq!(v, serde_json::json!({"kind": "modal"}));
@@ -926,7 +975,7 @@ mod tests {
     fn tap_id(tap: &Tap) -> Option<&str> {
         match tap {
             Tap::Navigate { to } => to.id.as_deref(),
-            Tap::Modal => None,
+            Tap::Modal | Tap::RestoreSnapshot { .. } => None,
         }
     }
 
@@ -1023,6 +1072,19 @@ mod tests {
         };
         let err = resolve_thread_tap_id(&mut idless, Some(Uuid::new_v4())).expect_err("refused");
         assert!(err.contains("has none"), "got: {err}");
+    }
+
+    #[test]
+    fn only_the_engine_writes_a_restore_snapshot_tap() {
+        let restore: Tap = serde_json::from_value(serde_json::json!({
+            "kind": "restore-snapshot", "workspace_id": "example",
+            "handle": "snap_00000000000000000000000000",
+        }))
+        .unwrap();
+        let err = refuse_engine_only_tap(&restore).expect_err("refused");
+        assert!(err.contains("restore-snapshot"), "got: {err}");
+        refuse_engine_only_tap(&Tap::Modal).unwrap();
+        refuse_engine_only_tap(&default_tap(Some(Uuid::new_v4()), None)).unwrap();
     }
 
     // -----------------------------------------------------------------------

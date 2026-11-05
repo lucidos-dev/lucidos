@@ -65,7 +65,7 @@ impl Scenario {
         let mut worker =
             make_worker_with_active(pool.clone(), bus.clone(), root.clone(), (self.active)());
         if self.soft_pressure {
-            worker.free_soft_bytes = u64::MAX;
+            worker.soft_cap_bytes = u64::MAX;
         }
         let rx = bus.subscribe();
         worker.run_once().await;

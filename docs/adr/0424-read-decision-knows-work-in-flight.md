@@ -47,7 +47,9 @@ decision keeps, and seeing the reply could not clear it either.
 - A progress turn costs the same model call as before. The note adds a
   sentence to its prompt.
 - A thread can sit in Review while its sub-threads run, when its agent asked.
-  It leaves In flight for that time, since In flight reads the dot.
+  It stays in In flight too, since a read request marks the reply, not the
+  work: In flight reads the dot past the request. Before this amendment it
+  left In flight, and the group under-counted live work.
 - A change during a live wait still reads Waiting and stays out of Review.
 - `readRequestStanding` is the one client definition Review and the seen
   tracker share.

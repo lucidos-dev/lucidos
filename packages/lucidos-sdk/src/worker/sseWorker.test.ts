@@ -99,6 +99,114 @@ describe('shared worker upstream watchdog', () => {
     vi.unstubAllGlobals();
   });
 
+  it('fences collections across restore and rejects duplicate or uninvited answers', async () => {
+    const connect = await loadWorker();
+    const ports = [fakePort(), fakePort(), fakePort()];
+    for (const port of ports) { connect(port); port.send({ ...HELLO, pongs: true }); }
+    const fetchMock = vi.fn().mockResolvedValue({});
+    vi.stubGlobal('fetch', fetchMock);
+    const es = FakeEventSource.live[0];
+    const frame = (type: string, data: unknown) =>
+      es.onmessage!({ data: JSON.stringify({ type, data }) } as MessageEvent);
+    const pong = (sourceGeneration: string | null) => ({
+      t: 'pong', notificationId: 'same-id', sourceGeneration,
+      answer: { device_id: 'device', outcome: 'shown' },
+    });
+    frame('StreamHello', { restore_generation: null });
+    frame('PresenceCheck', { notification_id: 'same-id' });
+    ports[0].send(pong(null));
+    frame('StreamHello', { restore_generation: 'restored' });
+    frame('PresenceCheck', { notification_id: 'same-id' });
+    ports[0].send(pong(null));
+    ports[1].send(pong('restored'));
+    ports[1].send(pong('restored'));
+    const late = fakePort();
+    connect(late); late.send({ ...HELLO, pongs: true });
+    late.send(pong('restored'));
+    expect(fetchMock).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(300);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(new Headers(fetchMock.mock.calls[0][1].headers)
+      .get('x-lucidos-restore-generation')).toBe('restored');
+  });
+
+  it('discards collections when their upstream closes', async () => {
+    const connect = await loadWorker();
+    const port = fakePort();
+    connect(port); port.send({ ...HELLO, pongs: true });
+    const fetchMock = vi.fn().mockResolvedValue({});
+    vi.stubGlobal('fetch', fetchMock);
+    const es = FakeEventSource.live[0];
+    es.onmessage!({ data: JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } }) } as MessageEvent);
+    es.onmessage!({ data: JSON.stringify({ type: 'PresenceCheck', data: { notification_id: 'old' } }) } as MessageEvent);
+    port.send({ t: 'restart' });
+    port.send({ t: 'pong', notificationId: 'old', sourceGeneration: null,
+      answer: { device_id: 'device', outcome: 'shown' } });
+    vi.advanceTimersByTime(300);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('gives a late tab the current generation before any subsequent domain frame', async () => {
+    const attach = await startWorker();
+    const first = fakePort();
+    attach(first);
+    const es = FakeEventSource.live[0];
+    es.onopen!();
+    const hello = JSON.stringify({ type: 'StreamHello', data: { restore_generation: 'generation-one' } });
+    es.onmessage!({ data: hello } as MessageEvent);
+    const late = fakePort();
+    attach(late);
+    const domain = JSON.stringify({ type: 'ThreadCreated', data: {} });
+    es.onmessage!({ data: domain } as MessageEvent);
+    expect(late.received).toEqual([
+      INTRODUCE, { t: 'open', lateJoin: true },
+      { t: 'frame', data: hello }, { t: 'frame', data: domain },
+    ]);
+    expect(first.received.filter((m) => m.data === hello)).toHaveLength(1);
+  });
+
+  it('does not give a joining tab the previous upstream generation after a restart', async () => {
+    const attach = await startWorker();
+    const first = fakePort();
+    attach(first);
+    const old = FakeEventSource.live[0];
+    old.onopen!();
+    const oldHello = JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } });
+    old.onmessage!({ data: oldHello } as MessageEvent);
+    first.send({ t: 'restart' });
+    const current = FakeEventSource.live[0];
+    current.onopen!();
+    // Already queued callbacks from the closed EventSource cannot reinstall
+    // its generation, mark the replacement down, or broadcast stale frames.
+    const before = first.received.length;
+    old.onmessage!({ data: oldHello } as MessageEvent);
+    old.onopen!();
+    old.onerror!();
+    expect(first.received).toHaveLength(before);
+    expect(current.closed).toBe(false);
+    const late = fakePort();
+    attach(late);
+    expect(late.received.some((m) => m.data === oldHello)).toBe(false);
+    const hello = JSON.stringify({ type: 'StreamHello', data: { restore_generation: 'restored' } });
+    current.onmessage!({ data: hello } as MessageEvent);
+    expect(lastReceived(late)).toEqual({ t: 'frame', data: hello });
+  });
+
+  it('does not mistake a domain payload mentioning StreamHello for connection metadata', async () => {
+    const attach = await startWorker();
+    const first = fakePort();
+    attach(first);
+    const es = FakeEventSource.live[0];
+    es.onopen!();
+    const hello = JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } });
+    es.onmessage!({ data: hello } as MessageEvent);
+    es.onmessage!({ data: JSON.stringify({ type: 'MessageReceived', data: { text: 'StreamHello' } }) } as MessageEvent);
+    es.onmessage!({ data: 'malformed StreamHello' } as MessageEvent);
+    const late = fakePort();
+    attach(late);
+    expect(late.received).toEqual([INTRODUCE, { t: 'open', lateJoin: true }, { t: 'frame', data: hello }]);
+  });
+
   it('reopens a silent upstream and tells every port it stalled', async () => {
     const attach = await startWorker();
     const first = fakePort();

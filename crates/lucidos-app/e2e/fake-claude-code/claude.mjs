@@ -21,9 +21,10 @@
 // drift-check.mjs keeps these lines in step with the real CLI.
 
 import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { createInterface } from 'node:readline';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 export const FAKE_VERSION = '2.1.311';
 export const NO_RULE_REPLY = 'fake-claude-code: no rule for this prompt';
@@ -90,7 +91,7 @@ function flagValue(argv, name) {
 }
 
 /** One session: turns each stdin line into the lines Claude Code would print. */
-export function createSession(argv, cwd, turnMs = DEFAULT_TURN_MS, effort = NO_EFFORT) {
+export function createSession(argv, cwd, turnMs = DEFAULT_TURN_MS, effort = NO_EFFORT, answer = replyTo) {
   const sessionId = flagValue(argv, '--resume') ?? randomUUID();
   let model = resolveModel(flagValue(argv, '--model') ?? 'default');
   let initSent = false;
@@ -135,7 +136,7 @@ export function createSession(argv, cwd, turnMs = DEFAULT_TURN_MS, effort = NO_E
     }
     out.push({ ...line, session_id: sessionId, timestamp: new Date().toISOString(), isReplay: true });
     const prompt = promptText(line.message?.content);
-    const text = replyTo(prompt, effort);
+    const text = answer(prompt, effort);
     const id = `msg_fake_${randomUUID().replaceAll('-', '')}`;
     const message = { model, id, type: 'message', role: 'assistant', usage };
     const reply = [
@@ -181,7 +182,28 @@ function main(argv) {
     return;
   }
   const turnMs = Number(process.env.FAKE_CLAUDE_CODE_TURN_MS ?? DEFAULT_TURN_MS);
-  const session = createSession(argv, process.cwd(), turnMs, process.env.CLAUDE_CODE_EFFORT_LEVEL ?? NO_EFFORT);
+  const answer = (prompt, effort) => {
+    const restoreCli = turnText(prompt).match(/Probe snapshot CLI restore: (\{[^\n]*\})/);
+    if (restoreCli) {
+      const request = JSON.parse(restoreCli[1]);
+      const result = spawnSync(request.cli, ['snapshot', 'restore', request.handle,
+        '--workspace', request.workspace, '--expected-workspace-id', request.workspace,
+        '--port', String(request.port), '--wait', '--json'], {
+        encoding: 'utf8', timeout: 120000, maxBuffer: 65536,
+      });
+      let status = null;
+      try { status = JSON.parse(result.stdout); } catch { /* No untrusted stderr in the proof. */ }
+      return JSON.stringify({ code: result.status ?? 4, status });
+    }
+    const selfRestore = turnText(prompt).includes('Probe snapshot self-restore refusal.');
+    const gateway = turnText(prompt).match(/Probe snapshot gateway restore origin: (http:\/\/127\.0\.0\.1:[0-9]+)\./)?.[1];
+    if (!gateway && !selfRestore && !turnText(prompt).includes('Probe snapshot restore origin.')) return replyTo(prompt, effort);
+    const result = spawnSync(process.execPath, [fileURLToPath(new URL('./restore-origin-probe.mjs', import.meta.url)), ...(gateway ? ['--gateway', gateway, ...(turnText(prompt).includes('Spend snapshot approval.') ? ['--approval'] : [])] : selfRestore ? ['--self-restore'] : [])], {
+      encoding: 'utf8', timeout: 55000, maxBuffer: 8192,
+    });
+    return result.status === 0 ? result.stdout.trim() : '{"verified":false}';
+  };
+  const session = createSession(argv, process.cwd(), turnMs, process.env.CLAUDE_CODE_EFFORT_LEVEL ?? NO_EFFORT, answer);
   const print = (lines) => { for (const line of lines) process.stdout.write(`${JSON.stringify(line)}\n`); };
   let turns = Promise.resolve();
   let interruptTurn = () => {};

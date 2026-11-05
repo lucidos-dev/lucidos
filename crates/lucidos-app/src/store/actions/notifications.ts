@@ -1,3 +1,4 @@
+import { sourceGeneration } from '../../utils/restoreSourceGeneration';
 import { batch } from '@preact/signals';
 import {
   notifications,
@@ -432,9 +433,15 @@ function notificationName(id: string): string {
  *  acknowledgement replaces it (ADR 0437). Idempotent, so safe on read rows,
  *  and a POST lost in transit is sent once more. A POST that still fails
  *  shows the row again and says so. */
-export function markReadOptimistic(id: string): void {
+export function markReadOptimistic(id: string, generation = sourceGeneration() ?? 'none'): void {
+  if (generation !== (sourceGeneration() ?? 'none')) return;
   const owner = holdReads([id]);
-  retryTransient(() => markNotificationRead(id))
+  retryTransient(() => {
+    if (generation !== (sourceGeneration() ?? 'none')) {
+      throw new Error('Workspace restored; notification read canceled');
+    }
+    return markNotificationRead(id);
+  })
     .then(() => acknowledgeReads([id], owner))
     .catch((error) => {
       abandonReads([id], owner);
@@ -444,7 +451,7 @@ export function markReadOptimistic(id: string): void {
     });
 }
 
-export async function viewNotification(id: string): Promise<void> {
+export async function viewNotification(id: string, generation = sourceGeneration() ?? 'none'): Promise<void> {
   const now = Date.now();
   if (id === _lastViewedId && now - _lastViewedAt < 10_000) return;
   // Stamp the dedup guard synchronously, before the await, so a near-simultaneous
@@ -498,7 +505,7 @@ export async function viewNotification(id: string): Promise<void> {
     // valid and the chevrons can walk the inbox. In-app opens from the panel
     // already have the list loaded with this row, so they skip the fetch.
     if (!browseListHas(id)) await loadNotifications();
-    markReadOptimistic(id);
+    markReadOptimistic(id, generation);
   } catch (error) {
     _lastViewedId = null;
     showToast('Failed to load notification: ' + errorDetail(error), 'error');

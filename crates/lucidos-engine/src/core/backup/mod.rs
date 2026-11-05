@@ -1,3 +1,4 @@
+pub mod capture;
 pub mod crypto;
 pub mod dropbox;
 pub mod google_drive;
@@ -520,6 +521,16 @@ pub async fn load_recent_runs(pool: &PgPool, limit: i64) -> Vec<BackupRunSummary
 /// than a missing one. [`load_recent_runs`] degrades instead, because an empty
 /// history list says nothing false.
 pub async fn load_last_successful_backup(pool: &PgPool) -> Result<Option<DateTime<Utc>>, BoxError> {
+    Ok(load_last_successful_backup_run(pool)
+        .await?
+        .map(|run| run.finished_at))
+}
+
+/// The newest SUCCESSFUL backup run, or `None` when there is none. A query
+/// failure is an `Err`, for the reason [`load_last_successful_backup`] gives.
+pub async fn load_last_successful_backup_run(
+    pool: &PgPool,
+) -> Result<Option<BackupRunSummary>, BoxError> {
     use sqlx::Row;
 
     let Some(row) = sqlx::query(
@@ -536,7 +547,7 @@ pub async fn load_last_successful_backup(pool: &PgPool) -> Result<Option<DateTim
     let created: DateTime<Utc> = row.get("created");
     // Through the same reader the history list uses, so the two cannot disagree
     // about where a run's finish time lives in the payload.
-    Ok(backup_run_from_event("BackupCompleted", &payload, created).map(|run| run.finished_at))
+    Ok(backup_run_from_event("BackupCompleted", &payload, created))
 }
 
 /// Reconstruct a [`BackupRunSummary`] from one persisted backup event row. Pure
@@ -915,50 +926,54 @@ pub async fn create_backup(
         .await?
         .then_some(pending_dir);
 
+    let compressed_path = {
+        let workspace = workspace.to_path_buf();
+        let database_url = database_url.to_owned();
+        let temp_path = temp_dir.path().to_path_buf();
+        let progress = progress.clone();
+        tokio::task::spawn_blocking(move || {
+            capture::capture_workspace_archive(
+                &workspace,
+                &database_url,
+                &temp_path,
+                pending_dir.as_deref(),
+                ws_bytes,
+                progress.as_ref(),
+            )
+        })
+        .await??
+    };
+    seal_and_upload(
+        workspace,
+        temp_dir.path(),
+        &compressed_path,
+        ws_bytes,
+        key,
+        provider,
+        progress,
+    )
+    .await
+}
+
+/// Seal a captured archive on the blocking pool, then upload it asynchronously.
+async fn seal_and_upload(
+    workspace: &Path,
+    temp_path: &Path,
+    compressed_path: &Path,
+    ws_bytes: u64,
+    key: crypto::SealingKey,
+    provider: &dyn BackupProvider,
+    progress: Arc<impl Fn(&str, usize, usize) + Send + Sync + 'static>,
+) -> Result<BackupEntry, BoxError> {
     let suffix = key.archive_suffix();
-    // Phases 1-3: blocking I/O — run on the blocking thread pool
+    // Encryption is blocking I/O; upload below remains asynchronous.
     let (encrypted_path, encrypt_end) = {
         let progress = progress.clone();
-        let workspace = workspace.to_path_buf();
-        let database_url = database_url.to_string();
-        let temp_path = temp_dir.path().to_path_buf();
+        let temp_path = temp_path.to_path_buf();
+        let compressed_path = compressed_path.to_path_buf();
 
         tokio::task::spawn_blocking(move || -> Result<(PathBuf, usize), BoxError> {
-            // Load data/.backupignore once for this run — shared by the tar walk
-            // (the workspace can have tens of thousands of entries; never
-            // re-parse per file).
-            let ignore = BackupIgnore::load(&workspace);
-
-            // Phase weights from the size already computed for preflight.
-            progress("estimating", 0, 100);
-            let (dump_end, compress_end, encrypt_end) = estimate_weights(ws_bytes);
-
-            // Phase 1: pg_dump (0% → dump_end%)
-            crate::log!("[Backup] Phase 1/4: pg_dump");
-            progress("dumping_db", 1, 100);
-            let dump_path = temp_path.join("lucidos_backup.dump");
-            pg_dump(&database_url, &dump_path)?;
-            // The dump holds sealed secrets, so the archive carries their key
-            // beside it, inside the same encryption (ADR 0509).
-            let secret_key_path = temp_path.join(SECRET_STORE_KEY_ENTRY);
-            lucidos_local_token::write_owner_only(
-                &secret_key_path,
-                &crate::core::secret_store::key()?.to_base64(),
-            )?;
-
-            // Phase 2: tar + zstd compress (dump_end% → compress_end%)
-            crate::log!("[Backup] Phase 2/4: tar + zstd compress");
-            progress("compressing", dump_end, 100);
-            let compressed_path = temp_path.join("backup.tar.zst");
-            tar_and_compress(
-                &workspace,
-                &dump_path,
-                &secret_key_path,
-                pending_dir.as_deref(),
-                &compressed_path,
-                &ignore,
-            )?;
-
+            let (_, compress_end, encrypt_end) = estimate_weights(ws_bytes);
             // Phase 3: encrypt with per-chunk progress (compress_end% → encrypt_end%)
             crate::log!("[Backup] Phase 3/4: encrypt");
             progress("encrypting", compress_end, 100);
@@ -1105,21 +1120,61 @@ pub async fn prune_old_backups(
     Ok(deleted)
 }
 
+/// The snapshot capture's free-space estimate. Unlike the backup preflight it
+/// refuses an unreadable tree, so a disk floor is never checked against zero.
+pub(crate) fn snapshot_file_estimate(workspace: &Path) -> Result<u64, BoxError> {
+    included_file_bytes(
+        workspace,
+        &BackupIgnore::load(workspace),
+        Unreadable::Refuse,
+    )
+}
+
 /// Sum the on-disk size of every file that WILL be included in the backup tar
 /// (i.e. after the hardcoded + `.backupignore` exclusions). One walk, shared by
 /// preflight's free-space estimate and the phase-weight estimate. The tar phase
 /// walks once more to actually stream the files.
 fn workspace_backup_size(workspace: &Path, ignore: &BackupIgnore) -> u64 {
-    walkdir(workspace)
-        .unwrap_or_default()
-        .iter()
-        .filter(|p| {
-            p.strip_prefix(workspace)
-                .map(|rel| !is_excluded_workspace_path(rel, ignore))
-                .unwrap_or(true)
-        })
-        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
-        .sum::<u64>()
+    included_file_bytes(workspace, ignore, Unreadable::Skip).unwrap_or_default()
+}
+
+fn included_file_bytes(
+    workspace: &Path,
+    ignore: &BackupIgnore,
+    unreadable: Unreadable,
+) -> Result<u64, BoxError> {
+    sum_file_bytes(workspace, walkdir(workspace)?, ignore, unreadable)
+}
+
+/// What the size walk does with a file it cannot stat for a reason other than
+/// it being gone.
+#[derive(Debug, Clone, Copy)]
+enum Unreadable {
+    Skip,
+    Refuse,
+}
+
+/// A file that vanishes after the walk, such as a pruned worktree, counts as
+/// nothing.
+fn sum_file_bytes(
+    workspace: &Path,
+    paths: Vec<PathBuf>,
+    ignore: &BackupIgnore,
+    unreadable: Unreadable,
+) -> Result<u64, BoxError> {
+    let mut bytes = 0u64;
+    for path in paths {
+        if is_excluded_workspace_path(path.strip_prefix(workspace)?, ignore) {
+            continue;
+        }
+        match (std::fs::metadata(&path), unreadable) {
+            (Ok(metadata), _) => bytes = bytes.saturating_add(metadata.len()),
+            (Err(error), _) if error.kind() == std::io::ErrorKind::NotFound => {}
+            (Err(_), Unreadable::Skip) => {}
+            (Err(error), Unreadable::Refuse) => return Err(error.into()),
+        }
+    }
+    Ok(bytes)
 }
 
 /// Estimate the size of the *encrypted archive that will be uploaded* from the
@@ -1340,7 +1395,18 @@ fn pg_tools_preflight(database_url: &str) -> Result<(), BoxError> {
 /// Connection details flow through libpq `PG*` env vars so the password
 /// stays out of argv.
 fn pg_dump(database_url: &str, output_path: &Path) -> Result<(), BoxError> {
+    pg_dump_with_snapshot(database_url, output_path, None)
+}
+
+fn pg_dump_with_snapshot(
+    database_url: &str,
+    output_path: &Path,
+    snapshot: Option<&str>,
+) -> Result<(), BoxError> {
     let mut cmd = pg_tool_command("pg_dump", database_url)?;
+    if let Some(snapshot) = snapshot {
+        cmd.arg(format!("--snapshot={snapshot}"));
+    }
     let output = cmd
         .args([
             "--format=custom",
@@ -1405,6 +1471,17 @@ fn is_cross_version_set(line: &str) -> bool {
 /// filtered SQL to `psql --single-transaction`. This makes cross-version
 /// restores (e.g. PG 17 dump → PG 16 server) work without losing atomicity.
 fn pg_restore(database_url: &str, dump_path: &Path) -> Result<(), BoxError> {
+    pg_restore_with_checks(database_url, dump_path, "", "")
+}
+
+/// Offline snapshot replay shares the archive SQL filtering and atomic psql
+/// pipeline. The surrounding SQL is generated internally, never caller input.
+pub(super) fn pg_restore_with_checks(
+    database_url: &str,
+    dump_path: &Path,
+    before: &str,
+    after: &str,
+) -> Result<(), BoxError> {
     use std::io::{BufRead, BufReader, Write};
 
     let dbname = pg_dbname(database_url)?;
@@ -1433,7 +1510,8 @@ fn pg_restore(database_url: &str, dump_path: &Path) -> Result<(), BoxError> {
 
     // Step 2: filter out cross-version SET statements
     let reader = BufReader::new(&restore_output.stdout[..]);
-    let mut filtered = Vec::with_capacity(restore_output.stdout.len());
+    let mut filtered = Vec::with_capacity(restore_output.stdout.len() + before.len() + after.len());
+    filtered.extend_from_slice(before.as_bytes());
     for line in reader.split(b'\n') {
         let line = line?;
         let text = String::from_utf8_lossy(&line);
@@ -1442,6 +1520,8 @@ fn pg_restore(database_url: &str, dump_path: &Path) -> Result<(), BoxError> {
             filtered.push(b'\n');
         }
     }
+
+    filtered.extend_from_slice(after.as_bytes());
 
     // Step 3: pipe filtered SQL to psql inside a single transaction
     let mut psql_cmd = pg_tool_command("psql", database_url)?;
@@ -1546,9 +1626,64 @@ impl IgnorePattern {
 /// across the size estimate and the tar walk. An absent or empty file yields an
 /// empty set.
 #[derive(Default)]
-struct BackupIgnore(Vec<IgnorePattern>);
+pub(crate) struct BackupIgnore(Vec<IgnorePattern>);
 
 impl BackupIgnore {
+    /// Destructive restore cannot interpret an unreadable or malformed policy
+    /// as permission to replace files. Keep capture's matching semantics.
+    pub(crate) fn load_for_restore(workspace: &Path) -> Result<Self, BoxError> {
+        let path = workspace.join("data/.backupignore");
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling policy link is not an absent policy.
+                if std::fs::symlink_metadata(&path).is_ok() {
+                    return Err("snapshot restore ignore policy is unreadable".into());
+                }
+                return Ok(Self::default());
+            }
+            Err(_) => return Err("snapshot restore ignore policy is unreadable".into()),
+        };
+        for line in content.lines().map(str::trim) {
+            if !line.is_empty() && !line.starts_with('#') && line.contains(['*', '?', '[']) {
+                glob::Pattern::new(line.trim_end_matches('/'))
+                    .map_err(|_| "snapshot restore ignore policy is invalid")?;
+            }
+        }
+        Ok(Self::parse(&content))
+    }
+
+    pub(crate) fn normalized_patterns(&self) -> Result<Vec<String>, BoxError> {
+        self.0
+            .iter()
+            .map(|pattern| match pattern {
+                IgnorePattern::Prefix(path) => path
+                    .to_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "snapshot ignore pattern is not UTF-8".into()),
+                IgnorePattern::Glob(pattern) => Ok(pattern.as_str().to_owned()),
+            })
+            .collect()
+    }
+
+    pub(crate) fn from_normalized_patterns(patterns: &[String]) -> Result<Self, BoxError> {
+        for pattern in patterns {
+            if pattern.is_empty()
+                || pattern.trim() != pattern
+                || pattern.contains(['\n', '\r'])
+                || pattern.starts_with('#')
+                || pattern.ends_with('/')
+            {
+                return Err("invalid frozen snapshot ignore pattern".into());
+            }
+            if pattern.contains(['*', '?', '[']) {
+                glob::Pattern::new(pattern)
+                    .map_err(|_| "invalid frozen snapshot ignore pattern")?;
+            }
+        }
+        Ok(Self::parse(&patterns.join("\n")))
+    }
+
     /// Load `<workspace>/data/.backupignore`. A missing file is the common case
     /// and yields no patterns silently. Any other read error is logged and also
     /// treated as no patterns: a broken ignore file never aborts the backup.
@@ -1629,7 +1764,7 @@ impl BackupIgnore {
 ///
 /// Then, in addition, any path matched by the workspace's `.backupignore`
 /// (`ignore`) — see [`BackupIgnore`].
-fn is_excluded_workspace_path(rel: &Path, ignore: &BackupIgnore) -> bool {
+pub(crate) fn is_excluded_workspace_path(rel: &Path, ignore: &BackupIgnore) -> bool {
     if rel.starts_with(".lucidos") {
         return true;
     }
@@ -1900,7 +2035,7 @@ fn walkdir(root: &Path) -> Result<Vec<PathBuf>, BoxError> {
 }
 
 /// What the walk does with a symlink it met.
-enum SymlinkAction {
+pub(crate) enum SymlinkAction {
     /// The one relocation a backup follows. Recursion enters the LINK path
     /// rather than its target, so every child stays under the workspace and
     /// `is_excluded_workspace_path` keeps working on the relative path.
@@ -1915,7 +2050,7 @@ enum SymlinkAction {
 /// triggers. `workspace_backup_size` walks this same function, so the
 /// preflight agrees and the run reports success. The user finds out at
 /// restore. An unmounted external disk is the ordinary way to get here.
-fn classify_symlink(path: &Path, root: &Path) -> Result<SymlinkAction, BoxError> {
+pub(crate) fn classify_symlink(path: &Path, root: &Path) -> Result<SymlinkAction, BoxError> {
     if path != root.join(crate::core::DATA_DIR) {
         return Ok(SymlinkAction::Skip);
     }

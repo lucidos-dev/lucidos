@@ -160,6 +160,11 @@ other: they coalesce to one entry per trigger (see *Cron coalescing* above).
 
 ## Persistence & restart
 
+After snapshot restore, archived entries cannot authorize another run.
+Recovery checks the first `ThreadQueued` event against the restore boundary.
+Missing provenance also refuses recovery. Later requeue events cannot renew archived authority.
+Cancellation persists through `ThreadQueueDropped`; fresh entries remain eligible on subsequent boots.
+
 **Background** entries live in the `thread_queue` projection (event-sourced from
 `ThreadQueued` / `ThreadQueueAdmitted` / `ThreadQueueDropped` /
 `ThreadQueueCompleted`). Rows also persist:

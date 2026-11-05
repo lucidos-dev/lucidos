@@ -1,7 +1,7 @@
 import { changeWork, EVENT_CLASSIFICATION, LAST_ACTIVITY_EVENTS } from '../../generated/thread-lifecycle';
 import type { ChangeWork, EventChannel, ThreadStatus } from '../../generated/thread-lifecycle';
 import type { EventWaitSummary, StoredEvent, ThreadInitiator, ThreadSection, TodoItem } from './thread-event-types';
-import type { CodingAgentChangeState, PairStamp, SuccessorLink } from '../../api/threads';
+import type { CardSize, CodingAgentChangeState, PairStamp, SuccessorLink } from '../../api/threads';
 import type { CacheKeepAliveStatus, CodingAgent } from '../../generated/thread-event-wire';
 
 /** Post-event projection snapshot carried on persisted SSE thread events
@@ -469,6 +469,10 @@ export type ThreadState = {
    *  and `threadModelSelections` reads these beside the loaded events. Absent
    *  on a thread served whole. */
   pairStamps?: PairStamp[];
+  /** The newest size per widget instance, as the server last reduced them. A
+   *  page can leave the pick behind it, and `widgetCardSize` reads these
+   *  beside the loaded events. Absent on a thread served whole. */
+  cardSizes?: CardSize[];
   /** Optimistic user messages shown before real SSE events arrive.
    *  Each entry is removed when its corresponding MessageReceived event arrives
    *  from SSE, matched by the client-generated event_id UUID.

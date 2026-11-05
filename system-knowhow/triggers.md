@@ -340,6 +340,23 @@ A scheduled fire never starts on an engine that is shutting down, because its ru
 
 The catch-up fires only the most recent slot of the past hour, and only one with no recorded run at or after it. A recorded run counts whatever its status, `failed` included. So a run that failed on a healthy engine is not repeated on restart. Fix the cause, then run the trigger once if the user wants the result now.
 
+The same catch-up runs when the computer wakes from sleep past a slot. In both cases a slot within the past 60 minutes fires once, however many slots the gap held.
+
+### Skipped slots
+
+A slot older than the 60-minute grace never runs. It becomes a **skipped slot**: Lucidos posts one inbox notice, with a push, per trigger per gap. The title reads "Morning brief: scheduled run skipped", or "Morning brief: 5 scheduled runs skipped". The body names the first and last slot in the trigger's timezone, and the tap opens the trigger.
+
+A notice goes out only when the trigger did not run at all for the gap. A 15-minute poller that catches up once after a night asleep stays quiet. A 07:00 daily brief opened at 09:00 gets its notice.
+
+These bound the gap, so their slots never count as skipped:
+
+- the trigger's last run, its creation, and its latest pause, resume or edit;
+- a snapshot restore;
+- the gap an earlier notice already reported;
+- a lookback of seven days, so a trigger off for a month reports one week at most.
+
+The notice records a `TriggerSlotsSkipped` event, so a trigger can watch for it. To get the missed result, run the trigger once.
+
 A run already in progress may finish before shutdown cuts it. On boot, an **interrupted run** gets a failed last-run status, one notification, and an inbox thread showing the retry decision. Boot reports cut runs from the past seven days. A working automatic resume after a user-initiated switch is excluded.
 
 A qualifying interrupted run retries once through the Thread Queue in a **new thread**. It must have started less than 24 hours ago, before its next cron slot is due, with no newer fire of that trigger. It must not have completed, spawned sub-threads, or already been a retry. The trigger must still exist, be enabled and unpaused, and its original queued request must be recoverable. An already queued fire can cover the work instead.
@@ -829,7 +846,7 @@ It is a real fire. It records `TriggerExecuted` / `TriggerCompleted` and updates
 Three answers other than "started". Relay each as-is, never as a run:
 
 - **Already running.** A fire of this trigger was already active or queued, so nothing new started: scheduled fires coalesce to at most one pending run per trigger. Tell the user that; do not claim you started one.
-- **Paused.** Refused. Resuming runs nothing *on purpose*, so if the user wants both, do both. Re-registering the schedule does re-run the missed-slot catch-up, so a cron slot from the past hour that never ran fires on resume. That side effect is not a way to ask for a run, and you cannot predict it. A pause *you* just made counts at once: every trigger write is visible to the next call, so `triggers(action="pause")` then `run` in one turn is refused, not raced.
+- **Paused.** Refused. Resuming runs nothing *on purpose*, so if the user wants both, do both. Resuming re-runs the missed-slot catch-up, so a cron slot from the past hour that never ran fires, and paused slots post no notice. That side effect is not a way to ask for a run, and you cannot predict it. A pause *you* just made counts at once: every trigger write is visible to the next call, so `triggers(action="pause")` then `run` in one turn is refused, not raced.
 - **No cron schedule.** Refused: an event-only trigger has never fired without a payload. An intent run would find no `## Triggering Event` block, and a script run would get none of the `TRIGGER_EVENT_*` vars. Emit its event instead.
 
 ### Event-only trigger: emit the event

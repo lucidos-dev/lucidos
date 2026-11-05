@@ -80,7 +80,7 @@ impl BuildHost for StubHost {
         self.emitted.lock().unwrap().push(state.as_wire());
     }
 
-    async fn run_build(&self, previous_failure: Option<&str>) -> FinishedBuild {
+    async fn run_build(&self, previous_failure: Option<&str>, _: u64) -> FinishedBuild {
         self.retried_failures
             .lock()
             .unwrap()
@@ -260,4 +260,20 @@ async fn an_explicit_restart_with_nothing_running_starts_a_build() {
     until_settled(&host).await;
     assert_eq!(host.killed.load(Ordering::SeqCst), 0);
     assert!(matches!(host.build_state(), BuildState::Ready { .. }));
+}
+
+#[tokio::test]
+async fn a_superseded_build_cannot_publish_progress() {
+    let host = StubHost::new();
+    join_or_start(&host);
+    until("first build", || host.started() == 1).await;
+    let old = host.build.slot.lock().unwrap().generation;
+    restart(&host);
+    assert!(super::with_current_build(host.as_ref(), old, || host
+        .set_build_state(BuildState::Verifying))
+    .is_none());
+    assert!(matches!(host.build_state(), BuildState::Building { .. }));
+    until("replacement build", || host.started() == 2).await;
+    host.release_one();
+    until_settled(&host).await;
 }
