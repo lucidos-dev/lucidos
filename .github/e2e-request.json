@@ -1,0 +1,19 @@
+{
+  "run_id": "20261105-080647-b87f",
+  "coverage": false,
+  "suites": [
+    "browser"
+  ],
+  "api_args": [],
+  "browser": {
+    "projects": [
+      "chromium",
+      "mobile"
+    ],
+    "specs": [
+      "widget-one-render-all.spec.ts",
+      "widget-loop-guard-mobile.spec.ts"
+    ],
+    "pw_args": []
+  }
+}

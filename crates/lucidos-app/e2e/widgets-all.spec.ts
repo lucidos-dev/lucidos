@@ -1,0 +1,179 @@
+import { test, expect, Page } from './fixtures';
+import { randomUUID } from 'crypto';
+import { apiRequest, assertHealthy, navigateToApp, isMobileViewport, hideDashboardRail, rightClickInsideFrame } from './helpers';
+import { psql } from './db-helpers';
+
+/**
+ * Widgets (ADRs 0402, 0466) at desktop and phone width. The turn that showed a
+ * widget holds a card with the widget inline, which survives a reload. A
+ * legacy pin draws no chip, since the shelf is gone.
+ *
+ * The thread, its `WidgetShown` and any legacy `WidgetPinned` are seeded
+ * directly, so the spec needs no model. The widget's folder goes through the data API,
+ * which commits it.
+ */
+
+const WIDGET_NAME = 'E2E fare grid';
+const THREAD_TITLE = 'E2E widgets for a trip to Stockholm';
+
+/** Every data file a test wrote, so `afterEach` removes them all. */
+let written: string[] = [];
+
+async function writeFile(page: Page, path: string, body: string): Promise<void> {
+  written.push(path);
+  const resp = await apiRequest(page).put(`/api/v1/data/${path}`, {
+    headers: { 'Content-Type': 'text/plain' },
+    data: body,
+  });
+  expect(resp.ok(), `PUT ${path}`).toBeTruthy();
+}
+
+/** A widget a few lines tall, well inside the inline widget's clip. */
+const SHORT_WIDGET = '<!doctype html><html><head><script src="/api/v1/sdk.js"></script></head><body><h1>Fares</h1></body></html>';
+/** A widget far taller than any widget box, so its inline widget clips. */
+const TALL_WIDGET = '<!doctype html><html><head><script src="/api/v1/sdk.js"></script></head>'
+  + '<body><h1>Fares</h1><div style="height: 3000px"></div></body></html>';
+
+const ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8"><rect width="8" height="8" fill="teal"/></svg>';
+
+async function writeWidget(
+  page: Page,
+  appId: string,
+  threadId: string,
+  html: string,
+  { name = WIDGET_NAME, icon = false }: { name?: string; icon?: boolean } = {},
+): Promise<void> {
+  await writeFile(page, `apps/${appId}/index.html`, html);
+  if (icon) await writeFile(page, `apps/${appId}/assets/icon.svg`, ICON_SVG);
+  await writeFile(page, `apps/${appId}/manifest.json`, JSON.stringify({
+    name,
+    description: 'Fares by date',
+    kind: 'widget',
+    origin_thread_id: threadId,
+    ...(icon ? { icon: 'assets/icon.svg' } : {}),
+  }));
+}
+
+function seedThreadShowingWidget(threadId: string, appId: string | string[], { legacyPin = false }: { legacyPin?: boolean } = {}): void {
+  const now = new Date().toISOString();
+  const appIds = Array.isArray(appId) ? appId : [appId];
+  psql([
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_change_state, coding_agent_is_external_repo) `
+      + `VALUES ('${threadId}', '${THREAD_TITLE}', 'chat', '${now}', 2, false, true, 'idle', 'inbox', false, 0, 'none', false)`,
+    `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) `
+      + `VALUES ('${randomUUID()}', 'MessageReceived', '{"text":"compare the fares","mode":"human","channel":"chat"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+    ...appIds.flatMap((id) => [
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) `
+        + `VALUES ('${randomUUID()}', 'WidgetShown', '{"app_id":"${id}"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+      // Nothing writes a pin any more, but old rows remain.
+      ...(legacyPin ? [
+        `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) `
+          + `VALUES ('${randomUUID()}', 'WidgetPinned', '{"app_id":"${id}"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+      ] : []),
+    ]),
+  ].join(';\n'));
+}
+
+async function openThread(page: Page, threadId: string): Promise<void> {
+  await page.addInitScript((tid: string) => {
+    localStorage.setItem('lucidos-focused-thread', tid);
+  }, threadId);
+  await navigateToApp(page);
+}
+
+const card = (page: Page) => page.locator('.chat-exchange .inline-widget:visible').first();
+
+test.describe('Widgets', () => {
+  let threadId: string;
+  let appId: string;
+
+  test.beforeEach(async ({ page }) => {
+    await assertHealthy(page);
+    written = [];
+    threadId = randomUUID();
+    appId = `e2e-widget-${randomUUID().slice(0, 8)}`;
+    await hideDashboardRail(page);
+    await page.goto('/');
+  });
+
+  test.afterEach(async ({ page }) => {
+    psql(`DELETE FROM events WHERE thread_id = '${threadId}'; DELETE FROM thread_summaries WHERE thread_id = '${threadId}'`);
+    for (const path of written) {
+      await apiRequest(page).delete(`/api/v1/data/${path}`);
+    }
+  });
+
+  /** I8 and I9: a legacy pin still loads, draws no chip, and its card stays. */
+  test('shows the widget inline in its turn, with no chip for a legacy pin, and survives a reload', async ({ page }) => {
+    await writeWidget(page, appId, threadId, SHORT_WIDGET);
+    seedThreadShowingWidget(threadId, appId, { legacyPin: true });
+    await openThread(page, threadId);
+
+    await expect(card(page).locator('.widget-bar-name')).toHaveText(WIDGET_NAME, { timeout: 15_000 });
+    await expect(card(page).locator('iframe[data-role="app-ui-frame"]')).toHaveAttribute(
+      'src', new RegExp(`/app/${appId}/`),
+    );
+    // It fits its box, so the card does not clip it.
+    await expect(card(page).locator('.widget-box-fade')).toHaveCount(0);
+    await expect(page.locator('.widget-chip, .widget-shelf')).toHaveCount(0);
+
+    // Its menu offers no pin.
+    await card(page).getByRole('button', { name: `${WIDGET_NAME} widget actions` }).click();
+    await expect(page.getByRole('menuitem', { name: 'Open in Canvas' })).toBeVisible();
+    await expect(page.getByRole('menuitem', { name: /pin|shelf/i })).toHaveCount(0);
+    await page.keyboard.press('Escape');
+
+    // The apps list never holds it.
+    const apps = await (await page.request.get('/api/v1/apps')).json() as Array<{ id: string }>;
+    expect(apps.some((a) => a.id === appId)).toBe(false);
+
+    await page.reload();
+    await expect(card(page)).toBeVisible({ timeout: 15_000 });
+  });
+
+  /** Invariant I1: the frame forwards an unclaimed right-click to the card. */
+  test('a right-click inside the widget opens its menu at the pointer', async ({ page }) => {
+    test.skip(isMobileViewport(page), 'a phone places the menu against the card, not the pointer');
+    await writeWidget(page, appId, threadId, SHORT_WIDGET);
+    seedThreadShowingWidget(threadId, appId);
+    await openThread(page, threadId);
+    await expect(card(page).locator('.widget-bar-name')).toHaveText(WIDGET_NAME, { timeout: 15_000 });
+    await expect(card(page).frameLocator('iframe').locator('html')).toHaveAttribute('data-widget-place', 'inline');
+
+    const menu = await rightClickInsideFrame(page, card(page).locator('.widget-frame'));
+    await expect(menu.getByRole('menuitem', { name: 'Open in Canvas' })).toBeVisible();
+  });
+
+  test('a tall widget is clipped to its box under a fade, and ⋯ › Open in Canvas shows it whole', async ({ page }) => {
+    await writeWidget(page, appId, threadId, TALL_WIDGET);
+    seedThreadShowingWidget(threadId, appId);
+    await openThread(page, threadId);
+
+    await expect(card(page).locator('.widget-box-fade')).toBeVisible({ timeout: 15_000 });
+    // The box sets the frame, so the frame never grows to the content.
+    const [frameBox, boxBox] = await Promise.all([
+      card(page).locator('.widget-frame').boundingBox(),
+      card(page).locator('.widget-box').boundingBox(),
+    ]);
+    expect(frameBox && boxBox).toBeTruthy();
+    expect(frameBox!.height).toBeLessThanOrEqual(boxBox!.height);
+
+    await card(page).getByRole('button', { name: `${WIDGET_NAME} widget actions` }).click();
+    await page.getByRole('menuitem', { name: 'Open in Canvas' }).click();
+    await expect(page.locator(`.app-ui-inline iframe[data-role="app-ui-frame"][src*="${appId}"]:visible`))
+      .toHaveCount(1, { timeout: 15_000 });
+  });
+
+  test("a card's bar shows its widget's app icon, or the monogram tile without one", async ({ page }) => {
+    const plainId = `${appId}-plain`;
+    await writeWidget(page, appId, threadId, SHORT_WIDGET, { icon: true });
+    await writeWidget(page, plainId, threadId, SHORT_WIDGET, { name: 'Ferry times' });
+    seedThreadShowingWidget(threadId, [appId, plainId]);
+    await openThread(page, threadId);
+
+    await expect(page.locator(`.inline-widget:visible .app-icon-image img[src*="/app/${appId}/assets/icon.svg"]`).first())
+      .toBeVisible({ timeout: 15_000 });
+    const plain = page.locator('.inline-widget:visible', { hasText: 'Ferry times' }).first();
+    await expect(plain.locator('.app-icon-monogram')).toHaveText('F');
+  });
+});

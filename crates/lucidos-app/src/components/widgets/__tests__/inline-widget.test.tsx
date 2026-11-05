@@ -1,0 +1,325 @@
+// @vitest-environment jsdom
+/**
+ * An inline widget in the transcript (ADRs 0432, 0466): a bar over a
+ * widget box, the box a dashboard tile is. Its frame mounts once on screen and
+ * fills the box. Content past the box is clipped under a fade. The pill picks
+ * another declared size and keeps the frame. A reply's embed and an old
+ * `WidgetShown` draw the same one.
+ */
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { WIDGET_PARAMS_QUERY } from '@lucidos/sdk';
+import { render } from 'preact';
+import { act } from 'preact/test-utils';
+import type { App } from '../../../store/types';
+import type { StoredEvent } from '../../../store/thread-events';
+
+let reportOnScreen: ((onScreen: boolean) => void) | null = null;
+vi.mock('../../../hooks/useOnScreenInTranscript', () => ({
+  watchOnScreen: (_el: HTMLElement, onChange: (onScreen: boolean) => void) => {
+    reportOnScreen = onChange;
+    onChange(false);
+    return () => { reportOnScreen = null; };
+  },
+}));
+
+const addToDashboard = vi.fn((..._args: unknown[]) => Promise.resolve());
+vi.mock('../../../store/actions/dashboards', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../store/actions/dashboards')>()),
+  addToDashboard: (...args: unknown[]) => addToDashboard(...args),
+  rereadDashboard: () => Promise.resolve(),
+}));
+
+/** A pick lands as the engine's `InlineWidgetSized`, which the card draws. */
+let nextSeq = 1;
+function sizeEventArrives(appId: string, size: string): void {
+  const thread = threadMap.value.get(THREAD);
+  const events = new Map(thread?.events);
+  events.set(nextSeq++, { type: 'InlineWidgetSized', app_id: appId, size } as StoredEvent);
+  // Only `events` is read, so the rest of the thread stays a stub.
+  threadMap.value = new Map([[THREAD, { ...thread, events } as never]]);
+}
+const sizeWidgetCards = vi.fn((instance: { appId: string }, _name: string, size: string) => {
+  sizeEventArrives(instance.appId, size);
+  return Promise.resolve();
+});
+vi.mock('../../../store/actions/widget-actions', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../store/actions/widget-actions')>()),
+  sizeWidgetCards: (...args: Parameters<typeof sizeWidgetCards>) => sizeWidgetCards(...args),
+}));
+
+const { InlineWidget, WIDGET_UNAVAILABLE_TEXT } = await import('../InlineWidget');
+const { threadMap } = await import('../../../store/store');
+const { _resetWidgetHeightsForTesting, OFF_SCREEN_HOLD_MS } = await import('../WidgetFrame');
+const { appsById } = await import('../../../store/appsById');
+const { dashboards } = await import('../../../store/dashboards');
+const { APP_FRAME_MENU_EVENT, APP_FRAME_SIZE_EVENT } = await import('../../../store/actions/widget-frame-bridge');
+const { WidgetMenuItems } = await import('../widgetMenuChunks');
+const { LONG_PRESS_DELAY_MS } = await import('../../../hooks/useLongPress');
+
+const THREAD = 'thread-1';
+/** A stand-in for the widget box's height, which CSS sets and jsdom cannot read. */
+const BOX_PX = 160;
+
+function readEmptyDashboard(): void {
+  dashboards.value = new Map([['desktop', { status: 'loaded', data: { dashboard: 'desktop', tiles: [] } }]]);
+}
+
+function appRead(app: Partial<App> & { id: string }): void {
+  appsById.value = new Map([...appsById.value, [app.id, {
+    status: 'loaded',
+    data: { name: app.id, description: '', reveal: 'on-load', kind: 'widget', reusable: false, sizes: ['medium', 'small', 'large'], ...app } as App,
+  }]]);
+}
+
+// jsdom lays nothing out, so the widget box answers as a browser would: as
+// tall as its size. The stub shadows jsdom's own on `Element`.
+beforeEach(() => {
+  Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+    configurable: true,
+    get(this: HTMLElement) {
+      return this.classList.contains('widget-box') ? BOX_PX : 0;
+    },
+  });
+});
+afterEach(() => {
+  delete (HTMLElement.prototype as { clientHeight?: number }).clientHeight;
+});
+
+let host: HTMLElement;
+
+beforeEach(() => {
+  _resetWidgetHeightsForTesting();
+  // A frame applies a report on the next animation frame. Run it at once.
+  vi.stubGlobal('requestAnimationFrame', (run: FrameRequestCallback) => { run(performance.now()); return 0; });
+  appRead({ id: 'flight-picker', name: 'Flight picker' });
+  appRead({ id: 'player', name: 'Sound player', reusable: true });
+  addToDashboard.mockClear();
+  sizeWidgetCards.mockClear();
+  host = document.createElement('div');
+  document.body.appendChild(host);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  render(null, host);
+  host.remove();
+  appsById.value = new Map();
+  dashboards.value = new Map();
+  threadMap.value = new Map();
+  // A case that fails mid-way still hands the next one real timers.
+  vi.useRealTimers();
+});
+
+const frames = () => host.querySelectorAll<HTMLIFrameElement>('iframe');
+const box = () => host.querySelector<HTMLElement>('.inline-widget .widget-box')!;
+const fade = () => host.querySelector('.widget-box-fade');
+const sizeOption = (size: string) => host.querySelector<HTMLButtonElement>(`[role="radio"][aria-label="${size}"]`)!;
+const addButton = () => host.querySelector<HTMLButtonElement>('.widget-bar-add');
+
+function renderCard(): void {
+  act(() => { render(<InlineWidget threadId={THREAD} appId="flight-picker" eventId="shown-1" stamped />, host); });
+}
+
+function report(px: number): void {
+  act(() => {
+    frames()[0].dispatchEvent(new CustomEvent(APP_FRAME_SIZE_EVENT, { detail: { height: px }, bubbles: true }));
+  });
+}
+
+describe('InlineWidget', () => {
+  it('draws the bar over its box at the default size, with no iframe off screen', () => {
+    renderCard();
+    expect(host.querySelector('.inline-widget')!.getAttribute('data-event-id')).toBe('shown-1');
+    expect(host.querySelector('.widget-bar-name')!.textContent).toBe('Flight picker');
+    expect(box().getAttribute('data-size'), 'the first declared size').toBe('medium');
+    expect(frames()).toHaveLength(0);
+  });
+
+  it('sets the box from its size, on the card', () => {
+    renderCard();
+    const card = host.querySelector<HTMLElement>('.inline-widget')!;
+    expect(card.style.getPropertyValue('--widget-box-width')).toContain('2 * var(--widget-cell)');
+    expect(card.style.getPropertyValue('--widget-box-height')).toContain('1 * var(--widget-cell)');
+  });
+
+  it('mounts the iframe on screen, and drops it once the off-screen hold runs out', () => {
+    vi.useFakeTimers();
+    renderCard();
+    act(() => { reportOnScreen?.(true); });
+    expect(frames()).toHaveLength(1);
+    act(() => { reportOnScreen?.(false); });
+    expect(frames(), 'held while off screen').toHaveLength(1);
+    act(() => { vi.advanceTimersByTime(OFF_SCREEN_HOLD_MS); });
+    expect(frames()).toHaveLength(0);
+  });
+
+  it('clips a tall widget under a fade, and never sizes the box from a report (I4)', () => {
+    renderCard();
+    act(() => { reportOnScreen?.(true); });
+    report(2000);
+    expect(box().querySelector<HTMLElement>('.widget-frame')!.style.height).toBe('');
+    expect(fade()).not.toBeNull();
+  });
+
+  it('shows no fade for a widget that fits', () => {
+    renderCard();
+    act(() => { reportOnScreen?.(true); });
+    report(120);
+    expect(fade()).toBeNull();
+  });
+
+  it('offers the declared sizes, and a pick resizes the box with the same frame (I12)', () => {
+    appRead({ id: 'flight-picker', name: 'Flight picker', sizes: ['medium', 'large'] });
+    renderCard();
+    act(() => { reportOnScreen?.(true); });
+    const frame = frames()[0];
+    expect([...host.querySelectorAll('[role="radio"]')].map((b) => b.getAttribute('aria-label'))).toEqual(['medium', 'large']);
+    expect(sizeOption('medium').getAttribute('aria-checked')).toBe('true');
+
+    act(() => { sizeOption('large').click(); });
+    expect(sizeWidgetCards).toHaveBeenCalledWith({ appId: 'flight-picker', threadId: THREAD, params: undefined }, 'Flight picker', 'large');
+    expect(box().getAttribute('data-size')).toBe('large');
+    expect(sizeOption('large').getAttribute('aria-checked')).toBe('true');
+    expect(frames()[0], 'the frame stays').toBe(frame);
+  });
+
+  it('draws no pill for a widget with one size', () => {
+    appRead({ id: 'flight-picker', name: 'Flight picker', sizes: ['large'] });
+    renderCard();
+    expect(host.querySelector('[role="radiogroup"]')).toBeNull();
+    expect(box().getAttribute('data-size')).toBe('large');
+  });
+
+  it('folds its name and + Dashboard away at small, leaving the icon, the pill and the ⋯', () => {
+    readEmptyDashboard();
+    renderCard();
+    expect(addButton()).not.toBeNull();
+    act(() => { sizeOption('small').click(); });
+    expect(host.querySelector('.widget-bar-name')).toBeNull();
+    expect(addButton()).toBeNull();
+    expect(host.querySelector('[aria-label="Flight picker widget actions"]')).not.toBeNull();
+  });
+
+  it('adds the widget to the dashboard from + Dashboard, once the dashboard is read', () => {
+    renderCard();
+    expect(addButton(), 'not until the dashboard is read').toBeNull();
+    act(() => { readEmptyDashboard(); });
+    act(() => { addButton()!.click(); });
+    expect(addToDashboard).toHaveBeenCalledWith('desktop', { appId: 'flight-picker', params: undefined, label: undefined, size: 'medium' }, 'Flight picker', 'widget');
+  });
+
+  // I6 and I7: the card draws the thread's newest pick, as after a reload or
+  // a pick on another device, and adds its tile at that size.
+  it('draws the newest size the thread holds, and adds at it', () => {
+    appRead({ id: 'flight-picker', name: 'Flight picker', sizes: ['medium', 'large'] });
+    readEmptyDashboard();
+    sizeEventArrives('player', 'large');
+    sizeEventArrives('flight-picker', 'large');
+    renderCard();
+    expect(box().getAttribute('data-size')).toBe('large');
+    act(() => { sizeEventArrives('flight-picker', 'medium'); });
+    expect(box().getAttribute('data-size')).toBe('medium');
+    act(() => { sizeEventArrives('flight-picker', 'large'); });
+    act(() => { addButton()!.click(); });
+    expect(addToDashboard).toHaveBeenCalledWith('desktop', expect.objectContaining({ size: 'large' }), 'Flight picker', 'widget');
+  });
+
+  it('starts at the default size when the newest pick is one it no longer declares', () => {
+    appRead({ id: 'flight-picker', name: 'Flight picker', sizes: ['medium', 'large'] });
+    sizeEventArrives('flight-picker', 'small');
+    renderCard();
+    expect(box().getAttribute('data-size')).toBe('medium');
+  });
+
+  // ADR 0415: the card finds its own instance among two of one widget, puts
+  // its params in the frame, and reads its label.
+  it('draws its own instance: params in the frame, the label in the bar', () => {
+    act(() => {
+      render(<InlineWidget threadId={THREAD} appId="player" params={{ clip: 'b.mp3' }} label="Cedar" eventId="s-b" stamped />, host);
+    });
+    expect(host.querySelector('.widget-bar-name')!.textContent).toBe('Cedar');
+    act(() => { reportOnScreen?.(true); });
+    const src = new URL(frames()[0].src);
+    expect(JSON.parse(src.searchParams.get(WIDGET_PARAMS_QUERY)!)).toEqual({ clip: 'b.mp3' });
+  });
+
+  it("names itself from the widget's manifest", () => {
+    renderCard();
+    expect(host.querySelector('.widget-bar-name')!.textContent).toBe('Flight picker');
+  });
+
+  it("wears no event id of its own in a reply: the turn root wears the starter", () => {
+    act(() => { render(<InlineWidget threadId={THREAD} appId="flight-picker" eventId="starter-1" />, host); });
+    expect(host.querySelector('.inline-widget')!.hasAttribute('data-event-id')).toBe(false);
+  });
+
+  it('says it is not available for a widget that declares no sizes', () => {
+    appRead({ id: 'flight-picker', name: 'Flight picker', sizes: [] });
+    renderCard();
+    expect(host.querySelector('.inline-widget-gone-reason')!.textContent).toBe("Widget 'flight-picker' declares no sizes.");
+  });
+
+  it('says it is not available, and why, for a missing widget or a refused reply embed', () => {
+    appsById.value = new Map([...appsById.value, ['gone', { status: 'loaded', data: null }]]);
+    act(() => { render(<InlineWidget threadId={THREAD} appId="gone" />, host); });
+    expect(host.textContent).toBe(`${WIDGET_UNAVAILABLE_TEXT}No widget 'gone' exists.`);
+    act(() => { render(<InlineWidget threadId={THREAD} appId="flight-picker" refusal={() => 'Because.'} />, host); });
+    expect(host.querySelector('.inline-widget-gone-reason')!.textContent).toBe('Because.');
+    expect(frames()).toHaveLength(0);
+  });
+});
+
+
+describe('InlineWidget menu', () => {
+  beforeEach(async () => {
+    // The menu opens once its rows are in memory: load them up front.
+    await WidgetMenuItems.preload();
+    renderCard();
+  });
+
+  const menuItems = () => [...document.querySelectorAll('.thread-overflow-menu [role="menuitem"]')].map((b) => b.textContent);
+  const bar = () => host.querySelector<HTMLElement>('.widget-bar')!;
+  const rightClick = (target: Element, init: MouseEventInit = {}) => {
+    const e = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 30, clientY: 40, ...init });
+    act(() => { target.dispatchEvent(e); });
+    return e;
+  };
+
+  it("a right-click on the card opens the widget's own menu, the ⋯ still drawn", () => {
+    expect(rightClick(bar()).defaultPrevented).toBe(true);
+    expect(menuItems()).toEqual(expect.arrayContaining(['Open in CanvasFull size, beside the thread']));
+    expect(host.querySelector('[aria-label="Flight picker widget actions"]')).not.toBeNull();
+  });
+
+  it('Option+right-click leaves the native menu', () => {
+    expect(rightClick(bar(), { altKey: true }).defaultPrevented).toBe(false);
+    expect(menuItems()).toEqual([]);
+  });
+
+  it("the frame's forwarded right-click opens the same menu", () => {
+    act(() => { reportOnScreen?.(true); });
+    act(() => {
+      frames()[0].dispatchEvent(new CustomEvent(APP_FRAME_MENU_EVENT, { detail: { x: 30, y: 40 }, bubbles: true }));
+    });
+    expect(menuItems().length).toBeGreaterThan(0);
+  });
+
+  it('a hold over a size opens the menu, and does not also pick the size', () => {
+    vi.useFakeTimers();
+    const button = sizeOption('large');
+    act(() => {
+      button.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, button: 0 }));
+      vi.advanceTimersByTime(LONG_PRESS_DELAY_MS);
+    });
+    expect(menuItems().length).toBeGreaterThan(0);
+    // Closed first, so only the card can stop the click that follows.
+    act(() => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); });
+    expect(menuItems()).toEqual([]);
+    // The lift's paired click is swallowed before it reaches the button.
+    act(() => {
+      button.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, button: 0 }));
+      button.click();
+    });
+    expect(box().getAttribute('data-size')).toBe('medium');
+  });
+});
