@@ -287,6 +287,9 @@ test.describe('dynamic bars over an app: motion trace', () => {
   });
 
   test.afterEach(async ({ page }) => {
+    // A preferences fetch still in flight when the test ends would reject
+    // inside the handler and fail whichever test the worker runs next.
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
     await disableMobileDynamicBars(page);
   });
 

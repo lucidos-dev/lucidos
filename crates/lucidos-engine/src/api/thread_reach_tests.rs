@@ -740,6 +740,7 @@ async fn a_trigger_fire_reaches_its_own_subtree_and_wider() {
             go_to_review: false,
             model: None,
             reasoning_effort: None,
+            continue_key: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Chat),

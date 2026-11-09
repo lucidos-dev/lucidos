@@ -358,12 +358,16 @@
     pointer-events: auto;
 }
 
-/* The content pane's variant: same box, same chevron positions, with the title
+/* The content variant shares chevron positions until the brand floor, with the title
    as its one shrinkable member. `space-between` centres a short title exactly
    (the two chevrons are equal width), and a long one ellipsises at the span
    rather than pushing a chevron into an edge control. A tighter gap than the
    mark's, since here every rem of it is a rem off the title. */
 .header-title-cluster {
+    /* Keep the text on the pane axis even below the shared brand floor.
+       Equal chevrons bound the title; only its text gives up room. */
+    --header-nav-cluster-width: max(0rem,
+        calc(100% - 2 * var(--header-nav-edge-reserve)));
     gap: 0.15rem;
 }
 

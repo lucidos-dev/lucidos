@@ -229,6 +229,9 @@ impl RepositoryStore {
                 .emit_or_log(
                     BusEvent::System(SystemEvent::RepositoryRemoved {
                         repo_id: old_id.to_string(),
+                        name: None,
+                        root_path: None,
+                        description: None,
                         actor: actor.clone(),
                     }),
                     "[Repositories] RepositoryRemoved",
@@ -286,12 +289,16 @@ impl RepositoryStore {
     /// Delete a repository row. **Private on purpose**, same as
     /// [`Self::upsert_row`]: [`Self::unregister`] is the reachable mutator, and
     /// it emits.
-    async fn delete_row(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query("DELETE FROM repositories WHERE id = $1")
+    /// Returns the deleted row's name, path and description, which the
+    /// announcement records so Undo can re-register it.
+    async fn delete_row(
+        pool: &PgPool,
+        id: Uuid,
+    ) -> Result<Option<(String, String, Option<String>)>, sqlx::Error> {
+        sqlx::query_as("DELETE FROM repositories WHERE id = $1 RETURNING name, path, description")
             .bind(id)
-            .execute(pool)
-            .await?;
-        Ok(result.rows_affected() > 0)
+            .fetch_optional(pool)
+            .await
     }
 
     /// Unregister a repository and announce it. The ONLY way to remove one.
@@ -306,19 +313,22 @@ impl RepositoryStore {
         id: Uuid,
         actor: Option<MessageOrigin>,
     ) -> Result<bool, sqlx::Error> {
-        let removed = Self::delete_row(pool, id).await?;
-        if removed {
-            event_bus
-                .emit_or_log(
-                    BusEvent::System(SystemEvent::RepositoryRemoved {
-                        repo_id: id.to_string(),
-                        actor,
-                    }),
-                    "[Repositories] RepositoryRemoved",
-                )
-                .await;
-        }
-        Ok(removed)
+        let Some((name, path, description)) = Self::delete_row(pool, id).await? else {
+            return Ok(false);
+        };
+        event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::RepositoryRemoved {
+                    repo_id: id.to_string(),
+                    name: Some(name),
+                    root_path: Some(path),
+                    description,
+                    actor,
+                }),
+                "[Repositories] RepositoryRemoved",
+            )
+            .await;
+        Ok(true)
     }
 }
 

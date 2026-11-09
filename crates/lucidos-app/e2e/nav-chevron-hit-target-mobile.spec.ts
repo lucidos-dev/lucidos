@@ -144,7 +144,8 @@ interface Neighbour {
   sel: string;
   /** Probe this child's box instead of the element's own, e.g. a drawn glyph. */
   glyph?: string;
-  /** Not rendered in every state, like a content title with no view open. */
+  /** Not rendered in every state, like a content title with no view open, or
+   *  one squeezed to its padding with no room left for text. */
   optional?: boolean;
 }
 
@@ -156,11 +157,14 @@ const ALL_SELF: Landed[] = ['self', 'self', 'self', 'self', 'self'];
 /** Tap the centre and 1px inside each edge of an element (or its glyph), and
  *  report where each tap lands. Null if the element is not rendered. */
 async function tapsOn(page: Page, n: Neighbour): Promise<Landed[] | null> {
-  return page.evaluate(({ sel, glyph }) => {
+  return page.evaluate(({ sel, glyph, optional }) => {
     const el = document.querySelector(sel) as HTMLElement | null;
     const target = glyph ? el?.querySelector(glyph) : el;
     const r = target?.getBoundingClientRect();
     if (!el || !r || r.width === 0) return null;
+    const style = getComputedStyle(el);
+    const padding = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+    if (optional && r.width - padding < 1) return null;
     const cx = (r.left + r.right) / 2;
     const cy = (r.top + r.bottom) / 2;
     return [[cx, cy], [r.left + 1, cy], [r.right - 1, cy], [cx, r.top + 1], [cx, r.bottom - 1]]

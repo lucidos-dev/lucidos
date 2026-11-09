@@ -30,7 +30,9 @@ fn type_name(value: PrefValue) -> &'static str {
         | PrefValue::ModelBytes
         | PrefValue::ModelEfforts
         | PrefValue::IntelligenceLadder(_)
-        | PrefValue::FontFamily => "text",
+        | PrefValue::FontFamily
+        | PrefValue::PermissionWait
+        | PrefValue::ContextCeiling => "text",
     }
 }
 

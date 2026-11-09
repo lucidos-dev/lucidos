@@ -910,6 +910,98 @@ async fn stay_here_on_a_working_thread_records_nothing() {
     assert_eq!(declined, 0, "a refused Stay here records no decision");
 }
 
+async fn insert_event(pool: &sqlx::PgPool, thread_id: Uuid, event_type: &str, payload: Value) {
+    sqlx::query(
+        "INSERT INTO events (id, event_type, payload, thread_id, aggregate, aggregate_id) \
+         VALUES ($1, $2, $3, $4, 'thread', $4::text)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(event_type)
+    .bind(payload)
+    .bind(thread_id)
+    .execute(pool)
+    .await
+    .expect("insert event failed");
+}
+
+async fn post_withdraw(client: &reqwest::Client, thread_id: Uuid) -> (u16, Value) {
+    let resp = client
+        .post(format!(
+            "{}/api/v1/threads/{thread_id}/successor/withdraw",
+            base_url()
+        ))
+        .send()
+        .await
+        .expect("withdraw request failed");
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+/// *Return to the old session*: the context reading names the waiting ceiling
+/// handoff, and the withdraw raises the ceiling past the session, then ends it.
+#[tokio::test]
+async fn return_to_the_old_session_withdraws_the_ceiling_handoff() {
+    let client = user_client().await;
+    let pool = connect().await;
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread_summary(&pool, thread_id, "idle").await;
+    insert_capture(
+        &pool,
+        thread_id,
+        json!({"usage": {"input_tokens": 352_000, "output_tokens": 1}, "context_window": 1_000_000}),
+    )
+    .await;
+    let crossing = json!({"context_tokens": 352_000, "ceiling": 300_000, "window": 1_000_000});
+    insert_event(&pool, thread_id, "ContextCeilingReached", crossing.clone()).await;
+    insert_event(
+        &pool,
+        thread_id,
+        "SessionHandedOff",
+        json!({
+            "opening": "narrative", "message": "m", "coding_agent": "claude-code",
+            "cause": "context-ceiling", "starts": "on-next-input", "crossing": crossing,
+        }),
+    )
+    .await;
+
+    let waiting = get_context(&client, thread_id).await;
+    let (status, body) = post_withdraw(&client, thread_id).await;
+    let (again, _) = post_withdraw(&client, thread_id).await;
+    let withdrawn = count_events_of_type(&pool, thread_id, "SessionHandoffWithdrawn").await;
+    let after = get_context(&client, thread_id).await;
+    delete_thread_rows(&pool, thread_id).await;
+
+    assert_eq!(
+        waiting["ceiling_handoff"]["opening"], "narrative",
+        "{waiting}"
+    );
+    assert_eq!(waiting["ceiling_handoff"]["crossing"], crossing);
+    assert_eq!(waiting["ceiling_handoff"]["raises_to"], 452_000);
+    assert_eq!(status, 200, "a person's return must succeed: {body}");
+    assert_eq!(body["ceiling"], "452k");
+    assert_eq!(withdrawn, 1);
+    assert_eq!(again, 409, "a second return finds no handoff");
+    assert!(after.get("ceiling_handoff").is_none(), "{after}");
+}
+
+/// A thread with no ceiling handoff waiting refuses the return and records
+/// nothing.
+#[tokio::test]
+async fn return_to_the_old_session_needs_a_ceiling_handoff() {
+    let client = user_client().await;
+    let pool = connect().await;
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread_summary(&pool, thread_id, "idle").await;
+
+    let (status, body) = post_withdraw(&client, thread_id).await;
+    let recorded = count_events_of_type(&pool, thread_id, "SessionHandoffWithdrawn").await;
+    delete_thread_rows(&pool, thread_id).await;
+
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["reason"], "no-ceiling-handoff");
+    assert_eq!(recorded, 0);
+}
+
 /// Uncommitted work stays in the worktree, so it never blocks a handoff: the
 /// successor session finds it there.
 #[tokio::test]

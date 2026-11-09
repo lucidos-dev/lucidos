@@ -39,7 +39,7 @@ fn session(head: &str, held: Option<ProposalHold>) -> SessionFacts {
 }
 
 fn idle(facts: SessionFacts) -> TurnEndState {
-    TurnEndState::at_session_idle(true, true, facts)
+    TurnEndState::at_session_idle(true, true, facts, None)
 }
 
 const PLAN: ProposalHold = ProposalHold::Plan(PlanHold::Missing);
@@ -53,14 +53,14 @@ fn an_undecided_turn_owes_a_read_decision_and_a_decided_one_does_not() {
     assert_eq!(undecided.unmet(), vec![TurnEndRequirement::ReadDecision]);
     let decided = TurnEndState {
         read_decided: true,
-        session: None,
+        ..TurnEndState::default()
     };
     assert!(decided.unmet().is_empty());
 }
 
 #[test]
 fn the_read_decision_is_forced_and_a_hold_re_enters() {
-    let state = TurnEndState::at_session_idle(false, true, session("a1", Some(HARDEN)));
+    let state = TurnEndState::at_session_idle(false, true, session("a1", Some(HARDEN)), None);
     assert_eq!(
         state.unmet(),
         vec![
@@ -76,7 +76,7 @@ fn the_read_decision_is_forced_and_a_hold_re_enters() {
 fn a_held_proposal_nudges_once_per_branch_head() {
     let mut ledger = ReentryLedger::default();
     let held = |head| idle(session(head, Some(PLAN)));
-    assert_eq!(ledger.take_due(&held("a1")), Some(PLAN));
+    assert_eq!(ledger.take_due(&held("a1")), Some(DueReentry::Hold(PLAN)));
     assert!(
         ledger.take_due(&held("a1")).is_none(),
         "an agent that ignored the nudge must end its turn, not loop"
@@ -90,7 +90,7 @@ fn a_held_proposal_nudges_once_per_branch_head() {
 #[test]
 fn a_held_proposal_never_nudges_after_a_user_stop() {
     let mut ledger = ReentryLedger::default();
-    let stopped = TurnEndState::at_session_idle(true, false, session("a1", Some(PLAN)));
+    let stopped = TurnEndState::at_session_idle(true, false, session("a1", Some(PLAN)), None);
     assert!(ledger.take_due(&stopped).is_none());
 }
 
@@ -112,11 +112,11 @@ fn a_settled_plan_lets_the_harden_ask_through_at_the_same_head() {
     let mut ledger = ReentryLedger::default();
     assert_eq!(
         ledger.take_due(&idle(session("a1", Some(PLAN)))),
-        Some(PLAN)
+        Some(DueReentry::Hold(PLAN))
     );
     assert_eq!(
         ledger.take_due(&idle(session("a1", Some(HARDEN)))),
-        Some(HARDEN)
+        Some(DueReentry::Hold(HARDEN))
     );
     assert!(ledger
         .take_due(&idle(session("a1", Some(HARDEN))))
@@ -139,7 +139,7 @@ fn a_plan_only_hold_sends_the_agent_nowhere() {
     let mixed = ProposalHold::Plan(PlanHold::AwaitingApproval);
     assert_eq!(
         ledger.take_due(&idle(session("a1", Some(mixed)))),
-        Some(mixed)
+        Some(DueReentry::Hold(mixed))
     );
 }
 
@@ -156,6 +156,173 @@ fn integrated_work_sends_the_agent_nowhere() {
     let mut ledger = ReentryLedger::default();
     let held = idle(session("a1", Some(ProposalHold::IntegratedIntoParent)));
     assert!(ledger.take_due(&held).is_none());
+}
+
+// ---- the context ceiling (ADR 0629) ----
+
+const K: u64 = 1_000;
+
+/// A later turn of a session at `tokens` in a 1M window, under a 300k ceiling.
+fn past(tokens: u64) -> CeilingFacts {
+    CeilingFacts {
+        reading: SessionReading {
+            tokens: Some(tokens),
+            window: Some(1_000 * K),
+        },
+        ceiling: ContextCeiling::Tokens(300 * K),
+        reached: false,
+        first_turn: false,
+        busy: false,
+    }
+}
+
+#[test]
+fn ceiling_fires_past_the_effective_ceiling_only() {
+    assert_eq!(
+        past(335 * K).crossing(),
+        Some(CeilingCrossing {
+            context_tokens: 335 * K,
+            ceiling: 300 * K,
+            window: Some(1_000 * K),
+        })
+    );
+    assert_eq!(
+        past(300 * K).crossing(),
+        None,
+        "at the ceiling is not past it"
+    );
+    assert_eq!(past(120 * K).crossing(), None);
+}
+
+/// The cap applies before the comparison: a 200k window caps 300k at 150k.
+#[test]
+fn ceiling_fires_at_the_capped_value() {
+    let small_window = CeilingFacts {
+        reading: SessionReading {
+            tokens: Some(160 * K),
+            window: Some(200 * K),
+        },
+        ..past(0)
+    };
+    assert_eq!(small_window.crossing().map(|c| c.ceiling), Some(150 * K));
+}
+
+#[test]
+fn ceiling_never_fires_on_an_unknown_reading_or_an_unsized_ceiling() {
+    let unknown = CeilingFacts {
+        reading: SessionReading {
+            tokens: None,
+            window: Some(1_000 * K),
+        },
+        ..past(0)
+    };
+    assert_eq!(unknown.crossing(), None);
+    let off = CeilingFacts {
+        ceiling: ContextCeiling::Off,
+        ..past(900 * K)
+    };
+    assert_eq!(off.crossing(), None);
+    let share_without_window = CeilingFacts {
+        reading: SessionReading {
+            tokens: Some(900 * K),
+            window: None,
+        },
+        ceiling: ContextCeiling::WindowShare(30),
+        ..past(0)
+    };
+    assert_eq!(share_without_window.crossing(), None);
+}
+
+/// I2: one `ContextCeilingReached` per session, and none in its first turn,
+/// so a successor never hands off on its own opening.
+#[test]
+fn ceiling_fires_once_per_session_and_not_in_the_first_turn() {
+    let reached = CeilingFacts {
+        reached: true,
+        ..past(400 * K)
+    };
+    assert_eq!(reached.crossing(), None);
+    let opening = CeilingFacts {
+        first_turn: true,
+        ..past(400 * K)
+    };
+    assert_eq!(opening.crossing(), None);
+}
+
+/// I1, I16: an unread input, an open card or a pending handoff keeps the
+/// session from handing off at this turn end.
+#[test]
+fn ceiling_never_fires_while_the_session_is_busy() {
+    let busy = CeilingFacts {
+        busy: true,
+        ..past(400 * K)
+    };
+    assert_eq!(busy.crossing(), None);
+}
+
+/// I13: a turn due both re-entries sends only the ceiling's, and the hold's
+/// HEAD stays unspent for the successor session.
+#[test]
+fn ceiling_outranks_the_proposal_hold() {
+    let crossing = past(400 * K).crossing();
+    let both = TurnEndState::at_session_idle(false, true, session("a1", Some(HARDEN)), crossing);
+    assert_eq!(
+        both.unmet(),
+        vec![
+            TurnEndRequirement::ReadDecision,
+            TurnEndRequirement::CeilingHandoff(crossing.unwrap()),
+            TurnEndRequirement::Reentry(HARDEN),
+        ]
+    );
+    let mut ledger = ReentryLedger::default();
+    assert_eq!(
+        ledger.take_due(&both),
+        Some(DueReentry::Ceiling(crossing.unwrap()))
+    );
+    assert_eq!(
+        ledger.take_due(&idle(session("a1", Some(HARDEN)))),
+        Some(DueReentry::Hold(HARDEN)),
+        "the ceiling spent nothing of the hold's"
+    );
+}
+
+/// The ledger sends the ceiling once per run, and the crossing counts on an
+/// external-repo turn whose session facts never complete.
+#[test]
+fn the_ledger_sends_the_ceiling_once_even_with_no_session_facts() {
+    let crossing = past(400 * K).crossing();
+    let external = TurnEndState::at_session_idle(true, false, SessionFacts::default(), crossing);
+    let mut ledger = ReentryLedger::default();
+    assert_eq!(
+        ledger.take_due(&external),
+        Some(DueReentry::Ceiling(crossing.unwrap()))
+    );
+    assert_eq!(ledger.take_due(&external), None);
+}
+
+/// The evidence shape: captures cross 300k mid-turn, and only the clean turn
+/// end at about 335k reads the measure. Each mid-turn reading is never a turn
+/// end, so the engine never asks; the turn end fires once.
+#[test]
+fn session_13_shape_hands_off_at_the_first_turn_end() {
+    let mut ledger = ReentryLedger::default();
+    let turn_end =
+        TurnEndState::at_session_idle(true, true, session("a1", None), past(335 * K).crossing());
+    assert!(matches!(
+        ledger.take_due(&turn_end),
+        Some(DueReentry::Ceiling(CeilingCrossing { context_tokens, .. })) if context_tokens == 335 * K
+    ));
+    let next = TurnEndState::at_session_idle(
+        true,
+        true,
+        session("a1", None),
+        CeilingFacts {
+            reached: true,
+            ..past(360 * K)
+        }
+        .crossing(),
+    );
+    assert_eq!(ledger.take_due(&next), None);
 }
 
 // ---- the forced read decision ----

@@ -15,6 +15,7 @@ import { loadCredentials } from './actions/credentials';
 import { loadChatLadder, loadChatModels } from './actions/models';
 import { loadDevices, registerCurrentDevice } from './actions/devices';
 import { loadPairedDevices } from './actions/pairedDevices';
+import { loadOperators } from './actions/operators';
 import { loadTriggers, loadHistoricalTriggers } from './actions/triggers';
 import { loadTriggerGroups } from './actions/triggerGroups';
 import { loadThreadQueue } from './actions/threadQueue';
@@ -23,13 +24,15 @@ import { reopenDashboardPanelFromHistory } from './actions/thread-navigation';
 import { loadPreferences, flushPendingPreferenceWrites } from './actions/preferences';
 import { loadPinnedApps } from './actions/pinnedApps';
 import { loadReleaseNotices } from './actions/releaseNotices';
+import { loadReaderDevices } from './actions/reader-devices';
 import { loadWebhookIngress } from './actions/webhookIngress';
 import { loadWebhookRefusals } from './actions/webhookRefusals';
 import { loadWorkspaceDisplayName } from './actions/workspace-label';
 import { connectThreadEvents, disconnectThreadEvents } from './actions/thread-sync';
 import { loadAllThreads, loadFilterFacets } from './actions/thread-loading';
-import { refreshPushSubscription, recoverServiceWorker } from './actions/push';
+import { refreshPushSubscription, recoverServiceWorker, unregisterServiceWorker } from './actions/push';
 import { createSwLivenessProbe } from '../utils/swLivenessProbe';
+import { createSwFetchPathProbe } from '../utils/swFetchPathProbe';
 import { setupNativePushTapRouting } from './actions/native-push';
 import { startDevicePresenceTracking } from './actions/device-presence';
 import { startAppUpdateProgress, stopAppUpdateProgress, refreshReleaseCheck, resumeUpdateRelay } from './actions/app-update';
@@ -198,6 +201,8 @@ export function startClient(): () => void {
   }).catch(() => { /* checkConnection swallows internally; satisfy fail-fast rule */ });
   // Cold-start: load the unread set so the bell badge is correct.
   void loadUnreadNotifications();
+  // ...and this page's person, which decides its Review group.
+  void loadReaderDevices();
   // ...and the other workspaces' counts, which the bell never shows but the
   // app ICON does: behind the gateway one installed icon covers every
   // workspace on the origin. A no-op on a direct engine port. See
@@ -402,6 +407,7 @@ export function startClient(): () => void {
   // device reads these two lists.
   loadDevices();
   void loadPairedDevices();
+  void loadOperators();
 
   // Load data for the restored active menu item (switchMenuItem isn't called on reload)
   const tab = activeMenuItem.value;
@@ -506,7 +512,39 @@ export function startClient(): () => void {
     recover: recoverServiceWorker,
     onRecovered: () => showToast('Notifications repaired: the service worker was unresponsive', 'info'),
   });
-  const checkSwHealth = () => swLiveness.check();
+  // A worker can answer the ping above while its own fetch() hangs. Reset it and
+  // reload without registering again: a register on the same URL would keep the
+  // wedged worker. The reload is uncontrolled, and startup registers a fresh one.
+  const swFetchPath = createSwFetchPathProbe({
+    hasController: () => !!navigator.serviceWorker?.controller,
+    fetchUrl: (url, signal) => fetch(url, { signal, cache: 'no-store' }),
+    healthUrl: withBase('/api/v1/health'),
+    recover: async () => {
+      await unregisterServiceWorker();
+      window.location.reload();
+    },
+    onSuspected: () => postClientLog('sw', 'fetch_path_slow', {}),
+    onWedged: () => postClientLog('sw', 'fetch_path_wedged', {}),
+  });
+  // One run at a time: a fetch-path reset must never unregister the worker that
+  // the ping probe's repair just registered.
+  let swHealthRun: Promise<void> | null = null;
+  const runSwHealth = (steps: () => Promise<void>) => (swHealthRun ??= (async () => {
+    try {
+      await steps();
+    } finally {
+      swHealthRun = null;
+    }
+  })());
+  // Ping probe first: its in-place repair keeps the page.
+  const checkSwHealth = () => runSwHealth(async () => {
+    await swLiveness.check();
+    await swFetchPath.check();
+  });
+  // A wedged fetch path strands the boot on its splash, so probe it at once.
+  // This document just came through the worker, so the worker is awake.
+  const bootFetchPathCheck = runSwHealth(() => swFetchPath.check())
+    .catch(() => { /* best-effort recovery; the 5s check below probes again */ });
 
   function onServiceWorkerMessage(event: MessageEvent) {
     const data = event.data as { type?: unknown; target?: unknown; buildId?: unknown } | null;
@@ -533,10 +571,13 @@ export function startClient(): () => void {
     }
   }
 
-  // Cold-start delay: lets the initial register + activate finish so the
-  // probe doesn't time out against a pre-activation SW that wasn't broken.
+  // Cold-start delay: lets the initial register + activate finish so the ping
+  // probe doesn't time out against a pre-activation SW that wasn't broken. It
+  // waits for the boot fetch-path run, which would otherwise absorb it.
   const initialHealthCheck = window.setTimeout(() => {
-    checkSwHealth().catch(() => { /* best-effort recovery; next probe retries */ });
+    bootFetchPathCheck
+      .then(checkSwHealth)
+      .catch(() => { /* best-effort recovery; next probe retries */ });
   }, 5000);
 
   // On iOS PWA, the page doesn't reload when returning from background.
@@ -729,6 +770,7 @@ export function startClient(): () => void {
   return () => {
     stopped = true;
     swLiveness.stop();
+    swFetchPath.stop();
     stopLiveness();
     stopBootMarks();
     stopChatLadderReads();

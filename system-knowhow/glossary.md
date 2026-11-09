@@ -77,7 +77,7 @@ See also: `system-knowhow/building-an-app.md`, `docs/taxonomy.md` § Apps.
 <!--gloss-app-end-->
 
 ### App icon
-The picture that stands for an *app* or *widget* across Lucidos (apps panel, menu drawer, a widget's card bar, search). An image file inside the app folder, named by the *app manifest*'s `icon` (`assets/icon.svg`). Without a valid one, a *monogram tile* stands in. Distinct from the *app-icon badge*, which counts on Lucidos's own home-screen or dock icon.
+The picture that stands for an *app* or *widget* across Lucidos (apps panel, menu drawer, a dashboard's Add, search). An image file inside the app folder, named by the *app manifest*'s `icon` (`assets/icon.svg`). Without a valid one, a *monogram tile* stands in. Distinct from the *app-icon badge*, which counts on Lucidos's own home-screen or dock icon.
 See also: `system-knowhow/building-an-app.md` § App icon.
 
 ### App-icon badge
@@ -217,7 +217,7 @@ Three lanes. A clearly catastrophic command (`rm -rf /`, a fork bomb, formatting
 
 Two sub-settings apply while the guard is on. Turning off the **LLM judge** uses the static dangerous-command classifier and destruction scan, and a command it cannot see through asks. If an enabled judge fails, the permission card asks the user and explains why. The **judge model** defaults to `gemini-3.1-flash-lite`.
 
-A third sub-setting, **Enabled for coding agents** (on by default), lets the guard also answer the permission cards of coding-agent commands (Codex, Claude Code `Bash`). On, a command the guard places as safe or reversible runs without a card, and a wrong reversible verdict has no undo.
+A third sub-setting, **Answer coding-agent questions** (on by default), lets the guard also answer the permission cards of coding-agent commands (Codex, Claude Code `Bash`). It sees only what would otherwise card: the Claude Code permission mode and the Coding agent permissions list settle the rest first. On, a command the guard places as safe or reversible runs without a card, and a wrong reversible verdict has no undo. Off, the guard runs no Claude Code command unasked. Whatever the switches say, it refuses a catastrophic command it recognises. A Codex card means Codex's own sandbox blocked the command, so one the guard places as safe runs whatever the switches say.
 
 "Always allow" commands live in an editable list under **Settings → Permissions → Lucidos Agent permissions**. The list is **per workspace** (`<workspace>/.lucidos/agent-allowed-commands`), so another workspace asks again.
 
@@ -913,6 +913,28 @@ On iOS the home-screen app is its own *device*, so it pairs separately from Safa
 The browser cookie carries a window, refreshed each day the device is seen, but the *workspace gateway* never reads it. So **Devices** shows when each device was last seen, to the day. That is what separates a phone in daily use from a laptop you sold, so read it before revoking. A device paired before Lucidos recorded this shows no last-seen until its next request.
 See also: *device*, *pairing code*, `system-knowhow/remote-access.md` § Devices pair before Lucidos answers them.
 
+### Operator
+A person, as Lucidos knows them: a name, one or more emails, and the *paired devices* they hold. One device belongs to one person. The *workspace gateway* keeps operators beside its devices, in its *gateway event log*, so every *workspace* it serves sees the same people. **Settings → Devices → People** names operators, adds their emails, moves a device to another operator, and removes an operator.
+
+Minting a *pairing secret* asks who it is for, and the device that uses it joins that operator. A device that reaches this gateway through a *gateway pairing* shows as its operator on the other gateway: "Sam via A".
+
+**An operator is identity without authority.** It decides attribution ("Sam changed this trigger"), routing (whose *gate* it is) and read state. It never allows or refuses an action: every paired device can read, answer and change anything (ADR 0623).
+
+Events keep the device, or an *actor* email for outside input, never the operator. So moving a device or an email also moves the credit for older actions. Removing an operator revokes all its devices, which is how a team offboards someone.
+
+A gateway with one operator looks exactly as before.
+See also: *paired device*, *actor*, *team workspace*, *driver*.
+
+### Team workspace
+A *workspace* that more than one *operator* pairs devices to, run as the team's factory. The workspace is the only principal: it holds the bot credentials and does the work, and people steer it. No person-level permission exists (ADR 0623).
+
+Tickets and chat threads reach it through *triggers*, each fire a *work item*. Policy on where work stops for a person lives in knowhow, as *gates*. Questions and outcomes go back to the source through workspace script triggers, each a short message with a link to the thread. The *factory app* shows the team its work items.
+See also: *operator*, *work item*, *gate*, *factory app*.
+
+### Gateway event log
+The append-only file in the *workspace gateway*'s data directory that records every pairing, revoke and *operator* change. The device list and the operators are rebuilt from it, so it is their only source of truth. It needs no Postgres, so devices still pair and sign in while Postgres is down. The older `paired-devices.json` moves into it once, with every device under one operator.
+See also: *operator*, *paired device*.
+
 ### Pairing code
 The 8-digit one-time code that makes a device a *paired device*, for a person who has to type. It works once and expires in five minutes. **It works only from another device on the LAN or the tailnet.** On the machine Lucidos runs on, and through a tunnel, a proxy or `tailscale serve`, Lucidos refuses it. It says to scan the QR or open the link instead (ADR 0615). Each code is minted beside a *pairing secret*, and using either spends both.
 
@@ -985,6 +1007,9 @@ Paused is a *verdict* about the interrupted turn, not a resting state, so events
 **Not a stopped child.** A *child thread* paused by a user Stop waits on the user, not the engine. That makes it a *stopped child*, and it counts toward attention.
 
 **A pending change does not change the verdict.** A thread interrupted mid-turn reads Paused (or *failed*) whether or not it carries a *change*. Nothing writes `waiting` for that now: the thread's change state carries the change, not its status. The change stays in the thread and the review list.
+
+### Permission wait
+How long a parked permission card in an *unattended* coding-agent thread waits for an answer before the engine denies it. A card parks only for a command the *command guard* refused to classify. It also needs an enabled trigger that announces the card, such as "When agent needs me". The value is `"deny"` (never park), whole minutes from 1 to 1440, or `"indefinite"`. It comes from the root trigger's `permission_wait`, else the workspace preference `unattended_permission_wait` (default 30 minutes). See `system-knowhow/triggers.md` § Permission wait.
 
 ### Pinned thread
 A *thread* the user pinned to keep at hand, in the Pinned section of the *thread drawer*. A pinned thread is never archived: pinning an archived thread brings it back, and archiving a pinned thread unpins it. So a settled pinned thread offers Archive beside Unpin. Only the user's own Archive unpins. Automatic archiving (a finished, unwatched trigger run) and an agent's archive leave a pinned thread alone.
@@ -1059,7 +1084,7 @@ Dragging down past the top of a *content pane* view on a touch screen to re-read
 Each view decides what it re-reads. Disk Usage re-measures its worktrees, the Plugins panel rechecks every marketplace, and an *app* reloads as its header Refresh does. Live views, such as the thread list, have nothing to pull. Inside an app the SDK sees the pull, and an app can opt out (`system-knowhow/js-sdk.md` § Pull to refresh).
 
 ### Pane swipe
-On a phone, a sideways drag that moves between the three panes: the *thread drawer*, the *thread pane* and the *content pane*. A short fast flick or a drag past a third of the screen moves one pane; anything less springs back. It works anywhere, over an open *app* or an HTML preview too, except while an app is fullscreen. A swipe the phone interrupts, such as a notification taking the touch, springs back. Over a PDF or a web page preview it starts only at the screen edges. Inside an app or an HTML preview, a carousel or a slider keeps its own sideways drag (`system-knowhow/js-sdk.md` § Pane swipe).
+On a phone, a sideways drag that moves between the three panes: the *thread drawer*, the *thread pane* and the *content pane*. A short fast flick or a drag past a third of the screen moves one pane; anything less springs back. It works anywhere, over an open *app* or an HTML preview too, except while an app is fullscreen. A swipe the phone interrupts, such as a notification taking the touch, springs back. Over a PDF or a web page preview it starts only at the screen edges. A carousel or slider in an app or HTML preview, or a clamped XL *widget box*, keeps its own sideways drag (`system-knowhow/js-sdk.md` § Pane swipe).
 
 ### One sound at a time
 Starting a sound in one *app* or *widget* pauses every other sound playing in Lucidos, the file previews' players included. Two sound players on one question card never play over each other. Muted media takes no part. Inside an app the SDK handles it, with no code from the app (`system-knowhow/js-sdk.md` § One sound at a time).
@@ -1276,6 +1301,50 @@ The *Ongoing grouping* group for threads that cannot go on without you. It lists
 Questions come first, then the newest. Its count rides the *grouping button* under Folders, and the thread-drawer toggle while the list is hidden. Opening a thread from Blocked lands on the open question or permission card, or on the failure. It was called Needs attention until ADR 0409.
 
 While it holds threads, its tile wears the waiting colour. A halo breathes around it while a blocked thread is still unseen. Selecting Blocked sees them all, and opening one sees that one. Only a newly blocked thread starts the halo again. With Reduce motion on, the halo holds still.
+
+### Work item
+One piece of work in a *team workspace*: a root *thread* and its *sub-threads*. It is not a separate record. The root thread's own state is the work item's state.
+
+A person starts one by writing a thread. A *trigger* starts one per fire, unless the fire's *continue key* matches an open thread, which then gets the fire as a new message.
+See also: *continue key*, *driver*, *gate*.
+
+### Gate
+A question card on a *work item*: the point where the work waits for a person. Which work stops where is policy, written in knowhow. No engine code decides when to stop.
+
+A gate is live. Anyone's answer clears it from every view, for every *operator*. A gate always reaches someone: with no reachable *driver*, its push goes to the whole team.
+See also: *driver*, *Blocked*, *work item*.
+
+### Driver
+The one *operator* responsible for a *work item* right now. A thread you start makes you its driver. A trigger's work item starts with none. Answering a *gate*, or tapping **Take**, makes you the driver, and **Take over** moves the role in one tap.
+
+**The driver is soft.** Anyone can still answer any gate. A gate its driver leaves past the team's timeout escalates once: it pushes the whole team and shows in the Team view. The driver keeps the work item. An answer from the source, through a keyed trigger fire, sets a driver only when its *actor* matches an operator.
+
+The timeout is the `driver_timeout_hours` preference, and `0` never escalates. **Release** gives the role up.
+See also: *watcher*, *gate*, *operator*.
+
+### Watcher
+An *operator* who follows a *work item* without being responsible for it. Tap **Watch** in the *factory app*. A watcher gets the work item's gate pushes beside the *driver*, and sees it under Mine.
+See also: *driver*, *work item*.
+
+### Notification audience
+The devices a notification is for: the people a work item notice names, or else the work item's. A notification that opens a *work item* is for its *driver*'s and *watchers*' devices. It widens to the whole team when the work item has no driver, has an escalated *gate*, or names nobody who holds a device. Every other notification, and every notification on a gateway with one *operator*, is for everyone. Push skips devices outside it, where it reads as read.
+See also: *driver*, *watcher*, *gate*, *read state*.
+
+### Read state
+Whether you have read a notification, or seen a reply a *read request* points at. On a gateway with two or more *operators* it is per person: a read on one of your devices counts on all of them and on nobody else's. With one operator it is shared, as before.
+See also: *operator*, *notification audience*.
+
+### Config change
+A repository, trigger, MCP server or credential that someone added, changed or removed. On a *team workspace* each one tells the rest of the team who made it, with **Undo** where the change can be inverted. Undo never brings back a credential's value, only its other settings.
+See also: *team workspace*, *operator*.
+
+### Factory app
+The Lucidos app a *team workspace* installs from its setup knowhow (`system-knowhow/team-workspace`). It lists *work items* with their *driver* chips, split into Mine, Team and All, and offers **Take** and **Watch**. Team lists the *gates* nobody owns: no driver, or escalated past the team's timeout. The core thread drawer does not change.
+See also: *team workspace*, *driver*, *watcher*.
+
+### Translation script
+A script *trigger* in a *team workspace* that turns a source's raw input into a *domain event* the intake trigger can read. It resolves the source's user id to an email, skips the factory's own bot and strangers, and names the source in the event. The engine never learns what the source is.
+See also: *team workspace*, *actor*, *continue key*.
 
 ### Review
 The *Ongoing grouping* group for finished work that is your turn to look at. It lists every Current and Saved *thread* whose turn has ended and that holds a ready *change* or a *read request*. A change the *landing lane* holds leaves Review, since the lane decides when it lands. Opening one from Review lands on the change's turn when a change is ready, and otherwise on the start of the newest turn. A read request adds nothing to the Blocked count.
@@ -1556,6 +1625,18 @@ Three rules. Resolution prefers a key that exists verbatim at every level, so a 
 
 See also: *event subscription*, *trigger*, `system-knowhow/triggers.md` § "What a condition can say".
 
+### Continue key
+An opaque value that ties later *trigger* fires to the thread an earlier fire started. A trigger's key spec lists parts. Each part is a *field path*, or a list of field paths where the first with a value wins. The key is the JSON array of the resolved values. Keys are shared across triggers, so two triggers that build the same key reach the same thread.
+
+A fire whose key matches an open thread becomes a new message there. If that thread waits on a *gate*, the fire answers it as free text, and the agent asks again if it does not. Otherwise a new thread starts and keeps the key. One key maps to at most one open thread. The Archive action releases a thread's key, and unarchiving does not take it back. An unattended run that lands in Archive on its own keeps its key.
+
+The key is only for input. Lucidos compares it and never parses it, so it names no provider. Replies go out through workspace script triggers, addressed from the thread's first delivery.
+See also: *work item*, *field path*, *actor*, `system-knowhow/triggers.md` § "Continue key".
+
+### Actor
+The person behind a *trigger* fire, named by email. A trigger's `actor` field names the payload field that holds the email. Lucidos maps the email to an *operator*, and an email no operator holds reads as a stranger. A source that sends ids instead of emails gets a workspace script trigger that looks the email up and emits a domain event carrying it.
+See also: *operator*, *continue key*, `system-knowhow/triggers.md` § "Actor".
+
 ### Trigger thread
 A *thread* spawned by a *trigger* firing, marked `source = 'trigger'`. Its LLM has the same knowhow access as a chat thread: the system prompt advertises the intent registry, and the LLM calls `load_knowhow` when relevant. No per-trigger knowhow allowlist. Terminal event: `TriggerCompleted`.
 
@@ -1766,12 +1847,12 @@ See also: *reusable widget*, *built-in widget*, *widget instance*, *inline widge
 A *widget* whose manifest says `"reusable": true`, so any thread may embed it. The apps panel lists them in a Widgets group, and the agent sees them in its prompt. Its origin thread stays recorded: "Stop reusing" clears the flag, and the widget then belongs to that thread again. So it is refused once that thread is deleted, and while a *dashboard* holds the widget. Deleting the origin thread never removes a reusable widget. A *built-in widget* is a reusable widget that ships with Lucidos, and a *plugin widget* one a plugin ships, and neither offers "Stop reusing".
 
 ### Inline widget
-A *widget* drawn in a turn, also called its card: a bar over its *widget box*. The bar holds its icon, its name, a size pill, "+ Dashboard" and the ⋯ menu. A small card folds the name and the button into ⋯.
+A *widget* drawn in a turn, also called its card: its bare *widget box*, centred in the turn, drawn as its dashboard tile is. A right-click, a long press on a phone, or the menu key on the focused card opens its menu. The menu starts with a Size row, then Open in Canvas, Add to dashboard and the rest, the same on every device.
 
-A reply draws one from each *widget embed* it holds, and an old `WidgetShown` still draws one at its turn. It starts at the widget's default size. The user's pill pick sticks to that *widget instance* in the thread, on every device and after a reload (`InlineWidgetSized`). The agent sets one with `widgets(action="size")` only when you name a size (ADRs 0466, 0621).
+A reply draws one from each *widget embed* it holds, and an old `WidgetShown` still draws one at its turn. It starts at the widget's default size. The user's size pick sticks to that *widget instance* in the thread, on every device and after a reload (`InlineWidgetSized`). The agent sets one with `widgets(action="size")` only when you name a size (ADRs 0466, 0621).
 
 ### Widget box
-The fixed box a *widget* draws into wherever it has a *widget size*: its *inline widget* in a thread and its tile on a *dashboard*. Both draw the same box at the same size, so what the thread shows is what the dashboard shows. The host sets the box, and content never sizes it. The widget fits by showing less, never by shrinking its text, and never scrolls inside. Content past the box is clipped under a fade, and Open in Canvas shows the widget full size. A question option and the Canvas draw a widget with no box (ADR 0621).
+The fixed box a *widget* draws into wherever it has a *widget size*: its *inline widget* in a thread and its tile on a *dashboard*. Both draw the same box at the same size, so what the thread shows is what the dashboard shows. The host sets the box, content never sizes it, and a host narrower than an XL box scrolls the box sideways. The widget fits by showing less, never by shrinking its text, and never scrolls inside. Content past the box is clipped under a fade, and Open in Canvas shows the widget full size. A question option and the Canvas draw a widget with no box (ADR 0621).
 
 ### Widget shape
 A class the app stylesheet serves for a *widget*'s main shape: `.ring` for a gauge, `.bar-run` for a short series, and `.choice-row` for the tap targets of a pick. Each draws from the theme tokens and follows the motion setting. A widget leads with one instead of a table (`system-knowhow/building-an-app.md` § Widgets, `system-knowhow/js-sdk.md` § Widget shapes).
@@ -1786,9 +1867,9 @@ The JSON object a *widget* receives for one place it is shown, read with `lucido
 One *widget* with one set of *widget params*. A card size and a *dashboard* tile key on it, so two instances of one widget can each have their own. Its label is not part of the key. The same names and values in a different order are one instance (ADR 0415).
 
 ### Widget size
-One of three sizes a *widget*'s *widget box* takes, in a thread card and a *dashboard* tile alike. An *app shortcut* has its own, `quarter`, which no widget takes. The three are `small` (one cell, square), `medium` (two cells wide, one high) and `large` (two by two).
+One of four sizes a *widget*'s *widget box* takes, in a thread card and a *dashboard* tile alike. An *app shortcut* has its own, `quarter`, which no widget takes. The four are `small` (one cell, square), `medium` (two cells wide, one high), `large` (two by two) and `xl` (four wide, two high).
 
-Cells are square and scale with the UI scale. A cell keeps its size at every dashboard width: the dashboard has as many columns as fit, centred, and only one too narrow for two draws them smaller. A widget that declares no sizes takes all three and starts medium. One that declares `"sizes": ["medium", "small"]` in its *app manifest* takes only those, the first as its default.
+Cells are square and scale with the UI scale. A cell keeps its size at every dashboard width: the dashboard has as many columns as fit, centred, and only one too narrow for two draws them smaller. An `xl` tile or card can be wider than its host. The host then clamps it to the room and scrolls the box sideways at its true size. A widget that declares no sizes takes small, medium and large and starts medium, because `xl` is opt-in. One that declares `"sizes": ["medium", "small"]` in its *app manifest* takes only those, the first as its default.
 
 The box sets the size and the widget draws for it, with no scroll inside. It reads its size from `data-widget-size` on `<html>` or `lucidos.widget.size()`. Content past the box is clipped under a fade, and the menu opens the widget full size in Canvas. A size the widget no longer declares falls back to the nearest smaller one it does (ADRs 0432, 0621).
 
@@ -2106,12 +2187,13 @@ A fresh coding-agent session that carries on a heavy thread's work in the same t
 
 It may run on another implementer, Claude Code or Codex. The branch, the change and the parent's wait stay with the thread. A thread may hand off any number of times.
 
-Four moments start one:
+Five moments start one:
 
 - picking an `Implement in a fresh session` option on a plan card;
 - asking the agent to "handoff this session";
 - **Continue with context** on the *Successor card*;
-- an automatic *handoff checkpoint* where the *handoff estimate* says the handoff pays.
+- an automatic *handoff checkpoint* where the *handoff estimate* says the handoff pays;
+- the first turn end past the thread's *context ceiling*.
 
 The agent writes the narrative, runs `lucidos successor start`, and ends its turn. The successor session then starts in the thread. No owner approval is needed, and uncommitted work stays in the worktree. Stopping the turn first withdraws the handoff, and so does a successor session that fails to start.
 
@@ -2207,6 +2289,16 @@ It offers three options, drawn like a question card's:
 A picker pick under the card switches nothing. If you send in the current session instead, that send asks the usual rung switch question first.
 
 The card flips from warm to cold by itself when the cache goes cold. Uncommitted work stays in the worktree, and the new session reads `git status` first. Right after a handoff the card hides, since it reads only the current session's size.
+
+### Context ceiling
+The context size at which a coding-agent session hands off to a *successor session*, whatever its flow says. The value is `off`, a size such as `300k`, or a share of the window such as `30%`. It never sits above 75% of the session's recorded window, nor below 100k. The default is `300k`.
+
+- **Where it is set:** the `coding_agent_context_ceiling` *preference*, a trigger's `context_ceiling`, or the thread itself with `lucidos threads context-ceiling`. A child takes its parent's at spawn.
+- **Who may raise it:** only a person raises it or turns it off. An agent may lower its own thread's.
+- **When it acts:** at the first turn end past it, never mid-turn. The session writes its *handoff narrative* while the cache is warm. If it writes none, Lucidos uses a *handoff brief*.
+- **When the successor starts:** on the thread's next input, such as your next message or a wake. Until then the old session takes no input.
+
+Above the composer, **Return to the old session** withdraws the handoff and raises the ceiling to the session's size plus 100k.
 
 ### Handoff brief
 What the engine writes as a *successor session*'s first message in place of a *handoff narrative*: when the *prompt cache* is cold, or when a resume failed. It says why the context did not carry over, and that the worktree holds all the work. It tells the session to rebuild only what it needs: `git status`, the thread's recent turns, the branch's git log and any plan under `docs/plans/`.

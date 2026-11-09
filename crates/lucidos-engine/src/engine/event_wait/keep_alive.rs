@@ -1988,7 +1988,8 @@ async fn emit_status(bus: &EventBus, thread_id: Uuid, status: Option<CacheKeepAl
 }
 
 /// The candidates: `waiting` threads, every parent with active children, and
-/// every thread parked on the user.
+/// every thread parked on the user. A session past its *context ceiling* owes
+/// a handoff, so no beat may resume it, as with a pending handoff.
 async fn read_candidates(
     pool: &sqlx::PgPool,
     waiting: &[Uuid],
@@ -1997,7 +1998,7 @@ async fn read_candidates(
     // The planner prices the query high, so JIT compiles it for over a second
     // on every run, to return a couple of rows.
     sqlx::query("SET LOCAL jit = off").execute(&mut *tx).await?;
-    let rows = sqlx::query_as(&candidates_sql())
+    let rows: Vec<CandidateRow> = sqlx::query_as(&candidates_sql())
         .bind(waiting)
         .bind(KEEP_ALIVE_IDLE_REASON)
         .bind(ThreadStatus::WaitingForUserAnswer.as_str())
@@ -2009,7 +2010,17 @@ async fn read_candidates(
         .fetch_all(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(rows)
+    let mut kept = Vec::with_capacity(rows.len());
+    for row in rows {
+        if !row.is_coding_agent
+            || crate::engine::context_ceiling::past_ceiling(pool, row.thread_id)
+                .await?
+                .is_none()
+        {
+            kept.push(row);
+        }
+    }
+    Ok(kept)
 }
 
 /// The user's per-thread keep-alive switch, as a request names it (ADR 0554).

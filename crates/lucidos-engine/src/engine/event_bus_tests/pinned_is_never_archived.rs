@@ -109,6 +109,7 @@ async fn an_unattended_trigger_run_never_archives_a_pinned_thread() {
             go_to_review: false,
             model: None,
             reasoning_effort: None,
+            continue_key: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),

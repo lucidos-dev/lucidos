@@ -1147,7 +1147,7 @@ describe('a deep-link landing ends the ride on a thread parked on a question', (
     // notification.
     const { onResize } = armThenLandOnAnOldTurn();
 
-    container.scrollHeight = 20000; // render-all, a decoded image, markdown settling
+    container.scrollHeight = 20000; // the window growing, a decoded image, markdown settling
     onResize();
 
     expect(container.scrollTop).toBe(3000);

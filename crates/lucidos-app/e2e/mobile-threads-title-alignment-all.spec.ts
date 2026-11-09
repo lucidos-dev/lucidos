@@ -289,17 +289,9 @@ test.describe('Mobile header titles are centered and clear of the leading icons'
     });
   }
 
-  test('the nav cluster edges land in the same places on all three panes', async ({ page }) => {
-    // The ask this pins: navigation must not move under the thumb when the user
-    // swipes between panes. All three clusters are the same fixed-width centred
-    // box, so the chevrons agree by construction; what could break it is a
-    // per-pane width, a shift, or a change to a pane's edge clusters that moves
-    // the reserve on one row and not the other.
-    //
-    // Swept across both ARMS of the cluster's width. At 375px the arm is a pure
-    // function of the root. The edge reserve places the chevrons at 100% and at
-    // 125%. At 200% the row cannot hold the cluster at all, so the min-span
-    // floor takes over and the ends do reach their edge controls.
+  test('nav edges agree until content must shrink below the brand floor', async ({ page }) => {
+    // Content shares the edge reserve until the brand floor engages. At large
+    // scales it has no mark to protect, so it shrinks to keep controls clear.
     await navigateToApp(page);
 
     // Both thread chevrons carry the same class, so they are told apart by
@@ -342,14 +334,20 @@ test.describe('Mobile header titles are centered and clear of the leading icons'
         .not.toBeNull();
       const content = (await chevrons(page, ...contentArgs))!;
 
-      expect(
-        Math.abs(thread.backLeft - content.backLeft),
-        `ui-scale ${scale} back chevron: thread ${thread.backLeft.toFixed(1)}, content ${content.backLeft.toFixed(1)}`,
-      ).toBeLessThan(1);
-      expect(
-        Math.abs(thread.forwardRight - content.forwardRight),
-        `ui-scale ${scale} forward chevron: thread ${thread.forwardRight.toFixed(1)}, content ${content.forwardRight.toFixed(1)}`,
-      ).toBeLessThan(1);
+      if (expected === 'floor') {
+        // Content has no brand mark: it shrinks between its edge controls.
+        expect(content.backLeft).toBeGreaterThan(thread.backLeft);
+        expect(content.forwardRight).toBeLessThan(thread.forwardRight);
+      } else {
+        expect(
+          Math.abs(thread.backLeft - content.backLeft),
+          `ui-scale ${scale} back chevron: thread ${thread.backLeft.toFixed(1)}, content ${content.backLeft.toFixed(1)}`,
+        ).toBeLessThan(1);
+        expect(
+          Math.abs(thread.forwardRight - content.forwardRight),
+          `ui-scale ${scale} forward chevron: thread ${thread.forwardRight.toFixed(1)}, content ${content.forwardRight.toFixed(1)}`,
+        ).toBeLessThan(1);
+      }
 
       // The threads pane carries no chevrons, so its cluster holds one member,
       // the Lucidos mark, at the same trailing edge. The mark is the only

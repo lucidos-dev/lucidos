@@ -72,13 +72,9 @@ const THREAD_ROW_PAD_REM = 0.5;
  *  (`2 * --header-icon-box + --header-mark-tap`), which the clamp on
  *  `.pane-header-brand-label` floors the box at. */
 const THREAD_ROW_CLUSTER_REM = 2 * 2.25 + 2.1;
-/** The Canvas pane's floor. 360px at a 16px root. It is a constant where the
- *  other two are derived. Its row needs
- *  `2 * --content-side-reserve + --desktop-nav-min-span`, which is 22.1rem, so
- *  the title cluster rests on its clamp's reserve arm down to this width. Pinned
- *  in the suite. The docked dashboard rail toggle widens the reserve by a box, and
- *  then the cluster reaches its min-span arm near this floor. There
- *  `useHeaderActionCollapse` folds the actions into ⋯ to keep them clear. */
+/** The Canvas pane's floor, 360px at a 16px root. The row is narrower than
+ *  the pane because of its edge insets. With the dashboard toggle docked it
+ *  can reach the title span floor; the collapse hook keeps actions clear. */
 const MIN_CONTENT_PANE_REM = 22.5;
 
 /** Floor for the thread drawer's width, from the root font size and the lead its

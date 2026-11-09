@@ -13,6 +13,7 @@ import { loadThreadQueue } from './threadQueue';
 import { resyncPluginCatalog } from './plugin-marketplaces';
 import { loadPreferences } from './preferences';
 import { loadReleaseNotices } from './releaseNotices';
+import { loadReaderDevices } from './reader-devices';
 import { reloadChangelogIfRead } from './whatsNew';
 import { releaseNoticeDismissed } from '../releaseNotices';
 import { flushUndeliveredComposeDrafts } from './compose';
@@ -233,6 +234,8 @@ function runResumeSync(): void {
   // a notice, never when a new one arrives. So an upgraded workspace showed
   // nothing until the reader opened the What's New page by hand.
   void loadReleaseNotices();
+  // No frame says the operators changed while the stream was down.
+  void loadReaderDevices();
   // The changelog the engine serves follows its release too, and What's New
   // opened during the restart holds a failed read.
   void reloadChangelogIfRead();

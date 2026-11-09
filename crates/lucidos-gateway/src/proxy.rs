@@ -102,6 +102,8 @@ pub(crate) fn gateway_owns_header(name: &HeaderName, keep_handover: bool) -> boo
         || n.eq_ignore_ascii_case(crate::relay::HEADER_RELAY_CLAIM)
         || n.eq_ignore_ascii_case(crate::relay::HEADER_RELAY_SIGNATURE)
         || n.eq_ignore_ascii_case(crate::relay::HEADER_RELAY_LOCAL_BROWSER)
+        || n.eq_ignore_ascii_case(crate::relay::HEADER_RELAY_OPERATOR)
+        || n.eq_ignore_ascii_case(crate::relay::HEADER_RELAY_OPERATOR_SIGNATURE)
         || n.eq_ignore_ascii_case(crate::oauth_callback::HEADER_LOCAL_BROWSER)
     {
         return true;
@@ -364,7 +366,7 @@ pub async fn proxy(
         Err(e) if e.is_foreign() => {
             crate::log!(
                 "[Gateway] proxy {} -> {} refused: {}",
-                path_and_query,
+                request_path_for_log(&path_and_query),
                 engine,
                 e
             );
@@ -377,7 +379,7 @@ pub async fn proxy(
         Err(e) => {
             crate::log!(
                 "[Gateway] proxy {} -> {} failed: {}",
-                path_and_query,
+                request_path_for_log(&path_and_query),
                 engine,
                 e
             );
@@ -413,6 +415,11 @@ pub async fn proxy(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// Request logs omit queries, which can contain legacy pairing credentials.
+pub(crate) fn request_path_for_log(target: &str) -> &str {
+    target.split(['?', '#']).next().unwrap_or_default()
+}
+
 /// Proxy a WebSocket upgrade to the engine, then splice the two byte streams.
 ///
 /// Transparent by construction (ADR 0151): the gateway never parses a frame, so
@@ -442,7 +449,7 @@ async fn proxy_upgrade(
             "[Gateway] websocket upgrade to /{}{} refused: it came from {}, and this gateway \
              is reached at {:?}",
             slug,
-            rest,
+            request_path_for_log(rest),
             origin,
             req.headers().get(header::HOST),
         );
@@ -499,7 +506,7 @@ async fn proxy_upgrade(
                 crate::log!(
                     "[Gateway] websocket upgrade to {}{} could not connect: {}",
                     engine,
-                    rest,
+                    request_path_for_log(rest),
                     e
                 );
                 return (StatusCode::SERVICE_UNAVAILABLE, "engine unreachable").into_response();
@@ -508,7 +515,7 @@ async fn proxy_upgrade(
                 crate::log!(
                     "[Gateway] websocket upgrade to {}{} failed: {}",
                     engine,
-                    rest,
+                    request_path_for_log(rest),
                     e
                 );
                 return (StatusCode::BAD_GATEWAY, "upgrade request failed").into_response();
@@ -2513,5 +2520,19 @@ mod upgrade_tests {
             assert!(!gateway_owns_header(&name, false), "{forwarded}");
             assert!(!gateway_owns_header(&name, true), "{forwarded}");
         }
+    }
+    #[test]
+    fn request_logs_omit_credentials_in_queries_and_fragments() {
+        for target in [
+            "/demo/?pair=01234567",
+            "/demo/#pair=01234567",
+            "/demo/?x=1&pair=secret",
+        ] {
+            assert_eq!(request_path_for_log(target), "/demo/");
+        }
+        assert_eq!(
+            request_path_for_log("/demo/api/v1/health"),
+            "/demo/api/v1/health"
+        );
     }
 }

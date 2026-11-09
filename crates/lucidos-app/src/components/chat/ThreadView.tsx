@@ -17,12 +17,12 @@ import { sideQuestionsFor } from '../../store/sideQuestions';
 import { threadVisualStatus } from '../shared/threadVisualStatus';
 import { ThreadTitleMenu, ThreadTitlePin } from './ThreadTitle';
 import { MobileThreadTitleBar } from '../layout/MobileAppHeader';
-import { computeExchanges, exchangeKey, drawnResponseEvents, hasContentEvents, turnBodyFolded, type Exchange } from '../../store/thread-events';
+import { computeExchanges, deepLinkTargetIndex, exchangeKey, drawnResponseEvents, hasContentEvents, turnBodyFolded, type Exchange } from '../../store/thread-events';
 import { rowsDrawnByClamp } from '../../store/event-rendering';
 import { statusLabel } from '../../store/exchange-status';
-import { awayFromBottom, notAtTop, scrollToBottomAnimated, scrollToTop, hasPendingEventScroll, isNavigationScroll, isScrollHeld, isWhereWeLastScrolledIt, markAnchorScroll, onScrollHoldReleased, scrollHoldReleased, deepLinkRenderAll, scrolledFromTop } from './scrollState';
+import { awayFromBottom, notAtTop, scrollToBottomAnimated, scrollToTop, hasPendingEventScroll, isNavigationScroll, isScrollHeld, isWhereWeLastScrolledIt, markAnchorScroll, onScrollHoldReleased, scrollHoldReleased, deepLinkTarget, scrolledFromTop } from './scrollState';
 import { isElementVisible } from '../../utils/elementVisibility';
-import { EMPTY_FILL_LEDGER, WHOLE_THREAD, chargeFillRound, drawnRowsInWindow, fillRoundAllowed, settleFillLedger, anythingAbove, atScrollTop, clampedScrollTop, scrollAsksForOlder, canSeedRenderWindow, deepLinkMustPersist, edgeHasMoreAbove, edgeMustReachRow, exchangeRenderCost, readingChaseAction, READING_CHASE_PAGE_SIZE, expandWindowEdge, fillAction, reseedOnReopen, seedWindowEdge, UPWARD_SCROLL_KEYS, WINDOW_EXPAND_MARGIN_PX, scrollToTopNeedsRenderAll, type FillLedger, type RowsAt, type WindowEdge } from './threadWindow';
+import { EMPTY_FILL_LEDGER, WHOLE_THREAD, chargeFillRound, drawnRowsInWindow, fillRoundAllowed, settleFillLedger, anythingAbove, atScrollTop, clampedScrollTop, scrollAsksForOlder, canSeedRenderWindow, deepLinkEdge, edgeHasMoreAbove, edgeMustReachRow, exchangeRenderCost, readingChaseAction, READING_CHASE_PAGE_SIZE, expandWindowEdge, fillAction, reseedOnReopen, seedWindowEdge, UPWARD_SCROLL_KEYS, WINDOW_EXPAND_MARGIN_PX, scrollToTopNeedsRenderAll, type FillLedger, type RowsAt, type StoredWindowKind, type WindowEdge } from './threadWindow';
 import { transcriptScrolls } from './transcriptScrolls';
 import { anchorTargetTop, readScrollAnchor, type ScrollAnchor } from './scrollAnchor';
 import { useScrollMemory, readSavedScroll, type SavedScroll } from '../../hooks/useScrollMemory';
@@ -57,12 +57,13 @@ let lastRevealedThread: string | null = null;
 
 // Per-thread render-window TOP EDGE: which exchange is the oldest rendered, and
 // how many of ITS leading rows are clamped off. Module-scoped so it survives a
-// switch-away-and-back (see the windowing block in ThreadView). `WHOLE_THREAD`
-// is what a deep-link sets. Session-scoped; two small ints per visited thread.
+// switch-away-and-back (see the windowing block in ThreadView). Session-scoped;
+// two small ints per visited thread.
 //
 // A window the reader grew survives that switch, even one grown to the first
-// turn. A render-all does not: it is a claim one visit's navigation made, and a
-// fresh open drops it back to the seed. See `reseedOnReopen`.
+// turn. A claimed one does not: a deep link's target turn or the chevron's
+// render-all is one visit's navigation, and a fresh open drops it back to the
+// seed. See `reseedOnReopen`.
 //
 // The edge, not the trailing count, in both dimensions. A turn or a row already
 // on screen must not leave the DOM when a newer one is appended.
@@ -77,20 +78,18 @@ let lastRevealedThread: string | null = null;
 const renderFloorByThread = new Map<string, StoredWindow>();
 
 /** A stored window, and who stored it (`StoredWindowKind`, which is what a
- *  reopen asks). A render-all is pinned to the thread's first turn whatever
- *  arrives in front of it. A grown edge names its turns by key
- *  (`exchangeKey`): its own, and the one after it, for when a fold absorbs a
- *  fragment into its real turn. */
-type StoredWindow =
-    | { kind: 'render-all' }
-    | { kind: 'grown'; edge: WindowEdge; key: string | null; nextKey: string | null };
+ *  reopen asks). The edge names its turns by key (`exchangeKey`): its own, and
+ *  the one after it, for when a fold absorbs a fragment into its real turn.
+ *  A render-all stores no key, so it stays pinned to the first turn whatever
+ *  arrives in front of it. */
+type StoredWindow = { kind: StoredWindowKind; edge: WindowEdge; key: string | null; nextKey: string | null };
 
 /** Store `edge` against the exchanges it was computed from. */
-function storeEdge(threadId: string, edge: WindowEdge, exchanges: readonly Exchange[]): void {
+function storeEdge(threadId: string, edge: WindowEdge, exchanges: readonly Exchange[], kind: StoredWindowKind = 'grown'): void {
     const at = exchanges[edge.exchange];
     const next = exchanges[edge.exchange + 1];
     renderFloorByThread.set(threadId, {
-        kind: 'grown',
+        kind,
         edge,
         key: at ? exchangeKey(at) : null,
         nextKey: next ? exchangeKey(next) : null,
@@ -99,7 +98,7 @@ function storeEdge(threadId: string, edge: WindowEdge, exchanges: readonly Excha
 
 /** Store a render-all: the thread's first turn, pinned there. */
 function storeRenderAll(threadId: string): void {
-    renderFloorByThread.set(threadId, { kind: 'render-all' });
+    renderFloorByThread.set(threadId, { kind: 'claimed', edge: WHOLE_THREAD, key: null, nextKey: null });
 }
 
 /** The stored edge, resolved against THESE exchanges. The index stands while
@@ -107,7 +106,6 @@ function storeRenderAll(threadId: string): void {
 function storedEdge(threadId: string, exchanges: readonly Exchange[]): WindowEdge | undefined {
     const stored = renderFloorByThread.get(threadId);
     if (!stored) return undefined;
-    if (stored.kind === 'render-all') return WHOLE_THREAD;
     const { edge, key, nextKey } = stored;
     if (key === null) return edge;
     const at = exchanges[edge.exchange];
@@ -197,7 +195,7 @@ function growRenderWindow(
 type HistoryHold = {
     /** The turn to re-point the WINDOW onto, and null when there is none to
      *  re-point against: a page that folded to nothing renderable, or a
-     *  whole-history hold (see `wholeHistoryHold`). Either way the landing
+     *  hold for the reader alone (see `readerOnlyHold`). Either way the landing
      *  holds the reader by pixels and leaves the window alone. */
     anchorKey: string | null;
     /** The turn BELOW the anchor, as a second chance at re-pointing.
@@ -245,22 +243,23 @@ export function holdTargetTop(el: HTMLElement, hold: HistoryHold): number {
     return hold.prevScrollTop + (el.scrollHeight - hold.prevScrollHeight);
 }
 
-/** The hold a WHOLE-HISTORY fetch takes, and why it names no turn to re-point.
+/** The hold a read takes when it must not move the WINDOW: a deep link's page
+ *  toward its target, and a read already running when the view mounts.
  *
- *  A deep link renders the thread whole, so `ensureWholeThreadLoaded` pulls the
- *  history behind the newest page. That history folds in at the FRONT, seconds
- *  after the link has already landed the reader on their event. WebKit
- *  implements no scroll anchoring, so the transcript grows above them and
- *  carries them up into history nobody asked for.
+ *  That history folds in at the FRONT, possibly after the link has landed the
+ *  reader on their event. WebKit implements no scroll anchoring, so the
+ *  transcript grows above them and carries them up into history nobody asked
+ *  for.
  *
  *  It is the same hold a scroll-driven backfill takes, so the scroll listener
  *  keeps it current while the link's own glide moves the reader.
  *
  *  NO ANCHOR KEY, where `requestBackfill` names one. That key re-points the
- *  WINDOW, and a render-all draws every turn and must go on drawing them. The
- *  `anchor` beside it is a different thing, and this hold DOES carry one: it
- *  positions the reader rather than the window. */
-export function wholeHistoryHold(el: HTMLElement): HistoryHold {
+ *  window and then GROWS it one step, which is the reader's scroll asking for
+ *  more. A link's page asks for nothing on screen: the stored edge already
+ *  resolves its turn by key. The `anchor` beside it is a different thing, and
+ *  this hold DOES carry one: it positions the reader rather than the window. */
+export function readerOnlyHold(el: HTMLElement): HistoryHold {
     return {
         anchorKey: null,
         nextKey: null,
@@ -389,7 +388,7 @@ function requestBackfill(
 }
 
 /** What a read of older history does when it settles, either way. Both readers
- *  end here, `requestBackfill` above and `requestWholeHistory` below.
+ *  end here, `requestBackfill` above and `requestLinkPage` below.
  *
  *  A fold tells the landing through `onSettled`, never through `exchanges`
  *  changing. A live turn on an active thread changes those too. Consuming the
@@ -400,8 +399,8 @@ function requestBackfill(
  *  what lets the next scroll ask again.
  *
  *  A read whose thread the reader has LEFT says nothing at all. Its callbacks
- *  belong to the component, which is showing another thread by now. A
- *  whole-history read runs for seconds, so it would spend that thread's hold.
+ *  belong to the component, which is showing another thread by now. A deep
+ *  link's paging runs for seconds, so it would spend that thread's hold.
  *  The switch has already dropped this thread's own. Same guard the up chevron
  *  keeps on its own late read. */
 function settleHistoryRead(threadId: string, added: boolean, onSettled: (added: boolean) => void): void {
@@ -421,28 +420,31 @@ function settleOn(read: Promise<boolean>, threadId: string, onSettled: (added: b
     );
 }
 
-/** Threads whose whole history this visit has already asked for, so the retry
- *  below cannot ask twice. Module-scoped like the maps above, and cleared by
- *  the same teardown: a later visit is free to ask again. */
-const wholeHistoryAskedByThread = new Set<string>();
+/** Threads where a deep link's paging found nothing this visit, so the next
+ *  settle cannot ask again. Module-scoped like the maps above, and cleared by
+ *  the same teardown: a later visit is free to ask again. The link's deadline
+ *  then reports it unresolved. */
+const linkPagingGaveUp = new Set<string>();
 
-/** Pull the history behind the newest page for a deep link's render-all,
- *  holding the reader's place across the fold. `wholeHistoryHold` carries what
- *  the hold is for and why it re-points no window.
+/** Fetch one page of history for a deep link whose target is older than what
+ *  is loaded, holding the reader's place across the fold. `readerOnlyHold`
+ *  carries what the hold is for and why it re-points no window.
  *
  *  Its caller stands it down while a read is already running, so this never
  *  queues behind one. A queued read would fold with no hold at all: the hold it
  *  would take is the running read's, still in the map.
  *
- *  ONCE per visit, and that is what bounds the retry. A fetch that FAILS toasts
- *  inside the store and leaves `hasOlderEvents` true. Asking again on its own
- *  settle is then a loop, one toast a round. The chevron and the reader's own
- *  scroll are the ways back from a failure. */
-function requestWholeHistory(el: HTMLElement, threadId: string, onSettled: (added: boolean) => void): void {
-    if (wholeHistoryAskedByThread.has(threadId)) return;
-    wholeHistoryAskedByThread.add(threadId);
-    historyHoldByThread.set(threadId, wholeHistoryHold(el));
-    settleOn(ensureWholeThreadLoaded(threadId, () => scrollHoldReleased(el)), threadId, onSettled);
+ *  A page that adds nothing ends the paging for the visit, and that is what
+ *  bounds the retry. A fetch that FAILS toasts inside the store and leaves
+ *  `hasOlderEvents` true. Asking again on its own settle is then a loop, one
+ *  toast a round. The chevron and the reader's own scroll are the ways back. */
+function requestLinkPage(el: HTMLElement, threadId: string, onSettled: (added: boolean) => void): void {
+    if (linkPagingGaveUp.has(threadId)) return;
+    historyHoldByThread.set(threadId, readerOnlyHold(el));
+    settleOn(loadOlderThreadEvents(threadId, undefined, () => scrollHoldReleased(el)), threadId, (added) => {
+        if (!added) linkPagingGaveUp.add(threadId);
+        onSettled(added);
+    });
 }
 
 /** Escalating retry delays for the empty-thread safety retry. */
@@ -864,10 +866,9 @@ export function ThreadView() {
     // would re-window to the tail and useScrollMemory couldn't restore your spot.
     // A new thread starts at the SEEDED window: the newest exchanges fitting the
     // step budget, capped at INITIAL_WINDOW. Its first render is already windowed,
-    // never a one-off full render. A notification deep-link forces the full list
-    // instead, so a windowed-out target can render. The persist effect below then
-    // keeps it full, so clearing the claim doesn't snap the user back.
-    // See threadWindow.ts + scrollState.deepLinkRenderAll.
+    // never a one-off full render. A deep link moves the edge down to its
+    // target's turn, so a windowed-out target can render.
+    // See threadWindow.ts `deepLinkEdge` + scrollState.deepLinkTarget.
     const [winTick, bumpWin] = useState(0);
     // Bumped only when older history has FOLDED IN, which is what the re-point
     // effect keys on. An `exchanges` change is not the same event: a live turn
@@ -920,7 +921,8 @@ export function ThreadView() {
     // costs, and a live turn's cost grows with every streamed step. A derived
     // window would therefore push older turns off the top while the reader
     // watches. Write-once: the edge only ever moves UP the list afterwards, from
-    // the scroll-up expansion, the chevron's render-all, or the effect below.
+    // the scroll-up expansion, the chevron's render-all, a deep link's claim,
+    // or the effects below.
     //
     // `canSeedRenderWindow` is what keeps that write-once off a fragment.
     const canSeedWindow = canSeedRenderWindow({
@@ -942,29 +944,25 @@ export function ThreadView() {
     // a window drag does mid-read. Written past the settle guard, so a render
     // before the events land does not spend the visit. The teardown below is
     // what ends one.
+    const linkTarget = deepLinkTarget.value;
     if (threadId && canSeedWindow) {
         const firstThisVisit = lastSeededVisit?.threadId !== threadId;
         lastSeededVisit = { threadId, owner: visitOwner };
         const stored = renderFloorByThread.get(threadId);
-        if (!stored || (firstThisVisit && reseedOnReopen(stored.kind, deepLinkRenderAll.peek()))) {
+        if (!stored || (firstThisVisit && reseedOnReopen(stored.kind))) {
             storeEdge(threadId, seedWindowEdge(exchangeCosts, rowsDrawnAt), exchanges);
         }
+        // A deep link claims the turn holding its target, in render for the
+        // reason the re-seed above is. Stored by key, so the edge outlives the
+        // claim and the reader is not snapped back to the tail.
+        if (linkTarget) {
+            const now = currentEdge(threadId, exchanges, exchangeCosts, rowsDrawnAt);
+            const claimed = deepLinkEdge(now, deepLinkTargetIndex(exchanges, linkTarget));
+            if (claimed !== now) storeEdge(threadId, claimed, exchanges, 'claimed');
+        }
     }
-    const edge = deepLinkRenderAll.value
-        ? WHOLE_THREAD
-        : threadId ? currentEdge(threadId, exchanges, exchangeCosts, rowsDrawnAt) : WHOLE_THREAD;
+    const edge = threadId ? currentEdge(threadId, exchanges, exchangeCosts, rowsDrawnAt) : WHOLE_THREAD;
     const renderFromIndex = edge.exchange;
-
-    // Persist the deep-link "render all" so the thread stays fully rendered after
-    // the claim clears (no snap back to the tail while the user reads an old event).
-    // `deepLinkMustPersist` owns the not-yet-stored arm, which is the one a
-    // warm thread never exercises and an inline test got wrong.
-    useEffect(() => {
-        if (!threadId || !deepLinkRenderAll.value) return;
-        if (!deepLinkMustPersist(storedEdge(threadId, exchanges))) return;
-        storeRenderAll(threadId);
-        bumpWin(n => n + 1);
-    }, [threadId, deepLinkRenderAll.value]);
 
     // The find bar stepped to a turn the window does not draw yet. Move the
     // floor down to it, whole, and the find bar scrolls to the match itself.
@@ -979,22 +977,20 @@ export function ThreadView() {
         bumpWin(n => n + 1);
     }, [threadId, renderRequest, exchanges]);
 
-    // The window says draw everything, so the history has to BE everything. A
-    // long thread opens on one page, and the linked event is usually older.
+    // A deep link whose target is in no loaded turn pages history toward it. A
+    // long thread opens on one page, and the linked event is often older.
     //
-    // SEPARATE from the effect above, and keyed on `hasOlderEvents`. A cold
-    // open runs that one before the first page has landed, when the thread
-    // still reports nothing older. A single call there would ask for nothing
-    // and never be repeated. This asks again once the load settles the answer,
-    // and stands down on a thread already whole.
+    // Keyed on `hasOlderEvents`. A cold open renders before the first page
+    // has landed, when the thread still reports nothing older. This asks once
+    // the load settles the answer, and stands down on a thread already whole.
     //
-    // It HOLDS the reader across the fold. See `requestWholeHistory`: that
-    // history arrives at the FRONT, seconds after the deep link placed the
-    // reader, and nothing else answers for content growing above them.
+    // It HOLDS the reader across each fold. See `requestLinkPage`: that
+    // history arrives at the FRONT, and nothing else answers for content
+    // growing above them.
     //
-    // `historyReadSettled` is what RETRIES it. The ask stands down while
-    // another read is running, and that read's settle is the moment asking can
-    // hold the reader. `hasOlderEvents` does not always move with it.
+    // `historyReadSettled` is what asks for the NEXT page, and what retries an
+    // ask that stood down for another read. `hasOlderEvents` does not always
+    // move with it.
     useEffect(() => {
         if (!threadId || !hasOlderEvents) return;
         // Only the `!eventThread` return draws no transcript, and
@@ -1012,13 +1008,13 @@ export function ThreadView() {
         // running.
         if (threadHistoryReadInFlight(threadId)) {
             if (!historyHoldByThread.get(threadId)) {
-                historyHoldByThread.set(threadId, wholeHistoryHold(el));
+                historyHoldByThread.set(threadId, readerOnlyHold(el));
             }
             return;
         }
-        if (!deepLinkRenderAll.value) return;
-        requestWholeHistory(el, threadId, onHistoryRead);
-    }, [threadId, deepLinkRenderAll.value, hasOlderEvents, historyReadSettled]);
+        if (!linkTarget || deepLinkTargetIndex(exchangesRef.current, linkTarget) >= 0) return;
+        requestLinkPage(el, threadId, onHistoryRead);
+    }, [threadId, linkTarget, hasOlderEvents, historyReadSettled]);
 
 
     // Latest exchange costs for the scroll handler and the up-chevron, so neither
@@ -1623,12 +1619,12 @@ export function ThreadView() {
     // first window write, and yank a reader who pressed nothing.
     useEffect(() => () => {
         if (threadId) historyHoldByThread.delete(threadId);
-        if (threadId) wholeHistoryAskedByThread.delete(threadId);
+        if (threadId) linkPagingGaveUp.delete(threadId);
         pendingScrollTopRef.current = false;
         // The VISIT ends here, however it ends: a switch, a New chat that
         // unmounts the pane, or the layout swapping at the breakpoint. Leaving
         // the mark set would make the next open a later commit of this visit,
-        // and a render-all would outlive it after all. See `reseedOnReopen`.
+        // and a claimed window would outlive it after all. See `reseedOnReopen`.
         if (lastSeededVisit?.threadId === threadId && lastSeededVisit.owner === visitOwner) {
             lastSeededVisit = null;
         }
@@ -1843,13 +1839,11 @@ export function ThreadView() {
         // FAILED load satisfies `canSeedWindow` but attaches no restore, and a
         // walk with no restore behind it renders markdown for nobody.
         if (!el || !threadId || !canSeedWindow || !eventsLoaded || !target) return;
-        // A DEEP LINK owns the open, and renders the thread whole to do it. So
-        // there is nothing here to reach, and a round taken now would arm
-        // `pendingExpandRef` against a `renderFromIndex` the claim pins at 0.
-        // Nothing would ever consume it, wedging every grower for this mount.
-        // The target is KEPT: the link may end without having placed anybody,
-        // and the rescue that covers it reads the same record.
-        if (deepLinkRenderAll.value) return;
+        // A DEEP LINK owns the open, and claims its own turn to do it. So a
+        // round taken now would draw history for a position nobody is going
+        // to. The target is KEPT: the link may end without having placed
+        // anybody, and the rescue that covers it reads the same record.
+        if (deepLinkTarget.value) return;
         // The re-entrancy guard the other growers share: one grow is in flight
         // until the anchor effect lands it.
         if (pendingExpandRef.current) return;
@@ -2052,7 +2046,7 @@ export function ThreadView() {
                         // top of the thread, and the scroll-up window-expand re-anchors
                         // the viewport partway (the "needed N clicks" bug).
                         // `edge` is this render's effective window, so a
-                        // deep-link render-all already answers false here. A
+                        // render-all fallback already answers false here. A
                         // clamped floor turn answers TRUE: the true top is that
                         // turn's first row, not the first row on screen.
                         //

@@ -247,7 +247,9 @@ impl LucidosEngine {
                     .await,
             ),
             // Grouped manifest tools (consolidated surface the model sees).
-            tn::TRIGGERS | tn::TRIGGER_GROUPS => self.execute_scheduler_grouped(name, args).await,
+            tn::TRIGGERS | tn::TRIGGER_GROUPS => {
+                self.execute_scheduler_grouped(name, args, thread_id).await
+            }
             tn::PREFERENCES => self.execute_preferences_grouped(args, device_id).await,
             // Flat per-verb names: back-compat aliases that still dispatch to the
             // same handlers (consolidated into the grouped tools above, but kept
@@ -263,7 +265,9 @@ impl LucidosEngine {
             | tn::CREATE_TRIGGER_GROUP
             | tn::RENAME_TRIGGER_GROUP
             | tn::REORDER_TRIGGER_GROUPS
-            | tn::DELETE_TRIGGER_GROUP => to_outcome(self.execute_scheduler_tool(name, args).await),
+            | tn::DELETE_TRIGGER_GROUP => {
+                to_outcome(self.execute_scheduler_tool(name, args, thread_id).await)
+            }
             tn::SET_PREFERENCE | tn::GET_PREFERENCES => {
                 to_outcome(self.execute_preferences_tool(name, args, device_id).await)
             }
@@ -324,6 +328,7 @@ impl LucidosEngine {
             tn::SWITCH_CACHE_KEEP_ALIVE => {
                 self.execute_switch_cache_keep_alive(args, thread_id).await
             }
+            tn::SET_CONTEXT_CEILING => self.execute_set_context_ceiling(args, thread_id).await,
             tn::REQUEST_READ => self.execute_request_read(args, thread_id).await,
             tn::EXPECT_WAKE => self.execute_expect_wake(args, thread_id).await,
             tn::WAKE_PARENT => self.execute_wake_parent(args, thread_id).await,
@@ -508,6 +513,7 @@ impl LucidosEngine {
                     event_id: link_event_id.map(|e| e.to_string()),
                     tap: tap.clone(),
                     actor,
+                    audience: None,
                 },
             ))
             .await
@@ -805,6 +811,43 @@ impl LucidosEngine {
                 format!("Turned the cache keep-alive back on for {title}.")
             }
         })
+    }
+
+    /// LLM tool: set a thread's context ceiling (ADR 0629), as an agent.
+    async fn execute_set_context_ceiling(
+        &self,
+        args: &serde_json::Value,
+        caller_thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        use crate::engine::context_ceiling::{
+            set_ceiling, CeilingSet, CeilingSetter, ContextCeiling,
+        };
+
+        let raw_id = args
+            .get("thread_id")
+            .and_then(|v| v.as_str())
+            .ok_or("Error: context_ceiling needs a thread_id: the thread's uuid, or 'current'.")?;
+        let target = crate::api::resolve_thread_id_arg(raw_id, Some(caller_thread_id))
+            .map_err(|e| format!("Error: {e}"))?;
+        let ceiling = args
+            .get("ceiling")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Error: context_ceiling needs a ceiling.".to_string())
+            .and_then(|raw| ContextCeiling::parse(raw).map_err(|e| format!("Error: {e}")))?;
+        let outcome = set_ceiling(
+            &self.event_bus,
+            CeilingSetter::Agent(Some(caller_thread_id)),
+            target,
+            ceiling,
+            crate::engine::thread_events::EventMeta::NONE,
+        )
+        .await
+        .map_err(|e| format!("Error: {e}"))?;
+        match outcome {
+            CeilingSet::Set => Ok(format!("Set the thread's context ceiling to {ceiling}.")),
+            CeilingSet::Refused(refusal) => Err(format!("Error: {}", refusal.message)),
+            CeilingSet::NoThread => Err(format!("Error: no thread {target} in this workspace.")),
+        }
     }
 
     /// LLM tool: archive the calling thread or one of its direct children

@@ -20,6 +20,7 @@ import {
   mainCheck,
   toasts,
 } from '../../../store/store';
+import { engineBuildLogOpen } from '../../../store/engineBuildLog';
 import type { PendingCommits } from '../../../api/client';
 
 const cancelApplyAllBatch = vi.fn(async () => {});
@@ -113,6 +114,7 @@ function props(overrides: Partial<ActivityGroupProps>): ActivityGroupProps {
     onOpenFixThread: noop,
     onCloseMainCheck: noop,
     onOpenPending: noop,
+    onShowBuildLog: noop,
     ...overrides,
   };
 }
@@ -425,6 +427,19 @@ describe('ActivityMenuGroup', () => {
     });
     expect(cancelApplyAllBatch).toHaveBeenCalledOnce();
     expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it('closes the menu before it opens the build log, so the log is not drawn under it', async () => {
+    engineBuilding.value = true;
+    const { host: el, onClose } = mount();
+    await act(async () => { el.querySelector<HTMLButtonElement>('.brand-menu-activity-row')!.click(); });
+    const order: string[] = [];
+    onClose.mockImplementation(() => { order.push('menu closed'); });
+    const stop = engineBuildLogOpen.subscribe((open) => { if (open) order.push('log opened'); });
+    [...el.querySelectorAll('button')].find((b) => b.textContent === 'Show build log')!.click();
+    stop();
+    expect(order).toEqual(['menu closed', 'log opened']);
+    engineBuildLogOpen.value = false;
   });
 
   it('closes the menu and re-opens the pending version toast from its row', () => {

@@ -9,9 +9,10 @@
 //! thread that reports to a parent, the wake decision. Beside them, a turn that
 //! leaves its thread waiting with the keep-alive on gets an expected wake.
 //!
-//! The re-entry rules are the *proposal hold*'s, which owns when Lucidos-source
-//! work lacks a plan marker or a harden, and what the agent is told. This
-//! module owns only that a hold sends the agent back, and how often.
+//! Two re-entries exist. The *ceiling re-entry* asks a session past its
+//! *context ceiling* to hand off (ADR 0629). The *proposal hold*'s owns when
+//! Lucidos-source work lacks a plan marker or a harden, and what the agent is
+//! told. This module owns only that each sends the agent back, and how often.
 
 mod expected_wake_decision;
 mod read_decision;
@@ -27,6 +28,8 @@ pub use wake_decision::{
 };
 
 use crate::engine::change_ops::{PlanHold, ProposalHold};
+use crate::engine::context_ceiling::{CeilingCrossing, ContextCeiling};
+use crate::engine::successor::SessionReading;
 use crate::llm::judgment::{system_one_or_default_for, JudgmentProvider, JudgmentSite};
 
 impl crate::engine::LucidosEngine {
@@ -51,9 +54,37 @@ impl crate::engine::LucidosEngine {
 pub(crate) enum TurnEndRequirement {
     /// The turn says whether its reply is worth reading. A forced decision.
     ReadDecision,
+    /// The session grew past its context ceiling: a session re-entry, since
+    /// only the agent can write the handoff narrative. It outranks the hold,
+    /// whose work the successor session then owes.
+    CeilingHandoff(CeilingCrossing),
     /// The proposal hold kept the turn's work: a session re-entry, since only
     /// the agent can set a plan marker or run `/harden`.
     Reentry(ProposalHold),
+}
+
+/// What an ordinary clean turn end knows about its session's context ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CeilingFacts {
+    pub(crate) reading: SessionReading,
+    pub(crate) ceiling: ContextCeiling,
+    /// The session already recorded a `ContextCeilingReached`.
+    pub(crate) reached: bool,
+    /// The turn that just ended is the session's first.
+    pub(crate) first_turn: bool,
+    /// Something keeps the session from handing off now: an input the agent
+    /// has not read, an open card, or a handoff already pending.
+    pub(crate) busy: bool,
+}
+
+impl CeilingFacts {
+    /// The crossing these facts make due.
+    pub(crate) fn crossing(&self) -> Option<CeilingCrossing> {
+        if self.reached || self.first_turn || self.busy {
+            return None;
+        }
+        self.ceiling.crossed_by(self.reading)
+    }
 }
 
 /// What a coding-agent session knows at its turn end, for the re-entry.
@@ -75,6 +106,9 @@ pub(crate) struct TurnEndState {
     /// Present only for a session whose turn completed. Absent after a Stop,
     /// a failure or an abort, and for a chat turn.
     pub(crate) session: Option<SessionFacts>,
+    /// Present only when an ordinary clean turn end crossed the ceiling. Kept
+    /// apart from `session`, which an external-repo thread never completes.
+    pub(crate) ceiling: Option<CeilingCrossing>,
 }
 
 impl TurnEndState {
@@ -84,10 +118,12 @@ impl TurnEndState {
         read_decided: bool,
         completed: bool,
         facts: SessionFacts,
+        ceiling: Option<CeilingCrossing>,
     ) -> Self {
         Self {
             read_decided,
             session: completed.then_some(facts),
+            ceiling,
         }
     }
 
@@ -97,6 +133,9 @@ impl TurnEndState {
         if !self.read_decided {
             unmet.push(TurnEndRequirement::ReadDecision);
         }
+        if let Some(crossing) = self.ceiling {
+            unmet.push(TurnEndRequirement::CeilingHandoff(crossing));
+        }
         if let Some(hold) = self.session.as_ref().and_then(|s| s.held) {
             unmet.push(TurnEndRequirement::Reentry(hold));
         }
@@ -104,14 +143,23 @@ impl TurnEndState {
     }
 }
 
-/// The branch HEAD each kind of hold last sent the agent back for.
+/// The re-entry one idle sends, at most one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DueReentry {
+    Ceiling(CeilingCrossing),
+    Hold(ProposalHold),
+}
+
+/// What each re-entry last sent the agent back for.
 ///
-/// Held for the session's life, so each kind sends the agent back at most once
-/// per HEAD. An agent that ignores one ends its turn rather than looping, and
-/// new commits earn a new one. The plan and the harden keep separate keys, so
-/// settling the plan still lets the harden ask through at the same HEAD.
+/// Held for the session's life. The ceiling sends once. Each kind of hold
+/// sends at most once per branch HEAD: an agent that ignores one ends its turn
+/// rather than looping, and new commits earn a new one. The plan and the
+/// harden keep separate keys, so settling the plan still lets the harden ask
+/// through at the same HEAD.
 #[derive(Debug, Default)]
 pub(crate) struct ReentryLedger {
+    ceiling_sent: bool,
     plan: Option<String>,
     hardening: Option<String>,
 }
@@ -129,24 +177,31 @@ impl ReentryLedger {
         }
     }
 
-    /// The hold `state` makes due, recorded as sent. An idle sends at most
-    /// one re-entry, since a branch has at most one hold.
-    pub(crate) fn take_due(&mut self, state: &TurnEndState) -> Option<ProposalHold> {
+    /// The re-entry `state` makes due, recorded as sent. An idle sends at
+    /// most one, in the gate's order.
+    pub(crate) fn take_due(&mut self, state: &TurnEndState) -> Option<DueReentry> {
         let head = state
             .session
             .as_ref()
             .and_then(|s| s.head.clone())
             .unwrap_or_default();
-        state.unmet().into_iter().find_map(|requirement| {
-            let TurnEndRequirement::Reentry(hold) = requirement else {
-                return None;
-            };
-            let slot = self.slot(hold)?;
-            (slot.as_deref() != Some(head.as_str())).then(|| {
-                *slot = Some(head.clone());
-                hold
+        state
+            .unmet()
+            .into_iter()
+            .find_map(|requirement| match requirement {
+                TurnEndRequirement::ReadDecision => None,
+                TurnEndRequirement::CeilingHandoff(crossing) => (!self.ceiling_sent).then(|| {
+                    self.ceiling_sent = true;
+                    DueReentry::Ceiling(crossing)
+                }),
+                TurnEndRequirement::Reentry(hold) => {
+                    let slot = self.slot(hold)?;
+                    (slot.as_deref() != Some(head.as_str())).then(|| {
+                        *slot = Some(head.clone());
+                        DueReentry::Hold(hold)
+                    })
+                }
             })
-        })
     }
 }
 

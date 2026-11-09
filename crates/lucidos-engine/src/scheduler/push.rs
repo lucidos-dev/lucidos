@@ -50,6 +50,12 @@ pub struct PushSubscription {
     pub scope_url: Option<String>,
 }
 
+/// The push subscriptions a push reaches: those whose device has push enabled,
+/// plus legacy rows naming no device.
+const PUSH_ENABLED_FROM: &str = "FROM push_subscriptions ps
+     LEFT JOIN devices d ON ps.device_id = d.id
+     WHERE ps.device_id IS NULL OR d.push_enabled = true";
+
 /// VAPID key pair for Web Push authentication
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VapidKeys {
@@ -124,12 +130,10 @@ impl PushSubscriptionStore {
                 Option<String>,
                 Option<String>,
             ),
-        >(
-            "SELECT ps.endpoint, ps.p256dh, ps.auth, ps.device_id, ps.scope_url, d.user_agent
-                 FROM push_subscriptions ps
-                 LEFT JOIN devices d ON ps.device_id = d.id
-                 WHERE ps.device_id IS NULL OR d.push_enabled = true",
-        )
+        >(&format!(
+            "SELECT ps.endpoint, ps.p256dh, ps.auth, ps.device_id, ps.scope_url, d.user_agent \
+             {PUSH_ENABLED_FROM}"
+        ))
         .fetch_all(pool)
         .await?;
 
@@ -359,8 +363,12 @@ async fn fan_out_os_surface(
     // embedded WKWebView cannot subscribe to Web Push. Do NOT bail on empty
     // here. A connected client still needs the toast or the native banner, and
     // the "nobody reachable" bail comes once the client count is known.
-    let subs_with_ua = match PushSubscriptionStore::get_push_enabled(pool).await {
-        Ok(subs) => subs,
+    let audience = push_audience(pool, notification_id, &tap, link_event_id).await;
+    let subs_with_ua: Vec<_> = match PushSubscriptionStore::get_push_enabled(pool).await {
+        Ok(subs) => subs
+            .into_iter()
+            .filter(|(sub, _)| audience.reaches(sub.device_id.as_deref()))
+            .collect(),
         Err(e) => {
             log!("[Push] Failed to fetch subscriptions: {}", e);
             return;
@@ -411,6 +419,7 @@ async fn fan_out_os_surface(
                 event_id: link_event_id,
                 app_id,
                 tap: tap.clone(),
+                audience: audience.device_ids(),
             },
             expected_pongs,
         )
@@ -439,6 +448,7 @@ async fn fan_out_os_surface(
             link_event_id,
             app_id,
             tap.clone(),
+            audience.device_ids(),
         )
         .await;
     }
@@ -453,7 +463,7 @@ async fn fan_out_os_surface(
     // resolved once for the whole fan-out; `app_badge_for` picks which one a
     // subscription gets. Best-effort: a failure omits the badge field, or
     // falls back to the own count.
-    let unread_count = read_unread_count(pool).await;
+    let unread_counts = unread_counts_by_device(pool, &subscriptions).await;
     let cross_workspace_total = cross_workspace_unread_total(&subscriptions).await;
 
     let deliveries: Vec<(PushSubscription, String)> = subscriptions
@@ -471,7 +481,7 @@ async fn fan_out_os_surface(
                 sub.scope_url.as_deref(),
                 app_badge_for(
                     sub.scope_url.as_deref(),
-                    unread_count,
+                    unread_counts.get(&sub.device_id).copied().flatten(),
                     cross_workspace_total,
                 ),
             )
@@ -557,6 +567,37 @@ fn schedule_mac_chromium_wakes(
     }
 }
 
+/// Who a notification's OS push reaches: the audience its row recorded
+/// (ADR 0623). A push with no notification works the audience out from the
+/// thread it opens. Any lookup that fails reaches the whole team: a push must
+/// never silently reach nobody.
+async fn push_audience(
+    pool: &PgPool,
+    notification_id: Option<uuid::Uuid>,
+    tap: &crate::scheduler::notifications::Tap,
+    link_event_id: Option<uuid::Uuid>,
+) -> crate::engine::work_item::Audience {
+    use crate::engine::work_item::{audience_of_notification, Audience};
+    let resolved = match notification_id {
+        Some(id) => crate::scheduler::NotificationStore::audience(pool, id)
+            .await
+            .map(Audience::from_device_ids),
+        None => {
+            audience_of_notification(
+                pool,
+                tap,
+                link_event_id,
+                &crate::gateway_operators::current(),
+            )
+            .await
+        }
+    };
+    resolved.unwrap_or_else(|e| {
+        log!("[Push] Cannot read the audience (pushing everyone): {}", e);
+        Audience::Team
+    })
+}
+
 /// What a page needs to put a notification on screen as an in-app toast.
 struct ToastContent<'a> {
     notification_id: uuid::Uuid,
@@ -566,6 +607,7 @@ struct ToastContent<'a> {
     event_id: Option<uuid::Uuid>,
     app_id: Option<&'a str>,
     tap: crate::scheduler::notifications::Tap,
+    audience: Option<Vec<String>>,
 }
 
 /// Broadcast a PresenceCheck and wait up to `DEADLINE_MS` for every candidate
@@ -597,6 +639,7 @@ async fn run_presence_check(
                 tap: toast.tap,
                 deadline_ms: DEADLINE_MS,
                 sent_at_ms,
+                audience: toast.audience,
                 actor: None,
             },
         ))
@@ -637,6 +680,7 @@ async fn emit_native_push_requested(
     event_id: Option<uuid::Uuid>,
     app_id: Option<&str>,
     tap: crate::scheduler::notifications::Tap,
+    audience: Option<Vec<String>>,
 ) {
     let sent_at_ms = crate::engine::now_epoch_millis();
     if let Err(e) = event_bus
@@ -650,6 +694,7 @@ async fn emit_native_push_requested(
                 app_id: app_id.map(|s| s.to_string()),
                 tap,
                 sent_at_ms,
+                audience,
             },
         ))
         .await
@@ -676,6 +721,7 @@ async fn emit_native_push_requested(
 pub(crate) async fn emit_native_push_dismiss_requested(
     event_bus: &crate::engine::event_bus::EventBus,
     notification_id: Option<uuid::Uuid>,
+    reader: &crate::gateway_operators::Reader,
 ) {
     let sent_at_ms = crate::engine::now_epoch_millis();
     if let Err(e) = event_bus
@@ -683,6 +729,7 @@ pub(crate) async fn emit_native_push_dismiss_requested(
             crate::engine::event_bus::SystemEvent::NativePushDismissRequested {
                 notification_id,
                 sent_at_ms,
+                audience: reader.devices().map(<[String]>::to_vec),
             },
         ))
         .await
@@ -771,8 +818,15 @@ async fn send_wake_push_to_device(
     let pool = engine.pool();
     // This provenance was captured before scheduling the timer, never adopted
     // from the current workspace after its delay.
+    let reader = crate::gateway_operators::Reader::of(
+        Some(&crate::engine::thread_events::MessageOrigin::Device {
+            device_id: device_id.to_string(),
+        }),
+        &crate::gateway_operators::current(),
+    );
     let notification =
-        match crate::scheduler::NotificationStore::get_by_id(pool, notification_id).await? {
+        match crate::scheduler::NotificationStore::get_by_id(pool, &reader, notification_id).await?
+        {
             Some(n) => n,
             None => return Ok(0),
         };
@@ -788,7 +842,7 @@ async fn send_wake_push_to_device(
         return Ok(0);
     }
 
-    let unread_count = read_unread_count(pool).await;
+    let unread_count = read_unread_count(pool, &reader).await;
     let cross_workspace_total = cross_workspace_unread_total(&subscriptions).await;
     let deliveries: Vec<(PushSubscription, String)> = subscriptions
         .into_iter()
@@ -1083,17 +1137,45 @@ fn navigate_url_sw(params: &str) -> String {
     }
 }
 
-/// Read the workspace's current unread-notification count for the declarative
-/// `app_badge` field. Best-effort: a query failure logs and returns `None`, so
-/// the push still goes out (just without touching the badge that one time).
-async fn read_unread_count(pool: &sqlx::PgPool) -> Option<i64> {
-    match crate::scheduler::NotificationStore::count_unread(pool).await {
+/// Read what `reader` has not read, for the declarative `app_badge` field.
+/// Best-effort: a query failure logs and returns `None`, so the push still
+/// goes out (just without touching the badge that one time).
+async fn read_unread_count(
+    pool: &sqlx::PgPool,
+    reader: &crate::gateway_operators::Reader,
+) -> Option<i64> {
+    match crate::scheduler::NotificationStore::count_unread(pool, reader).await {
         Ok(count) => Some(count),
         Err(e) => {
             log!("[Push] Failed to count unread (omitting app_badge): {}", e);
             None
         }
     }
+}
+
+/// Each subscribed device's own unread count: on a team gateway every person
+/// badges what they have not read.
+async fn unread_counts_by_device(
+    pool: &sqlx::PgPool,
+    subscriptions: &[PushSubscription],
+) -> std::collections::HashMap<Option<String>, Option<i64>> {
+    let snapshot = crate::gateway_operators::current();
+    let mut counts = std::collections::HashMap::new();
+    for sub in subscriptions {
+        if counts.contains_key(&sub.device_id) {
+            continue;
+        }
+        let actor = sub
+            .device_id
+            .clone()
+            .map(|device_id| crate::engine::thread_events::MessageOrigin::Device { device_id });
+        let reader = crate::gateway_operators::Reader::of(actor.as_ref(), &snapshot);
+        counts.insert(
+            sub.device_id.clone(),
+            read_unread_count(pool, &reader).await,
+        );
+    }
+    counts
 }
 
 /// How long the engine waits for the gateway's cross-workspace unread total

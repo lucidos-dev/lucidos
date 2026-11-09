@@ -1,11 +1,12 @@
-import type { CacheKeepAliveStatus } from '../../generated/thread-event-wire';
+import type { CacheKeepAliveStatus, CeilingCrossing, HandoffOpening } from '../../generated/thread-event-wire';
 import { API, json, mutatingFetch, throwIfNotOk } from './_core';
 
 // --- Successor sessions ---
 //
 // GET /threads/:id/context reports a coding-agent thread's size and what the
 // Successor card makes of it. POST /threads/:id/successor-offer/continue and
-// /decline are the card's Continue and Stay here. GET
+// /decline are the card's Continue and Stay here. POST
+// /threads/:id/successor/withdraw is the ceiling card's Return. GET
 // /threads/:id/switch-estimate prices a model or effort switch.
 
 /** The Successor card's reading: whether a handoff pays on either cache state.
@@ -37,6 +38,17 @@ export interface ThreadContext {
   applied: boolean;
   /** The Successor card's verdict. Absent when the engine can make no reading. */
   card?: SuccessorCardVerdict;
+  /** A handoff at the *context ceiling* waiting for the next input. */
+  ceiling_handoff?: CeilingHandoff;
+}
+
+/** A ceiling handoff waiting for the thread's next input (ADR 0629). */
+export interface CeilingHandoff {
+  opening: HandoffOpening;
+  crossing: CeilingCrossing;
+  /** The ceiling Return to the old session sets, in tokens. `null` when the
+   *  context window keeps every ceiling under the session's size. */
+  raises_to: number | null;
 }
 
 export async function fetchThreadContext(threadId: string): Promise<ThreadContext> {
@@ -74,6 +86,15 @@ export async function continueInSuccessor(
 /** Stay here on the Successor card: hide it until the thread grows. */
 export async function declineSuccessorOffer(threadId: string): Promise<void> {
   const res = await mutatingFetch(`${API}/threads/${encodeURIComponent(threadId)}/successor-offer/decline`, {
+    method: 'POST',
+  });
+  await throwIfNotOk(res);
+}
+
+/** Return to the old session: withdraw the pending ceiling handoff. The engine
+ *  raises the thread's ceiling past the session's size first. */
+export async function withdrawCeilingHandoff(threadId: string): Promise<void> {
+  const res = await mutatingFetch(`${API}/threads/${encodeURIComponent(threadId)}/successor/withdraw`, {
     method: 'POST',
   });
   await throwIfNotOk(res);

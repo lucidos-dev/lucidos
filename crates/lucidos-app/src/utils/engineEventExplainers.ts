@@ -134,16 +134,20 @@ export function describeEngineReason(reason: EngineReason): string {
       return `${REVIEW_RULE} It had not run yet, so Lucidos asked the agent to run it.`;
     case 'missing_plan':
       return 'Changes to Lucidos itself need an approved implementation plan, or a note that the fix is local, before they are offered. This work had neither, so Lucidos held it back and asked the agent for one.';
+    case 'context_ceiling':
+      return 'The agent’s context grew past this thread’s context ceiling. Lucidos asked it to write down where the work stands, so a fresh start can carry on from there with a clean context.';
     case 'plugin_auto_update':
       return `Lucidos found a newer version of ${reason.plugin_id} in ${reason.marketplace_name} and updated the installed plugin.`;
     case 'plugin_setup':
       return describePluginSetup(reason);
     case 'plugin_upstream_proposal':
       return `You asked to offer your local changes to ${reason.plugin_name} to its author. Lucidos saved them as a patch and started this thread so the Lucidos Agent can propose it upstream.`;
-    case 'scheduler':
-      return reason.trigger_name
+    case 'scheduler': {
+      const ran = reason.trigger_name
         ? `The trigger “${reason.trigger_name}” ran on its schedule and sent this message.`
         : 'A trigger ran on its schedule and sent this message.';
+      return reason.actor_email ? `${ran} It carries an action by ${reason.actor_email}.` : ran;
+    }
     case 'event_wait':
       return describeEventWait(reason);
     case 'cache_keep_alive':

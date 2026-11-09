@@ -21,6 +21,7 @@ mod background_tasks;
 mod cache_keep_alive;
 mod cache_warmth;
 pub(super) mod child_reports;
+pub(super) mod context_ceiling;
 mod delete;
 mod detach;
 mod events_snapshot;
@@ -256,6 +257,10 @@ pub(super) fn router() -> Router<super::AppState> {
             get(cache_warmth::get_cache_warmth),
         )
         .route(
+            "/threads/:thread_id/context-ceiling",
+            put(context_ceiling::set_context_ceiling),
+        )
+        .route(
             "/threads/:thread_id/cache-keep-alive",
             post(cache_keep_alive::switch_cache_keep_alive),
         )
@@ -274,6 +279,10 @@ pub(super) fn router() -> Router<super::AppState> {
         .route(
             "/threads/:thread_id/successor-offer/decline",
             post(successor::decline_successor_offer),
+        )
+        .route(
+            "/threads/:thread_id/successor/withdraw",
+            post(successor::withdraw_successor),
         )
         .route(
             "/threads/:thread_id/successor-offer/continue",

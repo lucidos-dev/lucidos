@@ -95,8 +95,12 @@ const TYPE_SOURCES: &[(&str, &str)] = &[
     ("SessionContinuity", "engine/thread_events/session.rs"),
     ("FreshSessionReason", "engine/thread_events/session.rs"),
     ("HandoffOpening", "engine/thread_events/session.rs"),
+    ("HandoffCause", "engine/thread_events/session.rs"),
+    ("SessionStart", "engine/thread_events/session.rs"),
     ("VoiceSessionEndReason", "engine/thread_events/session.rs"),
     ("WakeMode", "engine/thread_events/session.rs"),
+    ("CeilingSource", "engine/context_ceiling.rs"),
+    ("CeilingCrossing", "engine/context_ceiling.rs"),
     ("AutoCompactArm", "engine/auto_compact_trial.rs"),
     ("CheckpointProgress", "engine/handoff_estimate.rs"),
     ("IntelligenceRung", "runtime/intelligence_ladder.rs"),
@@ -535,8 +539,8 @@ fn ts_type(ty: &syn::Type) -> Result<String, String> {
         "bool" => Ok("boolean".into()),
         "u8" | "u16" | "u32" | "u64" | "usize" | "i8" | "i16" | "i32" | "i64" | "isize" | "f32"
         | "f64" => Ok("number".into()),
-        // Both serialize to a string, so the frontend reads them as one.
-        "Uuid" | "DateTime" => Ok("string".into()),
+        // Each serializes to a string, so the frontend reads them as one.
+        "Uuid" | "DateTime" | "ContextCeiling" => Ok("string".into()),
         "Value" => Ok("unknown".into()),
         other if is_registered(other) => Ok(other.to_string()),
         other => Err(format!(

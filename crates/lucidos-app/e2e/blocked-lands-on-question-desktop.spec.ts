@@ -59,8 +59,14 @@ async function scrollTranscriptToTop(page: Page) {
   const box = await page.locator('.thread-content:visible').first().boundingBox();
   if (!box) throw new Error('no visible transcript');
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-  await page.mouse.wheel(0, -100_000);
-  await expect.poll(async () => (await visibleScroller(page))?.top).toBe(0);
+  // The landing draws from the question's turn (ADR 0631). Each wheel at the
+  // top grows older turns above the reader, so wheel until the first is drawn.
+  await expect.poll(async () => {
+    await page.mouse.wheel(0, -100_000);
+    const top = (await visibleScroller(page))?.top;
+    const firstDrawn = await page.locator('.chat-exchange:visible', { hasText: 'Message 1:' }).count();
+    return top === 0 && firstDrawn > 0;
+  }, { timeout: 15_000 }).toBe(true);
   // Past the scroll memory's save debounce.
   await page.waitForTimeout(800);
 }

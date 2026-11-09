@@ -310,7 +310,9 @@ export const PLAIN_RESOLUTION_NOTES: [string, string][] = [
   ['Auto-allowed: benign in-workspace operation', 'Allowed by Lucidos: a harmless step in a trigger run with nobody to ask.'],
   ['Auto-allowed: covered by the trigger', 'Allowed by Lucidos: the trigger was given permission for this kind of action.'],
   ['Auto-denied: catastrophic operation', 'Refused by Lucidos: this is never allowed in a run with nobody to ask.'],
-  ['Auto-denied: this coding-agent session runs unattended', 'Refused by Lucidos: its command check could not confirm this was safe, and nobody was there to ask.'],
+  ['Auto-denied: this coding-agent session runs unattended, and the command guard', 'Refused by Lucidos: its command check could not confirm this was safe, and nobody was there to ask.'],
+  ['Auto-denied: this unattended coding-agent session has no side-effect grant', 'Refused by Lucidos: this unattended run has no permission for this kind of action.'],
+  ['Auto-denied: nobody answered this permission card', 'Refused by Lucidos: nobody answered this card within its permission wait.'],
 ];
 
 /** What a card the ENGINE resolved says under its buttons, in plain words.

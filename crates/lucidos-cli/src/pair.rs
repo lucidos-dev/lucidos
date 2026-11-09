@@ -68,7 +68,7 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
             ),
         }
     } else {
-        None
+        crate::external_address::stored(&client, &base, &token)
     };
 
     let mut request = client
@@ -123,7 +123,7 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
     // left, and the gateway refuses it a typed code. So it gets a loopback link.
     let link = pair_url
         .map(str::to_owned)
-        .or_else(|| secret.map(|s| format!("{base}/{SIGIL}/?{PAIR_PARAM}={s}")));
+        .or_else(|| secret.map(|s| format!("{base}/{SIGIL}/#{PAIR_PARAM}={s}")));
     match link {
         Some(link) => println!("  Open {link} on the device you want to pair."),
         None => println!("  Open {base}/ on the device you want to pair, and enter the code."),

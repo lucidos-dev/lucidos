@@ -52,4 +52,10 @@ export const APP_REACHABLE_ROUTES: AppReachableRoute[] = [
   { path: '/triggers/historical', methods: ['GET'] },
   { path: '/triggers/run', methods: ['POST'] },
   { path: '/ui/navigate', methods: ['POST'] },
+  { path: '/work-items', methods: ['GET'] },
+  { path: '/work-items/:thread_id', methods: ['GET'] },
+  { path: '/work-items/:thread_id/release', methods: ['POST'] },
+  { path: '/work-items/:thread_id/take', methods: ['POST'] },
+  { path: '/work-items/:thread_id/unwatch', methods: ['POST'] },
+  { path: '/work-items/:thread_id/watch', methods: ['POST'] },
 ];

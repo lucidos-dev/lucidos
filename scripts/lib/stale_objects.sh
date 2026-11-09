@@ -7,6 +7,9 @@
 # whole directory on each proc-macro load, so a large one stalls every rustc
 # (ADR 0408). Temporary measure: docs/temporary-measures.md.
 
+# shellcheck source=scripts/lib/cargo_build_lock.sh
+source "$(dirname "${BASH_SOURCE[0]}")/cargo_build_lock.sh"
+
 # The linked generation plus the newest other one, so an engine still running
 # from the last build usually keeps its line numbers until the user switches.
 STALE_OBJECT_GENERATIONS_KEPT=2
@@ -22,20 +25,6 @@ _list_debug_objects() {
         find . -maxdepth 1 -type f -name '*.rcgu.o' -exec stat -f '%m %N' {} +
     fi
     return 0
-}
-
-# Prints why the prune must wait, or nothing when no other cargo builds in this
-# profile directory. Cargo holds `.cargo-lock` open for a whole build,
-# including while it waits for the lock, and a build mid-link needs every name
-# it made.
-_cargo_build_lock_holder() {
-    local lock="$1/../.cargo-lock"
-    [ -e "$lock" ] || return 0
-    if ! command -v lsof >/dev/null 2>&1; then
-        echo "no lsof to tell whether another cargo is building here"
-    elif lsof -t -- "$lock" >/dev/null 2>&1; then
-        echo "another cargo is building here"
-    fi
 }
 
 # Reads `_list_debug_objects` lines and prints each artifact holding more
@@ -112,7 +101,7 @@ prune_stale_debug_objects() {
         echo "Stale debug objects: no $deps, nothing to prune."
         return 0
     fi
-    holder="$(_cargo_build_lock_holder "$deps")"
+    holder="$(_cargo_build_lock_holder "$deps/..")"
     if [ -n "$holder" ]; then
         echo "Stale debug objects: $holder; left for the next build."
         return 0
@@ -131,7 +120,7 @@ prune_stale_debug_objects() {
     # Reading the binaries takes seconds, long enough for another cargo to start.
     # One that starts after this check writes new generation names and links
     # from the incremental cache, so it never needs a name on this list.
-    holder="$(_cargo_build_lock_holder "$deps")"
+    holder="$(_cargo_build_lock_holder "$deps/..")"
     if [ -n "$holder" ]; then
         echo "Stale debug objects: $holder; left for the next build."
         rm -rf "$work"

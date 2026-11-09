@@ -1516,6 +1516,54 @@ pub async fn answer_pending_question_with_event_id(
         return AnswerResult::Conflict(format!("Failed to persist answer: {}", e));
     }
 
+    // The answer stands either way, so a failed driver take only logs.
+    if let (Some(answerer), true) = (actor.as_ref(), answer.is_a_reply()) {
+        use crate::engine::work_item::{notify, take_on_answer, WorkItemNotice};
+        let snapshot = crate::gateway_operators::current();
+        let taken = match take_on_answer(
+            engine.pool(),
+            &engine.event_bus,
+            thread_id,
+            answerer,
+            &snapshot,
+        )
+        .await
+        {
+            Ok(taken) => taken,
+            Err(e) => {
+                log!(
+                    "[CCQuestion] Could not make the answerer of {}/{} the driver: {}",
+                    thread_id,
+                    tool_use_id,
+                    e
+                );
+                None
+            }
+        };
+        if let Some(takeover) = taken {
+            let notified =
+                match crate::engine::thread_family::family_root(engine.pool(), thread_id).await {
+                    Ok(root) => {
+                        notify(
+                            engine,
+                            root,
+                            WorkItemNotice::GateAnswered(takeover),
+                            &snapshot,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e.into()),
+                };
+            if let Err(e) = notified {
+                log!(
+                    "[CCQuestion] Could not tell the driver of {} about the answer: {}",
+                    thread_id,
+                    e
+                );
+            }
+        }
+    }
+
     // CC-specific resume side-effects: `CodingAgentPromptSent` (timeline
     // Thinking placeholder while CC processes the tool_result) and the
     // `ContinuationRequested` spawn (respawn Claude Code subprocess if no live one). The

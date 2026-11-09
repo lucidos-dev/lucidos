@@ -490,21 +490,26 @@ pub fn bind_socket_addr(choice: &BindChoice, port: u16) -> SocketAddr {
 /// API over `localhost:<port>` (start/restart a workspace), and each spawned
 /// engine's Apply-restart callback hits `http://127.0.0.1:<port>/~/...`. So an
 /// `Address` ALSO binds IPv4 loopback; otherwise those co-located callers are
-/// refused (and a workspace can never be told to start). `Loopback` and `All`
-/// already cover loopback (`[::]` accepts IPv4 loopback as v4-mapped), so they
-/// bind a single socket. Never empty.
+/// refused (and a workspace can never be told to start). A choice that already
+/// covers loopback binds a single socket ([`covers_loopback`]). Never empty.
 pub fn bind_socket_addrs(choice: &BindChoice, port: u16) -> Vec<SocketAddr> {
     let primary = bind_socket_addr(choice, port);
+    if covers_loopback(choice) {
+        vec![primary]
+    } else {
+        vec![primary, SocketAddr::from((Ipv4Addr::LOCALHOST, port))]
+    }
+}
+
+/// Whether the choice's one socket already accepts `127.0.0.1`.
+///
+/// `[::]` accepts IPv4 loopback as v4-mapped, and `0.0.0.0` accepts it outright.
+/// So does a wildcard `Address`, and Linux refuses a loopback socket beside it
+/// on the same port with `EADDRINUSE`.
+fn covers_loopback(choice: &BindChoice) -> bool {
     match choice {
-        BindChoice::Loopback | BindChoice::All => vec![primary],
-        BindChoice::Address(_) => {
-            let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-            if primary == loopback {
-                vec![primary]
-            } else {
-                vec![primary, loopback]
-            }
-        }
+        BindChoice::Loopback | BindChoice::All => true,
+        BindChoice::Address(ip) => ip.is_unspecified() || *ip == Ipv4Addr::LOCALHOST,
     }
 }
 
@@ -536,26 +541,21 @@ pub struct BindPlan {
 /// each engine's Apply-restart callback and the dev control POSTs actually
 /// speak, so a machine that can serve loopback can serve its user.
 ///
-/// `Loopback` and `All` keep fail-fast: their single address is required. An
-/// operator who asked to be reachable on all interfaces is owed an error when
-/// that cannot happen, not a quiet demotion, and a failure there is a held port
-/// rather than an absent interface.
+/// A single-socket choice keeps fail-fast: `Loopback`, `All` and a wildcard
+/// `Address`. An operator who asked to be reachable on all interfaces is owed
+/// an error when that cannot happen, not a quiet demotion. A failure there is a
+/// held port rather than an absent interface.
 pub fn bind_plan(choice: &BindChoice, port: u16) -> BindPlan {
     let addrs = bind_socket_addrs(choice, port);
-    match choice {
-        BindChoice::Loopback | BindChoice::All => BindPlan {
+    if covers_loopback(choice) {
+        return BindPlan {
             required: addrs,
             optional: Vec::new(),
-        },
-        // `bind_socket_addrs` puts the configured address first and appends
-        // loopback, and collapses the two when the configured address IS
-        // loopback (leaving one entry, which is required).
-        BindChoice::Address(_) => {
-            let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-            let (required, optional) = addrs.into_iter().partition(|a| *a == loopback);
-            BindPlan { required, optional }
-        }
+        };
     }
+    let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let (required, optional) = addrs.into_iter().partition(|a| *a == loopback);
+    BindPlan { required, optional }
 }
 
 /// A side listener's port: `configured` when set, else the gateway's own plus
@@ -581,6 +581,25 @@ pub fn side_port(
         },
         _ => gateway_port.checked_add(offset),
     }
+}
+
+/// A side listener's address: `configured` as an IP literal, else loopback.
+///
+/// Loopback is the default because funnel and `tailscale serve` proxy from
+/// this machine. A container sets an address so a Service at the pod IP can
+/// reach the listener (ADR 0624). An unparseable value stays on loopback and
+/// logs: a bad setting must never widen a bind. `var` names it in that line.
+pub fn side_bind_addr(var: &str, configured: Option<&str>, port: u16) -> SocketAddr {
+    let ip = match configured.map(str::trim) {
+        Some(raw) if !raw.is_empty() => raw.parse::<IpAddr>().unwrap_or_else(|_| {
+            crate::log!(
+                "[Gateway] {var} '{raw}' is not an IP address, so that listener stays on loopback"
+            );
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        }),
+        _ => IpAddr::V4(Ipv4Addr::LOCALHOST),
+    };
+    SocketAddr::new(ip, port)
 }
 
 /// Human-readable scope for the startup log — reports the actual address chosen.
@@ -1096,6 +1115,23 @@ mod tests {
     }
 
     #[test]
+    fn a_wildcard_address_binds_one_required_socket() {
+        // A loopback socket beside a wildcard on the same port is EADDRINUSE on
+        // Linux, which left `0.0.0.0` retrying forever behind loopback.
+        for ip in [
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        ] {
+            let choice = BindChoice::Address(ip);
+            let only = vec![SocketAddr::new(ip, 5251)];
+            assert_eq!(bind_socket_addrs(&choice, 5251), only);
+            let plan = bind_plan(&choice, 5251);
+            assert_eq!(plan.required, only);
+            assert!(plan.optional.is_empty(), "{ip} must fail fast");
+        }
+    }
+
+    #[test]
     fn bind_plan_of_explicit_loopback_is_required_and_not_duplicated() {
         let plan = bind_plan(&BindChoice::Address(IpAddr::V4(Ipv4Addr::LOCALHOST)), 5251);
         assert_eq!(
@@ -1103,6 +1139,36 @@ mod tests {
             vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 5251))]
         );
         assert!(plan.optional.is_empty());
+    }
+
+    #[test]
+    fn a_side_listener_binds_loopback_unless_an_address_is_set() {
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 5262));
+        for unset in [None, Some(""), Some("  ")] {
+            assert_eq!(side_bind_addr("X", unset, 5262), loopback, "{unset:?}");
+        }
+        assert_eq!(
+            side_bind_addr("X", Some(" 0.0.0.0 "), 5262),
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 5262))
+        );
+        assert_eq!(
+            side_bind_addr("X", Some("::"), 5262),
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 5262))
+        );
+        assert_eq!(
+            side_bind_addr("X", Some(TAILNET), 5262).ip(),
+            TAILNET.parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_side_listener_setting_that_will_not_parse_stays_on_loopback() {
+        for bad in ["all", "bogus", "0.0.0.0:5262", "10.0.0"] {
+            assert!(
+                side_bind_addr("X", Some(bad), 5262).ip().is_loopback(),
+                "{bad} must never widen the bind"
+            );
+        }
     }
 
     #[test]

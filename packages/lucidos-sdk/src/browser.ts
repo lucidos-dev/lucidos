@@ -6,6 +6,7 @@ import { installAppPaneSwipe } from './paneSwipe';
 import { installLinkPressGuard } from './linkPressGuard';
 import { installAppLinkRouting } from './appLinks';
 import { installExternalLinksListener, traceAppLink } from './externalLinks';
+import { installFullScreenTrace } from './fullScreenTrace';
 import { installAppScrollReport } from './appScroll';
 import { installTooltips } from './tooltip';
 import { primeDevicePreferences } from './ui';
@@ -15,7 +16,7 @@ import { isBridged } from './_bridge';
 import { primeBridgedStorage } from './_storage';
 import { installHostOps } from './hostOps';
 import { installCapabilityRenewal, installDocumentRelativeUrls } from './frameCapability';
-import { installWidgetFrame } from './widgetFrame';
+import { inSidewaysBox, installWidgetFrame } from './widgetFrame';
 import { installOneSound } from './oneSound';
 
 export * from './index';
@@ -85,7 +86,8 @@ if (typeof document !== 'undefined') {
   installAppPullToRefresh();
   // A sideways drag anywhere in the app swipes the host's panes, as it does
   // over the transcript. Same reason: only the SDK can see the frame's touches.
-  installAppPaneSwipe();
+  // In an XL widget box the drag pans the box instead.
+  installAppPaneSwipe(inSidewaysBox);
   // The app's scroll moves the host's mobile header, as a transcript's does.
   // Same reason again: the frame's own document scrolls, out of the host's sight.
   installAppScrollReport();
@@ -105,4 +107,8 @@ if (typeof document !== 'undefined') {
   // answer decides whether a web page opens from the frame or from the host.
   installExternalLinksListener();
   installAppLinkRouting();
+
+  // Every full screen request leaves breadcrumbs in the engine log, since an
+  // iPhone can accept a request and never open it.
+  installFullScreenTrace();
 }

@@ -328,6 +328,15 @@ export const PREF_FOLLOW_MAIN_INTERVAL_MINUTES = {
   fallback: "3",
 } as const;
 
+export const PREF_DRIVER_TIMEOUT_HOURS = {
+  key: "driver_timeout_hours",
+  scope: "global",
+  type: "number",
+  min: 0,
+  max: 720,
+  fallback: "0",
+} as const;
+
 export const PREF_NOTIFICATIONS_FILTER = {
   key: "notifications_filter",
   scope: "global",
@@ -538,6 +547,13 @@ export const PREF_CACHE_KEEP_ALIVE_MODE = {
   fallback: "off",
 } as const;
 
+export const PREF_CODING_AGENT_CONTEXT_CEILING = {
+  key: "coding_agent_context_ceiling",
+  scope: "global",
+  type: "text",
+  fallback: "300k",
+} as const;
+
 export const PREF_MODEL_CLAUDE_CODE = {
   key: "model_claude_code",
   scope: "global",
@@ -736,6 +752,13 @@ export const PREF_COMMAND_GUARD_CODING_AGENTS = {
   scope: "global",
   type: "flag",
   fallback: "true",
+} as const;
+
+export const PREF_UNATTENDED_PERMISSION_WAIT = {
+  key: "unattended_permission_wait",
+  scope: "global",
+  type: "text",
+  fallback: "30",
 } as const;
 
 export const PREF_MODEL_COMMAND_JUDGE = {
@@ -1000,6 +1023,7 @@ export const PREFERENCE_CATALOG = {
   "opencode_free_enabled": PREF_OPENCODE_FREE_ENABLED,
   "proxy_timeout_secs": PREF_PROXY_TIMEOUT_SECS,
   "follow_main_interval_minutes": PREF_FOLLOW_MAIN_INTERVAL_MINUTES,
+  "driver_timeout_hours": PREF_DRIVER_TIMEOUT_HOURS,
   "notifications_filter": PREF_NOTIFICATIONS_FILTER,
   "notification_toasts": PREF_NOTIFICATION_TOASTS,
   "composer_enter_key": PREF_COMPOSER_ENTER_KEY,
@@ -1026,6 +1050,7 @@ export const PREFERENCE_CATALOG = {
   "coding_agent_claude_permission_mode": PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE,
   "coding_agent_auto_compact_trial": PREF_CODING_AGENT_AUTO_COMPACT_TRIAL,
   "cache_keep_alive_mode": PREF_CACHE_KEEP_ALIVE_MODE,
+  "coding_agent_context_ceiling": PREF_CODING_AGENT_CONTEXT_CEILING,
   "model_claude_code": PREF_MODEL_CLAUDE_CODE,
   "reasoning_claude_code": PREF_REASONING_CLAUDE_CODE,
   "model_codex": PREF_MODEL_CODEX,
@@ -1052,6 +1077,7 @@ export const PREFERENCE_CATALOG = {
   "command_guard": PREF_COMMAND_GUARD,
   "command_guard_judge": PREF_COMMAND_GUARD_JUDGE,
   "command_guard_coding_agents": PREF_COMMAND_GUARD_CODING_AGENTS,
+  "unattended_permission_wait": PREF_UNATTENDED_PERMISSION_WAIT,
   "model_command_judge": PREF_MODEL_COMMAND_JUDGE,
   "reasoning_command_judge": PREF_REASONING_COMMAND_JUDGE,
   "judgment_command_guard": PREF_JUDGMENT_COMMAND_GUARD,

@@ -152,16 +152,9 @@ describe('the centred cluster cannot reach a flanking control', () => {
     }
   });
 
-  it('the Canvas row needs no floor change, since its own already covers it', () => {
-    // The two centred desktop clusters share `--desktop-nav-min-span`, so
-    // lowering it to the brand cluster's natural width reaches the Canvas row
-    // too. It is harmless there: `2 * --content-side-reserve + the min span` is
-    // 22.1rem, inside `MIN_CONTENT_PANE_REM`, so that row sits on the clamp's
-    // middle arm at its own floor. This is the reserve without the docked Home
-    // rail toggle. Docked, the reserve grows a box, the row meets the min span
-    // near its floor, and the actions fold into ⋯ instead
-    // (e2e/content-title-position-desktop.spec.ts).
-    const CONTENT_SIDE_RESERVE_REM = 3 * ICON_BOX_REM + 4 * 0.25;
+  it('the Canvas floor covers the undocked control reserve', () => {
+    // The docked toggle and row insets can bring the title onto its floor arm.
+    const CONTENT_SIDE_RESERVE_REM = 2 * ICON_BOX_REM + 3 * 0.25;
     for (const remPx of ROOTS) {
       vi.stubGlobal('getComputedStyle', () => ({
         fontSize: `${remPx}px`, getPropertyValue: () => '',

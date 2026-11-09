@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-/** A pending command card links to the Command guard's Enabled for coding agents setting.
+/** A pending command card links to the Command guard's Answer coding-agent questions setting.
  *
  *  Only a command tool carries it, only while the card waits for an answer,
  *  and only while the guard does not already answer coding agents. That takes

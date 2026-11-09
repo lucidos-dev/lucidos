@@ -293,7 +293,7 @@ struct CommittedSystemEvent {
 }
 
 /// [`emit_depth`] for a caller that has the thread id but no `BusEvent` yet.
-fn thread_emit_depth(thread_id: Uuid) -> u32 {
+pub(crate) fn thread_emit_depth(thread_id: Uuid) -> u32 {
     let registered =
         crate::scheduler::user_tasks::chain_depth_for_thread(thread_id).unwrap_or_default();
     current_event_trigger_depth().max(registered)
@@ -1087,6 +1087,8 @@ impl EventBus {
                 return Ok(appended.and_then(|results| results.into_iter().next()));
             }
             BusEvent::System(se) if se.is_persisted() => {
+                // Before the transaction: the lookup reads on its own connection.
+                let se = self.with_notification_audience(se).await;
                 let append = self.begin_append().await?;
                 let appended = self
                     .append_system_event(append, Uuid::new_v4(), se, depth, emitting_trigger_id)
@@ -1397,7 +1399,7 @@ impl EventBus {
             // (ADR 0409). The thread append lock above orders it against
             // a new `ThreadReadRequested`. So this read drops a duplicate,
             // and a sighting older than a newer request.
-            if let ThreadEvent::ThreadReplySeen { seen_version } = &te {
+            if let ThreadEvent::ThreadReplySeen { seen_version, .. } = &te {
                 let row: Option<(bool, i64)> = sqlx::query_as(
                     "SELECT read_requested, summary_version FROM thread_summaries \
                      WHERE thread_id = $1",

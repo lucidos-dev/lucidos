@@ -225,18 +225,18 @@ html {
        Shared by every bar so they read as one family, and named so the live
        style remote can retune the wash without reaching into four rules. */
     --banner-tint-strength: 10%;
-    /* The connection banner's line-height, stated rather than inherited and
-       named rather than written into the rule, because the dot's offset is
-       derived from it: the offset lands the dot on the sentence's FIRST line,
-       so a second copy of the number would drift the dot off that line the
-       moment either is retuned. */
+    /* Every bar's line-height, stated rather than inherited and named rather
+       than written into a rule, because the offsets that land a leading dot,
+       icon, button or close X on the sentence's FIRST line derive from it. */
     --banner-line-height: 1.4;
+    /* Every bar's action button, the Start button included. */
+    --banner-button-height: 1.75rem;
     /* The dot leading the connection banner's sentence. Named because the
        shared `.status-dot` scale carries colour only: every host sizes its own
        (see `--brand-menu-notice-dot`, the same dot inside the Lucidos menu). */
     --connection-banner-dot: 0.5rem;
     /* The bar's Start button, sized as the other banners' buttons are. */
-    --connection-banner-button-height: 1.75rem;
+    --connection-banner-button-height: var(--banner-button-height);
     --connection-banner-button-inset: 0.75rem;
     /* Height of the desktop transcript's top fade (the mask that dissolves
        messages as they scroll up under the thread title header — see

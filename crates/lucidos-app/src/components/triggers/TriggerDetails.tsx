@@ -26,6 +26,7 @@ import { FormSkeleton } from '../shared/FormSkeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 import { Explainer, FieldLabel } from '../shared/Explainer';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
+import { permissionWaitFromValue, permissionWaitOptions, permissionWaitValue } from './permissionWaitChoices';
 
 const NEW_GROUP_SENTINEL = '__new_group__';
 
@@ -223,6 +224,9 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
   const [sideEffectGrant, setSideEffectGrant] = useServerBackedField<SideEffectCategory[]>(
     existingTrigger?.side_effect_grant ?? [], sameSet,
   );
+  const [permissionWait, setPermissionWait] = useServerBackedField(
+    permissionWaitValue(existingTrigger?.permission_wait),
+  );
   const toggleSideEffect = (cat: SideEffectCategory, on: boolean) => {
     setSideEffectGrant(
       on ? [...sideEffectGrant.filter(c => c !== cat), cat] : sideEffectGrant.filter(c => c !== cat)
@@ -356,8 +360,8 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
       on = built;
     }
 
-    // go_to_review / side_effect_grant / model / reasoning_effort / provider
-    // apply only to the intent path. `submitTrigger` gates all five on
+    // go_to_review / side_effect_grant / permission_wait / model /
+    // reasoning_effort / provider apply only to the intent path. `submitTrigger` gates them all on
     // `run.type`, so a script trigger can't persist state left over from an
     // intent → script switch.
     savingRef.current = true;
@@ -369,6 +373,7 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
         groupId: groupId || null,
         sideEffectGrant,
         // '' is the Default option; null is how it reaches the engine.
+        permissionWait: permissionWaitFromValue(permissionWait),
         model: model || null,
         reasoningEffort: triggerEffort || null,
         provider: triggerProvider || null,
@@ -738,7 +743,8 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
           )}
 
           {/* Both controls are consumed only on the intent (LLM) trigger path;
-              the script path never reads go_to_review or side_effect_grant. Hide
+              the script path never reads go_to_review, side_effect_grant or
+              permission_wait. Hide
               them in script mode so they can't imply behavior that never runs. */}
           {runType === 'intent' && (
             <>
@@ -818,6 +824,26 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
                     </label>
                   ))}
                 </div>
+              </div>
+
+              <div class="form-group">
+                <FieldLabel title="Permission wait">
+                    <p>
+                      When a coding agent this trigger started runs a command Lucidos
+                      cannot check, and one of your devices takes notifications,
+                      Lucidos parks a card and notifies you.
+                    </p>
+                    <p>
+                      This sets how long the card waits before it is denied. Deny at
+                      once skips the card. Workspace default follows the
+                      unattended_permission_wait preference.
+                    </p>
+                </FieldLabel>
+                <Dropdown
+                  value={permissionWait}
+                  onChange={setPermissionWait}
+                  options={permissionWaitOptions(permissionWait)}
+                />
               </div>
             </>
           )}

@@ -692,6 +692,8 @@ const AUTH = '/~/api/v1/auth';
 export interface PairedDevice {
   id: string;
   label: string;
+  /** The person holding this device (ADR 0623). */
+  operator_id?: string;
   paired_at: string;
   last_seen_at?: string;
 }
@@ -743,6 +745,72 @@ export function listPairedDevices(): Promise<PairedDevice[]> {
  *  response, so this browser lands back on the pairing screen. */
 export async function revokePairedDevice(id: string): Promise<void> {
   await authJson<void>(`/devices/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+// Operators (ADR 0623): a person, as the gateway knows them. Identity only:
+// nothing here allows or refuses anything. Every change answers the whole list.
+
+export interface GatewayOperator {
+  id: string;
+  name: string;
+  emails: string[];
+  device_ids: string[];
+}
+
+/** A device relayed through a gateway pairing, shown as "Sam via A". */
+export interface RelayedOperator {
+  device_id: string;
+  operator_id: string;
+  name: string;
+  via: string;
+  /** The emails the other gateway holds for the person. */
+  emails: string[];
+}
+
+export interface OperatorsResponse {
+  operators: GatewayOperator[];
+  relayed: RelayedOperator[];
+}
+
+function operatorsCall(path: string, method: string, body?: unknown): Promise<OperatorsResponse> {
+  return authJson<OperatorsResponse>(path, {
+    method,
+    headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+}
+
+const operatorPath = (id: string) => `/operators/${encodeURIComponent(id)}`;
+
+export function listOperators(): Promise<OperatorsResponse> {
+  return authJson<OperatorsResponse>('/operators');
+}
+
+export function addOperator(name: string): Promise<OperatorsResponse> {
+  return operatorsCall('/operators', 'POST', { name });
+}
+
+export function renameOperator(id: string, name: string): Promise<OperatorsResponse> {
+  return operatorsCall(operatorPath(id), 'PUT', { name });
+}
+
+/** Remove a person, revoking every device they hold. */
+export function removeOperator(id: string): Promise<OperatorsResponse> {
+  return operatorsCall(operatorPath(id), 'DELETE');
+}
+
+export function addOperatorEmail(id: string, email: string): Promise<OperatorsResponse> {
+  return operatorsCall(`${operatorPath(id)}/emails`, 'POST', { email });
+}
+
+export function removeOperatorEmail(id: string, email: string): Promise<OperatorsResponse> {
+  return operatorsCall(`${operatorPath(id)}/emails/${encodeURIComponent(email)}`, 'DELETE');
+}
+
+export function moveDeviceToOperator(deviceId: string, operatorId: string): Promise<OperatorsResponse> {
+  return operatorsCall(`/devices/${encodeURIComponent(deviceId)}/operator`, 'PUT', {
+    operator_id: operatorId,
+  });
 }
 
 // Gateway pairing (ADR 0590). This gateway, as B, grants another gateway

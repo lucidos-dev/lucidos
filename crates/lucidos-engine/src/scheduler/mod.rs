@@ -457,6 +457,23 @@ impl SchedulerManager {
             WEBHOOK_REFUSAL_CRON
         );
 
+        // A sweep, not a timer per gate, so a restart loses no escalation.
+        let engine_gates = self.engine.clone();
+        let gate_job = Job::new_async(
+            crate::engine::work_item::GATE_ESCALATION_CRON,
+            move |_uuid, _lock| {
+                let engine = engine_gates.clone();
+                Box::pin(async move {
+                    crate::engine::work_item::escalate_overdue_gates(&engine).await;
+                })
+            },
+        )?;
+        self.scheduler.add(gate_job).await?;
+        log!(
+            "[Scheduler] Registered system task: gate_escalation ({})",
+            crate::engine::work_item::GATE_ESCALATION_CRON
+        );
+
         Ok(())
     }
 
@@ -1246,6 +1263,7 @@ mod bus_subscriber;
 mod task_runner;
 #[cfg(test)]
 pub(crate) use task_runner::assert_snapshot_catch_up_excluded;
+pub(crate) use task_runner::event_dispatch_skipped;
 use task_runner::{check_task_health_and_restart, register_and_track, TrackedTask};
 
 /// Apply a trigger-group lifecycle event to the in-memory registry. Groups

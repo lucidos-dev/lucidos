@@ -148,7 +148,10 @@ impl PairedGatewayStore {
         self.pending
             .lock()
             .map_err(|_| "gateway pairing state is unavailable".to_string())?
-            .mint(label)
+            .mint(crate::pairing::PairingIntent {
+                label,
+                operator_id: None,
+            })
             .map(|minted| minted.secret)
             .map_err(|e| format!("could not mint a gateway pairing secret: {e}"))
     }
@@ -172,7 +175,7 @@ impl PairedGatewayStore {
                 .lock()
                 .map_err(|_| "gateway pairing state is unavailable".to_string())?;
             match pending.redeem(secret, PairingChannel::Public) {
-                Redemption::Redeemed(label) => label,
+                Redemption::Redeemed(intent) => intent.label,
                 Redemption::Rejected | Redemption::LocalOnly | Redemption::Throttled => {
                     return Ok(GatewayRedemption::Rejected)
                 }
@@ -530,11 +533,23 @@ async fn leave(
     State(state): State<GatewayState>,
     Extension(gateway): Extension<AuthenticatedGateway>,
 ) -> Result<StatusCode, ApiError> {
-    state
-        .paired_gateways()
-        .unpair(&gateway.pairing_id)
-        .map_err(ApiError::internal)?;
+    end_pairing(&state, &gateway.pairing_id)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Forget a paired gateway and the people it relayed, so they no longer
+/// count. `false` when no pairing had that id. A retry after a failed forget
+/// still forgets, though the pairing itself is already gone.
+fn end_pairing(state: &GatewayState, id: &str) -> Result<bool, ApiError> {
+    let unpaired = state
+        .paired_gateways()
+        .unpair(id)
+        .map_err(ApiError::internal)?;
+    state
+        .record(|directory| Ok(directory.pairing_forgotten(id).into_iter().collect()))
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)?;
+    Ok(unpaired)
 }
 
 /// B's management routes, merged into `auth_api::router` behind its gates.
@@ -606,11 +621,7 @@ async fn unpair_gateway(
     State(state): State<GatewayState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    if state
-        .paired_gateways()
-        .unpair(&id)
-        .map_err(ApiError::internal)?
-    {
+    if end_pairing(&state, &id)? {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found("no paired gateway with that id"))

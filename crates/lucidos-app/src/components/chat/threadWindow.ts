@@ -192,23 +192,25 @@ export interface WindowEdge {
  *  who asked for it: see `StoredWindowKind`. */
 export const WHOLE_THREAD: WindowEdge = { exchange: 0, rowsHidden: 0 };
 
-/** How a thread's stored window came to be. `render-all` is a NAVIGATION's
+/** How a thread's stored window came to be. `claimed` is a NAVIGATION's
  *  claim, stored by a deep link or the up chevron. `grown` is the seed or the
  *  reader's own scrolling, including a window grown to the first turn. */
-export type StoredWindowKind = 'render-all' | 'grown';
+export type StoredWindowKind = 'claimed' | 'grown';
 
-/** Must a deep link's render-all be WRITTEN to this thread's stored edge?
+/** The edge a deep link needs: the turn at `targetIndex` drawn whole, and
+ *  never a floor lower than `current`, so no turn on screen leaves the DOM.
+ *  Returns `current` itself when nothing should change, so the caller stores
+ *  only on a new value.
  *
- *  `undefined` is the case worth naming, and it answers YES. A cold push tap
- *  finds `threadMap` empty, so the claim lands before the seed does. Read as
- *  `WHOLE_THREAD` instead, an absent edge would skip the write. The seed would
- *  then store the tail, and the thread would snap back to it the moment the
- *  claim cleared.
+ *  A target no loaded turn holds (`targetIndex` < 0) keeps `current`. The
+ *  caller pages history toward it. Every stamp a link resolves comes from a
+ *  turn, so drawing more could not help it land (ADR 0631).
  *
- *  A function rather than an inline test because that is the arm the inline
- *  test got wrong, and it is invisible on a warm thread. */
-export function deepLinkMustPersist(stored: WindowEdge | undefined): boolean {
-  return !stored || edgeHasMoreAbove(stored);
+ *  It replaced a render-all. A 255-turn thread drew about 29,000 nodes that
+ *  way, and iOS killed the page under memory pressure. */
+export function deepLinkEdge(current: WindowEdge, targetIndex: number): WindowEdge {
+  if (targetIndex < 0 || edgeReachesRow(current, targetIndex, 0)) return current;
+  return { exchange: targetIndex, rowsHidden: 0 };
 }
 
 /** How many leading rows to hide so the rest draw `budget` of them.
@@ -550,13 +552,15 @@ export function anythingAbove(
 
 /** Must a FRESH open of this thread throw away the window it left behind?
  *
- *  Only for a render-all, and only one the current visit did not ask for.
+ *  Only for a claimed window. A deep link opening the thread claims its own
+ *  turn after the re-seed, so a stale claim never survives into its visit.
  *
- *  A render-all is a claim a NAVIGATION makes: a deep link to an old event, or
- *  the up chevron. It is right for the visit that made it, and it outlived the
- *  visit. The edge is module-scoped, and nothing narrowed it again, so one tap
- *  bought every later open of that thread a full render. One reported thread
- *  paid 4,069 rows an open, against the 37 its window would have drawn.
+ *  A claim is what a NAVIGATION stores: a deep link's target turn, or the up
+ *  chevron's render-all. It is right for the visit that made it, and it
+ *  outlived the visit. The edge is module-scoped, and nothing narrowed it
+ *  again, so one tap bought every later open of that thread a large render.
+ *  One reported thread paid 4,069 rows an open, against the 37 its window
+ *  would have drawn.
  *
  *  The reader still lands where they were. A *reading position* names a turn.
  *  `reachAnchor` walks the window up to it a budgeted round per frame, which is
@@ -569,12 +573,8 @@ export function anythingAbove(
  *  So the question is who stored the window, never its value. A reader who
  *  scrolled to the first turn holds `WHOLE_THREAD` too. Read as a claim, their
  *  thread would open on the newest turns and jump when the walk arrives. */
-export function reseedOnReopen(
-  stored: StoredWindowKind | undefined,
-  deepLinkClaimedThisVisit: boolean,
-): boolean {
-  if (deepLinkClaimedThisVisit) return false;
-  return stored === 'render-all';
+export function reseedOnReopen(stored: StoredWindowKind | undefined): boolean {
+  return stored === 'claimed';
 }
 
 /** Whether a "scroll to top" must render the FULL thread before scrolling.

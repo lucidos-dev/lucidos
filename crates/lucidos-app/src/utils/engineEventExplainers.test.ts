@@ -78,6 +78,10 @@ describe('describeEngineReason', () => {
     expect(describeEngineReason({ kind: 'missing_plan' }))
       .toMatch(/implementation plan/i);
   });
+  it('returns explainer for context_ceiling', () => {
+    expect(describeEngineReason({ kind: 'context_ceiling' }))
+      .toMatch(/context ceiling/i);
+  });
   it('returns explainer for plugin_auto_update', () => {
     expect(describeEngineReason({
       kind: 'plugin_auto_update',
@@ -93,6 +97,14 @@ describe('describeEngineReason', () => {
     const unnamed = describeEngineReason({ kind: 'scheduler', trigger_id: 't-1' });
     expect(unnamed).toMatch(/A trigger ran on its schedule/);
     expect(unnamed).not.toContain('t-1');
+  });
+  it('names the actor email a trigger fire carries', () => {
+    expect(describeEngineReason({
+      kind: 'scheduler',
+      trigger_id: 't-1',
+      trigger_name: 'Ticket intake',
+      actor_email: 'sam@example.com',
+    })).toMatch(/action by sam@example\.com/);
   });
 
   // The reported card: an expired wait read "Prompt to the agent" with no
@@ -142,7 +154,7 @@ describe('every explainer is plain', () => {
       ...CANCEL_CAUSES.map(describeCancelCause),
       ...(['continuation_started', 'session_recovered', 'orphan_recovery', 'harden_retrigger',
         'stale_session', 'archived_branch_work', 'unmerged_integrated_work', 'successor_residue', 'merge_conflict', 'main_check_red', 'main_check_flaky',
-        'missing_hardening', 'missing_plan'] as const)
+        'missing_hardening', 'missing_plan', 'context_ceiling'] as const)
         .map(kind => describeEngineReason({ kind })),
     ];
     for (const text of texts) expect(text).not.toMatch(ENGINE_INTERNALS);

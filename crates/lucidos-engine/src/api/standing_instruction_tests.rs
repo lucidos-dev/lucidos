@@ -116,10 +116,12 @@ async fn fire_trigger_on(bus: &EventBus, thread_id: Uuid, trigger_id: &str) {
             origin: Some(MessageOrigin::engine(EngineReason::Scheduler {
                 trigger_id: trigger_id.to_string(),
                 trigger_name: Some("Nightly release".into()),
+                actor_email: None,
             })),
             go_to_review: false,
             model: None,
             reasoning_effort: None,
+            continue_key: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Chat),

@@ -68,12 +68,12 @@ fi
 
 echo "test: stop.sh stops engine via kill -USR1 (frontend kill stays SIGTERM)"
 STOP_SH="$PROJECT_DIR/scripts/stop.sh"
-# The engine kill is the one inside the `if [ -f "$engine_pid_file" ]; then` block.
-# Scope to that block; the frontend kill block follows and stays SIGTERM.
+# The engine kill is the one inside the `for pid in $(engine_pids_to_signal ...)` loop.
+# Scope to that loop; the frontend kill follows and stays SIGTERM.
 ENGINE_BLOCK=$(awk '
-    /if \[ -f "\$engine_pid_file" \]; then/{f=1}
+    /for pid in \$\(engine_pids_to_signal/{f=1}
     f{print}
-    f && /^    fi$/{exit}
+    f && /^    done$/{exit}
 ' "$STOP_SH")
 if [ -z "$ENGINE_BLOCK" ]; then
     fail "could not locate engine pid block in stop.sh — refactored?"

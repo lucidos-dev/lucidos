@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use super::thread_events::{HandoffCause, HandoffOpening, SessionStart};
 use crate::runtime::intelligence_ladder::drops_context_variant;
 use crate::runtime::{validate_coding_agent_effort, validate_coding_agent_model, CodingAgent};
 
@@ -223,31 +224,54 @@ pub(crate) fn last_cache_refresh_started_sql(thread: &str) -> String {
     format!("GREATEST({}, {beat})", last_turn_started_sql(thread))
 }
 
-/// The one definition of a thread's context size: the latest `ContextCaptured`
-/// of its own turns in its current *agent session*, read as
-/// `usage.input_tokens`. A fresh session has none yet. A sub-agent's call and an
-/// auxiliary call on the thread do not count. A later `CodingAgentCompacted`
-/// replaces it with `post_tokens`, unknown when Claude Code did not report it.
+/// The current *agent session*'s context reading, the one definition of a
+/// thread's context size. `None` fields are unknown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionReading {
+    /// The latest `usage.input_tokens` of the session's own turns. A later
+    /// `CodingAgentCompacted` replaces it with `post_tokens`, unknown when
+    /// Claude Code did not report it. A fresh session has none yet.
+    pub tokens: Option<u64>,
+    /// The context window of the newest capture that records one.
+    pub window: Option<u64>,
+}
+
+/// Read [`SessionReading`]. A sub-agent's call and an auxiliary call on the
+/// thread do not count.
+pub async fn session_reading(
+    pool: &PgPool,
+    thread_id: Uuid,
+) -> Result<SessionReading, sqlx::Error> {
+    let sql = format!(
+        "SELECT (SELECT tokens FROM ( \
+                   SELECT sequence, (payload->'usage'->>'input_tokens')::bigint AS tokens \
+                     FROM events WHERE thread_id = $1 AND {capture} \
+                   UNION ALL \
+                   SELECT sequence, (payload->>'post_tokens')::bigint FROM events \
+                    WHERE thread_id = $1 AND event_type = 'CodingAgentCompacted' AND {scope} \
+                 ) readings ORDER BY sequence DESC LIMIT 1), \
+                (SELECT (payload->>'context_window')::bigint FROM events \
+                  WHERE thread_id = $1 AND {capture} \
+                    AND (payload->>'context_window')::bigint > 0 \
+                  ORDER BY sequence DESC LIMIT 1)",
+        capture = current_session_capture_sql("$1"),
+        scope = super::session_scope::in_current_session_sql("$1", "sequence"),
+    );
+    let (tokens, window): (Option<i64>, Option<i64>) =
+        sqlx::query_as(&sql).bind(thread_id).fetch_one(pool).await?;
+    let unsigned = |v: Option<i64>| v.and_then(|t| u64::try_from(t).ok());
+    Ok(SessionReading {
+        tokens: unsigned(tokens),
+        window: unsigned(window),
+    })
+}
+
+/// A thread's context size, from [`session_reading`], and what it calls for.
 /// An integrated sub-thread, a thread whose handoff is pending, and a thread
 /// that handed off to a legacy successor thread before successor sessions, are
 /// offered nothing.
 pub async fn thread_context(pool: &PgPool, thread_id: Uuid) -> Result<ThreadContext, sqlx::Error> {
-    let sql = format!(
-        "SELECT tokens FROM ( \
-           SELECT sequence, (payload->'usage'->>'input_tokens')::bigint AS tokens FROM events \
-            WHERE thread_id = $1 AND {} \
-           UNION ALL \
-           SELECT sequence, (payload->>'post_tokens')::bigint FROM events \
-            WHERE thread_id = $1 AND event_type = 'CodingAgentCompacted' AND {} \
-         ) readings ORDER BY sequence DESC LIMIT 1",
-        current_session_capture_sql("$1"),
-        super::session_scope::in_current_session_sql("$1", "sequence"),
-    );
-    let tokens: Option<i64> = sqlx::query_scalar(&sql)
-        .bind(thread_id)
-        .fetch_optional(pool)
-        .await?
-        .flatten();
+    let tokens = session_reading(pool, thread_id).await?.tokens;
     let (can_hand_off, applied): (bool, bool) = sqlx::query_as(&format!(
         "SELECT NOT coding_agent_integrated AND successor_thread_id IS NULL AND NOT {}, \
                 EXISTS (SELECT 1 FROM changes WHERE thread_id = $1 AND status = $2) \
@@ -259,7 +283,7 @@ pub async fn thread_context(pool: &PgPool, thread_id: Uuid) -> Result<ThreadCont
     .fetch_optional(pool)
     .await?
     .unwrap_or((true, false));
-    let mut context = ThreadContext::of_tokens(tokens.and_then(|t| u64::try_from(t).ok()));
+    let mut context = ThreadContext::of_tokens(tokens);
     context.can_hand_off = can_hand_off;
     context.offer &= can_hand_off;
     context.applied = applied;
@@ -350,6 +374,9 @@ pub enum BriefCause {
     CacheCold,
     /// The coding agent refused to resume the previous session.
     ResumeFailed,
+    /// The previous session reached its *context ceiling* and ended its
+    /// *ceiling re-entry* without handing off.
+    NoNarrative,
 }
 
 /// The opening of a session that starts with no *handoff narrative*. It tells
@@ -369,6 +396,10 @@ pub fn handoff_brief(
         BriefCause::ResumeFailed => {
             "The coding agent could not resume this thread's previous session, so its \
              context did not carry over."
+        }
+        BriefCause::NoNarrative => {
+            "The previous session in this thread reached its context ceiling and ended \
+             without writing a handoff narrative."
         }
     };
     let applied = applied
@@ -442,7 +473,7 @@ pub fn successor_first_message(opening: &str, request: Option<&str>, input: &str
 /// session of the thread is its *successor session*.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PendingHandoff {
-    pub opening: super::thread_events::HandoffOpening,
+    pub opening: HandoffOpening,
     pub message: String,
     #[serde(default)]
     pub checkpoint: Option<String>,
@@ -457,9 +488,21 @@ pub struct PendingHandoff {
     /// any request itself.
     #[serde(default)]
     pub request: Option<HandoffRequest>,
+    #[serde(default)]
+    pub cause: Option<HandoffCause>,
+    #[serde(default)]
+    pub starts: SessionStart,
+    #[serde(default)]
+    pub crossing: Option<super::context_ceiling::CeilingCrossing>,
 }
 
 impl PendingHandoff {
+    /// Whether the engine starts its session by itself, at boot or once the
+    /// thread is free. A *next-input start* waits for an input instead.
+    pub fn starts_unprompted(&self) -> bool {
+        self.starts != SessionStart::OnNextInput
+    }
+
     /// The first message of its session, given the `input` that started it.
     pub fn first_message(&self, input: &str) -> String {
         successor_first_message(
@@ -474,6 +517,7 @@ impl PendingHandoff {
         super::thread_events::SessionContinuity::Handoff {
             checkpoint: self.checkpoint.clone(),
             progress: self.progress.clone(),
+            crossing: self.crossing,
             opening: self.opening,
             message: self.message.clone(),
         }
@@ -512,11 +556,12 @@ pub(crate) fn pending_handoff_sql(thread: &str) -> String {
 /// `SessionHandedOff` and every type `ends_handoff_sql` matches. The partial
 /// index `idx_events_handoff_lifecycle` lists the same types, so the planner
 /// can answer `pending_handoff_threads_sql` from it.
-const HANDOFF_LIFECYCLE_EVENT_TYPES: [&str; 4] = [
+const HANDOFF_LIFECYCLE_EVENT_TYPES: [&str; 5] = [
     "SessionHandedOff",
     "SessionStarted",
     "ResponseCanceled",
     "ResponseFailed",
+    "SessionHandoffWithdrawn",
 ];
 
 /// A SQL query: the `thread_id` of every thread with a pending handoff, the
@@ -550,17 +595,19 @@ pub(crate) fn pending_handoff_threads_sql() -> String {
 }
 
 /// A SQL predicate: the `events` row `alias` ends the handoff recorded by the
-/// `SessionHandedOff` row `handoff`, on the same thread. Three things end one:
+/// `SessionHandedOff` row `handoff`, on the same thread. Four things end one:
 ///
 /// - its successor session's `SessionStarted`, whose `continuity` is
 ///   `handoff`. A recovery or conflict-resolution session records none;
 /// - a user's Stop, or an Apply, Discard or Archive that stopped a turn;
-/// - a failed turn that began after it: the successor session never started.
+/// - a failed turn that began after it: the successor session never started;
+/// - a person's *Return to the old session*, `SessionHandoffWithdrawn`.
 pub(crate) fn ends_handoff_sql(alias: &str, handoff: &str) -> String {
     format!(
         "{alias}.sequence > {handoff}.sequence AND ( \
            ({alias}.event_type = 'SessionStarted' \
               AND {alias}.payload->'continuity'->>'kind' = 'handoff') \
+           OR {alias}.event_type = 'SessionHandoffWithdrawn' \
            OR ({alias}.event_type = 'ResponseCanceled' \
               AND {alias}.payload->>'cause' IN ('user_stop', 'user_action')) \
            OR ({alias}.event_type = 'ResponseFailed' \
@@ -654,6 +701,259 @@ pub(crate) async fn awaits_landing(pool: &PgPool, thread_id: Uuid) -> Result<boo
     Ok(!super::landing_lane::queued_changes(pool, thread_id)
         .await?
         .is_empty())
+}
+
+/// What keeps a coding-agent thread from handing off, whoever asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HandoffBlock {
+    /// An *integrated sub-thread*: its parent's agent merges its branch.
+    Integrated,
+    /// It continued in a *legacy successor thread*.
+    LegacySuccessor(Uuid),
+    Archived,
+    /// Its change is applying.
+    Applying,
+    /// Its change waits in the landing lane.
+    AwaitingLanding,
+}
+
+/// The first [`HandoffBlock`] that holds for `thread_id`, if any. A thread
+/// with no summary row has none: the caller refuses it as missing.
+pub(crate) async fn handoff_block(
+    pool: &PgPool,
+    thread_id: Uuid,
+) -> Result<Option<HandoffBlock>, sqlx::Error> {
+    let row: Option<(bool, Option<Uuid>, String, bool)> = sqlx::query_as(
+        "SELECT coding_agent_integrated, successor_thread_id, archive_state, apply_in_flight \
+         FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((integrated, successor, archive_state, applying)) = row else {
+        return Ok(None);
+    };
+    Ok(if integrated {
+        Some(HandoffBlock::Integrated)
+    } else if let Some(successor) = successor {
+        Some(HandoffBlock::LegacySuccessor(successor))
+    } else if archive_state == "archived" {
+        Some(HandoffBlock::Archived)
+    } else if applying {
+        Some(HandoffBlock::Applying)
+    } else if awaits_landing(pool, thread_id).await? {
+        Some(HandoffBlock::AwaitingLanding)
+    } else {
+        None
+    })
+}
+
+/// A handoff to record: [`record_handoff`] writes it as `SessionHandedOff`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NewHandoff {
+    pub opening: HandoffOpening,
+    pub message: String,
+    pub checkpoint: Option<String>,
+    pub progress: Option<String>,
+    pub implementer: Implementer,
+    pub request: Option<HandoffRequest>,
+    pub cause: HandoffCause,
+    pub starts: SessionStart,
+    /// The ceiling the session crossed, on a ceiling handoff.
+    pub crossing: Option<super::context_ceiling::CeilingCrossing>,
+}
+
+/// Why a handoff happens and when its session starts. A session past its
+/// *context ceiling* starts on the next input, unless the user typed a request:
+/// that request is the input. An agent's own handoff holds the thread until
+/// its turn ends.
+pub(crate) fn cause_and_start(
+    past_ceiling: bool,
+    at_checkpoint: bool,
+    request: bool,
+    from_agent: bool,
+) -> (HandoffCause, SessionStart) {
+    let cause = if past_ceiling {
+        HandoffCause::ContextCeiling
+    } else if at_checkpoint {
+        HandoffCause::Checkpoint
+    } else {
+        HandoffCause::User
+    };
+    let starts = if past_ceiling && !request {
+        SessionStart::OnNextInput
+    } else if from_agent {
+        SessionStart::AfterThisTurn
+    } else {
+        SessionStart::Now
+    };
+    (cause, starts)
+}
+
+/// Take `thread_id`'s handoff lock until the returned transaction ends. Every
+/// writer of a handoff or its withdrawal holds it, across engines, so the
+/// second writer re-reads what the first recorded.
+pub(crate) async fn lock_handoff(
+    pool: &PgPool,
+    thread_id: Uuid,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
+    let mut claim = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(format!("successor-handoff:{thread_id}"))
+        .execute(&mut *claim)
+        .await?;
+    Ok(claim)
+}
+
+/// What [`record_handoff`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HandoffRecord {
+    Recorded,
+    /// A handoff is pending already: one per session.
+    Pending,
+    /// A ceiling handoff found the session no longer past its ceiling: a
+    /// person's raise or return landed first.
+    CeilingLifted,
+}
+
+/// Record `handoff` on `thread_id`, unless one is pending already. One
+/// handoff per session, across engines ([`lock_handoff`]). A ceiling handoff
+/// re-reads the crossing under the lock, so a person's raise always wins.
+pub(crate) async fn record_handoff(
+    bus: &super::event_bus::EventBus,
+    thread_id: Uuid,
+    handoff: NewHandoff,
+    meta: super::thread_events::EventMeta,
+) -> Result<HandoffRecord, Box<dyn std::error::Error + Send + Sync>> {
+    let pool = bus.pool();
+    let claim = lock_handoff(pool, thread_id).await?;
+    if pending_handoff(pool, thread_id).await?.is_some() {
+        return Ok(HandoffRecord::Pending);
+    }
+    if handoff.cause == super::thread_events::HandoffCause::ContextCeiling
+        && super::context_ceiling::past_ceiling(pool, thread_id)
+            .await?
+            .is_none()
+    {
+        return Ok(HandoffRecord::CeilingLifted);
+    }
+    bus.emit(super::event_bus::BusEvent::Thread {
+        thread_id,
+        event: super::thread_events::ThreadEvent::SessionHandedOff {
+            cause: Some(handoff.cause),
+            starts: handoff.starts,
+            crossing: handoff.crossing,
+            opening: handoff.opening,
+            message: handoff.message,
+            checkpoint: handoff.checkpoint,
+            progress: handoff.progress,
+            coding_agent: handoff.implementer.coding_agent,
+            coding_agent_model: handoff.implementer.model,
+            reasoning_effort: handoff.implementer.reasoning_effort,
+            request: handoff.request,
+        },
+        meta,
+    })
+    .await?;
+    claim.commit().await?;
+    Ok(HandoffRecord::Recorded)
+}
+
+/// What the thread's last applied change did, for a brief. Best effort: a
+/// brief without it is still whole.
+pub(crate) async fn last_applied_summary(pool: &PgPool, thread_id: Uuid) -> Option<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT COALESCE(summary, description) FROM changes \
+         WHERE thread_id = $1 AND status = 'applied' \
+         ORDER BY resolved_at DESC NULLS LAST LIMIT 1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_else(|e| {
+        crate::log!("[Successor] last applied change of {}: {}", thread_id, e);
+        None
+    })
+}
+
+/// The work a session leaves running at its handoff. Its results reach the
+/// thread, so the successor session must know not to start it again.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StillRunning {
+    /// Background tasks, by description.
+    pub tasks: Vec<String>,
+    /// Live event waits, by reason and the event types they watch.
+    pub waits: Vec<String>,
+    /// Working child threads, by title.
+    pub children: Vec<String>,
+}
+
+impl StillRunning {
+    /// `opening` with a "Still running" block after it. Nothing running
+    /// leaves `opening` as it is.
+    pub fn after(&self, opening: String) -> String {
+        let lines: Vec<String> = (self.tasks.iter().map(|t| format!("- Background task: {t}")))
+            .chain(self.waits.iter().map(|w| format!("- Event wait: {w}")))
+            .chain(self.children.iter().map(|c| format!("- Child thread: {c}")))
+            .collect();
+        if lines.is_empty() {
+            return opening;
+        }
+        format!(
+            "{opening}\n\n## Still running\n\nThe previous session started these, and they \
+             still run. Their results reach this thread, so do not start them again.\n\n{}",
+            lines.join("\n")
+        )
+    }
+}
+
+impl super::LucidosEngine {
+    /// What `thread_id` leaves running now: its unstopped background tasks,
+    /// its live event waits and its working children.
+    pub(crate) async fn still_running(&self, thread_id: Uuid) -> StillRunning {
+        let tasks = self
+            .bash_background
+            .running_for_thread(thread_id)
+            .await
+            .into_iter()
+            .filter(|task| !task.stop_requested)
+            .map(|task| {
+                let what = task.description.unwrap_or(task.command);
+                format!("{what} (`{}`)", task.task_id)
+            })
+            .collect();
+        let waits = self
+            .live_waits
+            .for_thread(thread_id)
+            .await
+            .into_iter()
+            .map(|wait| {
+                let on: Vec<&str> = wait.on.iter().map(|s| s.event_type.as_str()).collect();
+                format!("{} (on {})", wait.reason, on.join(", "))
+            })
+            .collect();
+        let children = sqlx::query_scalar::<_, String>(&format!(
+            "SELECT COALESCE(c.title, LEFT(c.first_message, 80), c.thread_id::text) \
+               FROM thread_summaries c \
+              WHERE c.parent_thread_id = $1 AND c.archive_state <> 'archived' \
+                AND (c.status = $2 OR {}) \
+              ORDER BY c.created_at",
+            pending_handoff_sql("c.thread_id")
+        ))
+        .bind(thread_id)
+        .bind(super::thread_lifecycle::ThreadStatus::Running.as_str())
+        .fetch_all(self.pool())
+        .await
+        .unwrap_or_else(|e| {
+            crate::log!("[Successor] working children of {}: {}", thread_id, e);
+            Vec::new()
+        });
+        StillRunning {
+            tasks,
+            waits,
+            children,
+        }
+    }
 }
 
 /// Whether `thread_id` handed off to a successor. A failed read counts as
@@ -830,7 +1130,8 @@ impl super::LucidosEngine {
     /// Start `thread_id`'s *successor session* once no run holds the thread,
     /// so its old session's process has exited first. Does nothing when no
     /// handoff is pending by then: another input already started the session,
-    /// and its first prompt carried the opening.
+    /// and its first prompt carried the opening. A *next-input start* waits for
+    /// that input instead.
     pub(crate) fn start_successor_session(self: &std::sync::Arc<Self>, thread_id: Uuid) {
         let Some(guard) = StartingGuard::take(self, thread_id) else {
             return;
@@ -846,8 +1147,8 @@ impl super::LucidosEngine {
                 return;
             }
             let handoff = match pending_handoff(engine.pool(), thread_id).await {
-                Ok(Some(handoff)) => handoff,
-                Ok(None) => return,
+                Ok(Some(handoff)) if handoff.starts_unprompted() => handoff,
+                Ok(_) => return,
                 Err(e) => {
                     crate::log!("[Successor] pending handoff of {}: {}", thread_id, e);
                     return;

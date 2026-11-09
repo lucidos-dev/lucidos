@@ -72,6 +72,15 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Rust engine
 
+- **An in-thread engine reason classed `Interactive` grants nothing.**
+  `resolve_attend_mode` reads only a thread's first origin-bearing
+  `MessageReceived` or `TriggerStarted`. Reasons stamped later inside a running
+  thread, such as `ContextCeiling`, `MissingHardening` and `CacheKeepAlive`,
+  never decide its mode. A scheduler thread that crosses its ceiling still
+  resolves through its `Scheduler` origin.
+  Re-flag only if such a reason can start a thread.
+  (`crates/lucidos-engine/src/engine/cc_permission.rs`.)
+
 - **The read-time mask leaves secret-reference credentials out on purpose.**
   A reviewer asks `stored_secret_values` to fail closed whenever a reference
   credential exists, since its resolved value stays unmasked. Resolving runs
@@ -1498,6 +1507,14 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Frontend
 
+- **A clamped XL widget box pans from a wheel or trackpad over its frame.**
+  Reviewers see the hidden scrollbar and the frame covering `.widget-box-scroll`,
+  and report that only a bridge could move the host scroller. The browser chains
+  a sideways wheel out of a frame whose root cannot scroll. A probe in Chromium
+  and WebKit moved the parent's `scrollLeft` by the full delta. Re-flag only if
+  the frame's root becomes scrollable sideways or the scroller sets
+  `overscroll-behavior` on the frame side. (`WidgetBox.tsx`, `chat/widgets.css`.)
+
 - **A spec's `browser.newContext({...})` keeps the project's context options.**
   A reviewer sees a fresh context that passes only `serviceWorkers` and reports
   that it loses `ignoreHTTPSErrors`, the viewport or the proxy. Playwright's
@@ -1644,20 +1661,20 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   load lands. Re-flag only with a path that parks the list on `failed` and
   never offers the retry.
 
-- **A backfill re-point that stores `grown` over a render-all is not a lost
+- **A backfill re-point that stores `grown` over a claim is not a lost
   claim.** A reviewer sees the re-point effect in `ThreadView.tsx` call
-  `storeEdge`, which always writes `kind: 'grown'`. It then reads every history
-  landing as relabelling a deep link's or the chevron's render-all, so the claim
-  outlives its visit (ADR 0232).
+  `storeEdge`, which defaults to `kind: 'grown'`. It then reads every history
+  landing as relabelling a deep link's or the chevron's claim, so the claim
+  outlives its visit (ADRs 0232, 0631).
 
-  The navigation reads never reach it. Both hold through `wholeHistoryHold`,
+  The navigation reads never reach it. Both hold through `readerOnlyHold`,
   whose null keys match nothing in `anchorAfterBackfill`, so the re-point
   stores nothing. A read that adds nothing drops its hold first
   (`settleHistoryRead`). What remains is the reader's own scroll folding a page
   in front of the window, and that window is the reader's to keep.
 
-  Re-flag with a navigation path that stores through `storeEdge`, or a hold
-  that names a turn for a whole-history read.
+  Re-flag with a navigation path that stores `grown` through `storeEdge`, or a
+  hold that names a turn for a deep-link page or the chevron's read.
 
 - **The composer row's 0.750 ink fraction is the GEOMETRIC extent, with the
   stroke excluded.** A reviewer computes a glyph's painted extent by hand, as
@@ -4830,3 +4847,21 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   A different normalization must not silently authorize a distinct filesystem name.
   Re-flag when copying the displayed phrase cannot confirm the same frozen resource.
   (crates/lucidos-app/src/components/picker/CleanupManager.tsx.)
+
+- **The SDK full screen trace never observes the promise `requestFullscreen` returns.**
+  A handler on that promise marks it handled and hides the app's own `unhandledrejection`.
+  A rejected request therefore logs as `never-opened` after the wait, with no reason.
+  Re-flag only if the trace changes what the app's call returns or how its rejection surfaces.
+  (`packages/lucidos-sdk/src/fullScreenTrace.ts`, `wrapMethod`.)
+
+- **ZIP advisories need an API reachability check.** The AES premature-EOF,
+  symlink-target allocation and dual-header parser advisories describe specific
+  APIs. The engine disables AES support and never calls the decrypting readers.
+  `read_text_from_zip` reads a bounded entry through `ZipArchive::by_name`.
+  Plugin `extract_zip` validates each central-directory name and writes that
+  same entry itself. Neither caller uses `ZipArchive::extract_internal` or
+  `ZipStreamReader`, so the reported extraction paths are absent here.
+
+  Re-flag if those APIs become reachable, dependency features change, or a new
+  advisory affects these bounded reads or validated writes. This finding does
+  not certify unrelated uses in transitive dependencies.

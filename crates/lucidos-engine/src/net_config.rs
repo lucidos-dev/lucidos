@@ -289,21 +289,26 @@ pub fn bind_socket_addr(choice: &BindChoice, port: u16) -> SocketAddr {
 /// `127.0.0.1:<port>` (proxy + health probe), the dev scripts POST the control
 /// API over loopback, and the engine's own Apply-restart callback hits the
 /// gateway over loopback. So an `Address` ALSO binds IPv4 loopback; otherwise
-/// every co-located, intra-host caller is refused. `Loopback` and `All` already
-/// cover loopback (`[::]` accepts IPv4 loopback as v4-mapped), so they bind a
-/// single socket. Never empty.
+/// every co-located, intra-host caller is refused. A choice that already covers
+/// loopback binds a single socket ([`covers_loopback`]). Never empty.
 pub fn bind_socket_addrs(choice: &BindChoice, port: u16) -> Vec<SocketAddr> {
     let primary = bind_socket_addr(choice, port);
+    if covers_loopback(choice) {
+        vec![primary]
+    } else {
+        vec![primary, SocketAddr::from((Ipv4Addr::LOCALHOST, port))]
+    }
+}
+
+/// Whether the choice's one socket already accepts `127.0.0.1`.
+///
+/// `[::]` accepts IPv4 loopback as v4-mapped, and `0.0.0.0` accepts it outright.
+/// So does a wildcard `Address`, and Linux refuses a loopback socket beside it
+/// on the same port with `EADDRINUSE`.
+fn covers_loopback(choice: &BindChoice) -> bool {
     match choice {
-        BindChoice::Loopback | BindChoice::All => vec![primary],
-        BindChoice::Address(_) => {
-            let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-            if primary == loopback {
-                vec![primary]
-            } else {
-                vec![primary, loopback]
-            }
-        }
+        BindChoice::Loopback | BindChoice::All => true,
+        BindChoice::Address(ip) => ip.is_unspecified() || *ip == Ipv4Addr::LOCALHOST,
     }
 }
 
@@ -575,6 +580,20 @@ mod tests {
             bind_socket_addrs(&BindChoice::Address(loop4), 3000),
             vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 3000))]
         );
+    }
+
+    #[test]
+    fn a_wildcard_address_binds_one_socket() {
+        // A loopback socket beside a wildcard on the same port is EADDRINUSE on Linux.
+        for ip in [
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        ] {
+            assert_eq!(
+                bind_socket_addrs(&BindChoice::Address(ip), 3000),
+                vec![SocketAddr::new(ip, 3000)]
+            );
+        }
     }
 
     #[test]

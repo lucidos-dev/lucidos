@@ -142,8 +142,9 @@ pub const LIST_EVENT_TYPES: &str = "list_event_types";
 // The grouped `threads` tool from the capability parity manifest: thread
 // reads, moving a child to top level, archiving, and thread triage. Its
 // actions are list, count, drafts, held_messages, search, detach_child,
-// archive, cache_keep_alive, triage and apply_triage. The flat names below are their dispatch
-// aliases. Spawning stays with the standalone run_thread and run_coding_agent.
+// archive, cache_keep_alive, context_ceiling, triage and apply_triage. The
+// flat names below are their dispatch aliases. Spawning stays with the
+// standalone run_thread and run_coding_agent.
 pub const THREADS: &str = "threads";
 pub const LIST_THREADS: &str = "list_threads";
 pub const COUNT_THREADS: &str = "count_threads";
@@ -153,6 +154,7 @@ pub const LIST_HELD_MESSAGES: &str = "list_held_messages";
 pub const DETACH_CHILD_THREAD: &str = "detach_child_thread";
 pub const ARCHIVE_THREAD: &str = "archive_thread";
 pub const SWITCH_CACHE_KEEP_ALIVE: &str = "switch_cache_keep_alive";
+pub const SET_CONTEXT_CEILING: &str = "set_context_ceiling";
 pub const TRIAGE_THREADS: &str = "triage_threads";
 pub const APPLY_THREAD_TRIAGE: &str = "apply_thread_triage";
 

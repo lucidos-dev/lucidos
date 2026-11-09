@@ -71,6 +71,9 @@ export interface ThreadSummary {
   is_stopped_child?: boolean;
   /** The *read request* (ADR 0409). Absent on an engine that predates it. */
   read_requested?: boolean;
+  /** The devices that saw the requested reply, on a team gateway (ADR 0623).
+   *  Absent on an engine that predates it. */
+  reply_seen_devices?: string[];
   /** Whether an Apply Now is running (ADR 0437). Absent on an engine that
    *  predates it. */
   apply_in_flight?: boolean;

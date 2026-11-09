@@ -191,6 +191,7 @@ async fn a_watermark_never_passes_an_uncommitted_system_event() {
                 event_id: None,
                 tap: crate::scheduler::notifications::Tap::Modal,
                 actor: None,
+                audience: None,
             }))
             .await
             .unwrap()

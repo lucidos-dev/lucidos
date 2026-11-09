@@ -247,6 +247,7 @@ export type BoundaryTurn = 'waiting' | 'working' | 'done' | 'stopped';
 const REASON_PILL: Partial<Record<EngineReason['kind'], string>> = {
   missing_hardening: 'hardening needed',
   missing_plan: 'plan needed',
+  context_ceiling: 'context ceiling',
   harden_retrigger: 'hardening needed',
   merge_conflict: 'merge conflict',
   main_check_red: 'main is red',
@@ -462,16 +463,28 @@ export function FreshSessionRow({ event }: { event: Extract<ResponseEvent, { typ
   });
 }
 
+/** Where a successor session's handoff ran, one sentence or two. */
+function handoffDetail(event: Extract<ResponseEvent, { type: 'handoff_session' }>): string {
+  if (event.crossing) {
+    const { context_tokens: size, ceiling } = event.crossing;
+    const where = `Handed off at the context ceiling: ${formatTokens(size)} tokens, past this thread's ${formatTokens(ceiling)}.`;
+    return event.opening === 'brief'
+      ? `${where} The previous session did not write a handoff in its one turn, so this session started from a brief.`
+      : `${where} The previous session wrote the handoff narrative.`;
+  }
+  const at = [event.checkpoint, event.progress].filter(Boolean).join(' ');
+  return at ? `Carried on from a handoff at ${at}.` : 'Carried on from a handoff.';
+}
+
 /** The start of a *successor session*: the same card as a fresh session's,
  *  saying where the handoff ran. The opening folds under it. */
 export function HandoffSessionRow({ event }: { event: Extract<ResponseEvent, { type: 'handoff_session' }> }) {
-  const at = [event.checkpoint, event.progress].filter(Boolean).join(' ');
   return eventRowBody({
     kind: 'session',
     role: 'handoff-session',
     subject: eventNameChip({ kind: 'chip', name: 'SessionStarted', label: 'New session', sentenceStart: true }),
-    stateLabel: 'Handed off',
-    detail: at ? `Carried on from a handoff at ${at}.` : 'Carried on from a handoff.',
+    stateLabel: event.opening === 'brief' ? 'Handed off from a brief' : 'Handed off',
+    detail: handoffDetail(event),
     fold: {
       label: 'What the new session was told',
       body: <MarkdownBlock html={renderMarkdown(event.message)} />,

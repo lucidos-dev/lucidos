@@ -116,6 +116,8 @@ mod read_request_test;
 mod wake_decision_test;
 #[path = "api_support/wake_mode_test.rs"]
 mod wake_mode_test;
+#[path = "api_support/work_item_roles_test.rs"]
+mod work_item_roles_test;
 
 #[path = "api_support/agent_question_test.rs"]
 mod agent_question_test;
@@ -307,6 +309,9 @@ mod webhook_ingress_test;
 
 #[path = "api_support/webhook_refusal_test.rs"]
 mod webhook_refusal_test;
+
+#[path = "api_support/webhook_slack_test.rs"]
+mod webhook_slack_test;
 
 #[path = "api_support/app_reach_test.rs"]
 mod app_reach_test;

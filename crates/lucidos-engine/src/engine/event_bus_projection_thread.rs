@@ -502,11 +502,12 @@ impl EventBus {
                 .await?;
                 Vec::new()
             }
-            ThreadEvent::TriggerStarted { trigger_id, trigger_name, go_to_review, .. } => {
+            ThreadEvent::TriggerStarted { trigger_id, trigger_name, go_to_review, continue_key, .. } => {
                 let source = meta.channel.as_ref().map(|c| c.as_str()).unwrap_or("trigger");
+                // A continuing fire carries no key, so it keeps the thread's own.
                 sqlx::query(&format!(
-                    r#"INSERT INTO thread_summaries (thread_id, first_message, source, initiator, created_at, last_activity, message_count, status, last_revived_at, trigger_id, trigger_name, trigger_go_to_review, state)
-                       VALUES ($1, $2, $3, 'system', NOW(), NOW(), 1, {RUNNING}, NOW(), $4, $5, $6, 'active')
+                    r#"INSERT INTO thread_summaries (thread_id, first_message, source, initiator, created_at, last_activity, message_count, status, last_revived_at, trigger_id, trigger_name, trigger_go_to_review, state, continue_key)
+                       VALUES ($1, $2, $3, 'system', NOW(), NOW(), 1, {RUNNING}, NOW(), $4, $5, $6, 'active', $7)
                        ON CONFLICT (thread_id) DO UPDATE
                        SET last_activity = NOW(),
                            -- A trigger firing is autonomous agent activity.
@@ -516,7 +517,8 @@ impl EventBus {
                            last_revived_at = NOW(),
                            state = 'active',
                            trigger_id = COALESCE(thread_summaries.trigger_id, EXCLUDED.trigger_id),
-                           trigger_name = COALESCE(thread_summaries.trigger_name, EXCLUDED.trigger_name)
+                           trigger_name = COALESCE(thread_summaries.trigger_name, EXCLUDED.trigger_name),
+                           continue_key = COALESCE(EXCLUDED.continue_key, thread_summaries.continue_key)
                        -- Defense in depth (see MessageReceived above for rationale).
                        WHERE thread_summaries.state != 'discarded'"#
                 ))
@@ -526,6 +528,7 @@ impl EventBus {
                 .bind(trigger_id.as_str())
                 .bind(trigger_name.as_deref())
                 .bind(*go_to_review)
+                .bind(continue_key.as_deref())
                 .execute(&mut **tx)
                 .await?;
                 Vec::new()
@@ -774,13 +777,36 @@ impl EventBus {
             // itself projects nothing (ADR 0310).
             ThreadEvent::ThreadArchiveRequested => Vec::new(),
 
-            ThreadEvent::ThreadReadRequested | ThreadEvent::ThreadReplySeen { .. } => {
-                let requested = matches!(event, ThreadEvent::ThreadReadRequested);
-                sqlx::query("UPDATE thread_summaries SET read_requested = $2 WHERE thread_id = $1")
+            ThreadEvent::ThreadReadRequested => {
+                sqlx::query(
+                    "UPDATE thread_summaries SET read_requested = TRUE, reply_seen_devices = '{}' \
+                     WHERE thread_id = $1",
+                )
+                .bind(thread_id)
+                .execute(&mut **tx)
+                .await?;
+                Vec::new()
+            }
+            ThreadEvent::ThreadReplySeen { personal: false, .. } => {
+                sqlx::query("UPDATE thread_summaries SET read_requested = FALSE WHERE thread_id = $1")
                     .bind(thread_id)
-                    .bind(requested)
                     .execute(&mut **tx)
                     .await?;
+                Vec::new()
+            }
+            // One person saw it: the request stays for everyone else.
+            ThreadEvent::ThreadReplySeen { personal: true, .. } => {
+                if let Some(MessageOrigin::Device { device_id }) = &meta.actor {
+                    sqlx::query(
+                        "UPDATE thread_summaries \
+                         SET reply_seen_devices = array_append(reply_seen_devices, $2) \
+                         WHERE thread_id = $1 AND NOT ($2 = ANY(reply_seen_devices))",
+                    )
+                    .bind(thread_id)
+                    .bind(device_id)
+                    .execute(&mut **tx)
+                    .await?;
+                }
                 Vec::new()
             }
 
@@ -882,10 +908,13 @@ impl EventBus {
                 // `is_stopped_child` clears too. A cascade from the parent
                 // archives the parent as well, so the child owes it nothing. A
                 // direct archive settles through the marker, which stays.
-                // An archive also dismisses a read request (ADR 0409).
+                // An archive also dismisses a read request (ADR 0409), and
+                // releases the thread's continue key: the next keyed fire
+                // starts a fresh thread (ADR 0623).
                 sqlx::query(&format!(
                     "UPDATE thread_summaries SET status = {IDLE}, \
                      is_saved = FALSE, is_stopped_child = FALSE, read_requested = FALSE, \
+                     continue_key = NULL, \
                      {clear} \
                      WHERE thread_id = $1",
                     clear = *CLEAR_CODING_AGENT_FLAGS,
@@ -1849,6 +1878,13 @@ impl EventBus {
             | ThreadEvent::OAuthAuthorizationRequested { .. }
             | ThreadEvent::FormRequestResolved { .. }
             | ThreadEvent::McpConsentRequested { .. }
+            // Work item roles resolve operators at read time, so no summary
+            // column can hold them (`engine::work_item`).
+            | ThreadEvent::WorkItemDriverTaken
+            | ThreadEvent::WorkItemDriverReleased
+            | ThreadEvent::WorkItemGateEscalated { .. }
+            | ThreadEvent::WorkItemWatched
+            | ThreadEvent::WorkItemUnwatched
             // Transient events (never persisted, never reach this function)
             | ThreadEvent::CumulativeTextUpdated { .. }
             | ThreadEvent::LlmCallRetried { .. }
@@ -1882,9 +1918,15 @@ impl EventBus {
             | ThreadEvent::SuccessorOfferDeclined { .. }
             // A request is read back by the narrative spawn, never projected.
             | ThreadEvent::SuccessorRequested { .. }
+            // A ceiling is read back from the events by the turn-end gate.
+            | ThreadEvent::ContextCeilingSet { .. }
+            // A crossing is read back by the input rule and the keep-alive.
+            | ThreadEvent::ContextCeilingReached { .. }
             // A pending handoff is read back from the events by the spawn of
             // the successor session.
             | ThreadEvent::SessionHandedOff { .. }
+            // A withdrawal ends a pending handoff in the same read.
+            | ThreadEvent::SessionHandoffWithdrawn
             // User removed a queued prompt before ingestion. Pure marker:
             // the original MessageReceived remains in history, and the
             // renderer/agentic loop consult this row without changing the

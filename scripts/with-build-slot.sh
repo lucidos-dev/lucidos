@@ -21,6 +21,10 @@
 # when it never does (ADR 0351). It is GO on a host it cannot read, so a clone
 # on Linux builds unchanged. A build waiting on memory holds no slot.
 #
+# The PRUNE of stale cargo incremental dirs runs after the memory gate and
+# before the slot, once a day per build dir (scripts/lib/stale_incremental.sh).
+# It never fails or delays the build: the delete runs in the background.
+#
 # Resolution order for the broker:
 #   1. `lucidos` on PATH. The engine puts it there for every spawned session.
 #   2. The newest `lucidos` under this checkout's `.launch/`.
@@ -116,6 +120,14 @@ _resolve_broker() {
 "$SCRIPT_DIR/build-memory-gate.sh" --label "${LABEL:-$1}" || exit $?
 LUCIDOS_BUILD_MEMORY_GATE_PASSED_AT="$(date +%s)"
 export LUCIDOS_BUILD_MEMORY_GATE_PASSED_AT
+
+# A subshell tested with `||`, so nothing in the prune can stop the build.
+if [ -r "$SCRIPT_DIR/lib/stale_incremental.sh" ]; then
+    (
+        # shellcheck source=scripts/lib/stale_incremental.sh
+        source "$SCRIPT_DIR/lib/stale_incremental.sh" && prune_stale_incremental "$PROJECT_DIR"
+    ) || echo "with-build-slot.sh: the stale incremental prune failed, building anyway" >&2
+fi
 
 if ! BROKER="$(_resolve_broker)"; then
     echo "with-build-slot.sh: no \`lucidos\` that knows \`build-slot\`, running the build unrestricted" >&2

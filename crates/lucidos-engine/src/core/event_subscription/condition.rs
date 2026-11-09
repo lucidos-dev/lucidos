@@ -109,7 +109,7 @@ fn evaluate_or(branches: &Value, payload: &Value, depth: usize) -> bool {
 ///
 /// Iterative rather than recursive, because the number of segments is
 /// caller-supplied.
-fn resolve<'a>(payload: &'a Value, key: &str) -> Option<&'a Value> {
+pub fn resolve<'a>(payload: &'a Value, key: &str) -> Option<&'a Value> {
     let mut current = payload;
     let mut rest = key;
     loop {

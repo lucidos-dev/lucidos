@@ -50,4 +50,13 @@ describe('composer menu above the scroll chevron', () => {
       expect(floatOffset(lift!.props.get('z-index'))).toBeGreaterThan(chevronOffset);
     }
   });
+
+  // The follow toggle renders inside `.prompt-area`, so the lift carries it
+  // too. It steps down to the base layer, where the menu, later in the tree,
+  // paints over it.
+  it('drops the follow toggle beneath an open menu', () => {
+    const drop = cssRules(styles('chat/input-messages.css'))
+      .find(r => r.selector === `.prompt-area${LIFT} .follow-toggle`);
+    expect(drop?.props.get('z-index')).toBe('auto');
+  });
 });

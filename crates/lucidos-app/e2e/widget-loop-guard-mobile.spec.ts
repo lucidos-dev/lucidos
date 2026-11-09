@@ -176,9 +176,10 @@ test.describe('A widget cannot lock a phone out of the app', () => {
     const toast = page.locator('.toast', { hasText: 'Started on Home' });
     await expect(toast).toBeVisible();
 
-    // A toast with one action takes the tap on the whole card.
-    await expect(toast).toHaveAttribute('data-toast-tap', 'action');
-    await toast.locator('.toast-title').click();
+    // Nothing in the text says a tap opens the thread, so the card keeps a
+    // real button and a tap on the card does nothing.
+    await expect(toast).not.toHaveAttribute('data-toast-tap');
+    await toast.getByRole('button', { name: 'Open thread' }).click();
     await expect(page.locator('.chat-exchange:visible', { hasText: MESSAGE_TEXT }).first()).toBeVisible();
     // The marker names the thread, then the window that armed it (ADR 0585).
     await expect.poll(() => page.evaluate(() => localStorage.getItem('lucidos-restore-guard')?.split(' ')[0]))

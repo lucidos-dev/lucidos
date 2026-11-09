@@ -8,7 +8,7 @@ import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import type { Exchange, ReadMarker, StoredEvent, ThreadEvent, MessageOrigin, ResolvedPermission, TypedAnswer } from '../../store/thread-events';
-import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, drawsInitiatorPanel, isResumeTurn, exchangeUserMessage, isUserBubbleEvent, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, messageReadTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, drawnResponseEvents, exchangeStatus, exchangeError, exchangeStarterId, dividerBodyIsSuppressed, opensAwaitingAnswer, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, turnBodyFolded, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isTurnlessBoundary, isUnsentExchange, agentMessageSender, waitReentryReason, RESPONSE_CANCELED_SUMMARY, triggerRunInterruption } from '../../store/thread-events';
+import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, drawsInitiatorPanel, isResumeTurn, exchangeUserMessage, isUserBubbleEvent, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, messageReadTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, drawnResponseEvents, exchangeStatus, exchangeError, exchangeChangeId, exchangeStarterId, dividerBodyIsSuppressed, opensAwaitingAnswer, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, turnBodyFolded, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isTurnlessBoundary, isUnsentExchange, agentMessageSender, waitReentryReason, RESPONSE_CANCELED_SUMMARY, triggerRunInterruption } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, expandExchange, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { discardUnsentMessage, editQueuedMessage, removeQueuedMessage, retryUnsentMessage } from '../../store/actions/chat';
@@ -44,23 +44,6 @@ import { engineReasonHeadline } from '../../utils/engineEventExplainers';
 // artifacts or apps are not loaded.
 const NO_ARTIFACTS: string[] = [];
 const NO_APPS: App[] = [];
-
-/** The change_id this exchange pertains to, used to stamp `data-change-id` so
- *  the Changes panel can deep-link a row to its originating turn. The aggregate
- *  `ChangeProposed` rides this turn as a (non-rendered) step — read it from
- *  there; lifecycle panels (ChangeApplied/Discarded/Reverted/Failed) carry the
- *  id on the userEvent. Per-commit ChangeProposed emits carry an empty
- *  change_id, so the truthiness check skips them. */
-function exchangeChangeId(exchange: Exchange, isChangePanel: boolean, threadIsCC: boolean): string | undefined {
-  if (isChangePanel) return (exchange.userEvent as { change_id?: string }).change_id;
-  // ChangeProposed only ever rides a coding-agent turn — skip the step scan on
-  // chat exchanges entirely.
-  if (!threadIsCC) return undefined;
-  for (const { event } of exchange.steps) {
-    if (event.type === 'ChangeProposed' && event.change_id) return event.change_id;
-  }
-  return undefined;
-}
 
 interface Props {
   exchange: Exchange;
@@ -468,7 +451,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
     && (!!initiator.summary || !!initiator.details);
   const isInitiatorCollapsed = canCollapseInitiator
     && collapsedInitiators.value.has(`${threadId}:${exchange.userSeq}`);
-  const changeId = exchangeChangeId(exchange, isChangePanel, threadIsCC);
+  const changeId = exchangeChangeId(exchange, threadIsCC);
   // A queued follow-up shows a "Queued" tag in its own bubble header, where
   // dividers show "Answered". A faux "Lucidos Agent" response panel below it
   // would misattribute it: the message is the user's, and a stack of them

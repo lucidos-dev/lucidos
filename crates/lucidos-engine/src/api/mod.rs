@@ -36,6 +36,7 @@ mod snapshots;
 pub(crate) use history::{ROUTE_FRAMES, SSE_KEEPALIVE_EVENT, SSE_KEEPALIVE_INTERVAL};
 #[cfg(test)]
 pub(crate) use snapshots::assert_restore_slot_busy;
+mod config_changes;
 mod images;
 pub(crate) mod internal;
 mod knowhow;
@@ -48,6 +49,7 @@ mod model_prices;
 pub(crate) mod mutating_gate;
 mod notifications;
 mod onepassword;
+mod operators;
 mod recall;
 mod restore_generation;
 #[cfg(test)]
@@ -104,6 +106,7 @@ mod voice;
 pub(crate) mod voice_ticket;
 mod webhooks;
 mod widgets;
+mod work_items;
 mod workspace_label;
 mod workspace_prompt_footprint;
 mod ws_echo;
@@ -1635,6 +1638,9 @@ pub fn create_router(
         .merge(plugins::router())
         .merge(plugin_media::router())
         .merge(webhooks::router())
+        .merge(work_items::router())
+        .merge(config_changes::router())
+        .merge(operators::router())
         .merge(workspace_label::router())
         .merge(workspace_prompt_footprint::router())
         .merge(handshake_scripts::router())

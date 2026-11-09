@@ -167,6 +167,11 @@ export function NotificationDetailInline() {
             Undo restore
           </button>
         )}
+        {detail.tap?.kind === 'undo-config-change' && (
+          <button class="action-btn" onClick={() => dispatchDeepLink(parseDeepLinkFromInboxRow(detail))}>
+            Undo
+          </button>
+        )}
         {actions.navTap && (
           <button class="action-btn" onClick={handleNavigateTap}>
             {navigateTapLabel(actions.navTap)}

@@ -10,6 +10,7 @@ export type DeepLinkAction =
    *  with the navigation. */
   | { type: 'navigate'; to: NavigateUi; notification: string | null }
   | { type: 'restore-snapshot'; tap: Extract<Tap, { kind: 'restore-snapshot' }>; notification: string | null }
+  | { type: 'undo-config-change'; tap: Extract<Tap, { kind: 'undo-config-change' }>; notification: string | null }
   | { type: 'view-notification'; id: string }
   | { type: 'noop' };
 
@@ -47,9 +48,12 @@ export function resolveDeepLink(target: DeepLinkTarget): DeepLinkAction {
   if (tap.kind === 'navigate') {
     return { type: 'navigate', to: tap.to, notification: target.notification ?? null };
   }
-  const restoreTap = validateTap(tap);
-  if (restoreTap?.kind === 'restore-snapshot') {
-    return { type: 'restore-snapshot', tap: restoreTap, notification: target.notification ?? null };
+  const validTap = validateTap(tap);
+  if (validTap?.kind === 'restore-snapshot') {
+    return { type: 'restore-snapshot', tap: validTap, notification: target.notification ?? null };
+  }
+  if (validTap?.kind === 'undo-config-change') {
+    return { type: 'undo-config-change', tap: validTap, notification: target.notification ?? null };
   }
   if (target.notification) return { type: 'view-notification', id: target.notification };
   return { type: 'noop' };
@@ -113,6 +117,8 @@ export function hasDeepLinkParams(target: DeepLinkTarget): boolean {
  *  channel carries the structured object natively (no JSON round-trip), but
  *  we still type-guard at the boundary so a malformed payload (e.g. an old
  *  SW version sending a bare string) doesn't crash the dispatcher. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function validateTap(raw: unknown): Tap | null {
   if (!raw || typeof raw !== 'object') return null;
   const obj = raw as Record<string, unknown>;
@@ -121,6 +127,9 @@ function validateTap(raw: unknown): Tap | null {
       if (typeof obj.workspace_id !== 'string' || !isWorkspaceSlug(obj.workspace_id)
         || typeof obj.handle !== 'string' || !/^snap_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(obj.handle)) return null;
       return { kind: 'restore-snapshot', workspace_id: obj.workspace_id, handle: obj.handle };
+    case 'undo-config-change':
+      if (typeof obj.event_id !== 'string' || !UUID_RE.test(obj.event_id)) return null;
+      return { kind: 'undo-config-change', event_id: obj.event_id };
     case 'modal':
       return { kind: 'modal' };
     // The retired `none` kind is intentionally NOT accepted — a `{kind:'none'}`

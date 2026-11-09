@@ -77,6 +77,7 @@ fn presence_check_serializes_with_type_tag() {
         tap: Tap::Modal,
         deadline_ms: 250,
         sent_at_ms: 1_700_000_000_000,
+        audience: Some(vec!["my-iphone".to_string()]),
         actor: None,
     };
     let json = serde_json::to_value(&e).unwrap();
@@ -93,6 +94,7 @@ fn presence_check_serializes_with_type_tag() {
     assert!(json["data"].get("event_id").is_none());
     assert!(json["data"].get("app_id").is_none());
     assert!(json["data"].get("actor").is_none());
+    assert_eq!(json["data"]["audience"], serde_json::json!(["my-iphone"]));
 }
 
 #[test]
@@ -108,6 +110,7 @@ fn presence_check_is_transient_not_persisted() {
         tap: Tap::Modal,
         deadline_ms: 250,
         sent_at_ms: 0,
+        audience: None,
         actor: None,
     };
     assert!(!e.is_persisted());
@@ -132,6 +135,7 @@ fn native_push_requested_serializes_with_type_tag() {
         app_id: None,
         tap: Tap::Modal,
         sent_at_ms: 1_700_000_000_000,
+        audience: None,
     };
     let json = serde_json::to_value(&e).unwrap();
     assert_eq!(json["type"], "NativePushRequested");
@@ -143,6 +147,8 @@ fn native_push_requested_serializes_with_type_tag() {
     assert_eq!(json["data"]["tap"], serde_json::json!({"kind": "modal"}));
     assert!(json["data"].get("event_id").is_none());
     assert!(json["data"].get("app_id").is_none());
+    // No audience means every device, so the field stays off the wire.
+    assert!(json["data"].get("audience").is_none());
 }
 
 #[test]
@@ -158,6 +164,7 @@ fn native_push_requested_is_transient_on_notification_aggregate() {
         app_id: None,
         tap: Tap::Modal,
         sent_at_ms: 0,
+        audience: None,
     };
     assert!(!e.is_persisted());
     assert_eq!(e.aggregate(), "notification");
@@ -370,6 +377,7 @@ fn native_push_dismiss_requested_is_transient_on_notification_aggregate() {
     let one = SystemEvent::NativePushDismissRequested {
         notification_id: Some(Uuid::nil()),
         sent_at_ms: 0,
+        audience: Some(vec!["sam-phone".into()]),
     };
     assert!(!one.is_persisted());
     assert_eq!(one.aggregate(), "notification");
@@ -379,6 +387,7 @@ fn native_push_dismiss_requested_is_transient_on_notification_aggregate() {
     let all = SystemEvent::NativePushDismissRequested {
         notification_id: None,
         sent_at_ms: 0,
+        audience: None,
     };
     assert!(!all.is_persisted());
     // `None` (dismiss-all) keys on the sentinel "all" rather than a single id.
@@ -388,8 +397,13 @@ fn native_push_dismiss_requested_is_transient_on_notification_aggregate() {
     let json_all = serde_json::to_value(&all).unwrap();
     assert_eq!(json_all["type"], "NativePushDismissRequested");
     assert!(json_all["data"].get("notification_id").is_none());
+    assert!(json_all["data"].get("audience").is_none());
     let json_one = serde_json::to_value(&one).unwrap();
     assert_eq!(json_one["data"]["notification_id"], Uuid::nil().to_string());
+    assert_eq!(
+        json_one["data"]["audience"],
+        serde_json::json!(["sam-phone"])
+    );
 }
 
 /// `PERSISTED_TYPE_NAMES` is the one list behind both `is_persisted` and

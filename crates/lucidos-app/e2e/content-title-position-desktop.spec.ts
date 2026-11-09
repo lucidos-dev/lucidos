@@ -38,8 +38,8 @@
  * regression at a ui-scale this viewport never renders would show up.
  */
 import { test, expect, type Page } from './fixtures';
-import { createIframeAppFixture } from './db-helpers';
-import { assertHealthy, gotoWithRetry, clickVisibleElement, hideDashboardRail } from './helpers';
+import { createIframeAppFixture, ensureHomeThread } from './db-helpers';
+import { assertHealthy, gotoWithRetry, clickVisibleElement, hideDashboardRail, watchPreferenceReads, openSettingsView } from './helpers';
 
 const APP_ID = 'e2e-desktop-title-position';
 const APP_NAME = 'Half Marathon';
@@ -95,16 +95,20 @@ async function measure(page: Page): Promise<HeaderMetrics | null> {
     if (b.width === 0 || a.width === 0) return null;
     // The clamp's floor, resolved by the browser rather than restated as a
     // number here: it is a rem token, so a literal would be right at exactly
-    // one ui-scale. Probed on a detached-from-flow div appended to <body>, the
-    // token being declared on :root, so nothing in the header is disturbed.
+    // one ui-scale. The hidden probe inherits the row's local reserve,
+    // including compact geometry and control insets.
     const resolve = (token: string) => {
       const probe = document.createElement('div');
       probe.style.cssText = `position:absolute;visibility:hidden;width:var(${token})`;
-      document.body.appendChild(probe);
+      row.appendChild(probe);
       const px = probe.getBoundingClientRect().width;
       probe.remove();
       return px;
     };
+    const compact = actions.hasAttribute('data-compact');
+    const more = actions.querySelector<HTMLElement>('.content-header-more');
+    const visibleRefresh = refresh && refresh.getBoundingClientRect().width > 0 ? refresh : null;
+    const leading = compact ? (more ?? nav) : (visibleRefresh ?? nav);
     const minSpan = resolve('--desktop-nav-min-span');
     const sideReserve = resolve('--content-side-reserve');
     return {
@@ -115,8 +119,8 @@ async function measure(page: Page): Promise<HeaderMetrics | null> {
       boxWidth: b.width,
       rowCentre: r.left + r.width / 2,
       rowWidth: r.width,
-      navRight: (refresh ?? nav).getBoundingClientRect().right,
-      hasRefresh: refresh !== null,
+      navRight: leading.getBoundingClientRect().right,
+      hasRefresh: visibleRefresh !== null,
       actionsLeft: a.left,
       minSpan,
       sideReserve,
@@ -125,7 +129,7 @@ async function measure(page: Page): Promise<HeaderMetrics | null> {
       unfoldedReserve: resolve('--content-unfolded-reserve'),
       titleText: (box.querySelector('.pane-header-title-text')?.textContent ?? '').trim(),
       hasOverflow: actions.querySelectorAll('.content-header-more').length > 0,
-      trailingIcons: actions.querySelectorAll('.icon-btn.header-icon').length,
+      trailingIcons: actions.querySelectorAll('.icon-btn.header-icon').length - (compact && more ? 1 : 0),
     };
   });
 }
@@ -182,7 +186,69 @@ test.describe('the desktop content title holds its position across views', () =>
 
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
+    // The rail toggle shows once the thread list carries Home, and a spec
+    // before this one may have truncated the threads, home included.
+    ensureHomeThread();
     await hideDashboardRail(page);
+  });
+
+  test('reported 1920 by 1080 at 175% keeps real destinations whole', async ({ page }) => {
+    await page.setViewportSize({ width: 1920, height: 1080 });
+    await page.addInitScript((id) => {
+      localStorage.setItem('app-window-open', id);
+      localStorage.setItem('lucidos-thread-drawer-open', 'true');
+      localStorage.setItem('lucidos-split-ratio', '0.6');
+    }, APP_ID);
+    const preferencesReady = watchPreferenceReads(page);
+    const scale = async () => {
+      await preferencesReady();
+      await page.evaluate(() => document.documentElement.style.setProperty('--user-ui-scale', '175%'));
+    };
+    await gotoWithRetry(page, '/');
+    await scale();
+    await expect(page.locator('.dashboard-rail-toggle')).toBeVisible();
+    for (const shown of [false, true]) {
+      if (shown) await page.locator('.dashboard-rail-toggle').click();
+      for (const destination of ['Apps', 'Memory', APP_NAME]) {
+        if (destination === 'Memory') {
+          await openSettingsView(page, 'memory');
+        } else {
+          await clickVisibleElement(page, '.hamburger-panel');
+          await expect.poll(() => clickVisibleElement(page, '.drawer-item', 'Apps')).toBe(true);
+          if (destination === APP_NAME) {
+            await page.locator('.apps-view .app-row', { hasText: APP_NAME })
+              .filter({ hasNotText: APP_NAME_LONG }).locator('.app-row-description').click();
+            await expect(page.locator('iframe[data-role="app-ui-frame"]:visible')).toBeVisible();
+          }
+        }
+        await expect.poll(() => page.evaluate(() =>
+          document.documentElement.hasAttribute('data-dashboard-rail'))).toBe(shown);
+        await expect(page.locator('.pane-content')).toBeVisible();
+        const header = await settled(page);
+        if (!shown) {
+          expect(header.backX, 'back clears leading overflow').toBeGreaterThanOrEqual(header.navRight - 0.6);
+          expect(header.boxRight, 'forward clears trailing controls').toBeLessThanOrEqual(header.actionsLeft + 0.6);
+          await page.locator('.desktop-header .content-header-more').click();
+          await expect(page.getByRole('menuitem', { name: 'Refresh', exact: true })).toBeVisible();
+          await page.keyboard.press('Escape');
+        }
+        const title = page.locator('.desktop-header .pane-header-title-text');
+        await expect(title).toBeVisible();
+        await expect(title).toHaveText(destination);
+        const metrics = await title.evaluate((el) => {
+          const r = el.getBoundingClientRect();
+          const pane = document.querySelector('.pane-content')!.getBoundingClientRect();
+          const range = document.createRange();
+          range.selectNodeContents(el);
+          return { available: el.clientWidth, natural: el.scrollWidth,
+            textWidth: range.getBoundingClientRect().width,
+            offset: r.x + r.width / 2 - pane.x - pane.width / 2 };
+        });
+        console.log(JSON.stringify({ destination, shown, ...metrics, header }));
+        expect.soft(metrics.natural, `${destination}, rail ${shown}`).toBeLessThanOrEqual(metrics.available + 1);
+        expect.soft(Math.abs(metrics.offset), `${destination} pane centering`).toBeLessThan(1.5);
+      }
+    }
   });
 
   test('the chevrons land on the same x for a short and a long title', async ({ page }) => {
@@ -312,22 +378,12 @@ test.describe('the desktop content title holds its position across views', () =>
     );
     expect(paneWidth, 'the seeded ratio did not narrow the Canvas pane').toBeLessThan(400);
     expect(paneWidth, 'the seeded ratio went under the Canvas pane floor').toBeGreaterThan(360);
-    // Which arm the box rests on depends on the dashboard rail's toggle. Docked, it
-    // widens the reserve by a box, and `2 * --content-side-reserve +
-    // --desktop-nav-min-span` outgrows MIN_CONTENT_PANE_REM. The box then
-    // rests on its min-span arm here, and the actions fold into ⋯ to clear it.
-    // Undocked, the reserve arm holds down to the floor
-    // (store/__tests__/conversation-pane-floor.test.ts). Either way the box is
-    // the clamp's answer, and the clearance below is what must hold.
-    const clampArm = Math.max(narrow.minSpan, narrow.rowWidth - 2 * narrow.sideReserve);
-    expect(
-      narrow.boxWidth,
-      `the box is ${narrow.boxWidth.toFixed(1)} wide, not the clamp's ${clampArm.toFixed(1)}`,
-    ).toBeCloseTo(clampArm, 0);
-    // Near the floor the three actions no longer fit, so at least two fold
-    // into ⋯. The cluster is then three boxes at most.
-    expect(narrow.trailingIcons, 'the narrow app view outgrew the reserve').toBeLessThanOrEqual(3);
-    expect(narrow.hasRefresh, 'Refresh still leads the narrow row').toBe(true);
+    // Compact panes fold every optional action into the leading overflow.
+    const compactWidth = Math.min(narrow.span, Math.max(0, narrow.rowWidth - 2 * narrow.sideReserve));
+    expect(narrow.boxWidth, 'compact span clears symmetric control reserves').toBeCloseTo(compactWidth, 0);
+    expect(narrow.trailingIcons, 'only the bell remains trailing').toBe(1);
+    expect(narrow.hasOverflow, 'optional actions remain accessible').toBe(true);
+    expect(narrow.hasRefresh, 'Refresh folds into the leading menu').toBe(false);
     expectCentredAndClear(narrow, 'canvas pane near its floor');
   });
 

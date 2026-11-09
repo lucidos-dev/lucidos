@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 import type { PresenceCheckPayload } from './presence-pong';
+import { DEVICE_ID_KEY } from '../../utils/deviceIdKey';
 
 // The order of calls across the two collaborators is the contract: the page
 // acts first, then answers. One log records both.
@@ -68,5 +69,20 @@ describe('handlePresenceCheck', () => {
     expect(outcome).toBeNull();
     expect(presentMock).not.toHaveBeenCalled();
     expect(submitPongMock).not.toHaveBeenCalled();
+  });
+
+  // A work item's push names its driver's and watchers' devices (ADR 0623).
+  test('outside the audience it shows nothing and answers not_shown at once', () => {
+    localStorage.setItem(DEVICE_ID_KEY, 'dev-test');
+    const outcome = handlePresenceCheck(check({ audience: ['someone-else'] }));
+    expect(outcome).toBe('not_shown');
+    expect(presentMock).not.toHaveBeenCalled();
+    expect(submitPongMock).toHaveBeenCalledWith('n-1', { device_id: 'dev-test', outcome: 'not_shown' });
+  });
+
+  test('inside the audience it acts as on any check', () => {
+    localStorage.setItem(DEVICE_ID_KEY, 'dev-test');
+    handlePresenceCheck(check({ audience: ['dev-test', 'someone-else'] }));
+    expect(calls).toEqual(['present', 'pong']);
   });
 });

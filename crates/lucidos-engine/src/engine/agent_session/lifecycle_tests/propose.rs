@@ -77,7 +77,7 @@ fn terminate_decision_handed_off_leaves_queued_follow_ups_to_the_successor() {
 fn a_handed_off_session_forwards_no_more_input() {
     const RUN_SRC: &str = include_str!("../run_session/run.rs");
     let arm = RUN_SRC
-        .find("msg_rx.recv(), if !handed_off =>")
+        .find("msg_rx.recv(), if !handed_off &&")
         .expect("the input arm must be off once the session handed off");
     let body = &RUN_SRC[arm..];
     let forward = body

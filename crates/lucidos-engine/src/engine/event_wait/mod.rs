@@ -52,7 +52,7 @@ pub(crate) use register::{MAX_RECENT_SUBSCRIPTIONS, RECENT_SUBSCRIPTION_WINDOW_S
 pub(crate) use remembered_requests::RememberedRequests;
 pub(crate) use wait_durations::WaitDurationsCache;
 
-use crate::engine::thread_events::not_a_keep_alive_idle_sql;
+use crate::engine::thread_events::not_an_engine_turn_idle_sql;
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
@@ -440,7 +440,7 @@ pub async fn catch_up_from_watermark(
             "SELECT id, event_type, payload, thread_id, sequence FROM events \
              WHERE sequence > $1 AND event_type = ANY($2) AND {} \
              ORDER BY sequence LIMIT $3",
-            not_a_keep_alive_idle_sql("")
+            not_an_engine_turn_idle_sql("")
         ))
         .bind(after)
         .bind(&types)
@@ -565,7 +565,7 @@ pub async fn arming_lookback_matches(
                AND created >= now() - make_interval(secs => $2) \
                AND event_type = ANY($3) AND {} \
              ORDER BY sequence DESC LIMIT $4",
-            not_a_keep_alive_idle_sql("")
+            not_an_engine_turn_idle_sql("")
         ))
         .bind(upper)
         .bind(window_secs)

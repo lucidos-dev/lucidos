@@ -117,7 +117,10 @@ async fn a_suppressed_event_drops_the_whole_atomic_emit() {
 
     // No read was requested, so Validate drops this sighting.
     let stale_sighting = (
-        ThreadEvent::ThreadReplySeen { seen_version: 999 },
+        ThreadEvent::ThreadReplySeen {
+            seen_version: 999,
+            personal: false,
+        },
         EventMeta::NONE,
     );
     let outcome = bus

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'preact/hooks';
+import { useState, useEffect, useLayoutEffect, useRef } from 'preact/hooks';
 import { NotificationsBell } from '../notifications/NotificationsBell';
 import { lucidos } from '@lucidos/sdk';
 import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, filePreviewWrap, diffWholeFile, diffWholeFileEffective, diffSideBySide, filePreviewEditing, appPseudoFullscreen, parseRepoPath, appSearchOpen, repositories, workspacePath, type PanelOverlay } from '../../store/store';
@@ -12,6 +12,7 @@ import { getAppFrameSrc, exitPseudoFullscreen, toggleAppSearch, popOutApp, toggl
 import { findAvailable, findSurface, toggleFind } from '../../store/actions/find-bar';
 import { panelRefreshAvailable, runPanelRefresh } from '../../store/panelRefresh';
 import { DIFF_REFRESH_PINNED, panelRefreshLive } from './RefreshIndicator';
+import { getRemPx } from '../../utils/dom';
 import { nativeFullscreenElement } from '../../store/appFullscreenHost';
 import { CloseIcon, ReloadIcon, SearchIcon, PopOutIcon, FullscreenIcon, ExitFullscreenIcon, CodeIcon, EyeIcon, EditIcon, FileIcon, DiffIcon, SideBySideColumnsIcon, WrapTextIcon, CopyIcon } from '../shared/icons';
 import { RENDERABLE_EXTS, REPO_RENDERABLE_EXTS, isEditableDataFile } from '../files/previewExts';
@@ -157,8 +158,8 @@ export function filePreviewCopyPathAction(encoded: string): HeaderActionSpec | n
  *  A phone refreshes by pulling. So Refresh shows only where it predates the
  *  pull (an app, a file preview). Its spinner is not an action at all, see
  *  `MobileRefreshIndicator`. A diff draws a disabled Refresh instead, and
- *  claiming both would throw on the duplicate key. Desktop leads the row with
- *  `ContentRefreshButton` and carries no Refresh here. */
+ *  claiming both would throw on the duplicate key. Wide desktop panes lead with
+ *  `ContentRefreshButton`; narrow desktop panes fold Refresh into their menu. */
 export function mobileRefreshActionShown(overlay: PanelOverlay, available: boolean): boolean {
   const predatesPull = overlay?.type === 'app-ui' || overlay?.type === 'file-preview';
   return predatesPull && panelRefreshLive(overlay, available);
@@ -325,6 +326,26 @@ interface Props {
 
 /** Shared action buttons for the content side of the header (used by both mobile and desktop). */
 export function ContentHeaderActions({ layout }: Props) {
+  const hostRef = useRef<HTMLDivElement>(null);
+  const [compact, setCompact] = useState(false);
+  useLayoutEffect(() => {
+    const row = hostRef.current?.closest<HTMLElement>('.content-header-elements');
+    if (layout !== 'desktop' || !row) return;
+    // Read the layout breakpoint independently of destination and collapse.
+    const measure = () => {
+      const rem = parseFloat(getComputedStyle(row).getPropertyValue('--content-compact-breakpoint'));
+      setCompact(row.clientWidth <= rem * getRemPx());
+      const host = hostRef.current;
+      if (host) host.style.setProperty('--content-actions-offset', `${host.offsetLeft}px`);
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(row);
+    if (hostRef.current) observer.observe(hostRef.current);
+    const title = row.querySelector('.pane-header-content-title');
+    if (title) observer.observe(title);
+    measure();
+    return () => observer.disconnect();
+  }, [layout]);
   // Track native fullscreen state. `nativeFullscreenElement` is the one reader
   // of both spellings (store/appFullscreenHost.ts), shared with the overlay
   // layer so the header and the layer can never disagree about what is
@@ -371,7 +392,8 @@ export function ContentHeaderActions({ layout }: Props) {
   // The open panel's refresh (the panel refresh contract), first so it folds
   // first. A phone spins the leading slot instead, which no action can fold.
   const mobile = layout === 'mobile';
-  if (mobile && mobileRefreshActionShown(overlay, panelRefreshAvailable.value)) {
+  if ((mobile && mobileRefreshActionShown(overlay, panelRefreshAvailable.value))
+      || (compact && panelRefreshLive(overlay, panelRefreshAvailable.value))) {
     addAction(reloadSpec('refresh', () => void runPanelRefresh()));
   }
 
@@ -400,7 +422,7 @@ export function ContentHeaderActions({ layout }: Props) {
       onClick: closeUrl,
     });
   } else if (overlay?.type === 'file-preview') {
-    for (const a of filePreviewContentActions(overlay.path, mobile)) addAction(a);
+    for (const a of filePreviewContentActions(overlay.path, mobile || compact)) addAction(a);
   } else if (!overlay && activeMenuItem.value === 'files') {
     addAction({
       key: 'search',
@@ -421,42 +443,14 @@ export function ContentHeaderActions({ layout }: Props) {
     });
   }
 
-  // ── Collapse ──
-  // Desktop collapses PROGRESSIVELY: as the pane narrows the leading context
-  // actions (nearest the title) move into a ⋯ overflow menu, two first and then
-  // one more per step, until only ⋯ + the bell remain.
-  //
-  // What it is giving way TO changed on 2026-08-13, even though the steps did
-  // not. The title used to be the flex middle of the row, so folding an icon
-  // handed it that width; it is a box centred on the row now, clearing a
-  // constant reserve at each end (--content-side-reserve in panels/shell.css),
-  // so folding frees the cluster's own room and nothing else. Which means the
-  // fold only has to fire where that reserve stops holding: the clamp's
-  // min-span arm, a Canvas pane at or near its floor, where the box's ends do
-  // reach the clusters. Above it the reserve is sized for the widest cluster
-  // this row can carry and the measurement finds everything fits.
-  //
-  // Mobile collapses EVERYTHING, at every width, bar the exception below. The
-  // trailing cluster is therefore ⋯ + the bell, or the bell alone for a view
-  // with no context actions. It predates the desktop row being centred and
-  // answers the same
-  // question differently. A phone's row cannot afford a reserve wide enough for
-  // a cluster that grows with the action count. So it bounds the cluster
-  // instead, which pins the chevrons to a fixed span agreeing with the thread
-  // pane's.
-  //
-  // One exception, and it agrees with the desktop rule rather than departing
-  // from it: a view carrying exactly ONE action keeps that action's own icon.
-  // The ⋯ trigger would stand in the same box, so the cluster is two boxes
-  // either way and the menu buys only a tap. See `mobileCollapseCount`.
-  const hostRef = useRef<HTMLDivElement>(null);
-  // Room alone decides: every action rides while it fits, then the two
-  // nearest the title fold first and one more follows per step.
-  const collapsedCount = useHeaderActionCollapse(hostRef, actions.length, layout, COLLAPSE_TARGETS);
+  // Wide desktop panes fold progressively at the trailing edge. Narrow ones
+  // fold all optional actions into the leading slot, including Refresh.
+  // Mobile retains its lone-action exception and trailing overflow.
+  const collapsedCount = useHeaderActionCollapse(hostRef, actions.length, compact ? 'mobile' : layout, COLLAPSE_TARGETS);
 
   return (
-    <div class="content-header-actions" ref={hostRef}>
-      <CollapsingActions actions={actions} collapsed={collapsedCount} moreClass="content-header-more">
+    <div class="content-header-actions" data-compact={compact || undefined} ref={hostRef}>
+      <CollapsingActions actions={actions} collapsed={compact ? actions.length : collapsedCount} moreClass="content-header-more">
         <NotificationsBell />
       </CollapsingActions>
     </div>

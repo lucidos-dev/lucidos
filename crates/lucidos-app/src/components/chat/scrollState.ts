@@ -11,6 +11,7 @@ import { isImageRetryPending } from '../../utils/markdownImageRetry';
 import { applyNavFocus, clearNavFocus, navFocusElement } from '../shared/focusMarker';
 import { isElementVisible, unmeasurableBox } from '../../utils/elementVisibility';
 import { EVENT_RESOLVE_DEADLINE_MS } from './deepLinkBudget';
+import type { DeepLinkTarget } from '../../store/thread-events/exchange-anchors';
 
 /** Shared scroll-position signals for the chat area.
  *
@@ -32,14 +33,13 @@ import { EVENT_RESOLVE_DEADLINE_MS } from './deepLinkBudget';
  *  reconciled on every scroll AND every resize. */
 export const awayFromBottom = signal(false);
 export const notAtTop = signal(false);
-/** True while a notification deep-link is resolving a scroll to a specific event
- *  or change. The thread render is WINDOWED (only a tail of exchanges is in the
- *  DOM), so a deep-link target above the window would never render for
- *  scrollToSelectorAndPulse to find. ThreadView reads this and renders ALL
- *  exchanges while it's true (and keeps them rendered afterwards, so the user
- *  isn't snapped when it clears). A signal (not the plain `_pendingEventScrollClaim`
- *  var) so the render subscribes. */
-export const deepLinkRenderAll = signal(false);
+/** What a deep link is resolving to, an event or a change, or null with no link
+ *  in flight. The thread render is WINDOWED, so a target above the window would
+ *  never render for `scrollToSelectorAndPulse` to find. ThreadView reads this
+ *  and draws from the turn holding the target. It keeps that edge once this
+ *  clears, so the reader is not snapped. A signal (not the plain
+ *  `_pendingEventScrollClaim` var) so the render subscribes. */
+export const deepLinkTarget = signal<DeepLinkTarget | null>(null);
 /** True once the transcript is scrolled even slightly from the very top (2px
  *  subpixel slack). Drives the title row's band on both layouts, and the mobile
  *  fade under it, so both ease in as content slides under the title.
@@ -2647,7 +2647,7 @@ function reportRideLandedShort(short: number, edge: number, view: number): void 
  *    between the captured `start` and the LIVE target. A target that grows
  *    mid-tween is therefore tracked, and the curve still lands cleanly at t=1.
  *    A target read that ended this tween ends its step too (`_endedTweens`).
- *  - `start` is captured on the FIRST frame, after the render-all
+ *  - `start` is captured on the FIRST frame, after the window growth's
  *    scroll-anchoring shift has settled. Thereafter the position is a pure
  *    function of elapsed time and `scrollTop` is never READ again, only written.
  *    An anchor write shifts `start` by its own delta (`_shiftTweenStart`), and
@@ -2744,7 +2744,7 @@ function landingTargetOf(el: HTMLElement): (c: HTMLElement) => number {
  *  It runs on the shared `animateScroll`, so the deep link and the chevrons
  *  scroll identically (ADR 0065). The target is recomputed each frame. An
  *  element still growing as markdown or images render is therefore tracked, and
- *  so is the whole transcript re-anchoring after a render-all. Reduced motion
+ *  so is the whole transcript re-anchoring after the window grows. Reduced motion
  *  jumps instantly. */
 function smoothScrollToElement(el: HTMLElement, onDone?: () => void): void {
   const targetOf = landingTargetOf(el);
@@ -2765,7 +2765,7 @@ function smoothScrollToElement(el: HTMLElement, onDone?: () => void): void {
  *     bottom, so the signal is set here rather than on the first scroll event.
  *     That keeps the down chevron on from the first frame of the glide.
  *  2. **Reduced motion** jumps, with one rAF re-assert to defeat an iOS no-op or
- *     a late render-all ResizeObserver settle.
+ *     a late ResizeObserver settle after the window grows.
  *
  *  A manual top jump also supersedes any in-flight deep-link claim. The link
  *  owns the viewport until it settles, and this is the user saying otherwise. */
@@ -3069,8 +3069,12 @@ function pinHeaderForScroll(): void {
  *  watches it as well as the DOM tree, see the observer below.
  *
  *  `selector` is asked on every look, because an event link's target can change
- *  once the thread's events arrive (see `EventDeepLinkOptions.anchorFor`). */
+ *  once the thread's events arrive (see `EventDeepLinkOptions.anchorFor`).
+ *
+ *  `linkTarget` names what `selector` looks for in thread terms, so ThreadView can
+ *  find its turn before it is drawn (`deepLinkTarget`). */
 function scrollToSelectorAndPulse(
+  linkTarget: DeepLinkTarget,
   selector: () => string,
   addressedBy: string,
   preferLast = false,
@@ -3117,11 +3121,10 @@ function scrollToSelectorAndPulse(
   // `onDeepLinkClaimed`). Notified AFTER the slot is set, so a listener asking
   // `hasPendingEventScroll` sees this claim rather than the state before it.
   for (const listener of _deepLinkClaimListeners) listener();
-  // Force ThreadView to render the FULL exchange list, so a windowed-out target
-  // can render for `tryResolve` and the MutationObserver to find. It stays true
-  // until the claim releases. ThreadView keeps the thread fully rendered
-  // afterwards, so the reader is not snapped back to the windowed tail mid-read.
-  deepLinkRenderAll.value = true;
+  // ThreadView draws from the turn holding the target, so a windowed-out target
+  // can render for `tryResolve` and the MutationObserver to find. It stands
+  // until the claim releases, and ThreadView keeps that edge afterwards.
+  deepLinkTarget.value = linkTarget;
   // An earlier arrival's hold would pull the reader back to ITS target.
   _arrivalHold = null;
 
@@ -3135,7 +3138,7 @@ function scrollToSelectorAndPulse(
       _pendingEventScrollClaim = null;
       _pendingEventScrollResolved = false;
       _pendingEventScrollLandedOffEdge = false;
-      deepLinkRenderAll.value = false;
+      deepLinkTarget.value = null;
     }
   };
 
@@ -3552,6 +3555,7 @@ export function scrollToEventAndPulse(eventId: string, opts?: EventDeepLinkOptio
   if (!eventId) return;
   const anchor = () => opts?.anchorFor?.() ?? eventId;
   scrollToSelectorAndPulse(
+    { kind: 'event', eventId },
     () => `[data-event-id="${CSS.escape(anchor())}"]`,
     'data-event-id',
     false,
@@ -3589,6 +3593,7 @@ export function scrollToChangeAndPulse(changeId: string, opts?: DeepLinkOptions)
   if (!changeId) return;
   const selector = `[data-change-id="${CSS.escape(changeId)}"]`;
   scrollToSelectorAndPulse(
+    { kind: 'change', changeId },
     () => selector,
     'data-change-id',
     true,
@@ -3608,7 +3613,7 @@ export function clearPendingEventScroll(): void {
   _pendingEventScrollClaim = null;
   _pendingEventScrollResolved = false;
   _pendingEventScrollLandedOffEdge = false;
-  deepLinkRenderAll.value = false;
+  deepLinkTarget.value = null;
   // A plain focus or explicit scroll is deliberate engagement elsewhere, so drop
   // any persistent focus marker rather than let it leak onto the next thread.
   clearNavFocus();

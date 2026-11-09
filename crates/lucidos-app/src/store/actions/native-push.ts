@@ -20,6 +20,7 @@ import {
 import { dispatchDeepLink, presentInAppNotification } from './in-app-notification-toast';
 import { parseDeepLinkFromSwMessage, type DeepLinkTarget } from './notification-deeplink';
 import { postClientLog } from '../../utils/liveness';
+import { isInAudience } from './push-audience';
 
 /** Wall-clock budget after which a `NativePushRequested` is too stale to show.
  *  A frame that flushes seconds late from a suspended-tab SSE queue would pop a
@@ -38,12 +39,15 @@ export interface NativePushRequestedPayload {
   tap?: Tap | null;
   /** Engine wall-clock at emit time. Drives the freshness gate. */
   sent_at_ms: number;
+  /** The devices this banner is for. Absent means every device. */
+  audience?: string[] | null;
 }
 
 /** SSE handler for the engine's native desktop surface trigger. Gates before
  *  touching the OS:
  *   - not Tauri → no-op (browser / PWA get the real web push instead);
- *   - stale frame → no-op (late SSE-queue flush).
+ *   - stale frame → no-op (late SSE-queue flush);
+ *   - another device's banner → no-op (a work item's audience, ADR 0623).
  *
  *  Then it always surfaces the notification. The page answered the check while
  *  its window was not in front, but the reader may have brought it forward
@@ -53,6 +57,7 @@ export interface NativePushRequestedPayload {
 export function handleNativePushRequested(payload: NativePushRequestedPayload): void {
   if (!isTauri()) return;
   if (Date.now() - payload.sent_at_ms > NATIVE_PUSH_STALE_AFTER_MS) return;
+  if (!isInAudience(payload.audience)) return;
   const outcome = presentInAppNotification({
     title: payload.title,
     body: payload.body,
@@ -73,6 +78,8 @@ export interface NativePushDismissRequestedPayload {
   notification_id: string | null;
   /** Engine wall-clock at emit time. Drives the freshness gate. */
   sent_at_ms: number;
+  /** The reader's devices on a team gateway (ADR 0623). Absent: everyone. */
+  audience?: string[] | null;
 }
 
 /** SSE handler for the engine's cross-device dismiss trigger. When a
@@ -93,6 +100,8 @@ export interface NativePushDismissRequestedPayload {
 export function handleNativePushDismiss(payload: NativePushDismissRequestedPayload): void {
   if (!isTauri()) return;
   if (Date.now() - payload.sent_at_ms > NATIVE_PUSH_STALE_AFTER_MS) return;
+  // Another person's read leaves this person's banners.
+  if (!isInAudience(payload.audience)) return;
   void dismissNativeBanner(payload);
 }
 

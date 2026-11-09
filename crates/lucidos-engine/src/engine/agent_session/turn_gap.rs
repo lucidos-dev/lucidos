@@ -493,7 +493,7 @@ pub(crate) async fn compute_turn_gap_note_until(
            AND NOT (e.event_type = 'BackgroundBashCompleted' AND e.sequence < COALESCE(( \
              SELECT max(i.sequence) FROM events i \
              WHERE i.thread_id = $1 AND i.event_type = 'CodingAgentIdled' \
-               AND {not_keep_alive_idle} \
+               AND {not_engine_turn_idle} \
                AND ($3::bigint IS NULL OR i.sequence < $3) \
            ), 0)) \
            AND NOT (e.event_type = 'BackgroundBashCompleted' \
@@ -506,7 +506,7 @@ pub(crate) async fn compute_turn_gap_note_until(
                  AND watched->'condition'->>'task_id' = e.payload->>'task_id' \
            )) \
          ORDER BY e.sequence ASC",
-            not_keep_alive_idle = crate::engine::thread_events::not_a_keep_alive_idle_sql("i.")
+            not_engine_turn_idle = crate::engine::thread_events::not_an_engine_turn_idle_sql("i.")
         ))
         .bind(thread_id)
         .bind(

@@ -242,11 +242,8 @@ impl Store {
     }
 
     pub fn preflight_space(&self, estimate: u64) -> Result<(), BoxError> {
-        check_floor(
-            fs2::available_space(&self.root)?,
-            fs2::total_space(&self.root)?,
-            estimate,
-        )
+        let (available, total) = volume_space(&self.root)?;
+        check_floor(available, total, estimate)
     }
 
     /// Run at boot while holding the store lock. Only stale partial captures
@@ -355,15 +352,45 @@ pub fn retention_victims(
     victims
 }
 
+/// The free-disk floor refused a capture or restore. `needed_bytes` is the
+/// space the user must free. The capture job branches on this type to tell the
+/// user; every other caller sees only the `snapshot_disk_floor` slug.
+#[derive(Debug)]
+pub struct DiskFloorRefused {
+    pub needed_bytes: u64,
+}
+
+impl std::fmt::Display for DiskFloorRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("snapshot_disk_floor")
+    }
+}
+
+impl std::error::Error for DiskFloorRefused {}
+
+/// Available and total bytes on the volume holding `path`.
+#[cfg(not(test))]
+pub(super) fn volume_space(path: &Path) -> std::io::Result<(u64, u64)> {
+    Ok((fs2::available_space(path)?, fs2::total_space(path)?))
+}
+
+/// Tests read a fixed, roomy volume, so no snapshot test depends on how
+/// full the host's disk is. The floor arithmetic has its own tests.
+#[cfg(test)]
+pub(super) fn volume_space(_path: &Path) -> std::io::Result<(u64, u64)> {
+    const TIB: u64 = 1 << 40;
+    Ok((TIB, 2 * TIB))
+}
+
 pub fn check_floor(available: u64, total: u64, estimate: u64) -> Result<(), BoxError> {
     let floor = (5 * 1024 * 1024 * 1024u64).max(total.div_ceil(10));
-    if available
-        .checked_sub(estimate)
-        .is_none_or(|remaining| remaining < floor)
-    {
-        return Err("snapshot_disk_floor".into());
+    match floor.checked_add(estimate) {
+        Some(needed) if available >= needed => Ok(()),
+        // A need past `u64::MAX` can never be met, so report the most there is.
+        needed => Err(Box::new(DiskFloorRefused {
+            needed_bytes: needed.map_or(u64::MAX, |needed| needed - available),
+        })),
     }
-    Ok(())
 }
 
 pub(super) fn regular_file(path: &Path) -> Result<(), BoxError> {

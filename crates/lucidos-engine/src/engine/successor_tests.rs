@@ -494,6 +494,9 @@ mod db {
 
     fn session_handed_off(checkpoint: Option<&str>) -> ThreadEvent {
         ThreadEvent::SessionHandedOff {
+            cause: None,
+            starts: crate::engine::thread_events::SessionStart::Now,
+            crossing: None,
             opening: crate::engine::thread_events::HandoffOpening::Narrative,
             message: "A fresh session starts here.".into(),
             checkpoint: checkpoint.map(str::to_string),
@@ -566,6 +569,7 @@ mod db {
             crate::engine::thread_events::SessionContinuity::Handoff {
                 checkpoint: Some("phase-commit".into()),
                 progress: Some("2/5".into()),
+                crossing: None,
                 opening: crate::engine::thread_events::HandoffOpening::Narrative,
                 message: "A fresh session starts here.".into(),
             }
@@ -685,6 +689,28 @@ mod db {
         teardown_test_db(&db).await;
     }
 
+    /// I15: a person's *Return to the old session* ends a pending handoff, so
+    /// the next input resumes the old session. A later handoff stands again.
+    #[tokio::test]
+    async fn pending_handoff_ignores_a_withdrawn_one() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread = coding_thread(&bus, None).await;
+        emit(&bus, thread, session_handed_off(None)).await;
+        emit(&bus, thread, ThreadEvent::SessionHandoffWithdrawn).await;
+        assert_eq!(pending_handoff(&pool, thread).await.unwrap(), None);
+        assert!(!handoff_pending(&pool, thread).await);
+
+        emit(&bus, thread, session_handed_off(Some("phase-commit"))).await;
+        let again = pending_handoff(&pool, thread).await.unwrap();
+        assert_eq!(
+            again.and_then(|h| h.checkpoint).as_deref(),
+            Some("phase-commit")
+        );
+
+        teardown_test_db(&db).await;
+    }
+
     /// The set form and the per-thread form of "pending" never disagree: one
     /// thread per way a handoff ends, one left pending, one never handed off.
     #[tokio::test]
@@ -717,6 +743,9 @@ mod db {
         emit(&bus, failed, session_handed_off(None)).await;
         emit(&bus, failed, message()).await;
         emit(&bus, failed, failure()).await;
+        let withdrawn = coding_thread(&bus, None).await;
+        emit(&bus, withdrawn, session_handed_off(None)).await;
+        emit(&bus, withdrawn, ThreadEvent::SessionHandoffWithdrawn).await;
         coding_thread(&bus, None).await;
 
         let mut from_set: Vec<Uuid> = sqlx::query_scalar(&pending_handoff_threads_sql())
@@ -916,6 +945,83 @@ mod db {
         teardown_test_db(&db).await;
     }
 
+    async fn compacted(pool: &sqlx::PgPool, thread_id: Uuid, payload: serde_json::Value) {
+        sqlx::query(
+            "INSERT INTO events (id, event_type, payload, thread_id, aggregate, aggregate_id) \
+             VALUES (gen_random_uuid(), 'CodingAgentCompacted', $1, $2, 'thread', $2::text)",
+        )
+        .bind(payload)
+        .bind(thread_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// I11: a compaction between captures lowers the reading, and the window
+    /// still comes from the capture before it.
+    #[tokio::test]
+    async fn session_reading_after_compaction_keeps_the_window() {
+        let (pool, db) = setup_test_db().await;
+        let thread = Uuid::new_v4();
+        assert_eq!(
+            session_reading(&pool, thread).await.unwrap(),
+            SessionReading::default()
+        );
+        capture(
+            &pool,
+            thread,
+            serde_json::json!({"usage": {"input_tokens": 400_000}, "context_window": 1_000_000}),
+        )
+        .await;
+        compacted(
+            &pool,
+            thread,
+            serde_json::json!({"trigger": "auto", "post_tokens": 50_000}),
+        )
+        .await;
+        assert_eq!(
+            session_reading(&pool, thread).await.unwrap(),
+            SessionReading {
+                tokens: Some(50_000),
+                window: Some(1_000_000),
+            }
+        );
+
+        teardown_test_db(&db).await;
+    }
+
+    /// I11: an unknown `post_tokens` is an unknown reading, and a capture
+    /// after the compaction is the reading again.
+    #[tokio::test]
+    async fn session_reading_unknown_post_tokens_then_a_capture_after_compaction() {
+        let (pool, db) = setup_test_db().await;
+        let thread = Uuid::new_v4();
+        capture(
+            &pool,
+            thread,
+            serde_json::json!({"usage": {"input_tokens": 400_000}, "context_window": 200_000}),
+        )
+        .await;
+        compacted(&pool, thread, serde_json::json!({"trigger": "manual"})).await;
+        assert_eq!(session_reading(&pool, thread).await.unwrap().tokens, None);
+        capture(
+            &pool,
+            thread,
+            serde_json::json!({"usage": {"input_tokens": 70_000}, "context_window": 0}),
+        )
+        .await;
+        assert_eq!(
+            session_reading(&pool, thread).await.unwrap(),
+            SessionReading {
+                tokens: Some(70_000),
+                window: Some(200_000),
+            },
+            "a capture with no window keeps the newest recorded one"
+        );
+
+        teardown_test_db(&db).await;
+    }
+
     /// A thread hands off once. A racing second handoff rolls its whole emit
     /// back, so it leaves no second link and no second event.
     #[tokio::test]
@@ -1110,8 +1216,9 @@ fn the_first_message_reads_the_opening_then_the_request_once() {
 /// migration must name every type `HANDOFF_LIFECYCLE_EVENT_TYPES` does.
 #[test]
 fn the_handoff_lifecycle_index_lists_every_probed_event_type() {
-    const MIGRATION: &str =
-        include_str!("../../migrations/20261101113111_index_events_handoff_lifecycle.sql");
+    const MIGRATION: &str = include_str!(
+        "../../migrations/20261108155953_index_events_handoff_lifecycle_withdrawn.sql"
+    );
     for event_type in HANDOFF_LIFECYCLE_EVENT_TYPES {
         assert!(
             MIGRATION.contains(&format!("'{event_type}'")),
@@ -1137,4 +1244,74 @@ fn every_handoff_ending_event_type_is_a_lifecycle_type() {
             "HANDOFF_LIFECYCLE_EVENT_TYPES lacks {event_type}"
         );
     }
+}
+
+/// I6: the opening names what the previous session left running, so the
+/// successor waits for it rather than starting it again. Nothing running
+/// leaves the opening alone.
+#[test]
+fn opening_lists_running_work() {
+    let opening = narrative_opening(None, "# Outcomes");
+    assert_eq!(StillRunning::default().after(opening.clone()), opening);
+    let running = StillRunning {
+        tasks: vec!["the full e2e suite (`task-7`)".to_string()],
+        waits: vec!["the deploy (on DeployFinished)".to_string()],
+        children: vec!["Fix the parser".to_string()],
+    };
+    let listed = running.after(opening.clone());
+    assert!(listed.starts_with(&opening));
+    for line in [
+        "## Still running",
+        "- Background task: the full e2e suite (`task-7`)",
+        "- Event wait: the deploy (on DeployFinished)",
+        "- Child thread: Fix the parser",
+        "do not start them again",
+    ] {
+        assert!(listed.contains(line), "{line}");
+    }
+}
+
+/// I5: only a session past its ceiling waits for the next input, and a typed
+/// request is that input. The cause follows the ceiling, then the checkpoint.
+#[test]
+fn a_ceiling_handoff_starts_on_the_next_input() {
+    use crate::engine::thread_events::{HandoffCause as C, SessionStart as S};
+    assert_eq!(
+        cause_and_start(true, true, false, true),
+        (C::ContextCeiling, S::OnNextInput)
+    );
+    assert_eq!(
+        cause_and_start(true, false, true, false),
+        (C::ContextCeiling, S::Now)
+    );
+    assert_eq!(
+        cause_and_start(false, true, false, true),
+        (C::Checkpoint, S::AfterThisTurn)
+    );
+    assert_eq!(
+        cause_and_start(false, false, false, false),
+        (C::User, S::Now)
+    );
+}
+
+/// I5: boot and a free thread start every handoff by themselves except a
+/// next-input start. A row from before the field starts as it always did.
+#[test]
+fn boot_does_not_start_an_on_next_input_handoff() {
+    let row = |extra: serde_json::Value| -> PendingHandoff {
+        let mut payload = serde_json::json!({
+            "opening": "narrative", "message": "m", "coding_agent": "claude-code",
+        });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(payload).unwrap()
+    };
+    let old = row(serde_json::json!({}));
+    assert_eq!(old.starts, crate::engine::thread_events::SessionStart::Now);
+    assert_eq!(old.cause, None);
+    assert!(old.starts_unprompted());
+    assert!(row(serde_json::json!({"starts": "after-this-turn"})).starts_unprompted());
+    assert!(!row(serde_json::json!({"starts": "on-next-input"})).starts_unprompted());
 }

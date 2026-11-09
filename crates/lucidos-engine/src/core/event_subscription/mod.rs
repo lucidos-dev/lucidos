@@ -278,12 +278,13 @@ pub enum SubscriptionSurface {
 ///
 /// Three kinds are dropped. The per-token firehose, because running the
 /// matcher per token would be pure waste. The side-question events, because no
-/// agent may ever see one (ADR 0320). A *cache keep-alive* idle, because the
-/// agent did not finish anything: it is still waiting.
+/// agent may ever see one (ADR 0320). An engine turn's idle, a *cache
+/// keep-alive* or a *ceiling re-entry*, because the agent finished nothing the
+/// user asked for.
 pub fn is_subscribable(event: &ThreadEvent) -> bool {
     !event.is_per_token_streaming()
         && !event.is_side_question_event()
-        && !event.is_cache_keep_alive_idle()
+        && !event.is_engine_turn_idle()
 }
 
 /// **The system-side gate.** A live `SystemEvent` reaches the trigger matcher

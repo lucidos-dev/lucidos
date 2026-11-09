@@ -8,6 +8,7 @@ import { loadResponseStyles } from '../../store/actions/responseStyles';
 import { loadThemeGallery } from '../../store/actions/themes';
 import { loadDevices } from '../../store/actions/devices';
 import { loadPairedDevices } from '../../store/actions/pairedDevices';
+import { loadOperators } from '../../store/actions/operators';
 import { loadOAuthAccounts } from '../../store/actions/oauth';
 import { refreshRepositories } from '../../store/actions/repositoriesLoader';
 
@@ -31,6 +32,7 @@ export const SETTINGS_SECTION_REFRESH: Partial<Record<SettingsSubview, PanelRefr
   devices: () => Promise.all([
     loadDevices(),
     loadPairedDevices(),
+    loadOperators(),
   ]),
   accounts: () => Promise.all([
     loadOAuthAccounts(),

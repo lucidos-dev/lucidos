@@ -925,6 +925,20 @@ enum ThreadsCmd {
         #[arg(long)]
         thread: String,
     },
+    /// Set a thread's context ceiling (ADR 0629): the context size at which
+    /// its coding-agent session hands off to a successor session.
+    ///
+    /// The value is `off`, a size such as `200k`, or a share of the window
+    /// such as `30%`. No ceiling goes above 75% of the window or below 100k.
+    /// Only a person raises a ceiling or turns it off. From inside a thread
+    /// you may lower your own, and set a direct child's at or below your own.
+    ContextCeiling {
+        /// `off`, `<N>k`, or `<P>%`.
+        ceiling: String,
+        /// The thread's uuid. Defaults to this thread (`LUCIDOS_THREAD_ID`).
+        #[arg(long)]
+        thread: Option<String>,
+    },
     /// Archive this thread, or one of its own direct children.
     ///
     /// `--thread current` archives THIS thread once its turn ends and it has
@@ -2229,6 +2243,9 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                 ThreadsCmd::Detach { thread } => threads::cmd_detach(&ws, &thread)?,
                 ThreadsCmd::ChildReports => threads::cmd_child_reports(&ws)?,
                 ThreadsCmd::Archive { thread } => threads::cmd_archive(&ws, &thread)?,
+                ThreadsCmd::ContextCeiling { ceiling, thread } => {
+                    threads::cmd_context_ceiling(&ws, &ceiling, thread.as_deref())?
+                }
             }
             Ok(0)
         }

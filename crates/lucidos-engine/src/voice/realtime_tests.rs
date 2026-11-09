@@ -318,6 +318,17 @@ fn end_of_turn_is_decided_semantically() {
     );
 }
 
+/// Only the client cuts a reply (ADR 0200). Left at the provider's default,
+/// its own VAD hears the talker's echo and cancels the reply mid-sentence.
+#[test]
+fn the_provider_never_cuts_its_own_reply() {
+    let payload = session_update(&opening());
+    assert_eq!(
+        payload["session"]["audio"]["input"]["turn_detection"]["interrupt_response"],
+        false
+    );
+}
+
 /// The honesty constraint reaches the session, since it is what stops a
 /// tool-less talker inventing an answer.
 #[test]

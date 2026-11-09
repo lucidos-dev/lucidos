@@ -95,17 +95,45 @@ const CLOCK_BLOCK: &str =
 /// here, which is the contract.
 #[test]
 fn trigger_context_has_no_preload_fields() {
-    let _tc = TriggerContext {
+    let _tc = trigger_context("id", "name");
+}
+
+fn trigger_context(trigger_id: &str, trigger_name: &str) -> TriggerContext {
+    TriggerContext {
         retry_of: None,
-        trigger_id: "id".to_string(),
-        trigger_name: "name".to_string(),
-        slug: "name".to_string(),
+        trigger_id: trigger_id.to_string(),
+        trigger_name: trigger_name.to_string(),
+        slug: trigger_name.to_string(),
         invocation: TriggerInvocation::Schedule,
         go_to_review: false,
         side_effect_grant: vec![],
         mcp_servers: vec![],
         queue_entry_id: uuid::Uuid::new_v4(),
+        continue_key: None,
+        actor_email: None,
+    }
+}
+
+/// The starter event records the email the trigger's actor field resolved
+/// to, so a display can credit the operator holding it (ADR 0623).
+#[test]
+fn build_trigger_started_event_records_the_actor_email() {
+    let tc = TriggerContext {
+        actor_email: Some("sam@example.com".into()),
+        ..trigger_context("t-1", "Ticket intake")
     };
+    let (event, _meta) = build_trigger_started_event(&tc, "Triage.", &sel(None, None, None));
+    let ThreadEvent::TriggerStarted {
+        origin:
+            Some(MessageOrigin::Engine {
+                reason: EngineReason::Scheduler { actor_email, .. },
+            }),
+        ..
+    } = event
+    else {
+        panic!("expected a TriggerStarted with a scheduler origin");
+    };
+    assert_eq!(actor_email.as_deref(), Some("sam@example.com"));
 }
 
 /// Regression for the v5-hash leak: the trigger id passed in (a
@@ -117,13 +145,9 @@ fn trigger_context_has_no_preload_fields() {
 fn build_trigger_started_event_preserves_config_id_verbatim() {
     let config_id = "5633f3e1-110c-4df4-a6fc-c0df8fd36df4";
     let (event, meta) = build_trigger_started_event(
-        config_id,
-        "Job Listing Check",
-        &TriggerInvocation::Schedule,
+        &trigger_context(config_id, "Job Listing Check"),
         "Run the check.",
-        false,
         &sel(None, None, None),
-        None,
     );
     assert_eq!(meta.channel, Some(EventChannel::Trigger));
     let ThreadEvent::TriggerStarted {
@@ -142,6 +166,7 @@ fn build_trigger_started_event_preserves_config_id_verbatim() {
             EngineReason::Scheduler {
                 trigger_id: origin_id,
                 trigger_name: origin_name,
+                ..
             },
     } = origin.expect("scheduler origin")
     else {
@@ -157,13 +182,9 @@ fn build_trigger_started_event_preserves_config_id_verbatim() {
 #[test]
 fn build_trigger_started_event_records_the_resolved_model_and_effort() {
     let (event, _meta) = build_trigger_started_event(
-        "t-1",
-        "Daily Digest",
-        &TriggerInvocation::Schedule,
+        &trigger_context("t-1", "Daily Digest"),
         "Summarize today.",
-        false,
         &sel(Some("gemini-3.8-flash"), Some("low"), Some("anthropic")),
-        None,
     );
     let ThreadEvent::TriggerStarted {
         model,
@@ -2446,15 +2467,11 @@ fn trigger_started_carries_retry_provenance() {
         thread_id: uuid::Uuid::new_v4(),
         deadline: chrono::Utc::now(),
     };
-    let (event, _) = build_trigger_started_event(
-        "daily-report",
-        "Daily report",
-        &TriggerInvocation::Schedule,
-        "Run the check.",
-        false,
-        &sel(None, None, None),
-        Some(&retry_of),
-    );
+    let tc = TriggerContext {
+        retry_of: Some(retry_of.clone()),
+        ..trigger_context("daily-report", "Daily report")
+    };
+    let (event, _) = build_trigger_started_event(&tc, "Run the check.", &sel(None, None, None));
     let ThreadEvent::TriggerStarted {
         retry_of: actual, ..
     } = event

@@ -180,6 +180,10 @@ pub struct ThreadSummary {
     /// the user has not seen it yet (ADR 0409). Lists the thread in the
     /// drawer's Review group. Counts toward neither attention nor blocking.
     pub read_requested: bool,
+    /// The devices that saw the reply a pending read request points at, on a
+    /// team gateway (ADR 0623). A person whose device is here no longer lists
+    /// the thread under Review. Empty on a gateway with one person.
+    pub reply_seen_devices: Vec<String>,
     /// Whether an Apply Now is running on this thread, from its
     /// `ApplyNowStarted` to its `ApplyNowEnded` (ADR 0437). Every client reads
     /// "applying" from here rather than inferring it.
@@ -413,6 +417,7 @@ struct ThreadRow {
     attention_descendant_count: i64,
     is_stopped_child: bool,
     read_requested: bool,
+    reply_seen_devices: Vec<String>,
     apply_in_flight: bool,
     live_event_wait_count: i64,
     /// `sqlx::types::Json` rather than a bare `Vec`, because that is what
@@ -507,6 +512,9 @@ pub struct ThreadAggregate {
     /// aggregate so the Review group gains and loses the thread live, on every
     /// device.
     pub read_requested: bool,
+    /// See `ThreadSummary::reply_seen_devices`. Carried on the per-event SSE
+    /// aggregate so a person's sighting leaves Review on their other devices.
+    pub reply_seen_devices: Vec<String>,
     /// See `ThreadSummary::apply_in_flight`. Carried on the per-event SSE
     /// aggregate so every device shows the apply start and end live.
     pub apply_in_flight: bool,
@@ -614,6 +622,7 @@ fn row_to_thread_aggregate(
         attention_descendant_count: r.attention_descendant_count,
         is_stopped_child: r.is_stopped_child,
         read_requested: r.read_requested,
+        reply_seen_devices: r.reply_seen_devices,
         apply_in_flight: r.apply_in_flight,
         live_event_wait_count: r.live_event_wait_count,
         live_event_waits: r.live_event_waits.0,
@@ -678,7 +687,7 @@ fn thread_cols(alias: &str) -> String {
         "{a}.thread_id::text, {a}.title, {a}.first_message, {a}.source, {a}.initiator, {a}.created_at, {a}.last_activity, \
         {a}.last_user_action, {a}.last_agent_action, \
         {a}.message_count::bigint, {a}.archive_state AS section, {a}.active_children_count::bigint, {a}.waiting_children_count::bigint, {a}.total_children_count::bigint, \
-        {a}.blocking_descendant_count::bigint, {a}.attention_descendant_count::bigint, {a}.is_stopped_child, {a}.read_requested, {a}.apply_in_flight, \
+        {a}.blocking_descendant_count::bigint, {a}.attention_descendant_count::bigint, {a}.is_stopped_child, {a}.read_requested, {a}.reply_seen_devices, {a}.apply_in_flight, \
         {a}.live_event_wait_count::bigint, {a}.live_event_waits, {a}.cache_keep_alive_status, \
         {a}.status, {a}.summary_version, {a}.coding_agent_change_state, {a}.coding_agent_unproposed_reason, {a}.coding_agent_requires_restart, \
         {a}.coding_agent_is_external_repo, {a}.last_revived_at, \
@@ -773,6 +782,7 @@ fn row_to_thread_summary(
         attention_descendant_count: r.attention_descendant_count,
         is_stopped_child: r.is_stopped_child,
         read_requested: r.read_requested,
+        reply_seen_devices: r.reply_seen_devices,
         apply_in_flight: r.apply_in_flight,
         live_event_wait_count: r.live_event_wait_count,
         live_event_waits: r.live_event_waits.0,

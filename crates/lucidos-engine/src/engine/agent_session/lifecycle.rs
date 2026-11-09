@@ -82,6 +82,7 @@ pub(crate) fn mark_turn_boundary(s: &mut crate::engine::AgentSession) {
     s.is_waiting = true;
     s.redirect_cause = None;
     s.cancel_actor = None;
+    s.in_ceiling_reentry = false;
     if futures::FutureExt::now_or_never(s.interrupt.notified()).is_some() {
         crate::log!("[AgentSession] Retired an interrupt that arrived after its turn's Result");
     }
@@ -420,18 +421,20 @@ pub(super) fn result_auto_commits(terminal: &TerminalKind) -> bool {
 }
 
 /// Whether the turn that just ended is the user's own, finished turn: a
-/// `Generated` terminal, outside an engine merge resolution and a cache
-/// keep-alive. A shutdown aborts the turn, so it never reads as `Generated`.
+/// `Generated` terminal, outside an engine merge resolution and an engine
+/// turn. An engine turn is a cache keep-alive or a *ceiling re-entry*. A
+/// shutdown aborts the turn, so it never reads as `Generated`.
 ///
 /// Only such a turn decides anything at its end: the turn-end gate's forced
-/// decisions (ADR 0417), and the wait over running background tasks. A user
-/// Stop, a redirect, a failure or an abort leaves both alone.
+/// decisions (ADR 0417), the wait over running background tasks, and the
+/// context ceiling (ADR 0629). A user Stop, a redirect, a failure or an abort
+/// leaves all three alone.
 pub(super) fn turn_ended_cleanly(
     terminal: &Option<TerminalKind>,
     is_resolution_session: bool,
-    keep_alive_turn: bool,
+    engine_turn: bool,
 ) -> bool {
-    matches!(terminal, Some(TerminalKind::Generated)) && !is_resolution_session && !keep_alive_turn
+    matches!(terminal, Some(TerminalKind::Generated)) && !is_resolution_session && !engine_turn
 }
 
 /// Whether the session-end path may delete this thread's worktree directory.

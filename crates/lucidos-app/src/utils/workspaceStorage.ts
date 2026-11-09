@@ -36,6 +36,7 @@
  * `workspaceStorage.install.ts`, imported on the first line of `main.tsx`.
  */
 
+import { SPENT_KEY } from './pairingCodeSeed';
 import { REMOTE_WORKSPACES_CACHE_KEY } from './remoteWorkspaces';
 
 import {
@@ -51,13 +52,16 @@ const NAMESPACE_PREFIX = 'ws:';
 const MIGRATION_MARKER = '__migrated';
 
 /**
- * The ONLY keys that stay raw (unscoped). All four are cross-workspace by
+ * The ONLY keys that stay raw (unscoped). These are cross-workspace by
  * definition. The picker reads the first two at `/~/` or `/`, where storage is
  * raw, but a workspace at `/<slug>/` writes them. The switcher's expand state is
  * written in one workspace and read in the next one the user switches to. A
  * namespaced key would never match across those contexts, so they MUST stay raw
  * on both ends (see `lastWorkspace.ts`). The remote cache shares the last
  * discovered rows between the picker and switcher in every workspace.
+ *
+ * Pairing launch history belongs to the gateway device, including before the
+ * workspace storage override installs.
  *
  * Everything else — theme, fonts, scale, device id, nav history, etc. — is
  * workspace-scoped. Notably `lucidos-device-id` is per-workspace now: each
@@ -69,6 +73,7 @@ export const GLOBAL_KEYS: ReadonlySet<string> = new Set([
   LAST_WORKSPACE_COUNT_KEY,
   WORKSPACE_SWITCHER_EXPANDED_KEY,
   REMOTE_WORKSPACES_CACHE_KEY,
+  SPENT_KEY,
 ]);
 
 /**

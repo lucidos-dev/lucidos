@@ -2118,6 +2118,13 @@
                 "commands": [],
                 "flags": [],
                 "hidden": false,
+                "name": "context-ceiling"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
                 "name": "count"
               },
               {
@@ -3691,6 +3698,16 @@
             "aliases": [],
             "commands": [],
             "flags": [
+              "help",
+              "thread"
+            ],
+            "hidden": false,
+            "name": "context-ceiling"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
               "active",
               "change-state",
               "has-draft",
@@ -3763,6 +3780,13 @@
                 "flags": [],
                 "hidden": false,
                 "name": "child-reports"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "context-ceiling"
               },
               {
                 "aliases": [],
@@ -4020,7 +4044,9 @@
             "aliases": [],
             "commands": [],
             "flags": [
+              "actor",
               "app-id",
+              "continue-key",
               "cron-expressions",
               "go-to-review",
               "group-id",
@@ -4029,6 +4055,7 @@
               "model",
               "name",
               "on",
+              "permission-wait",
               "provider",
               "reasoning-effort",
               "run",
@@ -4121,7 +4148,9 @@
             "aliases": [],
             "commands": [],
             "flags": [
+              "actor",
               "app-id",
+              "continue-key",
               "cron-expressions",
               "go-to-review",
               "group-id",
@@ -4132,6 +4161,7 @@
               "name",
               "on",
               "paused",
+              "permission-wait",
               "provider",
               "reasoning-effort",
               "run",
@@ -4707,6 +4737,7 @@
       "PresenceCheck",
       "NativePushRequested",
       "NativePushDismissRequested",
+      "OperatorsChanged",
       "PluginInstalled",
       "PluginLocalChangesMerged",
       "PluginUninstalled",
@@ -4844,6 +4875,11 @@
       "ParentWakeNotRequested",
       "ThreadReplySeen",
       "ThreadTriageProposed",
+      "WorkItemDriverTaken",
+      "WorkItemDriverReleased",
+      "WorkItemGateEscalated",
+      "WorkItemWatched",
+      "WorkItemUnwatched",
       "ThreadStarted",
       "ThreadDiscarded",
       "HomeThreadCreated",
@@ -4877,6 +4913,9 @@
       "HandoffCheckpointReached",
       "SuccessorOfferDeclined",
       "SuccessorRequested",
+      "ContextCeilingSet",
+      "ContextCeilingReached",
+      "SessionHandoffWithdrawn",
       "PromptInjected",
       "CredentialRequested",
       "PluginInstallRequested",
@@ -4964,7 +5003,8 @@
     "triggers",
     "ui",
     "utils",
-    "widget"
+    "widget",
+    "workItems"
   ],
   "tools": {
     "aliases": {
@@ -5017,6 +5057,7 @@
       "search_memory": "memory",
       "search_threads": "threads",
       "set_aside_change": "changes",
+      "set_context_ceiling": "threads",
       "set_environment_variable": "env_vars",
       "set_preference": "preferences",
       "setup_mcp_server": "mcp",

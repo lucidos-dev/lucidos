@@ -103,6 +103,12 @@ pub struct OwnerApproval {
 }
 
 impl AnswerKind {
+    /// Whether someone actually answered, rather than the card being torn
+    /// down or replaced.
+    pub fn is_a_reply(&self) -> bool {
+        !matches!(self, AnswerKind::Canceled | AnswerKind::Superseded)
+    }
+
     /// The blobs attached to this answer. Only a typed answer carries any.
     pub fn image_hashes(&self) -> &[String] {
         match self {

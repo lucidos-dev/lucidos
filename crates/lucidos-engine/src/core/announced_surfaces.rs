@@ -384,6 +384,14 @@ pub const TABLES: &[TableRule] = &[
         },
     },
     TableRule {
+        table: "notification_reads",
+        owners: &["scheduler/notifications.rs"],
+        announcement: Announcement::Announced {
+            events: &["NotificationRead", "NotificationsAllRead"],
+            exempt: &[],
+        },
+    },
+    TableRule {
         table: "notifications",
         owners: &[
             "api/threads/delete.rs",

@@ -1,9 +1,9 @@
-import { showToast, dismissToast, removeToast, toasts, engineVersionReady, engineVersionPending, engineBuilding, engineBuildDetail, frontendRefreshDetail, enginePendingCommits, engineRestarting, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
+import { showToast, dismissToast, removeToast, toasts, engineVersionReady, engineVersionPending, engineBuilding, engineBuildDetail, frontendRefreshDetail, enginePendingCommits, engineRestarting, NEW_VERSION_TOAST_KEY, BUILD_FAILED_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
 import { preferencesSettled } from './preferences';
 import { engineVersionStatus, rebuildEngine } from '../../api/client';
 import type { EngineVersionStatus, PendingCommits } from '../../api/client';
 import { confirmAndRestartEngine } from './chat-changes';
-import { noteAnnouncedEngineVersion, wasEngineVersionDismissed } from '../../hooks/sw-update';
+import { noteAnnouncedBuildFailure, noteAnnouncedEngineVersion, wasBuildFailureDismissed, wasEngineVersionDismissed } from '../../hooks/sw-update';
 import { engineBuildLogOpen, engineBuildLogVersion } from '../engineBuildLog';
 import { errorDetail } from '../../utils/errorDetail';
 
@@ -33,8 +33,6 @@ async function triggerRebuild(): Promise<void> {
  *  the check is a cheap GET (the engine only forks `--build-id` when the on-disk
  *  binary's mtime moved). */
 const ENGINE_UPDATE_POLL_MS = 4000;
-
-const BUILD_FAILED_TOAST_KEY = 'engine-build-failed';
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -148,9 +146,23 @@ function renderVersionToast(shape: VersionAnnouncement): void {
   });
 }
 
-/** Every failed build keeps a manual retry, including delivery failures. */
-function renderBuildFailedToast(failure: EngineVersionStatus['build_failure']): void {
-  const cause = failure?.summary ?? 'the engine did not report why';
+/** What makes one failure the same as another: the source it built and what
+ *  broke. The engine sends no id, and every poll repeats the same failure. */
+function buildFailureId(status: EngineVersionStatus): string {
+  const failure = status.build_failure;
+  return JSON.stringify([status.head_commit ?? null, failure?.kind ?? null, failure?.summary ?? null]);
+}
+
+/** Every failed build keeps a manual retry, including delivery failures.
+ *  A dismissed failure stays dismissed until a different one replaces it. */
+function renderBuildFailedToast(status: EngineVersionStatus): void {
+  const failureId = buildFailureId(status);
+  noteAnnouncedBuildFailure(failureId);
+  if (wasBuildFailureDismissed(failureId)) {
+    removeToast(BUILD_FAILED_TOAST_KEY);
+    return;
+  }
+  const cause = status.build_failure?.summary ?? 'the engine did not report why';
   showToast(`New engine version failed to build: ${cause}`, 'error', {
     key: BUILD_FAILED_TOAST_KEY,
     secondaryAction: { label: 'Show build log', onClick: showEngineBuildLog },
@@ -260,11 +272,12 @@ async function pollEngineVersion(): Promise<void> {
     // surface stands down rather than putting a second badge and a second
     // rebuild button on screen for the same stuck version.
     setEngineVersionPending(false);
-    renderBuildFailedToast(status.build_failure);
+    renderBuildFailedToast(status);
     return;
   }
-  // A prior failure cleared once a build starts / succeeds.
-  dismissToast(BUILD_FAILED_TOAST_KEY);
+  // A prior failure cleared once a build starts / succeeds. removeToast, since
+  // a user dismissal would hide the same failure if a retry hits it again.
+  removeToast(BUILD_FAILED_TOAST_KEY);
 
   // A background rebuild of the shared binary is in flight — this engine's own
   // (build_state === 'building') OR a CO-LOCATED peer's. Co-located workspaces

@@ -1053,6 +1053,8 @@ jobs:
   #      Docker — mirrors scripts/e2e-packaged.sh)
   #   4. uninstall.sh (data-safe, no --purge) removes the service (unit gone) — doubling
   #      as uninstall coverage
+  #   5. (runs before 4) a TLS install, then a re-run with only --name and --prefix,
+  #      still answers health over https
   #
   # Triggers: the same gate events as `smoke` (push to rc/**, workflow_dispatch, the
   # weekly schedule, and release: published with prerelease==false). Public mirror only
@@ -1249,6 +1251,38 @@ jobs:
 
           echo "OK — tarball download + always-on service smoke passed on ubuntu-latest"
 
+      # Rung 5: TLS survives an update. Re-register with a self-signed pair, then
+      # re-run with only --name and --prefix, which is the update command
+      # Settings composes (release_check.rs installer_command). The unit must keep
+      # the pair, so the gateway still serves https.
+      - name: Re-run as an update over a TLS install and assert https health
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LUCIDOS_VERSION="$(tr -d ' \t\r\n' < RELEASE)"
+          export LUCIDOS_RELEASE_BASE_URL="file://$GITHUB_WORKSPACE/dist/headless"
+          certs="$RUNNER_TEMP/tls"; mkdir -p "$certs"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=localhost' \
+            -keyout "$certs/key.pem" -out "$certs/cert.pem" 2>/dev/null
+          bash ./install.sh --prefix "$LUCIDOS_PREFIX" --name "$SLUG" \
+            --tls-cert "$certs/cert.pem" --tls-key "$certs/key.pem" \
+            >> "$RUNNER_TEMP/install.log" 2>&1
+          bash ./install.sh --prefix "$LUCIDOS_PREFIX" --name "$SLUG" \
+            > "$RUNNER_TEMP/update.log" 2>&1 \
+            || { echo "::error::the update-shaped re-run failed"; tail -n 40 "$RUNNER_TEMP/update.log"; exit 1; }
+          unit_path="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/lucidos-gateway-${SLUG}.service"
+          grep -q "LUCIDOS_TLS_CERT=$certs/cert.pem" "$unit_path" \
+            || { echo "::error::the re-run dropped LUCIDOS_TLS_CERT from $unit_path"; exit 1; }
+          gw=""
+          for _ in $(seq 1 60); do
+            gw="$(curl -fsSk --max-time 5 "https://localhost:$GW_PORT/~/api/v1/health" 2>/dev/null || true)"
+            echo "$gw" | grep -q '"status":"ok"' && break
+            sleep 1
+          done
+          echo "$gw" | grep -q '"status":"ok"' \
+            || { echo "::error::no https health after the update-shaped re-run: $gw"; exit 1; }
+          echo "rung 5 OK: TLS survived the update-shaped re-run: $gw"
+
       # Capture the gateway/engine journal BEFORE teardown (always), for diagnostics —
       # the systemd --user unit logs to the journal, not a file.
       - name: Capture the service journal
@@ -1284,6 +1318,7 @@ jobs:
           name: tarball-smoke-logs
           path: |
             ${{ runner.temp }}/install.log
+            ${{ runner.temp }}/update.log
             ${{ runner.temp }}/uninstall.log
             ${{ runner.temp }}/journal.log
           if-no-files-found: ignore

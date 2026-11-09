@@ -42,6 +42,76 @@ pub const HEADER_RELAY_LOCAL_BROWSER: &str = "x-lucidos-relay-local-browser";
 /// MAC can never equal the claim's own.
 const LOCAL_BROWSER_BINDING: &str = "|local-browser";
 
+/// The operator A holds the calling device under, as `<id>|<name>|<emails>`,
+/// each percent-encoded, the emails comma-joined (ADR 0623). Beside the claim
+/// rather than in it, so a gateway that predates operators ignores it. An
+/// older A sends no emails field.
+pub const HEADER_RELAY_OPERATOR: &str = "x-lucidos-relay-operator";
+
+/// The HMAC of the claim, [`OPERATOR_BINDING`] and the operator value, so the
+/// operator holds for that claim only.
+pub const HEADER_RELAY_OPERATOR_SIGNATURE: &str = "x-lucidos-relay-operator-signature";
+
+const OPERATOR_BINDING: &str = "|operator|";
+
+/// An operator as A signs it for B.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayedOperator {
+    pub id: String,
+    pub name: String,
+    /// What lets B tell the person is one of its own: B merges a relayed
+    /// person into the local person holding the same email.
+    pub emails: Vec<String>,
+}
+
+impl RelayedOperator {
+    pub fn encode(&self) -> String {
+        let emails: Vec<String> = self
+            .emails
+            .iter()
+            .map(|e| urlencoding::encode(e).into_owned())
+            .collect();
+        format!(
+            "{}{CLAIM_SEPARATOR}{}{CLAIM_SEPARATOR}{}",
+            urlencoding::encode(&self.id),
+            urlencoding::encode(&self.name),
+            emails.join(",")
+        )
+    }
+
+    pub fn decode(raw: &str) -> Option<Self> {
+        let mut fields = raw.splitn(3, CLAIM_SEPARATOR);
+        let id = urlencoding::decode(fields.next()?).ok()?.into_owned();
+        let name = urlencoding::decode(fields.next()?).ok()?.into_owned();
+        let emails = match fields.next() {
+            None | Some("") => Vec::new(),
+            Some(joined) => joined
+                .split(',')
+                .map(|e| urlencoding::decode(e).ok().map(|e| e.trim().to_lowercase()))
+                .collect::<Option<Vec<_>>>()?,
+        };
+        (is_usable_device_id(&id) && !name.trim().is_empty()).then_some(Self { id, name, emails })
+    }
+}
+
+/// The [`HEADER_RELAY_OPERATOR_SIGNATURE`] value for `operator` on `claim`.
+pub fn sign_operator(credential: &str, claim: &str, operator: &str) -> String {
+    sign(credential, &format!("{claim}{OPERATOR_BINDING}{operator}"))
+}
+
+/// The operator A signed for this verified request, if any. A missing or
+/// forged signature carries none: only A's signature may name an operator.
+pub fn signed_operator(headers: &HeaderMap, credential: &str) -> Option<RelayedOperator> {
+    let read = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let claim = read(HEADER_RELAY_CLAIM)?;
+    let operator = read(HEADER_RELAY_OPERATOR)?;
+    let signature = read(HEADER_RELAY_OPERATOR_SIGNATURE)?;
+    if !auth::ct_eq(&sign_operator(credential, claim, operator), signature) {
+        return None;
+    }
+    RelayedOperator::decode(operator)
+}
+
 /// The first field of every claim. A new claim shape gets a new version.
 const CLAIM_VERSION: &str = "v1";
 
@@ -298,13 +368,30 @@ pub async fn relay(state: &GatewayState, slug: &str, name: &str, req: Request) -
             .into_response();
     };
     let (parts, body) = req.into_parts();
+    let device = parts.extensions.get::<AuthenticatedDevice>().cloned();
+    let operator = device.as_ref().and_then(|d| {
+        let directory = state.directory();
+        let operator = directory.operator(directory.operator_of_device(&d.id)?)?;
+        Some(
+            RelayedOperator {
+                id: operator.id.clone(),
+                name: operator.name.clone(),
+                emails: operator.emails.clone(),
+            }
+            .encode(),
+        )
+    });
     let claim = RelayClaim {
         issued_at: chrono::Utc::now().timestamp(),
         prefix: format!("{route}/"),
-        device: parts.extensions.get::<AuthenticatedDevice>().cloned(),
+        device,
     }
     .encode();
     let signature = sign(&remote.credential, &claim);
+    let operator = operator.map(|value| {
+        let signature = sign_operator(&remote.credential, &claim, &value);
+        (value, signature)
+    });
     let local_browser = parts
         .extensions
         .get::<crate::oauth_callback::LocalBrowser>()
@@ -339,6 +426,15 @@ pub async fn relay(state: &GatewayState, slug: &str, name: &str, req: Request) -
     if let Some(stamp) = local_browser.and_then(|s| HeaderValue::from_str(&s).ok()) {
         headers.insert(HEADER_RELAY_LOCAL_BROWSER, stamp);
     }
+    if let Some((value, signature)) = operator {
+        if let (Ok(value), Ok(signature)) = (
+            HeaderValue::from_str(&value),
+            HeaderValue::from_str(&signature),
+        ) {
+            headers.insert(HEADER_RELAY_OPERATOR, value);
+            headers.insert(HEADER_RELAY_OPERATOR_SIGNATURE, signature);
+        }
+    }
 
     let mut upstream = match client.request(&remote, parts.method, &path) {
         Ok(request) => request.headers(headers),
@@ -356,9 +452,10 @@ pub async fn relay(state: &GatewayState, slug: &str, name: &str, req: Request) -
     let response = match upstream.send().await {
         Ok(r) => r,
         Err(e) => {
+            let e = e.without_url();
             crate::log!(
                 "[Gateway] relay {} to remote gateway '{}' failed: {}",
-                path_and_query,
+                crate::proxy::request_path_for_log(&path_and_query),
                 name,
                 crate::external_address::error_chain(&e)
             );
@@ -491,6 +588,7 @@ pub async fn receive(
         None => format!("/{slug}{rest}"),
     };
     let local_browser = stamped_local_browser(req.headers(), credential);
+    let operator = signed_operator(req.headers(), credential);
     let (mut parts, body) = req.into_parts();
     let Ok(uri) = local_path.parse() else {
         return (StatusCode::BAD_REQUEST, "malformed relayed path").into_response();
@@ -508,6 +606,9 @@ pub async fn receive(
         label: d.label,
     });
     let has_device = device.is_some();
+    if let (Some(device), Some(operator)) = (&device, operator) {
+        record_relayed_operator(&state, &gateway, device, operator);
+    }
     if let Some(device) = device {
         parts.extensions.insert(device);
     }
@@ -522,6 +623,44 @@ pub async fn receive(
         return refuse("a relayed request with no device reaches only public app assets");
     }
     crate::server::serve_workspace(&state, slug, &claim.prefix, local).await
+}
+
+/// Remember the operator A signed for a relayed device, when it changed, so
+/// B's engines can show "Sam via A". A failed write costs only the display.
+fn record_relayed_operator(
+    state: &GatewayState,
+    gateway: &AuthenticatedGateway,
+    device: &AuthenticatedDevice,
+    operator: RelayedOperator,
+) {
+    let seen = crate::gateway_event_log::RelayedDevice {
+        device_id: device.id.clone(),
+        operator_id: namespaced_device_id(&gateway.pairing_id, &operator.id),
+        name: operator.name,
+        via: gateway.label.clone(),
+        emails: operator.emails,
+    };
+    if state.directory().relayed.contains(&seen) {
+        return;
+    }
+    // Judged under the log lock: an unpair that already ran has forgotten
+    // this pairing's people, so a request still in flight must not add one.
+    let pairing_id = &gateway.pairing_id;
+    let recorded = state.record(|directory| {
+        let paired = state
+            .paired_gateways()
+            .list()
+            .iter()
+            .any(|g| &g.id == pairing_id);
+        Ok(paired
+            .then(|| directory.relayed_seen(seen))
+            .flatten()
+            .into_iter()
+            .collect())
+    });
+    if let Err(e) = recorded {
+        crate::log!("[Gateway] could not record a relayed device's operator: {e}");
+    }
 }
 
 #[cfg(test)]

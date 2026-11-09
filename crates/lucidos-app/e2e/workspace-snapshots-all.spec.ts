@@ -20,13 +20,15 @@ test('Settings lists a captured snapshot and confirms its target before restore'
   });
   try {
     let phase = 'running';
+    let state: unknown;
     await expect.poll(async () => {
       const response = await page.request.get(`/api/v1/snapshots/jobs/${job.job_id}`, { headers: { 'x-lucidos-device-id': device } });
       expect(response.ok()).toBeTruthy();
-      phase = (await response.json() as { state: { phase: string } }).state.phase;
+      state = (await response.json() as { state: { phase: string } }).state;
+      phase = (state as { phase: string }).phase;
       return phase;
     }, { timeout: 60_000 }).not.toBe('running');
-    expect(phase).toBe('completed');
+    expect(phase, `capture job state: ${JSON.stringify(state)}`).toBe('completed');
     await expect.poll(async () => {
       const response = await page.request.get('/api/v1/snapshots', { headers: { 'x-lucidos-device-id': device } });
       expect(response.ok()).toBeTruthy();

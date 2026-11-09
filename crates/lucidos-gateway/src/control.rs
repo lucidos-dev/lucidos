@@ -1790,14 +1790,12 @@ mod authz_tests {
     fn state_with_phone(dir: &std::path::Path) -> (crate::server::GatewayState, String) {
         let state = crate::server::GatewayState::for_tests_with_static_dir(Some(dir.to_path_buf()));
         state
-            .write_paired_devices_for_test(|paired| {
-                paired.devices.push(auth::PairedDevice {
-                    id: "device-1".into(),
-                    label: "My iPhone".into(),
-                    credential_digest: auth::digest("cred-phone"),
-                    paired_at: "2020-01-01T00:00:00Z".into(),
-                    last_seen_at: None,
-                });
+            .seed_device_for_test(auth::PairedDevice {
+                id: "device-1".into(),
+                label: "My iPhone".into(),
+                credential_digest: auth::digest("cred-phone"),
+                paired_at: "2020-01-01T00:00:00Z".into(),
+                last_seen_at: None,
             })
             .unwrap();
         let cookie = format!("{}=cred-phone", state.device_cookie_name());

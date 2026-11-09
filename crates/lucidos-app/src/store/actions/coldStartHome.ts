@@ -53,8 +53,10 @@ export function releaseWithheldToLiveWindow(withheld: WithheldThread | null): ()
 }
 
 /** Offer, once, the thread the restore guard withheld at this launch. The
- *  label waits for the thread list, which holds the title. "Open" focuses the
- *  thread, and that focus arms the guard again. Returns the stop function. */
+ *  label waits for the thread list, which holds the title. "Open thread" is a
+ *  real button, since nothing in the text says a tap on the card opens it. It
+ *  focuses the thread, and that focus arms the guard again. Returns the stop
+ *  function. */
 export function offerWithheldThread(threadId: string | null): () => void {
   if (threadId === null) return () => {};
   let offered = false;
@@ -65,7 +67,10 @@ export function offerWithheldThread(threadId: string | null): () => void {
     showToast(
       `Lucidos closed while ${formatThreadLabel(threadId)} was open, so it started on Home.`,
       'info',
-      { title: 'Started on Home', action: { label: 'Open', onClick: () => focusThreadOrBootstrap(threadId) } },
+      {
+        title: 'Started on Home',
+        action: { label: 'Open thread', onClick: () => focusThreadOrBootstrap(threadId), deliberate: true },
+      },
     );
   });
 }

@@ -78,6 +78,8 @@ source "$SCRIPT_DIR/lib/headless_tarball.sh"
 # Shared staging recipe (also used by build-dmg.sh).
 # shellcheck source=scripts/lib/stage_runtime.sh
 source "$SCRIPT_DIR/lib/stage_runtime.sh"
+# shellcheck source=scripts/lib/release_pg_major.sh
+source "$SCRIPT_DIR/lib/release_pg_major.sh"
 
 step() { printf '\n==> %s\n' "$*"; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -132,6 +134,8 @@ if [ -z "$TRIPLE" ]; then
     TRIPLE="$(stage_runtime_host_triple)" \
         || die "could not resolve the target triple for $(uname -s)/$(uname -m)"
 fi
+
+release_pg_major_guard "$PG_VERSION" || exit 1
 
 # --check: validate the resource contract offline and exit (no build, no network).
 # This used to be a printf and an exit 0, which could not fail, so a reader who

@@ -18,6 +18,7 @@ import { request } from './request';
 import { storage } from './storage';
 import { params } from './params';
 import { widget } from './widgetFrame';
+import { workItems } from './workItems';
 
 export const lucidos = {
   configure,
@@ -41,6 +42,8 @@ export const lucidos = {
   notifications,
   apps,
   threads,
+  // Driver and watchers of a work item (ADR 0623).
+  workItems,
   ui,
   sse,
   utils,
@@ -60,6 +63,8 @@ export const lucidos = {
 export { SdkError };
 export type * from './types';
 export type { StorageFailure } from './storage';
+export type { PermissionWait } from './triggers';
+export type { OperatorRef, WorkItemList, WorkItemRoles, WorkItemSummary } from './workItems';
 
 // The engine's answer for which routes an app may reach, and the matcher over
 // it. Runtime values rather than an internal, because the host bridge enforces

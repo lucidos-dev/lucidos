@@ -8,19 +8,29 @@ const GENERATE_IMAGE_TOOL: &str = "generate_image";
 /// The `reason` on a *cache keep-alive* turn's `CodingAgentIdled`.
 pub const KEEP_ALIVE_IDLE_REASON: &str = "cache_keep_alive";
 
+/// The `reason` on a *ceiling re-entry* turn's `CodingAgentIdled` (ADR 0629).
+pub const CEILING_REENTRY_IDLE_REASON: &str = "ceiling_reentry";
+
+/// The idle reasons of an engine turn: the agent did no work the user asked
+/// for, so no trigger, event wait or turn gap reads its idle.
+const ENGINE_TURN_IDLE_REASONS: [&str; 2] = [KEEP_ALIVE_IDLE_REASON, CEILING_REENTRY_IDLE_REASON];
+
 /// The events that end a *cache keep-alive* turn: a card the agent raised
 /// anyway. The thread now waits on a person, so the card and the turn after
 /// it show.
 pub const KEEP_ALIVE_ENDING_EVENT_TYPES: &[&str] =
     &["UserQuestionAsked", "CodingAgentPermissionRequest"];
 
-/// SQL true for every `events` row but a keep-alive idle, for each scan that
-/// must agree with [`ThreadEvent::is_cache_keep_alive_idle`]. `prefix` names
+/// SQL true for every `events` row but an engine turn's idle, for each scan
+/// that must agree with [`ThreadEvent::is_engine_turn_idle`]. `prefix` names
 /// the table alias with its dot, or is empty.
-pub fn not_a_keep_alive_idle_sql(prefix: &str) -> String {
+pub fn not_an_engine_turn_idle_sql(prefix: &str) -> String {
+    let reasons = ENGINE_TURN_IDLE_REASONS
+        .map(|r| format!("'{r}'"))
+        .join(", ");
     format!(
         "NOT ({prefix}event_type = 'CodingAgentIdled' \
-         AND COALESCE({prefix}payload->>'reason', '') = '{KEEP_ALIVE_IDLE_REASON}')"
+         AND COALESCE({prefix}payload->>'reason', '') IN ({reasons}))"
     )
 }
 
@@ -215,6 +225,11 @@ impl ThreadEvent {
             Self::ParentWakeNotRequested => "ParentWakeNotRequested",
             Self::ThreadReplySeen { .. } => "ThreadReplySeen",
             Self::ThreadTriageProposed { .. } => "ThreadTriageProposed",
+            Self::WorkItemDriverTaken => "WorkItemDriverTaken",
+            Self::WorkItemDriverReleased => "WorkItemDriverReleased",
+            Self::WorkItemGateEscalated { .. } => "WorkItemGateEscalated",
+            Self::WorkItemWatched => "WorkItemWatched",
+            Self::WorkItemUnwatched => "WorkItemUnwatched",
             Self::ThreadStarted { .. } => "ThreadStarted",
             Self::ThreadDiscarded { .. } => "ThreadDiscarded",
             Self::HomeThreadCreated => "HomeThreadCreated",
@@ -247,6 +262,9 @@ impl ThreadEvent {
             Self::SessionHandedOff { .. } => "SessionHandedOff",
             Self::HandoffCheckpointReached { .. } => "HandoffCheckpointReached",
             Self::SuccessorOfferDeclined { .. } => "SuccessorOfferDeclined",
+            Self::ContextCeilingSet { .. } => "ContextCeilingSet",
+            Self::ContextCeilingReached { .. } => "ContextCeilingReached",
+            Self::SessionHandoffWithdrawn => "SessionHandoffWithdrawn",
             Self::SuccessorRequested { .. } => "SuccessorRequested",
             Self::PromptInjected { .. } => "PromptInjected",
             Self::CredentialRequested { .. } => "CredentialRequested",
@@ -377,6 +395,11 @@ impl ThreadEvent {
         "ParentWakeNotRequested",
         "ThreadReplySeen",
         "ThreadTriageProposed",
+        "WorkItemDriverTaken",
+        "WorkItemDriverReleased",
+        "WorkItemGateEscalated",
+        "WorkItemWatched",
+        "WorkItemUnwatched",
         "ThreadStarted",
         "ThreadDiscarded",
         "HomeThreadCreated",
@@ -410,6 +433,9 @@ impl ThreadEvent {
         "HandoffCheckpointReached",
         "SuccessorOfferDeclined",
         "SuccessorRequested",
+        "ContextCeilingSet",
+        "ContextCeilingReached",
+        "SessionHandoffWithdrawn",
         "PromptInjected",
         "CredentialRequested",
         "PluginInstallRequested",
@@ -541,12 +567,14 @@ impl ThreadEvent {
         "ChildReportFiled",
     ];
 
-    /// Whether this is the idle a *cache keep-alive* turn ends with. No agent,
-    /// trigger or event wait may read it as the agent finishing.
-    pub fn is_cache_keep_alive_idle(&self) -> bool {
+    /// Whether this is the idle an engine turn ends with: a *cache keep-alive*
+    /// or a *ceiling re-entry*. No agent, trigger or event wait may read it as
+    /// the agent finishing.
+    pub fn is_engine_turn_idle(&self) -> bool {
         matches!(
             self,
-            Self::CodingAgentIdled { reason: Some(r), .. } if r == KEEP_ALIVE_IDLE_REASON
+            Self::CodingAgentIdled { reason: Some(r), .. }
+                if ENGINE_TURN_IDLE_REASONS.contains(&r.as_str())
         )
     }
 

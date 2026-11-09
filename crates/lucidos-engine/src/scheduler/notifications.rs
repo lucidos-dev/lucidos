@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
+use crate::gateway_operators::Reader;
 
 /// Where a tap on this notification (OS push, in-app toast) should land.
 ///
@@ -73,6 +74,12 @@ pub enum Tap {
         workspace_id: String,
         handle: crate::core::snapshot::handle::Handle,
     },
+    /// Opens a confirmation to undo the config change `event_id` recorded
+    /// (ADR 0623); never undoes on its own.
+    #[serde(rename = "undo-config-change")]
+    UndoConfigChange {
+        event_id: uuid::Uuid,
+    },
 }
 
 // Custom Deserialize (not derived) so the RETIRED `{"kind":"none"}` kind coerces
@@ -106,6 +113,10 @@ impl<'de> Deserialize<'de> for Tap {
                 workspace_id: String,
                 handle: crate::core::snapshot::handle::Handle,
             },
+            #[serde(rename = "undo-config-change")]
+            UndoConfigChange {
+                event_id: uuid::Uuid,
+            },
         }
         Ok(match TapWire::deserialize(deserializer)? {
             TapWire::Modal | TapWire::None => Tap::Modal,
@@ -117,6 +128,7 @@ impl<'de> Deserialize<'de> for Tap {
                 workspace_id,
                 handle,
             },
+            TapWire::UndoConfigChange { event_id } => Tap::UndoConfigChange { event_id },
         })
     }
 }
@@ -272,11 +284,16 @@ pub fn resolve_thread_tap_id(tap: &mut Tap, caller: Option<Uuid>) -> Result<(), 
 
 /// Refuse a tap kind that only the engine may write. A caller-written
 /// `RestoreSnapshot` would put any snapshot behind the "Undo restore"
-/// confirmation. The engine emits its own straight to the bus after a restore.
+/// confirmation, and an `UndoConfigChange` any event behind "Undo". The engine
+/// emits its own straight to the bus.
 pub fn refuse_engine_only_tap(tap: &Tap) -> Result<(), String> {
     match tap {
         Tap::RestoreSnapshot { .. } => Err(
             "a `restore-snapshot` tap is written only by the engine after a restore.".to_string(),
+        ),
+        Tap::UndoConfigChange { .. } => Err(
+            "an `undo-config-change` tap is written only by the engine after a config change."
+                .to_string(),
         ),
         Tap::Modal | Tap::Navigate { .. } => Ok(()),
     }
@@ -487,149 +504,125 @@ impl NotificationStore {
         })
     }
 
-    /// Count unread notifications (no cap — returns the real total)
-    pub async fn count_unread(pool: &PgPool) -> Result<i64, sqlx::Error> {
-        let (count,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM notifications WHERE read = false")
-                .fetch_one(pool)
-                .await?;
-        Ok(count)
+    /// Count what `reader` has not read (no cap: the real total).
+    pub async fn count_unread(pool: &PgPool, reader: &Reader) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM notifications n WHERE NOT {}",
+            read_by("$1")
+        ))
+        .bind(reader.devices())
+        .fetch_one(pool)
+        .await
     }
 
-    /// Get notifications with optional filter and cursor pagination.
+    /// Notifications newest first, as `reader` reads them.
     ///
     /// `filter` — `"unread"` returns only unread; anything else returns all.
     /// `before_ts` — cursor: only rows with `created_at < $ts` (for infinite scroll).
     /// `limit` — max rows to return.
     pub async fn get_filtered(
         pool: &PgPool,
+        reader: &Reader,
         filter: &str,
         limit: i64,
         before_ts: Option<DateTime<Utc>>,
     ) -> Result<Vec<Notification>, sqlx::Error> {
-        let unread_only = filter == "unread";
-
-        match (unread_only, before_ts) {
-            (true, Some(ts)) => {
-                sqlx::query_as::<_, Notification>(
-                    r#"
-                    SELECT id, task_id, app_id, thread_id, event_id, title, message, read, created_at, tap
-                    FROM notifications
-                    WHERE read = false AND created_at < $1
-                    ORDER BY created_at DESC
-                    LIMIT $2
-                    "#,
-                )
-                .bind(ts)
-                .bind(limit)
-                .fetch_all(pool)
-                .await
-            }
-            (true, None) => {
-                sqlx::query_as::<_, Notification>(
-                    r#"
-                    SELECT id, task_id, app_id, thread_id, event_id, title, message, read, created_at, tap
-                    FROM notifications
-                    WHERE read = false
-                    ORDER BY created_at DESC
-                    LIMIT $1
-                    "#,
-                )
-                .bind(limit)
-                .fetch_all(pool)
-                .await
-            }
-            (false, Some(ts)) => {
-                sqlx::query_as::<_, Notification>(
-                    r#"
-                    SELECT id, task_id, app_id, thread_id, event_id, title, message, read, created_at, tap
-                    FROM notifications
-                    WHERE created_at < $1
-                    ORDER BY created_at DESC
-                    LIMIT $2
-                    "#,
-                )
-                .bind(ts)
-                .bind(limit)
-                .fetch_all(pool)
-                .await
-            }
-            (false, None) => {
-                sqlx::query_as::<_, Notification>(
-                    r#"
-                    SELECT id, task_id, app_id, thread_id, event_id, title, message, read, created_at, tap
-                    FROM notifications
-                    ORDER BY created_at DESC
-                    LIMIT $1
-                    "#,
-                )
-                .bind(limit)
-                .fetch_all(pool)
-                .await
-            }
-        }
+        sqlx::query_as::<_, Notification>(&format!(
+            "SELECT * FROM ({}) s \
+             WHERE (NOT $2 OR NOT s.read) AND ($3::timestamptz IS NULL OR s.created_at < $3) \
+             ORDER BY s.created_at DESC LIMIT $4",
+            select_as_read_by("$1")
+        ))
+        .bind(reader.devices())
+        .bind(filter == "unread")
+        .bind(before_ts)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
     }
 
-    /// Get notifications created before a specific timestamp (for time travel)
+    /// Notifications created at or before a timestamp (for time travel).
     pub async fn get_all_before(
         pool: &PgPool,
+        reader: &Reader,
         before: DateTime<Utc>,
         limit: i64,
     ) -> Result<Vec<Notification>, sqlx::Error> {
-        sqlx::query_as::<_, Notification>(
-            r#"
-            SELECT id, task_id, app_id, thread_id, event_id, title, message, read, created_at, tap
-            FROM notifications
-            WHERE created_at <= $1
-            ORDER BY created_at DESC
-            LIMIT $2
-            "#,
-        )
+        sqlx::query_as::<_, Notification>(&format!(
+            "SELECT * FROM ({}) s WHERE s.created_at <= $2 ORDER BY s.created_at DESC LIMIT $3",
+            select_as_read_by("$1")
+        ))
+        .bind(reader.devices())
         .bind(before)
         .bind(limit)
         .fetch_all(pool)
         .await
     }
 
-    /// Flip one notification to read. Returns `true` only when the row moved
-    /// from unread to read.
+    /// Record one read for `reader`. Returns `true` only when the notification
+    /// moved from unread to read for them.
     ///
     /// **Private on purpose**: [`Self::mark_read`] is the reachable mutator,
     /// and it emits.
-    async fn mark_read_row(pool: &PgPool, notification_id: Uuid) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            r#"
-            UPDATE notifications
-            SET read = true
-            WHERE id = $1 AND read = false
-            "#,
-        )
-        .bind(notification_id)
-        .execute(pool)
-        .await?;
-
+    async fn mark_read_row(
+        pool: &PgPool,
+        reader: &Reader,
+        notification_id: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        let result = match reader {
+            Reader::Team => {
+                sqlx::query("UPDATE notifications SET read = true WHERE id = $1 AND read = false")
+                    .bind(notification_id)
+                    .execute(pool)
+                    .await?
+            }
+            Reader::Person { device_id, devices } => {
+                sqlx::query(&format!(
+                    "INSERT INTO notification_reads (notification_id, device_id) \
+                     SELECT n.id, $2 FROM notifications n WHERE n.id = $1 AND NOT {} \
+                     ON CONFLICT DO NOTHING",
+                    read_by("$3")
+                ))
+                .bind(notification_id)
+                .bind(device_id)
+                .bind(devices)
+                .execute(pool)
+                .await?
+            }
+        };
         Ok(result.rows_affected() > 0)
     }
 
-    /// Flip every unread notification to read, returning how many moved.
+    /// Record a read of everything `reader` has not read, returning how many
+    /// moved.
     ///
     /// **Private on purpose**: [`Self::mark_all_read`] is the reachable
     /// mutator, and it emits.
-    async fn mark_all_read_rows(pool: &PgPool) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query(
-            r#"
-            UPDATE notifications
-            SET read = true
-            WHERE read = false
-            "#,
-        )
-        .execute(pool)
-        .await?;
-
+    async fn mark_all_read_rows(pool: &PgPool, reader: &Reader) -> Result<u64, sqlx::Error> {
+        let result = match reader {
+            Reader::Team => {
+                sqlx::query("UPDATE notifications SET read = true WHERE read = false")
+                    .execute(pool)
+                    .await?
+            }
+            Reader::Person { device_id, devices } => {
+                sqlx::query(&format!(
+                    "INSERT INTO notification_reads (notification_id, device_id) \
+                     SELECT n.id, $1 FROM notifications n WHERE NOT {} \
+                     ON CONFLICT DO NOTHING",
+                    read_by("$2")
+                ))
+                .bind(device_id)
+                .bind(devices)
+                .execute(pool)
+                .await?
+            }
+        };
         Ok(result.rows_affected())
     }
 
-    /// Mark a notification read and announce it. The only way to flip one.
+    /// Mark a notification read for `reader` and announce it. The only way to
+    /// flip one.
     ///
     /// `NotificationRead` fires only when the row really moved from unread to
     /// read, so a redundant write (the service worker POSTs read on tap AND the
@@ -637,10 +630,11 @@ impl NotificationStore {
     pub async fn mark_read(
         pool: &PgPool,
         event_bus: &EventBus,
+        reader: &Reader,
         notification_id: Uuid,
         actor: Option<MessageOrigin>,
     ) -> Result<bool, sqlx::Error> {
-        let marked = Self::mark_read_row(pool, notification_id).await?;
+        let marked = Self::mark_read_row(pool, reader, notification_id).await?;
         if marked {
             event_bus
                 .emit_or_log(
@@ -655,14 +649,15 @@ impl NotificationStore {
         Ok(marked)
     }
 
-    /// Mark every unread notification read and announce it once. Returns how
+    /// Mark everything `reader` has not read and announce it once. Returns how
     /// many moved; announces nothing when the inbox was already clear.
     pub async fn mark_all_read(
         pool: &PgPool,
         event_bus: &EventBus,
+        reader: &Reader,
         actor: Option<MessageOrigin>,
     ) -> Result<u64, sqlx::Error> {
-        let count = Self::mark_all_read_rows(pool).await?;
+        let count = Self::mark_all_read_rows(pool, reader).await?;
         if count > 0 {
             event_bus
                 .emit_or_log(
@@ -674,22 +669,61 @@ impl NotificationStore {
         Ok(count)
     }
 
-    /// Get notification by ID
+    /// One notification, as `reader` reads it.
     pub async fn get_by_id(
         pool: &PgPool,
+        reader: &Reader,
         notification_id: Uuid,
     ) -> Result<Option<Notification>, sqlx::Error> {
-        sqlx::query_as::<_, Notification>(
-            r#"
-            SELECT id, task_id, app_id, thread_id, event_id, title, message, read, created_at, tap
-            FROM notifications
-            WHERE id = $1
-            "#,
-        )
+        sqlx::query_as::<_, Notification>(&format!(
+            "SELECT * FROM ({}) s WHERE s.id = $2",
+            select_as_read_by("$1")
+        ))
+        .bind(reader.devices())
         .bind(notification_id)
         .fetch_optional(pool)
         .await
     }
+
+    /// The devices a notification was sent to. `None` is the whole team, and
+    /// so is a notification that no longer exists.
+    pub async fn audience(
+        pool: &PgPool,
+        notification_id: Uuid,
+    ) -> Result<Option<Vec<String>>, sqlx::Error> {
+        Ok(
+            sqlx::query_scalar("SELECT audience FROM notifications WHERE id = $1")
+                .bind(notification_id)
+                .fetch_optional(pool)
+                .await?
+                .flatten(),
+        )
+    }
+}
+
+/// Whether `notifications n` is read, for the reader whose devices bind at
+/// `devices` (a `text[]`, NULL for the team). A person has read what the
+/// shared flag marks, what any of their devices read, and what was sent to
+/// other people only.
+fn read_by(devices: &str) -> String {
+    format!(
+        "(CASE WHEN {devices}::text[] IS NULL THEN n.read ELSE ( \
+             n.read \
+             OR (n.audience IS NOT NULL AND NOT (n.audience && {devices}::text[])) \
+             OR EXISTS (SELECT 1 FROM notification_reads r \
+                        WHERE r.notification_id = n.id AND r.device_id = ANY({devices}::text[])) \
+         ) END)"
+    )
+}
+
+/// Every notification row with `read` as the reader at `devices` reads it.
+fn select_as_read_by(devices: &str) -> String {
+    format!(
+        "SELECT n.id, n.task_id, n.app_id, n.thread_id, n.event_id, n.title, n.message, \
+                {} AS read, n.created_at, n.tap \
+         FROM notifications n",
+        read_by(devices)
+    )
 }
 
 #[cfg(test)]
@@ -975,7 +1009,7 @@ mod tests {
     fn tap_id(tap: &Tap) -> Option<&str> {
         match tap {
             Tap::Navigate { to } => to.id.as_deref(),
-            Tap::Modal | Tap::RestoreSnapshot { .. } => None,
+            Tap::Modal | Tap::RestoreSnapshot { .. } | Tap::UndoConfigChange { .. } => None,
         }
     }
 
@@ -1085,6 +1119,134 @@ mod tests {
         assert!(err.contains("restore-snapshot"), "got: {err}");
         refuse_engine_only_tap(&Tap::Modal).unwrap();
         refuse_engine_only_tap(&default_tap(Some(Uuid::new_v4()), None)).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-person read state (ADR 0623)
+    // -----------------------------------------------------------------------
+
+    fn sam(device_id: &str) -> Reader {
+        Reader::Person {
+            device_id: device_id.into(),
+            devices: vec!["sam-phone".into(), "sam-laptop".into()],
+        }
+    }
+
+    fn kim() -> Reader {
+        Reader::Person {
+            device_id: "kim-phone".into(),
+            devices: vec!["kim-phone".into()],
+        }
+    }
+
+    async fn insert_for(pool: &PgPool, audience: Option<&[&str]>) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO notifications (id, title, message, read, created_at, tap, audience) \
+             VALUES ($1, 't', 'm', false, NOW(), '{\"kind\":\"modal\"}', $2)",
+        )
+        .bind(id)
+        .bind(audience.map(|a| a.iter().map(|d| d.to_string()).collect::<Vec<_>>()))
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// Sam reading on one device reads for Sam's other device, and leaves
+    /// Kim's unread count alone. The team's flag stays unread too.
+    #[tokio::test]
+    async fn a_read_by_one_person_leaves_the_others_unread() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let id = insert_for(&pool, None).await;
+
+        assert!(
+            NotificationStore::mark_read(&pool, &bus, &sam("sam-phone"), id, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !NotificationStore::mark_read(&pool, &bus, &sam("sam-laptop"), id, None)
+                .await
+                .unwrap(),
+            "Sam already read it"
+        );
+        assert_eq!(
+            NotificationStore::count_unread(&pool, &sam("sam-laptop"))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            NotificationStore::count_unread(&pool, &kim())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            NotificationStore::count_unread(&pool, &Reader::Team)
+                .await
+                .unwrap(),
+            1
+        );
+        let for_kim = NotificationStore::get_by_id(&pool, &kim(), id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!for_kim.read);
+
+        assert_eq!(
+            NotificationStore::mark_all_read(&pool, &bus, &kim(), None)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            NotificationStore::count_unread(&pool, &kim())
+                .await
+                .unwrap(),
+            0
+        );
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// A notification sent to Kim only is never unread for Sam, and one the
+    /// whole team read before operators existed stays read for everyone.
+    #[tokio::test]
+    async fn a_notification_outside_the_audience_reads_as_read() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let for_kim = insert_for(&pool, Some(&["kim-phone"])).await;
+        let old = insert_for(&pool, None).await;
+        NotificationStore::mark_read(&pool, &bus, &Reader::Team, old, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            NotificationStore::count_unread(&pool, &sam("sam-phone"))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            NotificationStore::count_unread(&pool, &kim())
+                .await
+                .unwrap(),
+            1
+        );
+        let unread = NotificationStore::get_filtered(&pool, &kim(), "unread", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            unread.iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![for_kim]
+        );
+
+        pool.close().await;
+        teardown_test_db(&db).await;
     }
 
     // -----------------------------------------------------------------------

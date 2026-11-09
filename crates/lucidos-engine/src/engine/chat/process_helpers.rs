@@ -46,6 +46,11 @@ pub(super) struct TriggerContext {
     /// and silently re-run after every restart, which is the bug ADR 0133
     /// fixed. The compiler carries the id from the executor instead.
     pub queue_entry_id: Uuid,
+    /// A new thread's continue key claim (ADR 0623). The turn writes the key
+    /// into `TriggerStarted`, then releases the claim.
+    pub continue_key: Option<crate::triggers::continue_key::ContinueKeyClaim>,
+    /// The email the trigger's actor field resolved to (ADR 0623).
+    pub actor_email: Option<String>,
 }
 
 /// What restarts actually do to a chat thread, written as the chat-system
@@ -137,35 +142,33 @@ pub(super) const APPLY_VERIFY_DEV_ADDENDUM: &str = "\n- The user works on Lucido
 /// `EngineReason::Scheduler.trigger_id`" stays unit-testable without standing
 /// up the LLM that `process_trigger` runs through.
 pub(super) fn build_trigger_started_event(
-    trigger_id: &str,
-    trigger_name: &str,
-    invocation: &TriggerInvocation,
+    tc: &TriggerContext,
     user_message: &str,
-    go_to_review: bool,
     selection: &crate::core::ResolvedModelSelection,
-    retry_of: Option<&RetryOf>,
 ) -> (ThreadEvent, EventMeta) {
     use crate::engine::thread_events::EngineReason;
     (
         ThreadEvent::TriggerStarted {
-            retry_of: retry_of.cloned(),
-            trigger_id: trigger_id.to_string(),
-            trigger_name: Some(trigger_name.to_string()),
+            retry_of: tc.retry_of.clone(),
+            trigger_id: tc.trigger_id.clone(),
+            trigger_name: Some(tc.trigger_name.clone()),
             prompt: Some(user_message.to_string()),
-            invocation: Some(invocation.clone()),
+            invocation: Some(tc.invocation.clone()),
             // Scheduler-fired triggers always carry Engine origin so the
             // route popover can render "Engine · Scheduled · <name>".
             origin: Some(MessageOrigin::engine(EngineReason::Scheduler {
-                trigger_id: trigger_id.to_string(),
-                trigger_name: Some(trigger_name.to_string()),
+                trigger_id: tc.trigger_id.clone(),
+                trigger_name: Some(tc.trigger_name.clone()),
+                actor_email: tc.actor_email.clone(),
             })),
-            go_to_review,
+            go_to_review: tc.go_to_review,
             // The RESOLVED pair, not the trigger's raw pin: an unpinned trigger
             // records the account model it actually ran on, so the thread's
             // model memory is honest either way.
             model: selection.model.clone(),
             reasoning_effort: selection.reasoning_effort.clone(),
             provider: selection.provider.clone(),
+            continue_key: tc.continue_key.as_ref().map(|claim| claim.key.clone()),
         },
         EventMeta {
             channel: Some(EventChannel::Trigger),
@@ -566,8 +569,9 @@ pub(super) fn arm_followup_redirect(
 ) -> Option<std::sync::Arc<tokio::sync::Notify>> {
     let s = sessions.get_mut(&thread_id)?;
     // A starting run has no turn to interrupt yet: the follow-up just queues
-    // behind its first prompt. Interrupting would cancel the spawn.
-    if !s.is_running() {
+    // behind its first prompt. Interrupting would cancel the spawn. The
+    // ceiling re-entry is never cut short: the input waits for the successor.
+    if !s.is_running() || s.in_ceiling_reentry {
         return None;
     }
     if !should_redirect_followup(s.coding_agent, s.is_in_flight(), is_user_message, urgent) {

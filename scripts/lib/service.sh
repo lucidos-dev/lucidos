@@ -411,6 +411,38 @@ service_systemd_escape_env() {
     printf '%s' "$s"
 }
 
+# service_unit_env_value <manager> <unit-contents> <NAME>: the value the unit
+# sets for NAME ("" when it sets none). Reads back what service_launchd_plist or
+# service_systemd_unit wrote, undoing their escapes, so a value round-trips
+# byte-identical. Decoding runs in awk because bash 5.2 reads `&` in a
+# ${s//pattern/replacement} as the match.
+service_unit_env_value() {
+    local manager="$1" contents="$2" name="$3"
+    case "$manager" in
+        launchd)
+            printf '%s\n' "$contents" | awk -v k="<key>$name</key>" '
+                found {
+                    sub(/^[[:space:]]*<string>/, ""); sub(/<\/string>[[:space:]]*$/, "")
+                    gsub(/&lt;/, "<"); gsub(/&gt;/, ">"); gsub(/&amp;/, "\\&")
+                    print; exit
+                }
+                { line = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", line); if (line == k) found = 1 }'
+            ;;
+        systemd-user)
+            printf '%s\n' "$contents" | awk -v p="Environment=\"$name=" '
+                index($0, p) == 1 {
+                    s = substr($0, length(p) + 1); sub(/"$/, "", s); out = ""
+                    for (i = 1; i <= length(s); i++) {
+                        c = substr(s, i, 1)
+                        if ((c == "\\" || c == "%") && i < length(s)) { i++; c = substr(s, i, 1) }
+                        out = out c
+                    }
+                    print out; exit
+                }'
+            ;;
+    esac
+}
+
 # service_launchd_plist <label> <gateway-bin> <workdir> <out-log> <err-log> <env-block>
 # Render the LaunchAgent plist: RunAtLoad + KeepAlive (always-on), ProgramArguments
 # = ONLY the gateway binary (the service supervises the gateway, which spawns the

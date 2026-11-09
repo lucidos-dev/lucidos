@@ -9,6 +9,7 @@ use crate::boot_failure::BootFailure;
 use crate::boot_phase::{self, BootPhase};
 use crate::engine_hop::EngineAddress;
 use crate::error::ApiError;
+use crate::gateway_event_log::{GatewayEvent, LoggedEvent};
 use crate::hook_socket;
 use crate::net_config;
 use crate::next_boot;
@@ -193,24 +194,20 @@ struct GatewayInner {
     /// reaches one engine route, so a delivery from the open internet cannot
     /// become a workspace restart (`lucidos_local_token::HOOK_SOCKET_TOKEN_FILE`).
     hook_socket_token: String,
-    /// This gateway's own paired-device store, under its data dir. Never shared
-    /// with another gateway on the machine (`auth::paired_devices_path`).
-    paired_devices_path: PathBuf,
     /// The credential cookie this gateway writes and reads first
     /// (`auth::device_cookie_name`). Per gateway, because a cookie ignores the
     /// port, so one name would put two gateways in one slot on a hostname.
     device_cookie_name: String,
-    /// Paired devices, the source of truth for who may reach this gateway over
-    /// the network. Held in memory and written through on every change.
+    /// Paired devices and operators, projected from [`Self::event_log`]. Who
+    /// may reach this gateway over the network is read from here.
     ///
     /// `authorize` takes this lock on EVERY request, so nothing may hold it
-    /// across a file write. [`GatewayState::persist_paired_devices`] is the only
-    /// writer, and it holds it just long enough to clone.
-    paired_devices: Mutex<auth::PairedDevices>,
-    /// Serializes writers of the store, so two of them cannot interleave and
-    /// publish out of order. Separate from the data lock above precisely so the
-    /// file write happens with that one released.
-    paired_devices_writing: Mutex<()>,
+    /// across a file write. [`GatewayState::record`] holds it only to decide
+    /// and to apply.
+    directory: Mutex<crate::gateway_event_log::Directory>,
+    /// This gateway's own event log, under its data dir. Holding this lock
+    /// serializes writers, so the file and the projection see one order.
+    event_log: Mutex<crate::gateway_event_log::EventLog>,
     /// Device pairings minted and not yet redeemed. Never persisted: a pairing
     /// lives five minutes, so surviving a restart would buy nothing.
     pending_pairings: Mutex<pairing::PendingPairings>,
@@ -356,11 +353,9 @@ impl GatewayState {
     /// [`Self::for_tests`], with a frontend dir, for a test that needs a real
     /// shell served rather than "no frontend configured".
     ///
-    /// A supplied dir also roots the paired-device store, in a subdirectory of
-    /// its own. The default scratch dir is one per process, so it is shared by
-    /// every test in the binary, and tests run in parallel: two of them saving
-    /// the store at once race on the atomic rename and one fails. A test that
-    /// owns a directory gets its own store with it.
+    /// A supplied dir also roots the gateway event log, in a subdirectory of
+    /// its own. Every test in the binary shares the default scratch dir, so a
+    /// bare fixture gets a log dir of its own under it.
     #[cfg(test)]
     pub fn for_tests_with_static_dir(static_dir: Option<PathBuf>) -> Self {
         Self::for_tests_with(static_dir, "test-local-token", false)
@@ -386,6 +381,15 @@ impl GatewayState {
         // Bare fixtures share cached files, but represent independent gateways.
         // Give their host-wide operation lock an independent home. Tests that
         // model peers explicitly inject the same home into both states.
+        let log_home = if static_dir.is_some() {
+            scratch.clone()
+        } else {
+            tempfile::Builder::new()
+                .prefix("event-log-")
+                .tempdir_in(&scratch)
+                .unwrap()
+                .keep()
+        };
         let snapshot_home = if static_dir.is_some() {
             scratch.join("snapshot-home")
         } else {
@@ -405,10 +409,13 @@ impl GatewayState {
                 bind_choice: net_config::BindChoice::Loopback,
                 local_token: local_token.to_string(),
                 hook_socket_token: "test-hook-socket-token".to_string(),
-                paired_devices_path: scratch.join("paired-devices.json"),
                 device_cookie_name: auth::device_cookie_name(&scratch),
-                paired_devices: Mutex::new(auth::PairedDevices::default()),
-                paired_devices_writing: Mutex::new(()),
+                directory: Mutex::new(crate::gateway_event_log::Directory::default()),
+                event_log: Mutex::new(
+                    crate::gateway_event_log::open(&log_home, None)
+                        .expect("a scratch dir opens an empty log")
+                        .0,
+                ),
                 pending_pairings: Mutex::new(pairing::PendingPairings::new(
                     pairing::PairingKind::Device,
                 )),
@@ -754,11 +761,11 @@ impl GatewayState {
         &self,
         headers: &'a axum::http::HeaderMap,
     ) -> (auth::Authorization, Option<auth::PresentedCredential<'a>>) {
-        match self.inner.paired_devices.lock() {
-            Ok(paired) => auth::authorize_with_match(
+        match self.inner.directory.lock() {
+            Ok(directory) => auth::authorize_with_match(
                 headers,
                 &self.inner.local_token,
-                &paired,
+                &directory.devices,
                 &self.inner.device_cookie_name,
             ),
             Err(_) => (auth::Authorization::Unauthorized, None),
@@ -837,22 +844,31 @@ impl GatewayState {
         &self.inner.certs
     }
 
-    /// A snapshot of the paired devices, for the management list.
-    pub fn paired_devices(&self) -> auth::PairedDevices {
+    /// A snapshot of the devices and operators.
+    pub fn directory(&self) -> crate::gateway_event_log::Directory {
         self.inner
-            .paired_devices
+            .directory
             .lock()
-            .map(|p| p.clone())
+            .map(|d| d.clone())
             .unwrap_or_default()
     }
 
-    /// Mint a one-time device pairing, carrying the name the minter suggested.
-    pub fn mint_pairing(&self, label: Option<String>) -> Result<pairing::MintedPairing, String> {
+    /// A snapshot of the paired devices, for the management list.
+    pub fn paired_devices(&self) -> auth::PairedDevices {
+        self.directory().devices
+    }
+
+    /// Mint a one-time device pairing, carrying the name the minter suggested
+    /// and the operator the device will join.
+    pub fn mint_pairing(
+        &self,
+        intent: pairing::PairingIntent,
+    ) -> Result<pairing::MintedPairing, String> {
         self.inner
             .pending_pairings
             .lock()
             .map_err(|_| "pairing state is unavailable".to_string())?
-            .mint(label)
+            .mint(intent)
             .map_err(|e| format!("could not mint a pairing code: {e}"))
     }
 
@@ -872,14 +888,14 @@ impl GatewayState {
         // The name the device typed wins when it gave one, because that person
         // is being more specific than whoever minted the code. Otherwise the
         // `lucidos pair --label` name applies, and only then the fallback.
-        let minted_label = {
+        let intent = {
             let mut pending = self
                 .inner
                 .pending_pairings
                 .lock()
                 .map_err(|_| "pairing state is unavailable".to_string())?;
             match pending.redeem(presented, channel) {
-                pairing::Redemption::Redeemed(label) => label,
+                pairing::Redemption::Redeemed(intent) => intent,
                 pairing::Redemption::Rejected => return Ok(PairingOutcome::Rejected),
                 pairing::Redemption::LocalOnly => return Ok(PairingOutcome::LocalOnly),
                 pairing::Redemption::Throttled => return Ok(PairingOutcome::Throttled),
@@ -889,34 +905,38 @@ impl GatewayState {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
-            .or(minted_label)
+            .or(intent.label)
             .unwrap_or_else(|| "Paired device".to_string());
         let credential =
             auth::mint_credential().map_err(|e| format!("could not mint a credential: {e}"))?;
-        let device = auth::PairedDevice {
-            id: auth::mint_device_id().map_err(|e| format!("could not mint a device id: {e}"))?,
-            label: label.to_string(),
-            credential_digest: auth::digest(&credential),
-            paired_at: chrono::Utc::now().to_rfc3339(),
-            // Seeded, not left `None`: this device is reaching us right now, and
-            // an empty last-seen on a device that just paired reads as stale.
-            last_seen_at: Some(chrono::Utc::now().to_rfc3339()),
-        };
-        self.write_paired_devices(|paired| {
-            paired.devices.push(device.clone());
+        let device_id =
+            auth::mint_device_id().map_err(|e| format!("could not mint a device id: {e}"))?;
+        let recorded = self.record(|directory| {
+            let mut events = directory.pair(
+                &device_id,
+                &label,
+                &auth::digest(&credential),
+                intent.operator_id.as_deref(),
+            )?;
+            // Seen now, not left empty: this device is reaching us right now,
+            // and an empty last-seen on a device that just paired reads stale.
+            events.push(GatewayEvent::DeviceSeen {
+                device_id: device_id.clone(),
+            });
+            Ok(events)
         })?;
-        crate::log!("[Gateway] paired a new device: {}", device.label);
+        if let Err(refusal) = recorded {
+            crate::log!("[Gateway] refused a pairing: {refusal}");
+            return Ok(PairingOutcome::Rejected);
+        }
+        crate::log!("[Gateway] paired a new device: {label}");
         Ok(PairingOutcome::Paired(credential))
     }
 
     /// Forget a paired device. `false` when no device had that id.
     pub fn revoke_device(&self, id: &str) -> Result<bool, String> {
-        let mut removed = false;
-        self.write_paired_devices(|paired| {
-            let before = paired.devices.len();
-            paired.devices.retain(|d| d.id != id);
-            removed = paired.devices.len() != before;
-        })?;
+        let recorded = self.record(|directory| Ok(directory.revoke(id)))?;
+        let removed = recorded.is_ok_and(|events| !events.is_empty());
         if removed {
             crate::log!("[Gateway] revoked a paired device");
         }
@@ -933,30 +953,44 @@ impl GatewayState {
     ///
     /// So the check and the stamp share one lock acquisition. Reading first and
     /// writing after would let two concurrent requests both decide a stamp is
-    /// due and save twice. The throttle is what keeps a whole-file save off the
-    /// hot path: the store is rewritten once a day per device, not per request.
+    /// due and append twice. The throttle keeps the log off the hot path: one
+    /// line a day per device, not one per request.
     ///
-    /// The stamp is in memory before this returns; the disk write is handed to
-    /// a blocking thread and not waited on. Losing one to a crash costs a
-    /// restamp tomorrow, which is not worth making a request wait for a write.
-    ///
-    /// It does not go through [`Self::write_paired_devices`], which always
-    /// saves. Skipping the save is the entire throttle.
+    /// The stamp is in memory before this returns; the append is handed to a
+    /// blocking thread and not waited on. Losing one to a crash costs a
+    /// restamp tomorrow, which is not worth making a request wait for a sync.
+    /// A stamp landing after a revoke replays as nothing, so the order of the
+    /// two in the file does not matter.
     pub fn touch_device(&self, id: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
-        let stamped = match self.inner.paired_devices.lock() {
-            Ok(mut paired) => match paired.devices.iter_mut().find(|d| d.id == id) {
-                Some(device) if auth::last_seen_is_due(device.last_seen_at.as_deref(), now) => {
-                    device.last_seen_at = Some(now.to_rfc3339());
-                    true
-                }
-                _ => false,
+        let seen = LoggedEvent {
+            at: now.to_rfc3339(),
+            event: GatewayEvent::DeviceSeen {
+                device_id: id.to_string(),
             },
+        };
+        let stamped = match self.inner.directory.lock() {
+            Ok(mut directory) => {
+                let due =
+                    directory.devices.devices.iter().any(|d| {
+                        d.id == id && auth::last_seen_is_due(d.last_seen_at.as_deref(), now)
+                    });
+                if due {
+                    directory.apply(&seen);
+                }
+                due
+            }
             Err(_) => false,
         };
         if stamped {
             let state = self.clone();
             tokio::task::spawn_blocking(move || {
-                if let Err(e) = state.persist_paired_devices() {
+                let appended = state
+                    .inner
+                    .event_log
+                    .lock()
+                    .map_err(|_| "the gateway event log is unavailable".to_string())
+                    .and_then(|log| log.append(&[seen]).map_err(|e| e.to_string()));
+                if let Err(e) = appended {
                     crate::log!("[Gateway] could not record a device's last-seen time: {e}");
                 }
             });
@@ -964,61 +998,116 @@ impl GatewayState {
         stamped
     }
 
-    /// Write what the store says NOW, with the data lock released.
+    /// Decide on the current directory, append what was decided, then apply
+    /// it. The outer error is a failure to write; the inner one is the
+    /// decision's refusal, which is the caller's mistake.
     ///
-    /// Two properties, and the second is the subtle one. The data lock is held
-    /// only to clone: `authorize` takes it on every request, and a file write
-    /// is far longer than the digest compare it usually guards.
-    ///
-    /// And every writer publishes CURRENT memory, never a snapshot taken
-    /// earlier. A last-seen write holding a pre-revoke snapshot would otherwise
-    /// put the revoked device back in the file. The next boot would load it as
-    /// paired.
-    fn persist_paired_devices(&self) -> Result<(), String> {
-        let _writing = self
-            .inner
-            .paired_devices_writing
-            .lock()
-            .map_err(|_| "paired device store is unavailable".to_string())?;
-        let snapshot = self
-            .inner
-            .paired_devices
-            .lock()
-            .map_err(|_| "paired device store is unavailable".to_string())?
-            .clone();
-        snapshot
-            .save(&self.inner.paired_devices_path)
-            .map_err(|e| format!("could not save the paired device store: {e}"))
-    }
-
-    /// [`Self::write_paired_devices`], for a test that needs a seeded store.
-    #[cfg(test)]
-    pub fn write_paired_devices_for_test(
+    /// The log lock is held throughout, so a decision never acts on a
+    /// directory another writer is about to change. The directory lock is
+    /// held only to decide and to apply, never across the file write.
+    pub fn record(
         &self,
-        mutate: impl FnOnce(&mut auth::PairedDevices),
-    ) -> Result<(), String> {
-        self.write_paired_devices(mutate)
-    }
-
-    /// Mutate the paired-device store, then publish it.
-    ///
-    /// The mutation is atomic under the data lock, so a concurrent pair and
-    /// revoke cannot both read, both mutate, and have the loser's change lost.
-    /// The write is [`Self::persist_paired_devices`], which publishes whatever
-    /// memory holds once both mutations have landed.
-    fn write_paired_devices(
-        &self,
-        mutate: impl FnOnce(&mut auth::PairedDevices),
-    ) -> Result<(), String> {
-        {
-            let mut paired = self
+        decide: impl FnOnce(
+            &crate::gateway_event_log::Directory,
+        ) -> Result<Vec<GatewayEvent>, crate::gateway_event_log::Refusal>,
+    ) -> Result<Result<Vec<LoggedEvent>, crate::gateway_event_log::Refusal>, String> {
+        let log = self
+            .inner
+            .event_log
+            .lock()
+            .map_err(|_| "the gateway event log is unavailable".to_string())?;
+        let decided = {
+            let directory = self
                 .inner
-                .paired_devices
+                .directory
                 .lock()
-                .map_err(|_| "paired device store is unavailable".to_string())?;
-            mutate(&mut paired);
+                .map_err(|_| "the gateway directory is unavailable".to_string())?;
+            decide(&directory)
+        };
+        let events = match decided {
+            Ok(events) => events,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        let logged: Vec<LoggedEvent> = events.into_iter().map(LoggedEvent::now).collect();
+        self.append_and_apply(&log, &logged)?;
+        drop(log);
+        if logged.iter().any(|e| e.event.changes_identity()) {
+            crate::operators_api::signal_engines(self);
         }
-        self.persist_paired_devices()
+        Ok(Ok(logged))
+    }
+
+    fn append_and_apply(
+        &self,
+        log: &crate::gateway_event_log::EventLog,
+        logged: &[LoggedEvent],
+    ) -> Result<(), String> {
+        log.append(logged)
+            .map_err(|e| format!("could not write the gateway event log: {e}"))?;
+        let mut directory = self
+            .inner
+            .directory
+            .lock()
+            .map_err(|_| "the gateway directory is unavailable".to_string())?;
+        for event in logged {
+            directory.apply(event);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn log_path_for_test(&self) -> PathBuf {
+        self.inner.event_log.lock().unwrap().path().to_path_buf()
+    }
+
+    /// The directory a restart would rebuild from the log.
+    #[cfg(test)]
+    pub fn replayed_for_test(&self) -> crate::gateway_event_log::Directory {
+        let path = self.log_path_for_test();
+        crate::gateway_event_log::open(path.parent().unwrap(), None)
+            .unwrap()
+            .1
+    }
+
+    /// Pair `device` as it stands, timestamps included, under the first
+    /// operator, for a test that needs a seeded gateway.
+    #[cfg(test)]
+    pub fn seed_device_for_test(&self, device: auth::PairedDevice) -> Result<(), String> {
+        let log = self.inner.event_log.lock().unwrap();
+        let directory = self.directory();
+        let mut logged = Vec::new();
+        let operator_id = match directory.first_operator() {
+            Some(first) => first.id.clone(),
+            None => {
+                let id = format!("op-{}", device.id);
+                logged.push(LoggedEvent {
+                    at: device.paired_at.clone(),
+                    event: GatewayEvent::OperatorAdded {
+                        operator_id: id.clone(),
+                        name: crate::gateway_event_log::FIRST_OPERATOR_NAME.to_string(),
+                    },
+                });
+                id
+            }
+        };
+        logged.push(LoggedEvent {
+            at: device.paired_at.clone(),
+            event: GatewayEvent::DevicePaired {
+                device_id: device.id.clone(),
+                label: device.label.clone(),
+                credential_digest: device.credential_digest.clone(),
+                operator_id,
+            },
+        });
+        if let Some(seen) = &device.last_seen_at {
+            logged.push(LoggedEvent {
+                at: seen.clone(),
+                event: GatewayEvent::DeviceSeen {
+                    device_id: device.id.clone(),
+                },
+            });
+        }
+        self.append_and_apply(&log, &logged)
     }
 
     /// The engine serving `id`, if routed. Hot path, so no async locks.
@@ -3932,21 +4021,22 @@ pub async fn run(inherited_lock_fd: Option<String>) -> Result<RunOutcome, BoxErr
     // to an engine that requires a credential.
     let hook_socket_token = auth::ensure_hook_socket_token()?;
     // Per gateway, under this process's own data dir, so the packaged app and a
-    // dev checkout stop overwriting one machine-global file. The legacy path
-    // seeds this store once, which is what keeps an already-paired device in.
-    let paired_devices_path = auth::paired_devices_path(&app_data);
-    let seeded = auth::load_or_seed(
-        &paired_devices_path,
-        auth::legacy_paired_devices_path().as_deref(),
-    )?;
-    if let Some(count) = seeded.seeded_from_legacy {
-        crate::log!(
-            "[Gateway] seeded {} paired device(s) from the shared store into {}",
+    // dev checkout never share one file. The old device store migrates into
+    // the log once, which is what keeps an already-paired device in.
+    let (event_log, directory, opened) =
+        crate::gateway_event_log::open(&app_data, auth::legacy_paired_devices_path().as_deref())?;
+    match opened {
+        crate::gateway_event_log::Opened::Migrated(count) => crate::log!(
+            "[Gateway] moved {} paired device(s) into the gateway event log at {}",
             count,
-            paired_devices_path.display()
-        );
+            event_log.path().display()
+        ),
+        crate::gateway_event_log::Opened::RepairedTornTail => crate::log!(
+            "[Gateway] cut a torn last line off the gateway event log at {}",
+            event_log.path().display()
+        ),
+        crate::gateway_event_log::Opened::Replayed | crate::gateway_event_log::Opened::Fresh => {}
     }
-    let paired_devices = seeded.devices;
     let paired_gateways = crate::gateway_protocol::PairedGatewayStore::load(
         crate::gateway_protocol::paired_gateways_path(&app_data),
     )?;
@@ -3955,7 +4045,7 @@ pub async fn run(inherited_lock_fd: Option<String>) -> Result<RunOutcome, BoxErr
     )?;
     crate::log!(
         "[Gateway] inbound auth ready: {} paired device(s), local token at {}",
-        paired_devices.devices.len(),
+        directory.devices.devices.len(),
         auth::local_token_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "<unknown>".into())
@@ -3976,9 +4066,8 @@ pub async fn run(inherited_lock_fd: Option<String>) -> Result<RunOutcome, BoxErr
                 bind_choice: gateway_bind_choice,
                 local_token,
                 hook_socket_token,
-                paired_devices_path,
-                paired_devices: Mutex::new(paired_devices),
-                paired_devices_writing: Mutex::new(()),
+                directory: Mutex::new(directory),
+                event_log: Mutex::new(event_log),
                 pending_pairings: Mutex::new(pairing::PendingPairings::new(
                     pairing::PairingKind::Device,
                 )),
@@ -4260,8 +4349,8 @@ async fn serve(
     }
 
     // The hook socket, on its own port and its own router (`crate::hook_socket`).
-    // Plain http and loopback: this is what `tailscale funnel` maps, and funnel
-    // proxies from this machine. It shares the shutdown handle, so SIGUSR1
+    // Plain http, loopback unless `LUCIDOS_HOOK_BIND_ADDR` widens it: this is
+    // what `tailscale funnel` maps, and funnel proxies from this machine. It shares the shutdown handle, so SIGUSR1
     // stops both listeners together.
     //
     // Nothing about it is fatal, at bind time or later. The gateway's job is
@@ -4269,7 +4358,7 @@ async fn serve(
     // webhook surface nobody may be using is the wrong trade. Its failures are
     // logged and it stops answering, while every workspace keeps serving.
     if let Some(hook) = hook_socket::resolved_hook_port(port) {
-        let addr = hook_socket::bind_addr(hook);
+        let addr = hook_socket::resolved_bind_addr(hook);
         match std::net::TcpListener::bind(addr) {
             Ok(listener) => {
                 crate::log!("[Gateway] hook socket listening on http://{addr}");
@@ -4307,11 +4396,12 @@ async fn serve(
         ));
     }
 
-    // The public listener: loopback, plain, the whole router, and every request
-    // stamped public (`crate::pairing`). A tunnel or reverse proxy points here.
-    // Not fatal, for the hook socket's reason above.
+    // The public listener: loopback unless `LUCIDOS_PUBLIC_BIND_ADDR` widens
+    // it, plain, the whole router, and every request stamped public
+    // (`crate::pairing`). A tunnel or reverse proxy points here. Not fatal,
+    // for the hook socket's reason above.
     if let Some(public) = pairing::resolved_public_port(port) {
-        let addr = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, public));
+        let addr = pairing::resolved_public_bind_addr(public);
         match std::net::TcpListener::bind(addr) {
             Ok(listener) => {
                 crate::log!("[Gateway] public listener on http://{addr}");
@@ -4567,7 +4657,7 @@ async fn fallback(State(state): State<GatewayState>, mut req: axum::extract::Req
         if let Some(slug) = state.sole_workspace().filter(|_| credentialed) {
             return redirect(&format!("/{slug}/"));
         }
-        return serve_picker_shell(&state, None);
+        return serve_picker_shell(&state);
     }
 
     if path == format!("/{SIGIL}") {
@@ -4934,22 +5024,16 @@ async fn serve_sigil(state: &GatewayState, rest: &str, req: axum::extract::Reque
     let Some(dir) = state.inner.static_dir.clone() else {
         return (StatusCode::NOT_FOUND, "no frontend configured").into_response();
     };
-    // A scanned QR lands here as `/~/?pair=<code>`. The code rides into the
-    // shell's manifest link and out again in `start_url`, so an iOS home-screen
-    // install pairs itself on first launch. Owned rather than borrowed, because
-    // the asset branch below consumes `req`.
-    let pair_code = pairing_qr::pairing_token_in_query(req.uri().query()).map(str::to_string);
-
     // Serving the raw `dist/index.html` here would carry no base tag, so the
     // bundle would render the app rather than the picker. Mirrors the engine's
     // own `serve_frontend` index special-case.
     if rest.is_empty() || rest == "index.html" {
-        return serve_picker_shell(state, pair_code.as_deref());
+        return serve_picker_shell(state);
     }
     // The PWA manifest needs a picker-specific re-stamp (see
     // `serve_picker_manifest`), so it must NOT be served verbatim.
     if rest == "manifest.json" {
-        return serve_picker_manifest(state, pair_code.as_deref());
+        return serve_picker_manifest(state, pairing_qr::pairing_token_in_query(req.uri().query()));
     }
     // Reconstruct the request with the sigil stripped so `ServeDir` resolves
     // the asset against `static_dir`.
@@ -4969,15 +5053,15 @@ async fn serve_sigil(state: &GatewayState, rest: &str, req: axum::extract::Reque
     match service.oneshot(asset_req).await {
         Ok(resp) if resp.status() != StatusCode::NOT_FOUND => resp.map(Body::new),
         // No such asset. The picker is a SPA, so serve its shell.
-        _ => serve_picker_shell(state, pair_code.as_deref()),
+        _ => serve_picker_shell(state),
     }
 }
 
 /// Serve the picker shell: `index.html` from `static_dir` with `<base
 /// href="/~/">` stamped in, so the bundle's relative asset refs resolve under
 /// the sigil namespace (and `main.tsx` recognises the picker context).
-fn serve_picker_shell(state: &GatewayState, pair_code: Option<&str>) -> Response {
-    serve_stamped_picker_shell(state, false, pair_code)
+fn serve_picker_shell(state: &GatewayState) -> Response {
+    serve_stamped_picker_shell(state, false)
 }
 
 /// The picker shell, optionally stamped as the pairing screen.
@@ -4985,11 +5069,7 @@ fn serve_picker_shell(state: &GatewayState, pair_code: Option<&str>) -> Response
 /// One reader for one file, because the pairing screen IS the picker document
 /// plus a marker. Splitting them would leave two places to keep the base href
 /// and the error handling in step.
-fn serve_stamped_picker_shell(
-    state: &GatewayState,
-    pairing: bool,
-    pair_code: Option<&str>,
-) -> Response {
+fn serve_stamped_picker_shell(state: &GatewayState, pairing: bool) -> Response {
     let Some(dir) = state.inner.static_dir.as_ref() else {
         return (StatusCode::NOT_FOUND, "no frontend configured").into_response();
     };
@@ -5005,138 +5085,29 @@ fn serve_stamped_picker_shell(
             return (StatusCode::INTERNAL_SERVER_ERROR, "picker unavailable").into_response();
         }
     };
+    let manifest_source = read_gateway_manifest(dir);
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        stamp_picker_shell(&html, pairing, pair_code),
+        stamp_picker_shell(&html, pairing, &manifest_source),
     )
         .into_response()
 }
 
-/// Stamp the head tags the picker context needs. Pure, so the rules below are
-/// unit-tested against the real `index.html`.
-///
-/// # A stamped code leaves exactly one manifest link
-///
-/// A manifest is "the first link element in tree order whose rel contains
-/// manifest", and `inject_head_tags` puts ours at the top of `<head>`. Winning
-/// on the letter of that would still stake the auto-pair on the reader
-/// agreeing, on the one platform the feature exists for. So the bundle's link
-/// goes when a code is stamped, and the document has one manifest rather than a
-/// favourite.
-///
-/// The ordinary no-code load, which is every other request, removes nothing.
-/// That document is byte-identical to the bundle's.
-///
-/// Our href is absolute rather than relative to the stamped base. The base
-/// resolves it either way, and an absolute one owes nothing to tag ordering.
-fn stamp_picker_shell(html: &str, pairing: bool, pair_code: Option<&str>) -> String {
+/// Stamp the picker base, pairing marker and credential-free install template.
+fn stamp_picker_shell(html: &str, pairing: bool, manifest_source: &str) -> String {
     let mut tags = format!("<base href=\"/{SIGIL}/\">");
     if pairing {
         tags.push_str(&format!(
             "<meta name=\"{PAIRING_SHELL_META_NAME}\" content=\"1\">"
         ));
     }
-    let Some(code) = pair_code else {
-        return inject_head_tags(html, &tags);
-    };
-    let param = pairing_qr::PAIR_PARAM;
+    // The fragment is invisible to the server. Supply a credential-free template
+    // on every picker shell; the first head script builds the install manifest.
+    let template = gateway_manifest_json(manifest_source, "/~/", "/~/").replace('<', "\\u003c");
     tags.push_str(&format!(
-        "<link rel=\"manifest\" href=\"/{SIGIL}/manifest.json?{param}={code}\">"
+        "<script type=\"application/json\" id=\"lucidos-pairing-manifest\">{template}</script>"
     ));
-    inject_head_tags(&strip_manifest_links(html), &tags)
-}
-
-/// `html` with every `<link rel="manifest">` element removed.
-///
-/// This shares byte offsets with a lowercased copy, which holds because
-/// `to_ascii_lowercase` rewrites ASCII bytes in place and leaves every
-/// multi-byte sequence alone. `find_head_open_end` below leans on the same
-/// fact.
-fn strip_manifest_links(html: &str) -> String {
-    let lower = html.to_ascii_lowercase();
-    let mut out = String::with_capacity(html.len());
-    let mut cursor = 0;
-    while let Some(open) = lower[cursor..].find("<link").map(|i| i + cursor) {
-        let Some(end) = tag_end(&lower[open..]).map(|i| i + open) else {
-            break;
-        };
-        out.push_str(&html[cursor..open]);
-        if !declares_manifest_rel(&lower[open..end]) {
-            out.push_str(&html[open..end]);
-        }
-        cursor = end;
-    }
-    out.push_str(&html[cursor..]);
-    out
-}
-
-/// Byte offset just past the `>` closing the tag `tag` opens with.
-///
-/// Quote-aware, so a `>` inside an attribute value does not end the tag early.
-fn tag_end(tag: &str) -> Option<usize> {
-    let mut quote: Option<u8> = None;
-    for (i, &b) in tag.as_bytes().iter().enumerate() {
-        match quote {
-            Some(q) if b == q => quote = None,
-            Some(_) => {}
-            None if b == b'"' || b == b'\'' => quote = Some(b),
-            None if b == b'>' => return Some(i + 1),
-            None => {}
-        }
-    }
-    None
-}
-
-/// Does this lowercased tag carry `rel` with a `manifest` token?
-///
-/// `rel` is a space-separated token list, so the value has to MATCH a token
-/// rather than merely contain the word.
-fn declares_manifest_rel(tag: &str) -> bool {
-    attr_value(tag, "rel").is_some_and(|v| v.split_ascii_whitespace().any(|t| t == "manifest"))
-}
-
-/// The value of `name` in this lowercased tag, unquoted, or `None`.
-///
-/// Walks the attributes rather than searching for the name, because a search
-/// finds it inside another attribute's VALUE as readily as at an attribute
-/// boundary. Here that decides whether an element is deleted.
-fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
-    // Past `<link`, at the first attribute.
-    let mut rest = tag.strip_prefix('<')?.split_once(char::is_whitespace)?.1;
-    loop {
-        rest = rest.trim_start();
-        // The tag is out of attributes. Also the loop's termination: without it
-        // a leading `>` splits into an empty name and no progress.
-        if rest.starts_with('>') {
-            return None;
-        }
-        let split = rest.find(|c: char| c.is_ascii_whitespace() || c == '=' || c == '>')?;
-        let (attr, after) = rest.split_at(split);
-        let after = after.trim_start();
-        let (value, tail) = match after.strip_prefix('=') {
-            Some(v) => attr_tail(v.trim_start()),
-            None => ("", after),
-        };
-        if attr == name {
-            return Some(value);
-        }
-        rest = tail;
-    }
-}
-
-/// An attribute value, and the tag text after it.
-///
-/// Quoted runs to the closing quote; bare runs to the next whitespace or `>`.
-fn attr_tail(raw: &str) -> (&str, &str) {
-    for quote in ['"', '\''] {
-        if let Some(inner) = raw.strip_prefix(quote) {
-            return inner.split_once(quote).unwrap_or((inner, ""));
-        }
-    }
-    let end = raw
-        .find(|c: char| c.is_ascii_whitespace() || c == '>')
-        .unwrap_or(raw.len());
-    raw.split_at(end)
+    inject_head_tags(html, &tags)
 }
 
 /// Marks a response as the pairing screen rather than the app shell, so a
@@ -5182,15 +5153,9 @@ pub(crate) const PAIRING_SHELL_META_NAME: &str = "lucidos-pairing";
 /// No new public path is needed: the shell's `<base href="/~/">` keeps its
 /// assets under the sigil namespace. Rest:
 /// `docs/plans/2026-08-19-nobody-is-stranded-by-the-pairing-update.md`.
-/// `pair_code` is whatever the refused request's own query carried, validated
-/// by the same reader `serve_sigil` uses. A scan lands on the public
-/// `/~/?pair=`, so the ordinary path never gets here. The picker's cold-start
-/// fast path is why one still can: it redirects a remembered workspace and
-/// takes the query with it, landing a real code on a gated path. Drop the code
-/// there and the install this screen feeds gets a manifest without it, so the
-/// app opens asking to pair.
-pub(crate) fn serve_pairing_shell(state: &GatewayState, pair_code: Option<&str>) -> Response {
-    let mut response = serve_stamped_picker_shell(state, true, pair_code);
+/// Legacy query input remains accepted; new fragment input stays in the browser.
+pub(crate) fn serve_pairing_shell(state: &GatewayState) -> Response {
+    let mut response = serve_stamped_picker_shell(state, true);
     // Only a real shell wears the marker. A missing frontend answers 404 here,
     // and an unreadable index answers 500. A worker told either is the pairing
     // screen shows the error text, rather than falling back as it would for any
@@ -5215,7 +5180,7 @@ pub(crate) fn serve_pairing_shell(state: &GatewayState, pair_code: Option<&str>)
 /// iOS gives a home-screen app its own storage container, so pairing in Safari
 /// never reaches it. `start_url` is one of the two channels that do cross:
 /// install from a page carrying a code and the app launches at
-/// `/~/?pair=<code>`, which `PairingGate` already seeds itself from.
+/// `/~/#pair=<code>`, which `PairingGate` already seeds itself from.
 ///
 /// `id` is deliberately NOT varied by the code. It is the installation's
 /// identity, so a per-code `id` would read as a different app and could install
@@ -5232,7 +5197,7 @@ fn serve_picker_manifest(state: &GatewayState, pair_code: Option<&str>) -> Respo
 fn picker_start_url(pair_code: Option<&str>) -> String {
     let picker = format!("/{SIGIL}/");
     match pair_code {
-        Some(code) => format!("{picker}?{}={code}", pairing_qr::PAIR_PARAM),
+        Some(code) => format!("{picker}#{}={code}", pairing_qr::PAIR_PARAM),
         None => picker,
     }
 }
@@ -5249,8 +5214,18 @@ fn serve_gateway_manifest(state: &GatewayState, start_url: &str, id: &str) -> Re
     let Some(dir) = state.inner.static_dir.as_ref() else {
         return (StatusCode::NOT_FOUND, "no frontend configured").into_response();
     };
+    let source = read_gateway_manifest(dir);
+    (
+        [(header::CONTENT_TYPE, "application/manifest+json")],
+        gateway_manifest_json(&source, start_url, id),
+    )
+        .into_response()
+}
+
+/// Read the optional manifest consistently for the endpoint and shell template.
+fn read_gateway_manifest(dir: &std::path::Path) -> String {
     let path = dir.join("manifest.json");
-    let source = match std::fs::read_to_string(&path) {
+    match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
             // Degrade to a minimal valid manifest carrying the gateway scope,
@@ -5258,12 +5233,7 @@ fn serve_gateway_manifest(state: &GatewayState, start_url: &str, id: &str) -> Re
             crate::log!("[Gateway] manifest read failed ({}): {}", path.display(), e);
             String::new()
         }
-    };
-    (
-        [(header::CONTENT_TYPE, "application/manifest+json")],
-        gateway_manifest_json(&source, start_url, id),
-    )
-        .into_response()
+    }
 }
 
 /// Re-stamp a bundled manifest for a GATEWAY-served install: force `scope` to
@@ -5561,7 +5531,7 @@ mod tests {
         let dir_b = tempfile::tempdir().unwrap();
         let a = GatewayState::for_tests_with_static_dir(Some(dir_a.path().to_path_buf()));
         let b = GatewayState::for_tests_with_static_dir(Some(dir_b.path().to_path_buf()));
-        assert_ne!(a.inner.paired_devices_path, b.inner.paired_devices_path);
+        assert_ne!(a.log_path_for_test(), b.log_path_for_test());
         (dir_a, dir_b, a, b)
     }
 
@@ -5586,33 +5556,33 @@ mod tests {
         // once and rewrote it whole, so every write deleted the other's rows.
         let (_a_dir, _b_dir, a, b) = two_gateways();
 
-        let code = a.mint_pairing(Some("My iPhone".into())).unwrap().secret;
+        let code = a
+            .mint_pairing(crate::pairing::PairingIntent::labelled("My iPhone"))
+            .unwrap()
+            .secret;
         let credential = paired_credential(
             a.redeem_pairing(&code, crate::pairing::PairingChannel::Public, None)
                 .unwrap(),
         );
         assert_eq!(a.paired_devices().devices.len(), 1);
         assert!(b.paired_devices().devices.is_empty());
-        assert!(!b.inner.paired_devices_path.exists());
+        assert!(!b.log_path_for_test().exists());
 
         // B pairing its own device must leave A's file exactly as it was.
-        let code_b = b.mint_pairing(None).unwrap().secret;
+        let code_b = b
+            .mint_pairing(crate::pairing::PairingIntent::default())
+            .unwrap()
+            .secret;
         b.redeem_pairing(
             &code_b,
             crate::pairing::PairingChannel::Public,
             Some("My MacBook"),
         )
         .unwrap();
-        let a_store = auth::PairedDevices::load(&a.inner.paired_devices_path).unwrap();
+        let a_store = a.replayed_for_test().devices;
         assert_eq!(a_store.devices.len(), 1);
         assert_eq!(a_store.devices[0].label, "My iPhone");
-        assert_eq!(
-            auth::PairedDevices::load(&b.inner.paired_devices_path)
-                .unwrap()
-                .devices
-                .len(),
-            1
-        );
+        assert_eq!(b.replayed_for_test().devices.devices.len(), 1);
 
         // And the credential names its own gateway, nobody else's.
         let headers = cookie_header(&a, &credential);
@@ -5628,7 +5598,10 @@ mod tests {
         // Pinned because it is the CHOSEN behaviour, not an accident. A device
         // pairs to a gateway, so `lucidos pair` refuses to guess which one.
         let (_a_dir, _b_dir, a, b) = two_gateways();
-        let code = a.mint_pairing(None).unwrap().secret;
+        let code = a
+            .mint_pairing(crate::pairing::PairingIntent::default())
+            .unwrap()
+            .secret;
         assert!(matches!(
             b.redeem_pairing(&code, crate::pairing::PairingChannel::Public, None)
                 .unwrap(),
@@ -5644,14 +5617,20 @@ mod tests {
     #[test]
     fn revoking_on_one_gateway_leaves_the_other_s_device_alone() {
         let (_a_dir, _b_dir, a, b) = two_gateways();
-        let code_a = a.mint_pairing(None).unwrap().secret;
+        let code_a = a
+            .mint_pairing(crate::pairing::PairingIntent::default())
+            .unwrap()
+            .secret;
         a.redeem_pairing(
             &code_a,
             crate::pairing::PairingChannel::Public,
             Some("My iPhone"),
         )
         .unwrap();
-        let code_b = b.mint_pairing(None).unwrap().secret;
+        let code_b = b
+            .mint_pairing(crate::pairing::PairingIntent::default())
+            .unwrap()
+            .secret;
         let cred_b = paired_credential(
             b.redeem_pairing(
                 &code_b,
@@ -5672,47 +5651,60 @@ mod tests {
         ));
     }
 
-    // ── The paired-device store publishes memory, never a stale snapshot ─────
+    // ── The event log is the only truth about devices ───────────────────────
 
     #[test]
-    fn a_late_write_cannot_bring_a_revoked_device_back() {
-        // The hazard in taking the file write off the data lock. A last-seen
-        // write is spawned, a revoke lands first, and the write then arrives
-        // holding what it read before. Publishing that would re-pair a device
-        // the user revoked, on the next boot, with nothing saying why.
+    fn a_late_seen_stamp_cannot_bring_a_revoked_device_back() {
+        // A last-seen append is spawned, a revoke lands first, and the stamp
+        // then reaches the file after it. Replay must still find no device,
+        // or the next boot would re-pair a device the user revoked.
         let dir = tempfile::tempdir().unwrap();
         let state = GatewayState::for_tests_with_static_dir(Some(dir.path().to_path_buf()));
-        let path = state.inner.paired_devices_path.clone();
-
         state
-            .write_paired_devices_for_test(|paired| {
-                paired.devices.push(auth::PairedDevice {
-                    id: "device-1".into(),
-                    label: "My iPhone".into(),
-                    credential_digest: auth::digest("cred-abc"),
-                    paired_at: "2020-01-01T00:00:00Z".into(),
-                    last_seen_at: None,
-                });
+            .seed_device_for_test(auth::PairedDevice {
+                id: "device-1".into(),
+                label: "My iPhone".into(),
+                credential_digest: auth::digest("cred-abc"),
+                paired_at: "2020-01-01T00:00:00Z".into(),
+                last_seen_at: None,
             })
             .unwrap();
-        assert_eq!(auth::PairedDevices::load(&path).unwrap().devices.len(), 1);
+        assert_eq!(state.replayed_for_test().devices.devices.len(), 1);
 
         state.revoke_device("device-1").unwrap();
-        assert!(auth::PairedDevices::load(&path).unwrap().devices.is_empty());
-
-        // The late write, arriving after the revoke. It reads memory afresh, so
-        // it publishes the revoked state rather than resurrecting the device.
-        state.persist_paired_devices().unwrap();
+        state
+            .inner
+            .event_log
+            .lock()
+            .unwrap()
+            .append(&[LoggedEvent::now(GatewayEvent::DeviceSeen {
+                device_id: "device-1".into(),
+            })])
+            .unwrap();
         assert!(
-            auth::PairedDevices::load(&path).unwrap().devices.is_empty(),
-            "a revoked device must not come back through a later write"
+            state.replayed_for_test().devices.devices.is_empty(),
+            "a revoked device must not come back through a later stamp"
         );
     }
 
-    // That the data lock is released before the file write is structural: the
-    // clone ends its scope in `persist_paired_devices` before `save` runs. A
-    // test cannot observe it without instrumenting the write, and one that
-    // merely ran a read alongside a write would pass either way.
+    #[test]
+    fn every_pairing_and_revoke_replays_to_the_live_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = GatewayState::for_tests_with_static_dir(Some(dir.path().to_path_buf()));
+        for label in ["My iPhone", "My MacBook"] {
+            let code = state
+                .mint_pairing(crate::pairing::PairingIntent::default())
+                .unwrap()
+                .secret;
+            state
+                .redeem_pairing(&code, crate::pairing::PairingChannel::Public, Some(label))
+                .unwrap();
+        }
+        let first = state.paired_devices().devices[0].id.clone();
+        state.revoke_device(&first).unwrap();
+        assert_eq!(state.replayed_for_test(), state.directory());
+        assert_eq!(state.directory().operators.len(), 1);
+    }
 
     // ── The engines this gateway spawns stay off the network ─────────────────
 
@@ -6563,8 +6555,8 @@ mod tests {
 
     #[test]
     fn only_the_pairing_shell_marks_the_document() {
-        let picker = stamp_picker_shell(APP_INDEX_HTML, false, None);
-        let pairing = stamp_picker_shell(APP_INDEX_HTML, true, None);
+        let picker = stamp_picker_shell(APP_INDEX_HTML, false, APP_MANIFEST_JSON);
+        let pairing = stamp_picker_shell(APP_INDEX_HTML, true, APP_MANIFEST_JSON);
         assert!(
             !picker.contains(&marker_tag()),
             "the ordinary picker must not wear the marker, or auto-open dies for everyone"
@@ -6576,91 +6568,17 @@ mod tests {
         );
     }
 
-    /// The stamped manifest link, as the document carries it.
-    fn manifest_link(code: &str) -> String {
-        let param = pairing_qr::PAIR_PARAM;
-        format!("<link rel=\"manifest\" href=\"/{SIGIL}/manifest.json?{param}={code}\">")
-    }
-
     #[test]
-    fn a_scanned_shell_points_its_manifest_link_at_the_code() {
-        let scanned = stamp_picker_shell(APP_INDEX_HTML, false, Some("01234567"));
-        assert!(scanned.contains(&manifest_link("01234567")), "{scanned}");
+    fn pairing_shell_never_retransmits_the_credential() {
+        let scanned = stamp_picker_shell(APP_INDEX_HTML, false, APP_MANIFEST_JSON);
+        assert!(!scanned.contains("manifest.json?pair="));
+        assert!(scanned.contains("id=\"lucidos-pairing-manifest\""));
+        assert_eq!(scanned.matches("rel=\"manifest\"").count(), 1);
     }
 
-    #[test]
-    fn a_shell_with_no_code_grows_no_manifest_link() {
-        // Every ordinary picker load takes this path, and a second manifest
-        // link on it would override the bundle's for no reason.
-        let plain = stamp_picker_shell(APP_INDEX_HTML, false, None);
-        assert_eq!(
-            plain.matches("rel=\"manifest\"").count(),
-            APP_INDEX_HTML.matches("rel=\"manifest\"").count(),
-            "an unscanned shell must carry exactly the bundle's manifest links"
-        );
-    }
-
-    /// Two manifest links would make the auto-pair rest on the reader picking
-    /// the first in tree order. Ours is the only one instead.
-    #[test]
-    fn a_scanned_shell_carries_exactly_one_manifest_link() {
-        let scanned = stamp_picker_shell(APP_INDEX_HTML, false, Some("01234567"));
-        assert_eq!(
-            scanned.matches("rel=\"manifest\"").count(),
-            1,
-            "the bundle's own link must be gone: {scanned}"
-        );
-        assert!(scanned.contains(&manifest_link("01234567")));
-    }
-
-    /// The shell is mostly `<link>` elements, and every one of them but the
-    /// manifest has to survive the strip.
-    #[test]
-    fn stripping_the_manifest_link_leaves_every_other_link_alone() {
-        let scanned = stamp_picker_shell(APP_INDEX_HTML, false, Some("01234567"));
-        for rel in [
-            "icon",
-            "apple-touch-icon",
-            "apple-touch-startup-image",
-            "preconnect",
-        ] {
-            assert_eq!(
-                scanned.matches(&format!("rel=\"{rel}\"")).count(),
-                APP_INDEX_HTML.matches(&format!("rel=\"{rel}\"")).count(),
-                "the strip ate a {rel} link"
-            );
-        }
-    }
-
-    #[test]
-    fn the_strip_reads_rel_rather_than_the_tag_text() {
-        // Case, quoting and a multi-token rel are all the document's choice,
-        // and Vite rewrites the href on the way to `dist/`.
-        for tag in [
-            "<link rel=\"manifest\" href=\"./manifest.json\">",
-            "<LINK REL='MANIFEST' HREF='/x.json'>",
-            "<link href=\"m.json\" rel=\"alternate manifest\">",
-        ] {
-            let html = format!("<head>{tag}</head>");
-            assert_eq!(strip_manifest_links(&html), "<head></head>", "{tag}");
-        }
-        // And a rel that merely contains the word, or names it in a value, is
-        // a different element and stays.
-        for tag in [
-            "<link rel=\"manifestish\" href=\"x\">",
-            "<link rel=\"icon\" href=\"rel=manifest.png\">",
-            "<link rel=\"icon\" href=\"a>b\" sizes=\"1x1\">",
-        ] {
-            let html = format!("<head>{tag}</head>");
-            assert_eq!(strip_manifest_links(&html), html, "{tag}");
-        }
-    }
-
-    /// The marker only works if the cold-start fast path can see it, and that
-    /// script runs in `<head>` the moment it is parsed.
     #[test]
     fn the_pairing_marker_precedes_the_cold_start_fast_path() {
-        let pairing = stamp_picker_shell(APP_INDEX_HTML, true, None);
+        let pairing = stamp_picker_shell(APP_INDEX_HTML, true, APP_MANIFEST_JSON);
         let marker = pairing
             .find(&marker_tag())
             .expect("the pairing shell carries the marker");
@@ -7033,7 +6951,7 @@ mod tests {
         .expect("valid JSON");
 
         // The launch URL carries the code, so a fresh install pairs itself.
-        assert_eq!(out["start_url"], "/~/?pair=01234567");
+        assert_eq!(out["start_url"], "/~/#pair=01234567");
         // The identity does NOT move with it. A per-code id reads as a
         // different app, and installs a second icon.
         assert_eq!(out["id"], "/~/");
@@ -7082,8 +7000,8 @@ mod tests {
             .expect("valid JSON");
             let start_url = out["start_url"].as_str().expect("a string start_url");
             let tail = start_url
-                .strip_prefix(&format!("/{SIGIL}/?pair="))
-                .expect("the token sits in the query");
+                .strip_prefix(&format!("/{SIGIL}/#pair="))
+                .expect("the token sits in the fragment");
             assert_eq!(tail, token);
         }
     }

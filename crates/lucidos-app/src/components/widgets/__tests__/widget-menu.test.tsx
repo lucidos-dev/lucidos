@@ -55,7 +55,7 @@ function labels(target: Partial<WidgetMenuTarget>): string[] {
   document.body.appendChild(host);
   const ctx = { run: (fn: () => void) => () => fn(), anchor: null };
   render(widgetMenuItems(ctx, {
-    threadId: 't-1', appId: 'w', name: 'W', reusable: true, builtIn: false, ...target,
+    threadId: 't-1', appId: 'w', name: 'W', reusable: true, builtIn: false, sizes: [], ...target,
   }), host);
   return [...host.querySelectorAll('.widget-menu-label > span:first-child')].map((el) => el.textContent ?? '');
 }
@@ -80,6 +80,16 @@ describe('widgetMenuItems', () => {
       expect(items).toContain('Add to dashboard');
       expect(items.filter((l) => /pin|shelf|show in thread/i.test(l))).toEqual([]);
     }
+  });
+
+  it('leads with the size row, above a divider, when the widget offers a choice', () => {
+    labels({ sizes: ['small', 'medium'], size: 'medium' });
+    const first = host!.firstElementChild!;
+    expect(first.classList.contains('widget-menu-size')).toBe(true);
+    expect(first.nextElementSibling!.classList.contains('thread-overflow-divider')).toBe(true);
+    expect(first.querySelector('[aria-checked="true"]')!.getAttribute('aria-label')).toBe('medium');
+    labels({ sizes: ['medium'], size: 'medium' });
+    expect(host!.querySelector('.widget-menu-size')).toBeNull();
   });
 
   /** Invariant: Add to dashboard targets the dashboard this layout shows, and

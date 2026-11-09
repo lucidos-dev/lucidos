@@ -97,10 +97,10 @@ fn the_readers_refuse_anything_that_could_escape_a_json_string() {
 fn a_long_secret_redeems_once_on_any_channel() {
     for channel in [PairingChannel::Public, lan(2)] {
         let mut pending = device();
-        let minted = pending.mint(Some("My iPhone".into())).unwrap();
+        let minted = pending.mint(PairingIntent::labelled("My iPhone")).unwrap();
         assert_eq!(
             pending.redeem(&minted.secret, channel),
-            Redemption::Redeemed(Some("My iPhone".into()))
+            Redemption::Redeemed(PairingIntent::labelled("My iPhone"))
         );
         assert_eq!(
             pending.redeem(&minted.secret, channel),
@@ -112,10 +112,10 @@ fn a_long_secret_redeems_once_on_any_channel() {
 #[test]
 fn redeeming_either_half_spends_the_whole_pairing() {
     let mut pending = device();
-    let minted = pending.mint(None).unwrap();
+    let minted = pending.mint(PairingIntent::default()).unwrap();
     assert_eq!(
         pending.redeem(short(&minted), lan(2)),
-        Redemption::Redeemed(None)
+        Redemption::Redeemed(PairingIntent::default())
     );
     assert_eq!(
         pending.redeem(&minted.secret, lan(2)),
@@ -127,14 +127,14 @@ fn redeeming_either_half_spends_the_whole_pairing() {
 #[test]
 fn a_short_code_from_a_public_channel_is_refused_before_any_compare() {
     let mut pending = device();
-    let minted = pending.mint(None).unwrap();
+    let minted = pending.mint(PairingIntent::default()).unwrap();
     assert_eq!(
         pending.redeem(short(&minted), PairingChannel::Public),
         Redemption::LocalOnly
     );
     assert_eq!(
         pending.redeem(&minted.secret, PairingChannel::Public),
-        Redemption::Redeemed(None),
+        Redemption::Redeemed(PairingIntent::default()),
         "the refusal spent nothing"
     );
 }
@@ -142,20 +142,20 @@ fn a_short_code_from_a_public_channel_is_refused_before_any_compare() {
 #[test]
 fn a_gateway_pairing_has_no_short_code_on_any_channel() {
     let mut pending = gateway();
-    let minted = pending.mint(None).unwrap();
+    let minted = pending.mint(PairingIntent::default()).unwrap();
     assert_eq!(minted.code, None);
     assert!(minted.secret.starts_with("lgp_"));
     assert_eq!(pending.redeem("01234567", lan(2)), Redemption::Rejected);
     assert_eq!(
         pending.redeem(&minted.secret, PairingChannel::Public),
-        Redemption::Redeemed(None)
+        Redemption::Redeemed(PairingIntent::default())
     );
 }
 
 #[test]
 fn a_pairing_expires() {
     let mut pending = device();
-    let minted = pending.mint(None).unwrap();
+    let minted = pending.mint(PairingIntent::default()).unwrap();
     let later = Instant::now() + PAIRING_TTL;
     assert_eq!(
         pending.redeem_at(&minted.secret, PairingChannel::Public, later),
@@ -171,8 +171,8 @@ fn a_pairing_expires() {
 fn a_distributed_flood_never_stops_a_correct_long_secret() {
     for kind in [PairingKind::Device, PairingKind::Gateway] {
         let mut pending = PendingPairings::new(kind);
-        let over_public = pending.mint(None).unwrap();
-        let over_lan = pending.mint(None).unwrap();
+        let over_public = pending.mint(PairingIntent::default()).unwrap();
+        let over_lan = pending.mint(PairingIntent::default()).unwrap();
         let minted_codes = [over_public.code.clone(), over_lan.code.clone()];
         for n in 0..100_000u32 {
             let channel = if n % 2 == 0 {
@@ -190,14 +190,14 @@ fn a_distributed_flood_never_stops_a_correct_long_secret() {
             }
             assert_ne!(
                 pending.redeem(&guess, channel),
-                Redemption::Redeemed(None),
+                Redemption::Redeemed(PairingIntent::default()),
                 "a wrong guess paired"
             );
         }
         for (minted, channel) in [(over_public, PairingChannel::Public), (over_lan, source(2))] {
             assert_eq!(
                 pending.redeem(&minted.secret, channel),
-                Redemption::Redeemed(None),
+                Redemption::Redeemed(PairingIntent::default()),
                 "{kind:?}: the flood refused the correct secret on {channel:?}"
             );
         }
@@ -211,10 +211,10 @@ fn a_flood_with_nothing_pending_costs_the_next_pairing_nothing() {
     for _ in 0..1_000 {
         assert_eq!(pending.redeem("00000000", lan(9)), Redemption::Rejected);
     }
-    let minted = pending.mint(None).unwrap();
+    let minted = pending.mint(PairingIntent::default()).unwrap();
     assert_eq!(
         pending.redeem(short(&minted), lan(9)),
-        Redemption::Redeemed(None)
+        Redemption::Redeemed(PairingIntent::default())
     );
 }
 
@@ -222,7 +222,7 @@ fn a_flood_with_nothing_pending_costs_the_next_pairing_nothing() {
 #[test]
 fn one_local_source_spends_only_its_own_budget() {
     let mut pending = device();
-    let minted = pending.mint(None).unwrap();
+    let minted = pending.mint(PairingIntent::default()).unwrap();
     let wrong = if short(&minted) == "00000000" {
         "00000001"
     } else {
@@ -241,14 +241,14 @@ fn one_local_source_spends_only_its_own_budget() {
     );
     assert_eq!(
         pending.redeem(short(&minted), lan(7)),
-        Redemption::Redeemed(None)
+        Redemption::Redeemed(PairingIntent::default())
     );
 }
 
 #[test]
 fn an_ipv6_host_cannot_rotate_its_way_to_a_fresh_budget() {
     let mut pending = device();
-    let minted = pending.mint(None).unwrap();
+    let minted = pending.mint(PairingIntent::default()).unwrap();
     let wrong = if short(&minted) == "00000000" {
         "00000001"
     } else {
@@ -274,7 +274,7 @@ fn an_ipv6_host_cannot_rotate_its_way_to_a_fresh_budget() {
 #[test]
 fn one_tailnet_device_cannot_spend_another_ones_budget() {
     let mut pending = device();
-    let minted = pending.mint(None).unwrap();
+    let minted = pending.mint(PairingIntent::default()).unwrap();
     let wrong = if short(&minted) == "00000000" {
         "00000001"
     } else {
@@ -297,14 +297,14 @@ fn one_tailnet_device_cannot_spend_another_ones_budget() {
     );
     assert_eq!(
         pending.redeem(short(&minted), node(3)),
-        Redemption::Redeemed(None)
+        Redemption::Redeemed(PairingIntent::default())
     );
 }
 
 #[test]
 fn the_backstop_caps_many_local_sources_and_never_a_long_secret() {
     let mut pending = device();
-    let minted = pending.mint(None).unwrap();
+    let minted = pending.mint(PairingIntent::default()).unwrap();
     let wrong = if short(&minted) == "00000000" {
         "00000001"
     } else {
@@ -322,7 +322,7 @@ fn the_backstop_caps_many_local_sources_and_never_a_long_secret() {
     );
     assert_eq!(
         pending.redeem(&minted.secret, source(500)),
-        Redemption::Redeemed(None),
+        Redemption::Redeemed(PairingIntent::default()),
         "the long secret is never throttled"
     );
 }
@@ -330,7 +330,7 @@ fn the_backstop_caps_many_local_sources_and_never_a_long_secret() {
 #[test]
 fn a_correct_short_code_clears_its_source_and_the_window_refills() {
     let mut pending = device();
-    let first = pending.mint(None).unwrap();
+    let first = pending.mint(PairingIntent::default()).unwrap();
     let wrong = |m: &MintedPairing| {
         if short(m) == "00000000" {
             "00000001"
@@ -343,16 +343,16 @@ fn a_correct_short_code_clears_its_source_and_the_window_refills() {
     }
     assert_eq!(
         pending.redeem(short(&first), lan(3)),
-        Redemption::Redeemed(None)
+        Redemption::Redeemed(PairingIntent::default())
     );
-    let second = pending.mint(None).unwrap();
+    let second = pending.mint(PairingIntent::default()).unwrap();
     for _ in 0..SHORT_CODE_FAILURES_PER_SOURCE {
         assert_eq!(pending.redeem(wrong(&second), lan(3)), Redemption::Rejected);
     }
     let later = Instant::now() + FAILURE_WINDOW;
     assert_eq!(
         pending.redeem_at(short(&second), lan(3), later),
-        Redemption::Redeemed(None)
+        Redemption::Redeemed(PairingIntent::default())
     );
 }
 
@@ -461,7 +461,7 @@ fn a_peer_arriving_on_a_tailnet_address_of_this_machine_is_local() {
 #[test]
 fn a_spoofed_forwarding_header_neither_spends_nor_earns_a_budget() {
     let mut pending = device();
-    let minted = pending.mint(None).unwrap();
+    let minted = pending.mint(PairingIntent::default()).unwrap();
     let lan_peer = peer("192.168.1.40:4000", "192.168.1.5:5252");
     for n in 0..1_000 {
         let spoof = format!("10.9.{}.{}", n / 256, n % 256);
@@ -471,7 +471,7 @@ fn a_spoofed_forwarding_header_neither_spends_nor_earns_a_budget() {
     let direct = channel(lan_peer, &[]);
     assert_eq!(
         pending.redeem(short(&minted), direct),
-        Redemption::Redeemed(None)
+        Redemption::Redeemed(PairingIntent::default())
     );
 }
 

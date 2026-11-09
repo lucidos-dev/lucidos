@@ -78,7 +78,10 @@ async fn a_request_sets_the_flag_and_a_sighting_clears_it() {
     emit(
         &bus,
         thread_id,
-        ThreadEvent::ThreadReplySeen { seen_version },
+        ThreadEvent::ThreadReplySeen {
+            seen_version,
+            personal: false,
+        },
     )
     .await;
     assert!(!read_requested(&pool, thread_id).await);
@@ -373,6 +376,7 @@ async fn start_trigger_run(bus: &EventBus, thread_id: Uuid) {
             go_to_review: false,
             model: None,
             reasoning_effort: None,
+            continue_key: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),

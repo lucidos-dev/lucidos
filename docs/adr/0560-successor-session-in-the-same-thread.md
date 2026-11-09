@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-10-23
+- **Amended by**: [0629: A coding-agent session hands off at an engine-enforced context ceiling](0629-engine-enforced-context-ceiling.md)
 - **Supersedes**: [0474](0474-successor-threads.md), [0503](0503-build-chain.md), [0507](0507-successor-inherits-handoff-consent.md)
 - **Amends**: [0557](0557-harden-runs-on-the-default-floor.md), [0493](0493-a-plan-cards-new-thread-pick-is-owner-consent.md), [0497](0497-plan-card-offers-a-new-thread-for-a-cheaper-implementer.md), [0505](0505-named-handoff-checkpoints.md), [0539](0539-successor-context-by-cache-warmth.md)
 

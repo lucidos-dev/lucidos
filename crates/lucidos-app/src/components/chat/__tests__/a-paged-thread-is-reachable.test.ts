@@ -149,12 +149,12 @@ describe('a scroll asking for older history', () => {
     });
 });
 
-/** A render-all lasts ONE visit (ADR 0232), and the whole rule turns on where
+/** A claimed window lasts ONE visit (ADR 0232), and the whole rule turns on where
  *  a visit ends. `reseedOnReopen` has its own unit tests; what they cannot see
  *  is the component's bookkeeping around it, which is where both holes were.
  *
  *  Source scans, because the mark is module state read during render. */
-describe('the visit a render-all belongs to', () => {
+describe('the visit a claimed window belongs to', () => {
     it('ends whenever the thread pane lets the thread go', () => {
         // A switch, New chat unmounting the pane, and the layout swapping at
         // the breakpoint are one teardown, so one clear covers all three. It
@@ -169,7 +169,7 @@ describe('the visit a render-all belongs to', () => {
     it('is marked only once the load has settled', () => {
         const seed = threadViewSource.slice(
             threadViewSource.indexOf('if (threadId && canSeedWindow) {'),
-            threadViewSource.indexOf('const edge = deepLinkRenderAll.value'),
+            threadViewSource.indexOf('const edge = threadId ? currentEdge('),
         );
         expect(seed.length).toBeGreaterThan(0);
         expect(seed).toContain('lastSeededVisit = { threadId, owner: visitOwner };');

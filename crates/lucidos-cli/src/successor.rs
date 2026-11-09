@@ -151,6 +151,9 @@ pub(crate) enum AutomaticVerdict {
     HandOff {
         on: HandoffOn,
         risk_rung: Option<OfferedIntelligenceRung>,
+        /// The session is past its *context ceiling*, so it hands off here
+        /// whatever the estimate says.
+        past_ceiling: bool,
     },
     /// Only the risk rung is offered: carry on unless the change passes one
     /// of its two tests.
@@ -167,29 +170,46 @@ pub(crate) fn parse_verdict(body: &serde_json::Value) -> AutomaticVerdict {
     let pays = handoff.get("pays").and_then(|v| v.as_bool());
     let floor_rung = parse_offered_intelligence_rung(handoff.get("floor_rung"));
     let risk_rung = parse_offered_intelligence_rung(handoff.get("risk_rung"));
-    if pays != Some(true) && floor_rung.is_none() && risk_rung.is_none() {
+    let past_ceiling = past_ceiling(handoff);
+    if !past_ceiling && pays != Some(true) && floor_rung.is_none() && risk_rung.is_none() {
         return match pays {
             Some(false) => AutomaticVerdict::DoesNotPay,
             _ => AutomaticVerdict::Unknown,
         };
     }
+    let usd = |key: &str| handoff["estimate"].get(key).and_then(|v| v.as_f64());
     let on = match (floor_rung, pays) {
         (Some(floor), _) => HandoffOn::FloorRung(floor),
-        (None, Some(true)) => {
-            let usd = |key: &str| handoff["estimate"].get(key).and_then(|v| v.as_f64());
-            HandoffOn::ThisImplementer {
-                saving_usd: usd("saving_usd"),
-                cost_usd: usd("cost_usd"),
-            }
-        }
+        (None, Some(true)) => HandoffOn::ThisImplementer {
+            saving_usd: usd("saving_usd"),
+            cost_usd: usd("cost_usd"),
+        },
+        (None, _) if past_ceiling => HandoffOn::ThisImplementer {
+            saving_usd: None,
+            cost_usd: None,
+        },
         (None, _) => {
             return risk_rung.map_or(AutomaticVerdict::Unknown, |risk_rung| {
                 AutomaticVerdict::RiskRungOnly { risk_rung }
             })
         }
     };
-    AutomaticVerdict::HandOff { on, risk_rung }
+    AutomaticVerdict::HandOff {
+        on,
+        risk_rung,
+        past_ceiling,
+    }
 }
+
+/// The engine's `past_ceiling` flag on a checkpoint run's `handoff`. An
+/// engine older than the context ceiling sends none, which reads as false.
+fn past_ceiling(handoff: &serde_json::Value) -> bool {
+    handoff.get("past_ceiling").and_then(|v| v.as_bool()) == Some(true)
+}
+
+/// What a checkpoint run past the context ceiling tells the agent first.
+const PAST_CEILING: &str = "This session is past its context ceiling, so hand off here \
+     whatever the handoff estimate says.";
 
 /// The two tests that send a handoff to the risk rung.
 const RISK_TESTS: &str = "security work (a security or authority boundary, secrets, \
@@ -211,8 +231,15 @@ pub(crate) fn automatic_text(verdict: &AutomaticVerdict, run: &CheckpointRun) ->
         AutomaticVerdict::Unknown => {
             format!("{CARRY_ON} Lucidos could not estimate a handoff here.")
         }
-        AutomaticVerdict::HandOff { on, risk_rung } => {
+        AutomaticVerdict::HandOff {
+            on,
+            risk_rung,
+            past_ceiling,
+        } => {
             let (lead, floor) = match on {
+                HandoffOn::ThisImplementer { .. } if *past_ceiling => {
+                    (PAST_CEILING.to_string(), None)
+                }
                 HandoffOn::ThisImplementer {
                     saving_usd,
                     cost_usd,
@@ -230,8 +257,13 @@ pub(crate) fn automatic_text(verdict: &AutomaticVerdict, run: &CheckpointRun) ->
                 }
                 HandoffOn::FloorRung(floor) => (
                     format!(
-                        "This checkpoint runs on the default floor, and this thread runs \
+                        "{}This checkpoint runs on the default floor, and this thread runs \
                          below it: hand off on the floor rung, {}.",
+                        if *past_ceiling {
+                            format!("{PAST_CEILING} ")
+                        } else {
+                            String::new()
+                        },
                         floor.describe()
                     ),
                     Some(floor),
@@ -318,12 +350,14 @@ pub(crate) fn cmd_offer(ws: &Workspace, run: CheckpointRun, kind: CheckpointKind
                 input_tokens,
                 can_hand_off,
                 pays,
+                past_ceiling,
                 implementer,
                 ..
             } => ContextReading::Read {
                 input_tokens,
                 can_hand_off,
                 pays,
+                past_ceiling,
                 implementer,
                 ladder: crate::intelligence_ladder::read_own(ws),
             },
@@ -406,6 +440,12 @@ pub(crate) fn started_text(body: &serde_json::Value) -> String {
         .unwrap_or_default();
     if body["starts"] == "now" {
         format!("The successor session is starting in this thread.{runs_on}")
+    } else if body["starts"] == "on-next-input" {
+        format!(
+            "The successor session starts in this thread on its next input: a message, a \
+             finished task or a wake.{runs_on} End your turn now, with no question: the new \
+             session reads your narrative first."
+        )
     } else {
         format!(
             "The successor session starts in this thread once this turn ends.{runs_on} End your \
@@ -508,6 +548,9 @@ pub(crate) enum ContextReading {
         /// The handoff estimate says a fresh session pays here. False when
         /// the engine could not make a reading.
         pays: bool,
+        /// The session is past its *context ceiling*, so the card recommends
+        /// a fresh session whatever `pays` says.
+        past_ceiling: bool,
         /// `None` when the engine did not report one.
         implementer: Option<Implementer>,
         /// This thread's intelligence ladder. `None` when it was not read.
@@ -527,6 +570,7 @@ pub(crate) fn parse_reading(body: &serde_json::Value) -> ContextReading {
         input_tokens: body.get("input_tokens").and_then(|v| v.as_u64()),
         can_hand_off: body.get("can_hand_off").and_then(|v| v.as_bool()) == Some(true),
         pays: body["handoff"].get("pays").and_then(|v| v.as_bool()) == Some(true),
+        past_ceiling: past_ceiling(&body["handoff"]),
         implementer: body.get("implementer").and_then(parse_implementer),
         ladder: None,
     }
@@ -558,6 +602,7 @@ mod tests {
             input_tokens,
             can_hand_off,
             pays,
+            past_ceiling,
             implementer: Some(implementer),
             ladder: None,
         } = parse_reading(&answer(false.into()))
@@ -567,6 +612,20 @@ mod tests {
         assert_eq!(input_tokens, Some(240_000));
         assert!(can_hand_off);
         assert!(!pays, "a large context the estimate rejects does not pay");
+        assert!(
+            !past_ceiling,
+            "an engine that sends no flag is under the ceiling"
+        );
+        let mut past = answer(false.into());
+        past["handoff"]["past_ceiling"] = true.into();
+        assert!(matches!(
+            parse_reading(&past),
+            ContextReading::Read {
+                past_ceiling: true,
+                pays: false,
+                ..
+            }
+        ));
         assert_eq!(
             implementer.describe(),
             "claude-code with model claude-opus-5-5 at (the backend's default) effort"
@@ -647,6 +706,9 @@ mod tests {
         let now = started_text(&serde_json::json!({"starts": "now"}));
         assert!(now.contains("is starting"), "{now}");
         assert!(!now.contains("End your turn"), "{now}");
+        let next = started_text(&serde_json::json!({"starts": "on-next-input"}));
+        assert!(next.contains("on its next input"), "{next}");
+        assert!(next.contains("End your turn now"), "{next}");
     }
 
     #[test]
@@ -721,6 +783,7 @@ mod tests {
                 cost_usd: Some(0.4),
             },
             risk_rung: None,
+            past_ceiling: false,
         }
     }
 
@@ -757,6 +820,7 @@ mod tests {
                 AutomaticVerdict::HandOff {
                     on: HandoffOn::FloorRung(rung("floor-model", "e2")),
                     risk_rung: Some(rung("risk-model", "e3")),
+                    past_ceiling: false,
                 }
             );
         }
@@ -768,6 +832,7 @@ mod tests {
                     cost_usd: Some(0.4)
                 },
                 risk_rung: Some(rung("risk-model", "e3")),
+                past_ceiling: false,
             }
         );
         assert_eq!(
@@ -902,5 +967,66 @@ mod tests {
             assert!(text.contains("remaining checkpoint instructions"), "{text}");
             assert!(text.contains("End your turn"), "{text}");
         }
+    }
+
+    /// ADR 0629: past the context ceiling a checkpoint hands off whatever
+    /// `pays` says, on this thread's implementer and with no estimate figures.
+    #[test]
+    fn past_the_ceiling_a_checkpoint_hands_off_whatever_pays() {
+        for pays in [
+            serde_json::Value::from(true),
+            false.into(),
+            serde_json::Value::Null,
+        ] {
+            let mut answer = floor_answer(false, false, false);
+            answer["handoff"]["pays"] = pays.clone();
+            answer["handoff"]["past_ceiling"] = true.into();
+            let verdict = parse_verdict(&answer);
+            assert!(
+                matches!(
+                    verdict,
+                    AutomaticVerdict::HandOff {
+                        on: HandoffOn::ThisImplementer { .. },
+                        risk_rung: None,
+                        past_ceiling: true,
+                    }
+                ),
+                "{pays}: {verdict:?}"
+            );
+            for checkpoint in checkpoints() {
+                let text = automatic_text(&verdict, &checkpoint);
+                assert!(text.starts_with(PAST_CEILING), "{text}");
+                assert!(text.contains("Hand off now and ask nothing"), "{text}");
+                assert!(
+                    text.contains(&format!(
+                        "lucidos successor start --narrative <file> {}`, with no other flags",
+                        checkpoint.flags()
+                    )),
+                    "{text}"
+                );
+                assert!(!text.contains("pays here"), "{text}");
+                assert!(!text.contains("$"), "{text}");
+            }
+        }
+    }
+
+    /// Past the ceiling with a floor rung, the checkpoint hands off on the
+    /// floor rung and names the ceiling first. The risk rung stays the
+    /// alternative.
+    #[test]
+    fn past_the_ceiling_a_floor_rung_still_names_its_flags() {
+        let mut answer = floor_answer(false, true, true);
+        answer["handoff"]["past_ceiling"] = true.into();
+        let text = automatic_text(&parse_verdict(&answer), &run("pre-harden", None));
+        assert!(text.starts_with(PAST_CEILING), "{text}");
+        assert!(text.contains("hand off on the floor rung"), "{text}");
+        assert!(
+            text.contains("--coding-agent-model floor-model --reasoning-effort e2`"),
+            "{text}"
+        );
+        assert!(
+            text.contains("`--coding-agent-model risk-model --reasoning-effort e3` instead"),
+            "{text}"
+        );
     }
 }

@@ -502,6 +502,23 @@ describe('restore notification taps', () => {
   });
 });
 
+describe('config undo notification taps', () => {
+  const tap = { kind: 'undo-config-change' as const, event_id: '0b3f2c1e-8d4a-4c6e-9f10-2a3b4c5d6e7f' };
+  it('preserves Undo through URL, push and inbox routes as confirmation intent', () => {
+    const targets = [
+      parseDeepLinkFromUrl(new URL('https://example.com/?notification=n&tap=' + encodeURIComponent(JSON.stringify(tap)))),
+      parseDeepLinkFromSwMessage({ notification_id: 'n', tap })!,
+      parseDeepLinkFromInboxRow({ id: 'n', tap }),
+    ];
+    for (const target of targets) {
+      expect(resolveDeepLink(target)).toEqual({ type: 'undo-config-change', tap, notification: 'n' });
+    }
+  });
+  it.each(['../x', '', 'not-a-uuid'])('rejects malformed event id %s', (event_id) => {
+    expect(parseDeepLinkFromSwMessage({ notification_id: 'n', tap: { ...tap, event_id } })?.tap).toBeNull();
+  });
+});
+
 describe('push source provenance', () => {
   it('preserves UUID, original and unknown provenance in both transports', () => {
     for (const source of ['11111111-1111-4111-8111-111111111111', 'none', 'unknown']) {

@@ -1,6 +1,6 @@
 # 0097: Inbound webhooks answer on a separate loopback listener, never the main surface
 
-- **Status**: Accepted
+- **Status**: Accepted, amended by [0624](0624-side-listeners-bind-loopback-by-default.md)
 - **Date**: 2026-08-19
 
 ## Context

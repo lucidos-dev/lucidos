@@ -117,7 +117,7 @@ export function openProviderSettings(): void {
   openSettingsSubview('models');
 }
 
-/** Deep-link to Settings → Permissions → Command safety → Enabled for coding agents, the
+/** Deep-link to Settings → Permissions → Command safety → Answer coding-agent questions, the
  *  row a coding-agent permission card points at. */
 export function openCommandGuardCodingAgentsSettings(): void {
   settingsScrollTarget.value = 'command-safety:coding-agents';

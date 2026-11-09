@@ -1,5 +1,8 @@
 //! Conservative file-volume reservation before recovery capture and mutation.
-use super::{store::check_floor, BoxError};
+use super::{
+    store::{check_floor, volume_space},
+    BoxError,
+};
 use std::{collections::BTreeMap, os::unix::fs::MetadataExt, path::Path};
 
 /// Count a volume only once when the external store, workspace and linked data
@@ -67,11 +70,8 @@ pub(super) fn preflight_database(
         }
     }
     for (_, (path, estimate)) in volumes {
-        check_floor(
-            fs2::available_space(&path)?,
-            fs2::total_space(&path)?,
-            estimate,
-        )?;
+        let (available, total) = volume_space(&path)?;
+        check_floor(available, total, estimate)?;
     }
     Ok(())
 }

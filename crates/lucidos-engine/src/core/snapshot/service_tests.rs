@@ -1640,3 +1640,64 @@ async fn a_failed_capture_leaves_no_partial_directory() {
     pool.close().await;
     teardown_test_db(&database).await;
 }
+
+/// A workspace whose estimate exceeds the free disk fails with the shortfall
+/// rather than a bare capture failure. A sparse file sets the estimate without
+/// using disk.
+#[tokio::test]
+async fn a_capture_refused_by_the_disk_floor_names_the_space_to_free() {
+    use crate::test_support::{setup_test_db, teardown_test_db, test_db_url};
+    let (pool, database) = setup_test_db().await;
+    let workspace = tempfile::tempdir().unwrap();
+    let huge = 1u64 << 41;
+    std::fs::File::create(workspace.path().join("huge.bin"))
+        .unwrap()
+        .set_len(huge)
+        .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let session = std::sync::Arc::new(
+        Session::open(
+            Store::at(root.path().into(), "demo-workspace").unwrap(),
+            &ArchiveJobSlot::default(),
+            ArchiveJobKind::SnapshotCapture,
+            &TestKeyStore,
+            &database,
+        )
+        .unwrap(),
+    );
+    let actor = MessageOrigin::Device {
+        device_id: "test-device".into(),
+    };
+    let handle = Handle::generate();
+    let job = session
+        .create_job(handle.clone(), Action::Capture, actor.clone())
+        .unwrap();
+    let failed = session
+        .clone()
+        .run_capture_job(
+            job.id,
+            &pool,
+            &test_db_url(&database),
+            workspace.path(),
+            CaptureRequest {
+                handle,
+                workspace_name: "demo".into(),
+                actor,
+                label: None,
+                keep: false,
+                running_threads: 0,
+            },
+        )
+        .await
+        .unwrap();
+    let State::Failed {
+        reason: Failure::DiskFloor { needed_bytes },
+    } = failed.state
+    else {
+        panic!("expected a disk floor failure, got {:?}", failed.state);
+    };
+    assert!(needed_bytes > huge / 2, "{needed_bytes}");
+    drop(session);
+    pool.close().await;
+    teardown_test_db(&database).await;
+}

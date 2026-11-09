@@ -537,7 +537,7 @@ describe('attachScrollMemory teardown', () => {
   // not. A deep-link into the thread the reader is ALREADY in re-attaches
   // nothing. A thread whose events arrive while the tap resolves attaches
   // BEFORE the claim. In both the restore is mid-flight, waiting for the
-  // transcript to grow, and the claim's own render-all is that growth.
+  // transcript to grow, and the claim's own window growth is that growth.
   // Re-asking is not enough either: the claim releases within a second of a
   // synchronous landing, while the restore stays armed for three.
   //
@@ -576,7 +576,7 @@ describe('attachScrollMemory teardown', () => {
       scrollToEventAndPulse('e1'); // the tap claims the open
       expect(observers.armed()).toBeLessThan(armedBefore); // retired at the claim
 
-      el.scrollHeight = 20000; // render-all grows the transcript
+      el.scrollHeight = 20000; // the claim's window grows the transcript
       el.scrollTop = 8800;     // and the landing puts the reader on the event
       observers.fire();
 
@@ -586,7 +586,7 @@ describe('attachScrollMemory teardown', () => {
 
     it('retires the restore DEADLINE with it', async () => {
       // The other half of an armed restore: at RESTORE_DEADLINE_MS it takes one
-      // last look, and the claim's own render-all is the growth that makes the
+      // last look, and the claim's own window growth is the growth that makes the
       // saved offset reachable. Here the link is still resolving and has moved
       // nobody, so the container sits where the open found it. An un-retired
       // deadline would write 3200 over a landing that has not happened.
@@ -629,7 +629,7 @@ describe('attachScrollMemory teardown', () => {
         });
 
         scrollToEventAndPulse('e1');
-        el.scrollHeight = 20000; // render-all grows it, but nothing lands
+        el.scrollHeight = 20000; // the claim's window grows it, but nothing lands
 
         await vi.advanceTimersByTimeAsync(4000); // the deep-link's own deadline
         clearPendingEventScroll();               // it gave up and released
@@ -756,7 +756,7 @@ describe('attachScrollMemory teardown', () => {
         });
 
         scrollToEventAndPulse('e1');
-        el.scrollHeight = 20000; // the claim's render-all
+        el.scrollHeight = 20000; // the claim's window growth
         el.scrollTop = 8800;     // and the first link lands on its event
         await vi.advanceTimersByTimeAsync(1000);
         scrollToEventAndPulse('e2'); // a second, which turns out dead
@@ -895,7 +895,7 @@ describe('attachScrollMemory teardown', () => {
         localStorage.setItem('k', '3200');
         // Out of reach at attach, so the open parks at the top and waits. That
         // leaves a restore for the claim to stand down, and therefore a rescue
-        // to arm. The growth below is the claim's own render-all, which makes
+        // to arm. The growth below is the claim's own window growth, which makes
         // the rescue's write OBSERVABLE: without the resolve cancelling it,
         // 3200 would be reachable by the time it fires.
         const el = makeEl(4200, 1000);

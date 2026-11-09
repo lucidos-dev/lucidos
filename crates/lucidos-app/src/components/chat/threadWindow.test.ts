@@ -16,7 +16,7 @@ import {
     canSeedRenderWindow,
     computeRenderFromIndex,
     countWithinBudget,
-    deepLinkMustPersist,
+    deepLinkEdge,
     edgeHasMoreAbove,
     edgeMustReachRow,
     MAX_READING_CHASES,
@@ -301,16 +301,14 @@ describe('thread render windowing', () => {
         });
     });
 
-    /** A render-all is a NAVIGATION's claim, and it used to outlive the visit
-     *  that made it. One reported thread paid 4,069 rendered rows on every open
-     *  afterwards, against the 37 its window would have drawn. */
+    /** A deep link's floor is a NAVIGATION's claim, and it used to outlive the
+     *  visit that made it. One reported thread paid 4,069 rendered rows on every
+     *  open afterwards, against the 37 its window would have drawn. */
     describe('reseedOnReopen', () => {
-        it('drops a render-all the last visit left behind', () => {
-            expect(reseedOnReopen('render-all', false)).toBe(true);
-        });
-
-        it('keeps the one THIS visit is asking for', () => {
-            expect(reseedOnReopen('render-all', true)).toBe(false);
+        /** Even when a deep link opens it: the link claims its own turn after
+         *  the re-seed. A chevron's render-all kept here drew the thread whole. */
+        it('drops a claim the last visit left behind', () => {
+            expect(reseedOnReopen('claimed')).toBe(true);
         });
 
         /** The reader grew this one by scrolling, so it describes where they
@@ -320,12 +318,11 @@ describe('thread render windowing', () => {
          *  edge equals `WHOLE_THREAD` by value. Read as a claim, the thread
          *  would open on the newest turns and jump when the walk arrives. */
         it('keeps a window the reader grew, even one reaching the first turn', () => {
-            expect(reseedOnReopen('grown', false)).toBe(false);
-            expect(reseedOnReopen('grown', true)).toBe(false);
+            expect(reseedOnReopen('grown')).toBe(false);
         });
 
         it('leaves a thread with no stored edge to the ordinary seed', () => {
-            expect(reseedOnReopen(undefined, false)).toBe(false);
+            expect(reseedOnReopen(undefined)).toBe(false);
         });
     });
 
@@ -646,21 +643,37 @@ describe('clamping the floor turn', () => {
         });
     });
 
-    describe('deepLinkMustPersist', () => {
-        it('writes when nothing is stored yet, which is the cold push tap', () => {
-            // The claim lands before the seed on a cold open, so this arm is
-            // the whole point. Skip it and the seed stores the tail, and the
-            // thread snaps back to it when the claim clears.
-            expect(deepLinkMustPersist(undefined)).toBe(true);
+    /** A deep link used to render the whole thread. A 255-turn thread drew
+     *  about 29,000 nodes that way, and iOS killed the page. */
+    describe('deepLinkEdge', () => {
+        const edge = { exchange: 200, rowsHidden: 0 };
+
+        it('moves the floor up to a target above the window, whole', () => {
+            expect(deepLinkEdge(edge, 120)).toEqual({ exchange: 120, rowsHidden: 0 });
         });
 
-        it('writes over a windowed edge', () => {
-            expect(deepLinkMustPersist({ exchange: 3, rowsHidden: 0 })).toBe(true);
-            expect(deepLinkMustPersist({ exchange: 0, rowsHidden: 40 })).toBe(true);
+        it('keeps the window when it already draws the target', () => {
+            expect(deepLinkEdge(edge, 200)).toBe(edge);
+            expect(deepLinkEdge(edge, 230)).toBe(edge);
         });
 
-        it('leaves an edge that already renders the whole thread alone', () => {
-            expect(deepLinkMustPersist(WHOLE_THREAD)).toBe(false);
+        it('uncovers the head of a clamped floor turn that holds the target', () => {
+            expect(deepLinkEdge({ exchange: 200, rowsHidden: 40 }, 200)).toEqual({ exchange: 200, rowsHidden: 0 });
+        });
+
+        /** History is still paging toward the target, or holds no turn for
+         *  it. Every stamp a link resolves comes from a turn, so drawing more
+         *  could not help it land (ADR 0631). */
+        it('keeps the window for a target no loaded turn holds', () => {
+            expect(deepLinkEdge(edge, -1)).toBe(edge);
+        });
+
+        /** No turn on screen may leave the DOM when the floor moves. */
+        it('never moves the floor down', () => {
+            for (let target = 0; target < 260; target++) {
+                const next = deepLinkEdge({ exchange: 150, rowsHidden: 7 }, target);
+                expect(next.exchange).toBeLessThanOrEqual(150);
+            }
         });
     });
 });

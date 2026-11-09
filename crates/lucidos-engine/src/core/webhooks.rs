@@ -570,6 +570,32 @@ pub fn verify(
     Ok(())
 }
 
+/// The header Slack's v0 scheme signs with. A hook verifying with it is a Slack
+/// hook by construction, which is what gates [`slack_url_verification`].
+pub const SLACK_SIGNATURE_HEADER: &str = "X-Slack-Signature";
+
+/// The challenge to echo when Slack verifies a Request URL, else `None`.
+///
+/// Slack posts `{"type":"url_verification","challenge":"..."}` when a user
+/// saves the URL, and refuses the URL unless the response echoes the value.
+/// Call this only after [`verify`] passed, so a forged challenge never echoes.
+/// Every other hook, and every other body, returns `None` (ADR 0624).
+pub fn slack_url_verification(hook: &Webhook, body: &str) -> Option<String> {
+    let cfg = hook.hmac.as_ref()?;
+    if !cfg
+        .signature_header
+        .trim()
+        .eq_ignore_ascii_case(SLACK_SIGNATURE_HEADER)
+    {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    if value.get("type")?.as_str()? != "url_verification" {
+        return None;
+    }
+    value.get("challenge")?.as_str().map(str::to_string)
+}
+
 /// The columns every read selects, plus the two ages Postgres measures.
 ///
 /// **The ages are computed in SQL on purpose** (ADR 0053). The engine's clock

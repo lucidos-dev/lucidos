@@ -72,6 +72,10 @@ pub enum SessionContinuity {
         /// The checkpoint's progress, as `<done>/<total>`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         progress: Option<String>,
+        /// The ceiling the previous session crossed, when it handed off at its
+        /// *context ceiling*.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        crossing: Option<crate::engine::context_ceiling::CeilingCrossing>,
         opening: HandoffOpening,
         /// The opening itself, which the transcript folds under the session's
         /// card. The first input may also carry the message that started it.
@@ -87,6 +91,33 @@ pub enum HandoffOpening {
     Narrative,
     /// A *handoff brief*: the engine's note on how to rebuild the context.
     Brief,
+}
+
+/// Why a session handed off. Absent on handoffs recorded before the field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HandoffCause {
+    /// At a *handoff checkpoint* its flow names.
+    Checkpoint,
+    /// The user asked: at the *Successor card*, in words, or by a rule they
+    /// wrote.
+    User,
+    /// The session grew past its *context ceiling* (ADR 0629).
+    ContextCeiling,
+}
+
+/// When a *successor session* starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionStart {
+    /// Once nothing holds the thread. The default for handoffs recorded
+    /// before the field.
+    #[default]
+    Now,
+    /// Once the calling agent's turn ends, which then holds the thread.
+    AfterThisTurn,
+    /// On the thread's next input, of any kind: a *next-input start*.
+    OnNextInput,
 }
 
 /// Why a session on a thread that had one before started fresh.

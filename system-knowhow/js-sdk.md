@@ -132,6 +132,10 @@ A permissions-policy feature defaults to an allowlist of `self`, and an opaque
 origin is not `self`. Today the shell delegates `autoplay`, `fullscreen`,
 `encrypted-media` and `clipboard-write`. Media plays, fullscreen works, and
 `navigator.clipboard.writeText()` works from a Copy button.
+Every full screen request in a frame also writes `[Client/app-fullscreen]`
+lines to the engine log: the request, the open or close, and a
+`never-opened` line when WebKit accepts a request and shows nothing. Look there
+when full screen does nothing. Your app calls nothing for this.
 
 What your frame does not get, and why:
 
@@ -286,6 +290,7 @@ cancels its `touchmove` events so the page does not drift under the swipe. It
 stays out of the way of a drag that is not a pane swipe:
 
 - a drag on a range input, or inside an element that scrolls sideways;
+- a drag on an XL widget that Lucidos clamped and scrolls sideways;
 - a drag while a text field has focus;
 - a second finger, such as a pinch.
 
@@ -1239,6 +1244,9 @@ type SideEffectCategory =
   | 'out_of_workspace_destruction'
   | 'other';
 
+// 'deny' never parks a card; minutes run from 1 to 1440.
+type PermissionWait = 'deny' | number | 'indefinite';
+
 interface Trigger {
   id: string;
   name: string;
@@ -1260,6 +1268,9 @@ interface Trigger {
   // Side-effect grant: irreversible categories this trigger may perform
   // unattended. Omitted when empty (= no grant).
   side_effect_grant?: SideEffectCategory[];
+  // How long an unattended fire's parked permission card waits (triggers.md
+  // § "Permission wait"). Omitted when the workspace preference decides.
+  permission_wait?: PermissionWait;
   // MCP server ids its fires use. Only these run unattended in its threads.
   mcp_servers?: string[];
   // Chat model this trigger's intent fires on, and its thinking budget. Both
@@ -1269,6 +1280,12 @@ interface Trigger {
   reasoning_effort?: string;
   // The backend the pinned model runs on. Omitted when the model decides.
   provider?: string;
+  // Payload paths naming one thread (triggers.md § "Continue key"). Omitted
+  // when every fire starts a new thread.
+  continue_key?: (string | string[])[];
+  // The payload path of the email of the person behind a fire (triggers.md
+  // § "Actor"). Omitted when fires credit nobody.
+  actor?: string;
 }
 
 interface CreateTrigger {
@@ -1283,6 +1300,9 @@ interface CreateTrigger {
   /** Side-effect grant: irreversible categories this trigger may perform
    *  unattended. Omit / `[]` = none granted (the safe default). */
   side_effect_grant?: SideEffectCategory[];
+  /** Permission wait for unattended fires. Omit / null = the workspace
+   *  preference `unattended_permission_wait`. */
+  permission_wait?: PermissionWait | null;
   /** MCP server ids its fires use. A fire refuses a call to any other server. */
   mcp_servers?: string[];
   /** Pin the intent to a chat model and a thinking budget
@@ -1292,6 +1312,12 @@ interface CreateTrigger {
   /** The backend for the pinned model. Needs `model`, and must name one of its
    *  providers. A pin to an unconfigured backend refuses the fire. */
   provider?: string | null;
+  /** A fire whose key matches an open thread continues it. Intent triggers
+   *  only (triggers.md § "Continue key"). Omit / null / `[]` = none. */
+  continue_key?: (string | string[])[] | null;
+  /** The payload path of the email of the person behind a fire. Intent
+   *  triggers only (triggers.md § "Actor"). Omit / null = none. */
+  actor?: string | null;
 }
 
 interface UpdateTrigger {
@@ -1307,6 +1333,9 @@ interface UpdateTrigger {
   group_id?: string | null;
   /** Full replacement for the side-effect grant; pass `[]` to clear all. */
   side_effect_grant?: SideEffectCategory[];
+  /** Set the permission wait, clear it back to the workspace preference
+   *  (null), or leave it unchanged (absent). */
+  permission_wait?: PermissionWait | null;
   /** Full replacement for the MCP server ids; pass `[]` to clear them. */
   mcp_servers?: string[];
   /** Pin the intent's model / thinking budget / backend (string), clear it
@@ -1315,6 +1344,11 @@ interface UpdateTrigger {
   model?: string | null;
   reasoning_effort?: string | null;
   provider?: string | null;
+  /** Full replacement for the continue key spec; null or `[]` clears it. */
+  continue_key?: (string | string[])[] | null;
+  /** Set the actor field path (string), clear it (null), or leave it
+   *  unchanged (absent). */
+  actor?: string | null;
 }
 
 interface ApiResult {
@@ -1442,7 +1476,7 @@ if (!clip) document.body.textContent = 'No clip given';
 ## lucidos.widget: Where a Widget Shows
 
 ```ts
-lucidos.widget.size(): 'small' | 'medium' | 'large' | null
+lucidos.widget.size(): 'small' | 'medium' | 'large' | 'xl' | null
 lucidos.widget.onSize(callback: (size) => void): () => void
 lucidos.widget.place(): 'dashboard' | 'inline' | 'option' | null
 lucidos.widget.visible(): boolean
@@ -1452,9 +1486,9 @@ lucidos.widget.onVisibility(callback: (visible: boolean) => void): () => void
 What the host told a *widget* about the place it shows in (ADR 0432). The SDK also stamps two attributes on `<html>`, so most widgets adapt in CSS alone:
 
 - **`data-widget-place`**: `dashboard` on a *dashboard*, phone or desktop, `inline` in a thread (a reply's embed included), or `option`. Absent in the Canvas, where a widget opens as an app. Before ADR 0496 a dashboard tile read `home`, so a widget that still compares the place to `home` no longer matches.
-- **`data-widget-size`**: the *widget size* of its *widget box*, `small`, `medium` or `large`, in a thread card and on a dashboard alike. Absent in an option and in the Canvas, where `size()` is `null`.
+- **`data-widget-size`**: the *widget size* of its *widget box*, `small`, `medium`, `large` or `xl`, in a thread card and on a dashboard alike. An `xl` box keeps its true width where the host is narrower, and the host scrolls it sideways. Absent in an option and in the Canvas, where `size()` is `null`.
 
-In a thread card and on a dashboard the host sets the box and the frame fills it. Draw for the size you are told, with no scroll inside (§ Sizing a widget). A widget whose manifest declares no sizes takes all three (`system-knowhow/building-an-app.md` § Widgets).
+In a thread card and on a dashboard the host sets the box and the frame fills it. Draw for the size you are told, with no scroll inside (§ Sizing a widget). A widget whose manifest declares no sizes takes small, medium and large, and only a declared `xl` adds the fourth (`system-knowhow/building-an-app.md` § Widgets).
 
 `visible()` turns false while a frame stays loaded out of sight, such as a card scrolled off or a hidden dashboard, just before it unloads. Stop timers then, and read again when it turns true.
 
@@ -1732,6 +1766,9 @@ type Tap =
   // the recovery snapshot. Receiving or opening it never executes a restore.
   // Only the engine writes it: a sent notification with it is refused.
   | { kind: 'restore-snapshot'; workspace_id: string; handle: string }
+  // Engine config change notifications on a team workspace: asks to confirm,
+  // then undoes that change. Only the engine writes it, like restore-snapshot.
+  | { kind: 'undo-config-change'; event_id: string }
   | { kind: 'navigate'; to: NavigateUi };
 
 interface Notification {
@@ -1991,6 +2028,35 @@ interface ThreadSummary {
 | React to thread state changes in real time | Subscribe to `lucidos.sse` instead |
 | Spawn a new thread from an app | `lucidos.ui.startThread({ prompt })`, plus `coding_agent` and `folder` to preselect a coding target |
 | Open a link outside Lucidos from JS | `lucidos.ui.openExternal(url)` (never `window.open`) |
+
+## lucidos.workItems: Driver and Watchers
+
+In a *team workspace*, a *work item* is a root thread and its sub-threads (ADR 0623). It has at most one *driver* and any number of *watchers*. Each is a person (an operator). Roles route pushes and feed the factory app's views. They are never authority: anyone can still answer any gate.
+
+```javascript
+const { items, person } = await lucidos.workItems.list();
+// items: open work items, newest activity first, at most 200:
+// [{ root_thread_id, title, last_activity, driver, watchers,
+//    gate_open, escalated, needs_team, yours }]
+// person: the calling device's person, or null
+
+const roles = await lucidos.workItems.get(threadId);
+// { root_thread_id, driver: { id, name } | null, watchers: [{ id, name }] }
+
+await lucidos.workItems.take(threadId);    // Take, or Take over from the driver
+await lucidos.workItems.release(threadId); // stop driving; a no-op if you do not drive
+await lucidos.workItems.watch(threadId);
+await lucidos.workItems.unwatch(threadId); // from any of your devices
+```
+
+- `list` returns root threads that are not archived, the home thread aside. Archiving the root completes a work item.
+- `gate_open`: a thread of the work item waits on a question. `needs_team` is the Team view: an open gate with no driver, or one that escalated. `yours`: your person drives or watches it, so Mine is `items.filter(i => i.yours)`.
+- Any thread id names its work item, through its family root.
+- Each change acts as the person holding the calling device and returns the roles after it. A repeat that changes nothing records nothing.
+- A device that belongs to no person gets a 409 with `reason: "no_person"`. Add it to a person in Settings, People.
+- Answering a gate also makes you the driver. So does a keyed trigger fire whose *actor* email you hold.
+- A push about a work item with a driver reaches the driver's and watchers' devices. With no driver, or once a gate escalated past `driver_timeout_hours`, it reaches the whole team. A gateway with one person always pushes everyone.
+- Watch the role events (`WorkItemDriverTaken` and the rest, `thread-events.md`) through `lucidos.sse` to refresh a view.
 
 ## lucidos.modelRequest
 

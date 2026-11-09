@@ -177,6 +177,7 @@ async fn trigger_completed_sets_has_response_true() {
             go_to_review: false,
             model: None,
             reasoning_effort: None,
+            continue_key: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),

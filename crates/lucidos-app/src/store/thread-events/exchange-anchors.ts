@@ -2,7 +2,7 @@
 // transcript render code out of it (ADR 0288).
 import type { ThreadStatus } from '../../generated/thread-lifecycle';
 import { UNANCHORABLE_ASYNC_EVENTS, computeExchanges, dividerStillAwaitsUser } from './exchange-grouping';
-import type { Exchange } from './exchange';
+import { isChangeLifecycleEvent, type Exchange } from './exchange';
 import type { ThreadState } from './thread-meta';
 import type { OngoingGroup } from '../store';
 import type { CodingAgentExit } from './thread-event-types';
@@ -172,22 +172,72 @@ export function deepLinkAnchorForEvent(
   exchanges: Exchange[],
   eventId: string,
 ): string | null {
-  // Backward walk, matching `findExchangeByAnchorId`: on the vanishingly rare
-  // id collision the most recent owner is the one on screen.
+  const exchange = exchanges[exchangeIndexHoldingEvent(exchanges, eventId)];
+  if (!exchange) return null;
+  if (stampedEventIds(exchange).includes(eventId)) return eventId;
+  const step = exchange.steps.find(({ event }) => event._eventId === eventId);
+  if (step && UNANCHORABLE_ASYNC_EVENTS.has(step.event.type)) return null;
+  // A turn whose own starter is unstamped gives the deep-link nothing to aim
+  // at. Saying so beats an `undefined` that would read as "not in this thread"
+  // further down. Two ways to be unstamped: a legacy row carrying no id, and a
+  // turn with no starter loaded at all.
+  return exchangeStarterId(exchange) ?? null;
+}
+
+/** Index of the turn that draws `eventId`, or -1. Backward, matching
+ *  `findExchangeByAnchorId`: on the vanishingly rare id collision the most
+ *  recent owner is the one on screen. */
+function exchangeIndexHoldingEvent(exchanges: readonly Exchange[], eventId: string): number {
   for (let i = exchanges.length - 1; i >= 0; i--) {
     const exchange = exchanges[i];
-    if (stampedEventIds(exchange).includes(eventId)) return eventId;
-    const step = exchange.steps.find(({ event }) => event._eventId === eventId);
-    if (step) {
-      if (UNANCHORABLE_ASYNC_EVENTS.has(step.event.type)) return null;
-      // A turn whose own starter is unstamped gives the deep-link nothing to
-      // aim at. Saying so beats an `undefined` that would read as "not in this
-      // thread" further down. Two ways to be unstamped: a legacy row carrying
-      // no id, and a turn with no starter loaded at all.
-      return exchangeStarterId(exchange) ?? null;
-    }
+    if (stampedEventIds(exchange).includes(eventId)) return i;
+    if (exchange.steps.some(({ event }) => event._eventId === eventId)) return i;
   }
-  return null;
+  return -1;
+}
+
+/** The change id a turn stamps as `data-change-id`, which the Changes panel
+ *  deep-links a row by. A lifecycle card carries it on its starter. A
+ *  proposing turn carries it on its aggregate `ChangeProposed` step. A
+ *  per-commit `ChangeProposed` carries an empty id and stamps nothing.
+ *
+ *  `threadIsCC` skips the step scan where no `ChangeProposed` can ride. */
+export function exchangeChangeId(exchange: Exchange, threadIsCC = true): string | undefined {
+  if (isChangeLifecycleEvent(exchange.userEvent)) return exchange.userEvent.change_id;
+  if (!threadIsCC) return undefined;
+  for (const { event } of exchange.steps) {
+    if (event.type === 'ChangeProposed' && event.change_id) return event.change_id;
+  }
+  return undefined;
+}
+
+/** What a deep link is looking for: an event, or the turn a change stamps. */
+export type DeepLinkTarget =
+  | { kind: 'event'; eventId: string }
+  | { kind: 'change'; changeId: string };
+
+/** Index of the turn a deep link lands in, or -1 when no loaded turn holds it.
+ *  The window must draw that turn whole for the link to find it.
+ *
+ *  A step of a *continuation fragment* answers -1 too, so paging goes on until
+ *  its real turn merges in.
+ *
+ *  A change resolves to its NEWEST stamped turn, as `scrollToChangeAndPulse`
+ *  prefers the resolution card. An unanchorable event still names its turn,
+ *  which costs one turn to draw rather than the thread. */
+export function deepLinkTargetIndex(exchanges: readonly Exchange[], target: DeepLinkTarget): number {
+  if (target.kind === 'event') {
+    const index = exchangeIndexHoldingEvent(exchanges, target.eventId);
+    const holder = exchanges[index];
+    // A fragment stamps no starter, so only its real turn gives the link a place.
+    if (holder?.continuationFragment && !stampedEventIds(holder).includes(target.eventId)) return -1;
+    return index;
+  }
+  if (!target.changeId) return -1;
+  for (let i = exchanges.length - 1; i >= 0; i--) {
+    if (exchangeChangeId(exchanges[i]) === target.changeId) return i;
+  }
+  return -1;
 }
 
 /** {@link deepLinkAnchorForEvent} over a thread's own exchanges, and null for a

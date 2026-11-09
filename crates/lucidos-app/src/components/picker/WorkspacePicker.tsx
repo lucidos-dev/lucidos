@@ -60,6 +60,7 @@ import {
   recallLastWorkspaceCount,
 } from '../../utils/lastWorkspace';
 import { isPairingShellDocument } from '../../utils/pairingShell';
+import { hasUnspentPairingLaunch } from '../../utils/pairingCodeSeed';
 import {
   listWorkspaces,
   listRemoteWorkspaces,
@@ -413,6 +414,7 @@ export function WorkspacePicker() {
     typeof window !== 'undefined' &&
       !new URLSearchParams(window.location.search).has('pick') &&
       !isPairingShellDocument() &&
+      !hasUnspentPairingLaunch() &&
       recallLastWorkspace() !== null,
   );
 

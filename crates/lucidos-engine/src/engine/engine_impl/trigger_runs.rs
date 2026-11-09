@@ -286,10 +286,14 @@ mod tests {
             go_to_review: false,
             group_id: None,
             side_effect_grant: vec![],
+            permission_wait: None,
+            context_ceiling: None,
             mcp_servers: vec![],
             plugin_id: None,
             model: None,
             reasoning_effort: None,
+            continue_key: None,
+            actor: None,
         }
     }
 

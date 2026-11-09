@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::gateway_operators::Reader;
 use crate::scheduler::notifications::{
     default_tap, refuse_engine_only_tap, resolve_thread_tap_id, verify_event_anchors, Tap,
 };
@@ -107,10 +108,20 @@ pub(super) async fn create_notification(
 
 // ===== Notification Endpoints =====
 
+/// Whose read state a request reads: its device's person on a team gateway.
+fn reader_of(headers: &HeaderMap) -> Reader {
+    Reader::of(
+        crate::api::actor::user_actor(headers, None).as_ref(),
+        &crate::gateway_operators::current(),
+    )
+}
+
 pub(super) async fn get_notifications(
     State(state): State<AppState>,
     Query(query): Query<NotificationsListQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<NotificationsResponse>, (StatusCode, String)> {
+    let reader = reader_of(&headers);
     let filter = query.filter.as_deref().unwrap_or("all");
     // Clamp upper bound so a misconfigured client can't ask for an unbounded
     // page; sibling list endpoints (changes, applied changes) cap at 100 too.
@@ -122,7 +133,7 @@ pub(super) async fn get_notifications(
     let before_ts = query.before.map(super::parse_unix_ts);
 
     // Always fetch the real unread count (uncapped)
-    let unread_count = NotificationStore::count_unread(&state.pool)
+    let unread_count = NotificationStore::count_unread(&state.pool, &reader)
         .await
         .map_err(|e| {
             (
@@ -144,14 +155,15 @@ pub(super) async fn get_notifications(
     }
 
     // Fetch limit+1 to detect has_more
-    let mut items = NotificationStore::get_filtered(&state.pool, filter, limit + 1, before_ts)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to load notifications: {}", e),
-            )
-        })?;
+    let mut items =
+        NotificationStore::get_filtered(&state.pool, &reader, filter, limit + 1, before_ts)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to load notifications: {}", e),
+                )
+            })?;
 
     let has_more = items.len() as i64 > limit;
     if has_more {
@@ -169,6 +181,7 @@ pub(super) async fn get_notifications(
 pub(super) async fn get_notifications_at_timestamp(
     State(state): State<AppState>,
     Query(query): Query<BeforeTimestampQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<NotificationsResponse>, (StatusCode, String)> {
     let timestamp = query.before;
     use chrono::TimeZone;
@@ -177,14 +190,15 @@ pub(super) async fn get_notifications_at_timestamp(
         .single()
         .unwrap_or_else(chrono::Utc::now);
 
-    let notifications = NotificationStore::get_all_before(&state.pool, before, 50)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to load notifications: {}", e),
-            )
-        })?;
+    let notifications =
+        NotificationStore::get_all_before(&state.pool, &reader_of(&headers), before, 50)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to load notifications: {}", e),
+                )
+            })?;
     let unread_count = notifications.iter().filter(|n| !n.read).count() as i64;
 
     Ok(Json(NotificationsResponse {
@@ -204,14 +218,16 @@ pub(super) async fn mark_notification_read(
     // `mark_read` emits `NotificationRead` itself, and only when the row really
     // moved from unread to read; resolve the device actor for it.
     let actor = crate::api::actor::user_actor(&headers, None);
-    let success = NotificationStore::mark_read(&state.pool, &state.engine.event_bus, id, actor)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to mark notification read: {}", e),
-            )
-        })?;
+    let reader = reader_of(&headers);
+    let success =
+        NotificationStore::mark_read(&state.pool, &state.engine.event_bus, &reader, id, actor)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to mark notification read: {}", e),
+                )
+            })?;
 
     if success {
         // Cross-device dismiss (macOS desktop only): tell any connected Tauri
@@ -223,6 +239,7 @@ pub(super) async fn mark_notification_read(
         crate::scheduler::push::emit_native_push_dismiss_requested(
             &state.engine.event_bus,
             Some(id),
+            &reader,
         )
         .await;
     }
@@ -236,21 +253,27 @@ pub(super) async fn mark_all_notifications_read(
     headers: HeaderMap,
 ) -> Result<Json<MarkReadResponse>, (StatusCode, String)> {
     let actor = crate::api::actor::user_actor(&headers, None);
-    let count = NotificationStore::mark_all_read(&state.pool, &state.engine.event_bus, actor)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to mark all notifications read: {}", e),
-            )
-        })?;
+    let reader = reader_of(&headers);
+    let count =
+        NotificationStore::mark_all_read(&state.pool, &state.engine.event_bus, &reader, actor)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to mark all notifications read: {}", e),
+                )
+            })?;
 
     if count > 0 {
         // Cross-device dismiss (macOS desktop only): `None` = remove ALL
         // delivered native banners on connected Tauri apps. Web / PWA banners
         // persist (no silent Web Push removal). See notifications.md §4.
-        crate::scheduler::push::emit_native_push_dismiss_requested(&state.engine.event_bus, None)
-            .await;
+        crate::scheduler::push::emit_native_push_dismiss_requested(
+            &state.engine.event_bus,
+            None,
+            &reader,
+        )
+        .await;
     }
 
     Ok(Json(MarkReadResponse { success: count > 0 }))
@@ -260,9 +283,10 @@ pub(super) async fn mark_all_notifications_read(
 pub(super) async fn get_notification(
     State(state): State<AppState>,
     Query(query): Query<NotificationQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<Option<Notification>>, (StatusCode, String)> {
     let id = query.id;
-    let notification = NotificationStore::get_by_id(&state.pool, id)
+    let notification = NotificationStore::get_by_id(&state.pool, &reader_of(&headers), id)
         .await
         .map_err(|e| {
             (

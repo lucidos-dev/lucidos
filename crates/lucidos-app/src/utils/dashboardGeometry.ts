@@ -23,6 +23,7 @@ export const WIDGET_SIZE_CELLS: Record<WidgetSize, { columns: number; rows: numb
   small: { columns: 1, rows: 1 },
   medium: { columns: 2, rows: 1 },
   large: { columns: 2, rows: 2 },
+  xl: { columns: 4, rows: 2 },
 };
 
 /** The dashboard's column count for this content width: as many cells as fit,

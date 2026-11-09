@@ -197,6 +197,23 @@ The type is the frontmatter `name`, not the file name. Built-in types such as
 added mid-session with `/add-dir` is not covered. The hook lets a call
 through when it cannot read a definition. Do not call it directly.
 
+### Hidden: `lucidos cc-bash-guard`
+
+The PreToolUse hook Claude Code runs before every `Bash` call in a Lucidos
+session. It refuses two kinds of command, and the refusal tells the agent what
+to run instead:
+
+- **Broad kills.** `ps` or `pgrep` output fed to `kill`, `pkill -f`, and any
+  kill aimed at `claude`. A Claude Code process's argv names tools like
+  `cargo`, so an argv match kills every concurrent session.
+- **A `cd` with an output redirection** (`>`, `>>`, `&>`, `tee`). Claude
+  Code's own safety check stops every such command for manual approval,
+  whatever the allow rules say. The agent rewrites it with absolute paths, so
+  the user never sees that permission card.
+
+It reads the command as text, so a quoted mention can trip it. It lets a call
+through when it cannot parse the payload. Do not call it directly.
+
 ### `lucidos data path <relative> [--mkdir]`
 
 Print the absolute filesystem path that `<relative>` resolves to inside the parent workspace's `data/` directory.
@@ -610,6 +627,19 @@ $ lucidos threads archive --thread current
 - **The Archive button's refusals apply.** A running target or one waiting on the user is a 409 with `parent_not_archivable`. A pending change is `parent_has_pending_changes`, and a blocking sub-thread is `descendants_blocking`. A target parked on an event wait with unproposed work is `parent_holds_held_proposal`: stop waiting first. Each body carries a `message` saying what to do.
 - **A pinned target is a 409 with `thread_pinned`**: only the user archives a pinned thread. A pinned sub-thread of the target stays open and is listed under `skipped`.
 - **Archiving removes the worktree about an hour later.** Uncommitted work is committed on the thread's branch first, and the branch stays while it holds unapplied commits. A later follow-up rebuilds the worktree from it.
+
+### `lucidos threads context-ceiling <ceiling> [--thread <uuid>]`
+
+Set a thread's *context ceiling* (ADR 0629): the context size at which its coding-agent session hands off to a *successor session*. Wraps `PUT /api/v1/threads/<id>/context-ceiling`. `--thread` defaults to this thread.
+
+```bash
+$ lucidos threads context-ceiling 200k
+{"ceiling":"200k"}
+```
+
+- **The value** is `off`, a size such as `200k`, or a share of the window such as `30%`. No ceiling goes above 75% of the window or below 100k.
+- **Only a person raises a ceiling or turns it off.** From inside a thread you may lower your own, and set a direct child's at or below your own. A raise is a 403 with `ceiling-raise-needs-a-person`. Any other thread is a 403 with `ceiling-thread-out-of-reach`.
+- **A child takes its parent's ceiling at spawn.** A later change on the parent does not reach it.
 
 ### `lucidos spawn-thread --to <WS> --message <M> [--image <path> ...] [--coding-agent <backend>] [--folder <path> | --repo <name>] [--relation child|top] [--wake-mode <mode>] [--integrated] [--title <T>] [--model <M>] [--coding-agent-model <M>] [--reasoning-effort <level>]`
 
@@ -1389,7 +1419,10 @@ write. A key the catalog keeps for the owner, such as `command_guard` or
 
 Manage *triggers*: scheduled (cron) and/or event-driven automations. Generated
 from the manifest. The rich fields (`run`, `on`, `cron_expressions`,
-`side_effect_grant`, `mcp_servers`) are passed as JSON strings.
+`side_effect_grant`, `mcp_servers`, `continue_key`) are passed as JSON strings.
+`actor` is a plain payload path string. `permission_wait` is a plain string:
+`deny`, whole minutes from 1 to 1440, or `indefinite` (see `triggers.md`
+§ Permission wait).
 
 ```bash
 $ lucidos triggers list
@@ -2086,6 +2119,7 @@ A refusal reads as an unknown reading, so the thread carries on. A 404 with an e
 
 An **automatic** checkpoint prints one of these:
 
+- **Hand off at the context ceiling**: the session is past its *context ceiling*, so it hands off here whatever the estimate says. The engine reports `past_ceiling` once the session tops the ceiling in force. That holds mid-turn too, since a checkpoint is a better boundary than the turn end. Hand off as below, on a floor rung if the engine names one.
 - **Hand off**: the estimate pays. Commit, write a *handoff narrative*, then run `lucidos successor start --narrative <file>` with the same `--at` and `--progress` and no implementer flags. The narrative quotes the flow's remaining checkpoint instructions. End the turn.
 - **Hand off on the floor rung**: the engine named a floor rung. Hand off as above even when the estimate does not pay, adding the `--coding-agent-model` and `--reasoning-effort` the output names.
 - **The risk rung**: when the engine names one, the output adds two tests, and the agent hands off on it instead when the change passes either. Say why in one line. With no other handoff due, carry on unless the change passes a test.
@@ -2095,7 +2129,7 @@ An **automatic** checkpoint prints one of these:
 
 An **offered** checkpoint prints the card's shape:
 
-- **The estimate pays**: offer `Implement in a fresh session: <implementer> (Recommended)`, then this thread's implementer when it differs, then the flow's option to stay (`Approve here` for a plan, else `Continue here`), then a real fork. Never more than 4 options.
+- **The estimate pays, or the session is past its context ceiling**: offer `Implement in a fresh session: <implementer> (Recommended)`, then this thread's implementer when it differs, then the flow's option to stay (`Approve here` for a plan, else `Continue here`), then a real fork. Never more than 4 options.
 - **It does not pay**: a new session only for a lower *intelligence rung* on the *intelligence ladder* than this thread's (ADR 0497). For hard or long work, a thread with a rung above its own may also offer `Implement in a fresh session: <a higher rung>` (ADR 0499). It goes one or two rungs up, never to the top. Otherwise the flow's own question.
 - **The thread cannot hand off, or the engine could not be read**: the flow's own question, and no new session.
 
@@ -2133,14 +2167,16 @@ What the handoff does:
 
 - **It records `SessionHandedOff`** and creates no thread, no branch and no change. The thread keeps its worktree, branch, plan marker and change, uncommitted work included.
 - **The current session ends with its turn**, and the successor session then starts in the same thread. Its first message is the narrative, and its `SessionStarted` records continuity `handoff`. Another message arriving first starts it too, with the narrative ahead of that message.
+- **Past the *context ceiling*, it starts on the next input instead.** That holds once the session has recorded `ContextCeilingReached`, in its ceiling re-entry turn. The input is a message, a finished task, a wake or a child's report. The input follows the narrative in the first message. Input that arrives meanwhile waits for the new session.
+- **The narrative ends on a "Still running" list**: the background tasks, event waits and working children the session leaves behind. Their results reach the new session.
 - **The backend may change.** A session on Claude Code may hand off to Codex, and back. The thread's backend follows its newest session.
 - **A parent sees nothing change.** It keeps waiting on this thread, and hears from it once, at the real end.
 - **No authority is needed**, and no owner approval card is ever asked for. A thread can hand off only itself.
-- **Refused** for a thread that is not a coding-agent thread, an *integrated sub-thread*, or an archived thread. A thread with a handoff already pending is refused with reason `handoff-pending`. A second request racing a handoff waits for the first, then is refused. Also refused while the thread applies a change or has one in the *landing lane*.
+- **Refused** for a thread that is not a coding-agent thread, an *integrated sub-thread*, or an archived thread. A thread with a handoff already pending is refused with reason `handoff-pending`. A handoff past the context ceiling is refused with reason `ceiling-lifted` when a person raised the ceiling first. Hand off again if you still mean to. A second request racing a handoff waits for the first, then is refused. Also refused while the thread applies a change or has one in the *landing lane*.
 
-The route's body takes `coding_agent`, `coding_agent_model` and `reasoning_effort` beside the narrative, plus `checkpoint` and `progress`. Its reply carries `{implementer, starts}`. `starts` is `after-this-turn` when the thread's own agent called, and `now` for any other caller.
+The route's body takes `coding_agent`, `coding_agent_model` and `reasoning_effort` beside the narrative, plus `checkpoint` and `progress`. Its reply carries `{implementer, starts}`. `starts` is `on-next-input` once the session has recorded `ContextCeilingReached`, unless the user typed a request at the Successor card. Otherwise it is `after-this-turn` when the thread's own agent called, and `now` for any other caller.
 
-`GET /api/v1/threads/:id/context` returns `{input_tokens, can_hand_off, offer, applied, implementer, card}`. `input_tokens` is the context size, and `can_hand_off` says whether the thread may hand off at all. `offer` is the size decision the plan card reads.
+`GET /api/v1/threads/:id/context` returns `{input_tokens, can_hand_off, offer, applied, implementer, card, ceiling_handoff}`. `input_tokens` is the context size, and `can_hand_off` says whether the thread may hand off at all. `offer` is the size decision the plan card reads.
 
 `card` is the *Successor card*'s verdict, `{warm, cold, cold_at, fresh_ratio}`. `warm` and `cold` say whether the handoff estimate says a handoff pays while the prompt cache is warm and once it is cold. `cold_at` is when the cache goes cold. `fresh_ratio` is how many times a fresh session's context the thread holds. It is absent when the engine cannot make a reading.
 
@@ -2151,6 +2187,10 @@ The *Successor card* uses two other routes, both for a user's device and refused
 A thread that is not idle is refused.
 
 `POST /api/v1/threads/:id/successor-offer/decline` records *Stay here* as `SuccessorOfferDeclined`.
+
+`ceiling_handoff` is present while a handoff at the *context ceiling* waits for the next input: `{opening, crossing, raises_to}`. `crossing` holds the size and the ceiling it crossed. `raises_to` is the ceiling *Return to the old session* sets, in tokens: the session's size plus 100k. It is `null` when the window cap keeps every ceiling under that size.
+
+`POST /api/v1/threads/:id/successor/withdraw` is *Return to the old session*, for a person only. It records a raising `ContextCeilingSet`, a `SuccessorOfferDeclined` at the session's size, then `SessionHandoffWithdrawn`, and answers `{ceiling}`. The next input resumes the old session. An agent gets a 403 with reason `withdraw-needs-a-person`. A thread with no waiting ceiling handoff gets a 409 `no-ceiling-handoff`, and one the window cap holds gets a 409 `ceiling-cannot-rise`. Once a run holds the thread, the successor session is already starting, and the withdraw gets a 409 `handoff-starting`.
 
 `POST /api/v1/threads/:id/handoff-checkpoints` takes `{name, progress?, offered?}` and returns the same reading plus `handoff`: `{name, progress, pays, estimate}`. `pays` is `null` when the engine could not make a reading, such as a model with no price row. It is `false` while the thread holds a pending, applying or landing change. `estimate` holds `warmth`, `units_left`, `calls_per_unit`, `calls_left`, `fresh_tokens`, `saving_usd` and `cost_usd`. A malformed name or progress is a 400, and a thread records only its own runs.
 
@@ -2528,6 +2568,7 @@ device you want to let in. It works once and expires in five minutes.
 **The typed code works only from another device on the LAN or the tailnet.** On
 this machine, and through a tunnel or proxy, Lucidos refuses it. Open the printed
 link or paste the printed *pairing secret* there instead (ADR 0615).
+New device links carry credentials in `/~/#pair=` fragments. Ordinary printed links prefer the configured external address, with loopback as fallback.
 
 **`--gateway` lets another gateway in, not a device.** It mints a *gateway
 pairing secret*, which never pairs a device (ADR 0590). Paste it on the other
@@ -2735,6 +2776,27 @@ Paste the printed value into the Secret field on GitHub's own webhook form.
 **Slack and Stripe issue their own**, shown on the app's Basic Information page
 and on the endpoint's dashboard page. A secret you invent could never verify
 their deliveries, so those take `{"mode":"provided","value":"..."}`.
+
+**Slack's setup order matters.** Slack checks a Request URL the moment you save
+it, so the hook must exist first:
+
+1. Copy the Signing Secret from the Slack app's Basic Information page.
+2. Create the hook with that secret:
+
+   ```bash
+   lucidos webhooks create --name slack --event-type SlackEventReceived \
+     --hmac '{"credential":"slack-signing","signature_header":"X-Slack-Signature",
+              "timestamp_header":"X-Slack-Request-Timestamp",
+              "prefix":"v0=","template":"v0:{timestamp}:{body}"}' \
+     --signing-secret '{"mode":"provided","value":"<signing secret>"}'
+   ```
+
+3. Paste the delivery URL into **Event Subscriptions → Request URL**.
+
+Slack then posts a signed `url_verification` challenge. A hook verifying
+`X-Slack-Signature` echoes it with a 200 and emits no event, so no trigger
+fires on it. The echo runs only after the signature verifies, so a forged
+challenge gets a 401.
 
 A provided value is stored byte for byte. One that starts or ends with
 whitespace is refused by name, rather than trimmed: trimming can break a value

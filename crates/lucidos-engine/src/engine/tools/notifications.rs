@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use super::{LucidosEngine, ToolOutcome};
 
+use crate::gateway_operators::Reader;
 use crate::llm::tool_names as tn;
 use crate::scheduler::NotificationStore;
 
@@ -68,7 +69,9 @@ impl LucidosEngine {
             .clamp(1, 50);
 
         let notifications =
-            match NotificationStore::get_filtered(&self.pool, filter, limit, None).await {
+            match NotificationStore::get_filtered(&self.pool, &Reader::Team, filter, limit, None)
+                .await
+            {
                 Ok(n) => n,
                 Err(e) => return Err(format!("Error: failed to read notifications: {}", e)),
             };
@@ -119,7 +122,14 @@ impl LucidosEngine {
             }
         };
 
-        let marked = match NotificationStore::mark_read(&self.pool, &self.event_bus, id, None).await
+        let marked = match NotificationStore::mark_read(
+            &self.pool,
+            &self.event_bus,
+            &Reader::Team,
+            id,
+            None,
+        )
+        .await
         {
             Ok(b) => b,
             Err(e) => return Err(format!("Error: failed to mark notification read: {}", e)),
@@ -137,7 +147,13 @@ impl LucidosEngine {
     }
 
     async fn notifications_mark_all_read(&self) -> ToolOutcome {
-        let count = match NotificationStore::mark_all_read(&self.pool, &self.event_bus, None).await
+        let count = match NotificationStore::mark_all_read(
+            &self.pool,
+            &self.event_bus,
+            &Reader::Team,
+            None,
+        )
+        .await
         {
             Ok(c) => c,
             Err(e) => {

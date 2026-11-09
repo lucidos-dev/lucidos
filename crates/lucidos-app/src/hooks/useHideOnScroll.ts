@@ -330,14 +330,35 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
      *  and uses this var to anchor itself just below the bar's bottom edge —
      *  including when the title wraps to multiple lines. */
     function updateTitleBarHeightVar() {
+      syncRemSize();
       const newHeight = titleBarEl ? titleBarEl.getBoundingClientRect().height : 0;
       if (Math.abs(newHeight - titleBarHeight) <= 0.1) return;
       titleBarHeight = newHeight;
-      if (newHeight > 0) {
-        document.documentElement.style.setProperty('--mobile-thread-title-height', `${newHeight / cachedRemSize}rem`);
+      publishTitleBarHeightVar();
+    }
+
+    function publishTitleBarHeightVar() {
+      if (titleBarHeight > 0) {
+        document.documentElement.style.setProperty('--mobile-thread-title-height', `${titleBarHeight / cachedRemSize}rem`);
       } else {
         document.documentElement.style.removeProperty('--mobile-thread-title-height');
       }
+    }
+
+    /** Re-read the rem size before converting a measurement. A UI scale can
+     *  land after mount, and each element's observer may fire first, so every
+     *  var already published in the old rem republishes here. The prompt and
+     *  title bar are measured again first: their own observers may not have
+     *  run yet, and a cached height would publish a size they no longer have. */
+    function syncRemSize() {
+      const remPx = getRemPx();
+      if (remPx === cachedRemSize) return;
+      cachedRemSize = remPx;
+      updateHeaderVar();
+      titleBarHeight = titleBarEl ? titleBarEl.getBoundingClientRect().height : 0;
+      publishTitleBarHeightVar();
+      promptHeight = promptEl ? promptEl.getBoundingClientRect().height : 0;
+      updatePromptHeightVar();
     }
 
     /** Attach a ResizeObserver to the title bar so the CSS var updates when
@@ -438,6 +459,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     }
 
     function refreshPromptHeight() {
+      syncRemSize();
       promptHeight = promptEl ? promptEl.getBoundingClientRect().height : 0;
       updatePromptHeightVar();
       applyTransform();
@@ -559,7 +581,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     }
 
     function refreshHeight() {
-      cachedRemSize = getRemPx();
+      syncRemSize();
       const el = headerRef.current;
       if (!el) {
         if (cachedHeight !== 0 || cachedControlsTop !== 0) {

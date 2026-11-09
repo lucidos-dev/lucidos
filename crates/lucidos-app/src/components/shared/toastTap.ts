@@ -9,8 +9,8 @@ import type { ToastItem } from '../../store/types';
  *
  *  Only an info or success toast gives its action to the card. A warning or an
  *  error is read, and a tap to read it must not act or close it. Only a NEUTRAL
- *  action becomes the tap: a `danger`, `confirm` or `deliberate` one commits
- *  something. A spinning or progress toast narrates work in flight, so it is
+ *  action becomes the tap: a `danger` or `confirm` one commits something, and
+ *  so may a `deliberate` one, or the text gives no hint of it. A spinning or progress toast narrates work in flight, so it is
  *  not passive. */
 export type ToastTap = 'click' | 'action' | null;
 

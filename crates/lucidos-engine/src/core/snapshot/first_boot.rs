@@ -113,6 +113,7 @@ impl VerifiedRestoreBoot<'_> {
                     handle: recovery,
                 },
                 actor: Some(journal.actor),
+                audience: None,
             },
         )
         .await

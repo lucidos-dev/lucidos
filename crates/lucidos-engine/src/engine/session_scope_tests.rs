@@ -25,6 +25,7 @@ fn the_sql_names_every_kind_that_opens_a_session() {
         SessionContinuity::Handoff {
             checkpoint: None,
             progress: None,
+            crossing: None,
             opening: HandoffOpening::Brief,
             message: String::new(),
         },
@@ -71,6 +72,7 @@ fn handoff() -> SessionContinuity {
     SessionContinuity::Handoff {
         checkpoint: None,
         progress: None,
+        crossing: None,
         opening: HandoffOpening::Narrative,
         message: String::new(),
     }

@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
-import { landingTarget, deepLinkAnchorForEvent, stampedEventIds } from '../exchange-anchors';
+import { landingTarget, deepLinkAnchorForEvent, deepLinkTargetIndex, stampedEventIds } from '../exchange-anchors';
 import type { Exchange } from '../exchange';
 import type { StoredEvent } from '../thread-event-types';
 
@@ -116,6 +116,59 @@ describe('deepLinkAnchorForEvent', () => {
       exchange('start-2', [['CodingAgentIdled', 'dup']]),
     ];
     expect(deepLinkAnchorForEvent(exchanges, 'dup')).toBe('start-2');
+  });
+});
+
+/** Which turn the window must draw for a deep link to land. The window's floor
+ *  moves to it (`deepLinkEdge`), rather than to the thread's first turn. */
+describe('deepLinkTargetIndex', () => {
+  it('finds the turn an event starts, a step of, or a card it stamps', () => {
+    const exchanges = [
+      exchange('start-1'),
+      exchange('start-2', [['CodingAgentIdled', 'idle-1'], ['ResponseFailed', 'fail-1']]),
+      exchange('start-3'),
+    ];
+    expect(deepLinkTargetIndex(exchanges, { kind: 'event', eventId: 'start-1' })).toBe(0);
+    expect(deepLinkTargetIndex(exchanges, { kind: 'event', eventId: 'idle-1' })).toBe(1);
+    expect(deepLinkTargetIndex(exchanges, { kind: 'event', eventId: 'fail-1' })).toBe(1);
+    expect(deepLinkTargetIndex(exchanges, { kind: 'event', eventId: 'start-3' })).toBe(2);
+  });
+
+  /** An unanchorable event still names the turn it arrived in. Drawing that
+   *  turn costs one turn, where a render-all costs the thread. */
+  it('names the turn holding an unanchorable event', () => {
+    const exchanges = [exchange('start-1'), exchange('start-2', [['BackgroundBashCompleted', 'bash-1']])];
+    expect(deepLinkTargetIndex(exchanges, { kind: 'event', eventId: 'bash-1' })).toBe(1);
+  });
+
+  /** A fragment stamps no starter, so a link to one of its steps has nothing
+   *  to land on. Paging must go on until the real turn merges in. */
+  it('answers -1 for a step of a continuation fragment', () => {
+    const fragment = { ...exchange('frag-1', [['CodingAgentIdled', 'idle-2']]), continuationFragment: true as const };
+    expect(deepLinkTargetIndex([fragment, exchange('start-2')], { kind: 'event', eventId: 'idle-2' })).toBe(-1);
+  });
+
+  it('answers -1 for an event no loaded turn holds', () => {
+    expect(deepLinkTargetIndex([exchange('start-1')], { kind: 'event', eventId: 'older' })).toBe(-1);
+  });
+
+  /** `scrollToChangeAndPulse` prefers the LAST stamped turn: the resolution
+   *  card over the proposing turn. */
+  it('finds the newest turn stamped with a change', () => {
+    const proposing = exchange('start-1', [['ChangeProposed', 'prop-1', { change_id: 'c-1' }]]);
+    const applied = {
+      ...exchange('applied-1'),
+      userEvent: evt('ChangeApplied', 'applied-1', { change_id: 'c-1' }),
+    } as Exchange;
+    expect(deepLinkTargetIndex([proposing, exchange('start-2')], { kind: 'change', changeId: 'c-1' })).toBe(0);
+    expect(deepLinkTargetIndex([proposing, applied, exchange('start-3')], { kind: 'change', changeId: 'c-1' })).toBe(1);
+    expect(deepLinkTargetIndex([proposing], { kind: 'change', changeId: 'c-2' })).toBe(-1);
+  });
+
+  /** A per-commit `ChangeProposed` carries an empty id and stamps nothing. */
+  it('ignores a per-commit proposal with no change id', () => {
+    const commit = exchange('start-1', [['ChangeProposed', 'prop-1', { change_id: '' }]]);
+    expect(deepLinkTargetIndex([commit], { kind: 'change', changeId: '' })).toBe(-1);
   });
 });
 

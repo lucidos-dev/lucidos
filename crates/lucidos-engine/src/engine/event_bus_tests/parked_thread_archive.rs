@@ -18,6 +18,7 @@ async fn emit_unattended_trigger_start(bus: &EventBus, thread_id: Uuid) {
             go_to_review: false,
             model: None,
             reasoning_effort: None,
+            continue_key: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),

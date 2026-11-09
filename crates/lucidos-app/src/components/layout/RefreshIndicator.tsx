@@ -120,8 +120,8 @@ export function MobileRefreshIndicator() {
 
 /** The desktop content row's Refresh, beside the hamburger. The button is its
  *  own indicator: the arrow spins for at least the minimum, turns into the
- *  check, then comes back as the arrow. Leading the row keeps it out of the
- *  trailing cluster's fold. Until it is the arrow again it takes no press,
+ *  check, then comes back as the arrow. Compact panes hide this button and
+ *  offer Refresh in the leading overflow. Until the arrow returns it takes no press,
  *  but keeps its tooltip, so it is `aria-disabled` rather than `disabled`. */
 export function ContentRefreshButton() {
   const state = useRefreshIndicatorState();

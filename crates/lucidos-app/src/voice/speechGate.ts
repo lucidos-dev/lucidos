@@ -12,7 +12,9 @@
  *
  * `getUserMedia` is asked for echo cancellation, so the talker's own voice
  * coming back through the speaker is mostly gone before a frame reaches here.
- * What is left is handled by wanting a RUN of loud frames rather than one.
+ * What is left is handled by wanting a RUN of loud frames rather than one. It
+ * also decides what reaches the provider while the talker speaks: `call.ts`
+ * holds back every frame this gate calls quiet, since that frame is echo.
  */
 
 /** How loud, and for how long, before the caller counts as speaking. */

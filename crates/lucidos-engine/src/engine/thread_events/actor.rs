@@ -45,6 +45,10 @@ pub enum EngineReason {
         trigger_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trigger_name: Option<String>,
+        /// The email the trigger's *actor* field resolved to (ADR 0623). The
+        /// email, never the operator: a display maps it through the gateway.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor_email: Option<String>,
     },
     /// Engine auto-retriggered `/harden` because the marker was stale.
     HardenRetrigger,
@@ -76,6 +80,9 @@ pub enum EngineReason {
     /// Engine held a turn-end proposal because the branch's plan marker does
     /// not satisfy the gate, and told the agent how to set one.
     MissingPlan,
+    /// The session grew past its *context ceiling*, so the engine asked the
+    /// agent to hand off: the *ceiling re-entry* (ADR 0629).
+    ContextCeiling,
     /// Historical: the engine used to silently apply marketplace plugin updates
     /// in the background and stamped the resulting `PluginInstalled` event with
     /// this reason. That behavior was retired: the engine now checks for

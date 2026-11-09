@@ -22,6 +22,7 @@ const HEADER_PX = 100;
 let headerPx = HEADER_PX;
 const TITLE_PX = 36;
 const PROMPT_PX = 92;
+let promptPx = PROMPT_PX;
 
 function Header() {
   const ref = useRef<HTMLElement>(null);
@@ -60,10 +61,11 @@ beforeEach(() => {
   vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
     const height = this.classList.contains('app-header') ? headerPx
       : this.classList.contains('mobile-thread-title-row') ? TITLE_PX
-        : this.classList.contains('prompt-area') ? PROMPT_PX : 0;
+        : this.classList.contains('prompt-area') ? promptPx : 0;
     return { top: 0, left: 0, right: 0, bottom: height, width: 0, height, x: 0, y: 0, toJSON() {} } as DOMRect;
   });
   headerPx = HEADER_PX;
+  promptPx = PROMPT_PX;
   // A phone's width, so the hook's own breakpoint read agrees with the signal.
   Object.defineProperty(window, 'innerWidth', { value: 390, configurable: true });
   preferences.value = { status: 'loaded', data: { mobile_dynamic_bars: 'true' } };
@@ -77,6 +79,7 @@ afterEach(() => {
   render(null, host);
   findSurface.value = null;
   document.body.innerHTML = '';
+  document.documentElement.style.fontSize = '';
   Object.defineProperty(window, 'innerWidth', { value: desktopWidth, configurable: true });
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -114,6 +117,49 @@ describe('the bars hook across a layout swap', () => {
     const title = fresh.querySelector<HTMLElement>('.mobile-thread-title-row')!;
     expect(parseFloat(title.style.getPropertyValue('--mobile-header-offset'))).toBeLessThan(0);
     expect(document.documentElement.style.getPropertyValue('--mobile-prompt-height')).toBe(`${PROMPT_PX / 16}rem`);
+  });
+});
+
+describe('a UI scale applied after mount', () => {
+  it('publishes the prompt height in the new rem', async () => {
+    // The prompt's observer can fire before the header's, so it must not
+    // convert with the rem the header last read.
+    const observed = new Map<Element, () => void>();
+    vi.stubGlobal('ResizeObserver', class {
+      constructor(private cb: () => void) {}
+      observe(el: Element) { observed.set(el, this.cb); }
+      unobserve() {}
+      disconnect() {}
+    });
+    const tree = mountMobileTree();
+    render(<Header />, host);
+    await frames();
+
+    document.documentElement.style.fontSize = '18px';
+    observed.get(tree.querySelector('.prompt-area')!)!();
+
+    expect(document.documentElement.style.getPropertyValue('--mobile-prompt-height')).toBe(`${PROMPT_PX / 18}rem`);
+  });
+});
+
+describe('a UI scale that lands before the prompt observer has run', () => {
+  it('never publishes a prompt height the prompt no longer has', async () => {
+    const observed = new Map<Element, () => void>();
+    vi.stubGlobal('ResizeObserver', class {
+      constructor(private cb: () => void) {}
+      observe(el: Element) { observed.set(el, this.cb); }
+      unobserve() {}
+      disconnect() {}
+    });
+    const tree = mountMobileTree();
+    render(<Header />, host);
+    await frames();
+
+    promptPx = 60;
+    document.documentElement.style.fontSize = '18px';
+    observed.get(tree.querySelector('.mobile-thread-title-row')!)!();
+
+    expect(document.documentElement.style.getPropertyValue('--mobile-prompt-height')).toBe(`${60 / 18}rem`);
   });
 });
 

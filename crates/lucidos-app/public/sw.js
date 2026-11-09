@@ -159,6 +159,10 @@ const IS_BUILT = !BUILD_ID.startsWith('__');
 // cache name purges the prior generation.
 const KEEP_CACHES = [BLOB_CACHE, SHELL_CACHE];
 
+// Query parameter that marks a health request as the page's fetch-path probe.
+// Keep in step with FETCH_PROBE_PARAM in src/utils/swFetchPathProbe.ts.
+const FETCH_PROBE_PARAM = 'sw-fetch-probe';
+
 self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
   const url = event.request.url;
@@ -185,7 +189,10 @@ self.addEventListener('fetch', (event) => {
     // is already cheap by construction: three consecutive ones are suppressed
     // and the next is 5s away. Same reasoning as the SSE line above, for a
     // different reason: this endpoint's semantics are not what the SW assumes.
-    if (rel === '/api/v1/health') return;
+    // The one exception is the page's fetch-path probe (swFetchPathProbe.ts).
+    // It goes through fetchWithRetry like any other read, so a worker whose own
+    // fetch() never settles leaves it unanswered while the plain probe answers.
+    if (rel === '/api/v1/health' && !new URL(url).searchParams.has(FETCH_PROBE_PARAM)) return;
     // Content-addressed blobs are immutable for the lifetime of the hash.
     if (rel.startsWith('/api/v1/blobs/')) {
       event.respondWith(cacheFirst(event.request, BLOB_CACHE));

@@ -41,10 +41,17 @@ export interface PairingCode {
  * `origin` is the address the NEW device should open, never this page's own.
  * The caller resolves it, because only the client knows which of this
  * machine's addresses another device can reach. Pass `null` to mint a bare
- * code.
+ * code. `operatorId` names the person the new device joins; without it the
+ * device joins the gateway's first person.
  */
-export async function mintPairingCode(origin: string | null): Promise<PairingCode> {
-  const query = origin ? `?origin=${encodeURIComponent(origin)}` : '';
+export async function mintPairingCode(
+  origin: string | null,
+  operatorId: string | null = null,
+): Promise<PairingCode> {
+  const params = new URLSearchParams();
+  if (origin) params.set('origin', origin);
+  if (operatorId) params.set('operator', operatorId);
+  const query = params.size > 0 ? `?${params}` : '';
   const res = await fetch(`${AUTH}/pairing-code${query}`, {
     method: 'POST',
     credentials: 'same-origin',

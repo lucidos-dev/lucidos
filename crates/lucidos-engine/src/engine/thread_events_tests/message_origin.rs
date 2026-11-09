@@ -56,6 +56,7 @@ fn message_origin_engine_scheduler_carries_trigger_metadata() {
         reason: EngineReason::Scheduler {
             trigger_id: trigger_id.clone(),
             trigger_name: Some("nightly-backup".to_string()),
+            actor_email: None,
         },
     };
     let json = serde_json::to_value(&origin).unwrap();

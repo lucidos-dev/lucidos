@@ -588,20 +588,20 @@ function runStorageOp(
 }
 
 // ---------------------------------------------------------------------------
-// Link breadcrumbs
+// Frame breadcrumbs
 // ---------------------------------------------------------------------------
 
 /** The frame's detail is its own claim and can be any size. The engine answers
  *  400 over 4 KB of UTF-8 and would lose the line, so an oversized detail is
  *  dropped. Counted in bytes, since non-Latin text takes up to 3 per unit. */
-const MAX_APP_LINK_DETAIL_BYTES = 2000;
+const MAX_BREADCRUMB_DETAIL_BYTES = 2000;
 
-/** Write a frame's link breadcrumb to the engine log as `[Client/app-link]`.
+/** Write a frame's breadcrumb to the engine log as `[Client/<category>]`.
  *  The app id comes from the element the host mounted, never from the frame. */
-function logAppLink(args: unknown, appId: string | null): void {
+function logAppBreadcrumb(category: 'app-link' | 'app-fullscreen', args: unknown, appId: string | null): void {
   const { step, ...detail } = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>;
-  const fits = new TextEncoder().encode(JSON.stringify(detail)).length <= MAX_APP_LINK_DETAIL_BYTES;
-  postClientLog('app-link', typeof step === 'string' ? step.slice(0, 64) : 'unknown', {
+  const fits = new TextEncoder().encode(JSON.stringify(detail)).length <= MAX_BREADCRUMB_DETAIL_BYTES;
+  postClientLog(category, typeof step === 'string' ? step.slice(0, 64) : 'unknown', {
     ...(fits ? detail : { detailDropped: true }),
     app: appId,
   });
@@ -637,7 +637,8 @@ async function runOp(
     case 'storage.remove': return runStorageOp(frame, args, storageRemove);
     case 'storage.clear': return runStorageOp(frame, args, storageClear);
     case 'ui.focused-thread': return focusedThreadId.value;
-    case 'log.app-link': logAppLink(args, appIdForFrame(frame)); return null;
+    case 'log.app-link': logAppBreadcrumb('app-link', args, appIdForFrame(frame)); return null;
+    case 'log.app-fullscreen': logAppBreadcrumb('app-fullscreen', args, appIdForFrame(frame)); return null;
     default: throw new Error(`The app bridge has no operation "${op}"`);
   }
 }

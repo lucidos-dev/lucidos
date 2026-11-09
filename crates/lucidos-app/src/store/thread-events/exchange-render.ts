@@ -746,6 +746,8 @@ function handoffSession(
     type: 'handoff_session',
     checkpoint: continuity.checkpoint,
     progress: continuity.progress,
+    opening: continuity.opening,
+    ...(continuity.crossing && { crossing: continuity.crossing }),
     message: continuity.message,
   };
 }

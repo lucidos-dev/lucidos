@@ -1,4 +1,4 @@
-import type { CacheKeepAliveStatus, FreshSessionReason, TileSize, WidgetSize } from '../generated/thread-event-wire';
+import type { CacheKeepAliveStatus, CeilingCrossing, FreshSessionReason, HandoffOpening, TileSize, WidgetSize } from '../generated/thread-event-wire';
 import { errorDetail } from '../utils/errorDetail';
 import type { PluginLocalChangesResult } from '../api/client/apps';
 import type { WebhookIngress, WebhookRefusals } from '../api/client/webhooks';
@@ -18,7 +18,7 @@ import type {
   PluginSetupOccasion,
   RecalledMemory,
 } from '../generated/thread-event-wire';
-import type { Tap } from '@lucidos/sdk';
+import type { PermissionWait, Tap } from '@lucidos/sdk';
 
 // Generated from the Rust payload types. Re-exported so a consumer reaching
 // for the wire shape and one reaching for a view model share one spelling.
@@ -327,6 +327,9 @@ type ResponseEventKind =
       type: 'handoff_session';
       checkpoint?: string;
       progress?: string;
+      opening: HandoffOpening;
+      /** The ceiling the previous session crossed, on a ceiling handoff. */
+      crossing?: CeilingCrossing;
       message: string;
     }
   | {
@@ -406,7 +409,7 @@ type ResponseEventKind =
     }
   | {
       /** A widget shown at this point (`WidgetShown`, ADR 0466). Draws its
-       *  card: the bar over the widget's box. */
+       *  card: the widget's bare box. */
       type: 'widget';
       app_id: string;
       /** The instance's *widget params* (ADR 0415). Absent means none. */
@@ -568,6 +571,9 @@ export type SideEffectCategory =
  *  different payload shapes without one filter constraining the others. */
 export type { EventSubscription };
 
+/** A trigger's *permission wait*. Re-exported so the SDK holds the one wire form. */
+export type { PermissionWait };
+
 // A trigger config (event-sourced).
 // Configs may be schedule-only, event-only, or hybrid; `deriveTriggerType()`
 // classifies the config shape. The actual invocation that fired a given run
@@ -609,6 +615,9 @@ export interface TriggerInfo {
    *  side-effect categories it may perform unattended. Engine omits the field
    *  when empty, so readers must tolerate absence (= no grant). */
   side_effect_grant?: SideEffectCategory[];
+  /** The trigger's *permission wait*. Engine omits the field when the trigger
+   *  uses the workspace preference `unattended_permission_wait`. */
+  permission_wait?: PermissionWait;
   /** Plugin provenance (ADR 0019) — the id of the *plugin* that auto-registered
    *  this trigger. Absent for user-created triggers. Drives the "from <plugin>"
    *  chip in the triggers panel. */
@@ -1022,7 +1031,8 @@ export interface ToastAction {
   /** Visual intent. Default = neutral; 'danger' = destructive; 'confirm' = positive. */
   variant?: 'danger' | 'confirm';
   /** A tap on the card must not run it, so it keeps its own button. For a
-   *  neutral action that changes state, such as Undo. */
+   *  neutral action that changes state, such as Undo, or one the toast's text
+   *  gives no hint of, such as "Started on Home"'s Open thread. */
   deliberate?: boolean;
 }
 

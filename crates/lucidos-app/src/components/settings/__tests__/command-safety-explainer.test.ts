@@ -53,7 +53,7 @@ describe('Settings → Permissions: the Command safety explainer', () => {
   it('says when a coding agent is covered, and where its permissions are', () => {
     expect(body).toMatch(/With the guard off, it does not gate a coding agent's tools/);
     expect(body).toMatch(/Claude Code asks through its own permissions list below/);
-    expect(body).toMatch(/With the guard on, it also judges those commands, unless you turn off Enabled for coding agents/);
+    expect(body).toMatch(/With the guard on, it also judges those commands, unless you turn off Answer coding-agent questions/);
   });
 
   /** Two exceptions send a Codex escape through without a card, and only one
@@ -78,21 +78,37 @@ describe('Settings → Permissions: the Command safety explainer', () => {
 
 /** The coding-agents row widens what runs without a card, with no undo, so its
  *  own explainer has to say so beside the switch. */
-describe('Settings → Permissions: the Enabled for coding agents explainer', () => {
+describe('Settings → Permissions: the Answer coding-agent questions explainer', () => {
   const row = settingsView.indexOf('data-search-anchor="command-safety:coding-agents"');
-  const body = settingsView.slice(row, row + 1200).replace(/\s+/g, ' ');
+  const body = settingsView.slice(row, row + 2200).replace(/\s+/g, ' ');
 
   it('explains from the row label', () => {
-    expect(body).toMatch(/Enabled for coding agents <Explainer title="Enabled for coding agents">/);
+    expect(body).toMatch(/Answer coding-agent questions <Explainer title="Answer coding-agent questions">/);
   });
 
   it('says what the switch widens, and what it costs', () => {
-    expect(body).toMatch(/The guard also judges the commands of <strong>Claude Code<\/strong>/);
+    expect(body).toMatch(/the guard can answer for you/);
     expect(body).toMatch(/so a wrong reversible call has no undo/);
-    expect(body).toMatch(/Irreversible and catastrophic commands still ask/);
+    expect(body).toMatch(/An irreversible or catastrophic one never runs unasked/);
   });
 
-  it('says what the guard still does with the switch off', () => {
-    expect(body).toMatch(/answers only the Codex commands it places as safe/);
+  /** The permission mode and the allowlist settle a command before the gate
+   *  runs. "Off, every command asks" would promise cards that never come. */
+  it('says the guard only sees what would otherwise ask', () => {
+    expect(body).toMatch(/It sees only what would otherwise ask you/);
+    expect(body).toMatch(/Off, the guard runs no Claude Code command for you/);
+  });
+
+  /** `prompt_coding_agent_permission` refuses a catastrophic command ahead of
+   *  every switch, so "off, the guard stays out" would be false. */
+  it('says the catastrophic floor holds whatever the switches say', () => {
+    expect(body).toMatch(/the guard refuses a catastrophic command it recognises/);
+  });
+
+  /** `attended_command_allowed` lets a Safe Codex escape run whatever the
+   *  switches say, so the copy pins that on the sandbox, not on this switch. */
+  it('says a safe Codex sandbox escape runs regardless of the switches', () => {
+    expect(body).toMatch(/Codex is different/);
+    expect(body).toMatch(/the guard lets a safe one run whatever these switches say/);
   });
 });

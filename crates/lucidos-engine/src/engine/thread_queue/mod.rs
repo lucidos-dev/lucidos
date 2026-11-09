@@ -2196,6 +2196,7 @@ impl ThreadQueue {
                     event_id: None,
                     tap: tap.clone(),
                     actor: None,
+                    audience: None,
                 }),
                 "[ThreadQueue] NotificationCreated",
             )

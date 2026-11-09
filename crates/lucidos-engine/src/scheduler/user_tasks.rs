@@ -3,6 +3,7 @@
 use crate::api::SharedEngine;
 use crate::engine::thread_events::TriggerInvocation;
 use crate::scheduler::trigger_id_to_uuid;
+use crate::triggers::continue_key::FireTarget;
 use crate::triggers::{TriggerConfig, TriggerRun};
 use chrono::Datelike;
 use sqlx::PgPool;
@@ -339,6 +340,7 @@ pub(crate) async fn emit_trigger_notification(
             event_id: None,
             tap,
             actor: None,
+            audience: None,
         },
     ))
     .await?;
@@ -478,16 +480,49 @@ async fn execute_llm_task(
     queue_entry_id: uuid::Uuid,
     retry_of: Option<crate::engine::thread_events::RetryOf>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // A retry starts its own unkeyed thread: the run it retries still holds
+    // the key.
+    let spec = config.continue_key.as_ref().filter(|_| retry_of.is_none());
+    let target =
+        crate::triggers::continue_key::resolve_fire_target(pool, spec, event_payload).await?;
+    let actor_email = config
+        .actor
+        .as_ref()
+        .zip(event_payload)
+        .and_then(|(field, payload)| field.email_in(payload));
+    let continued_thread = match &target {
+        FireTarget::Continue(thread_id) => Some(*thread_id),
+        FireTarget::NewThread(_) => None,
+    };
     // The original event payload and retry provenance belong to the user
     // message, alongside the intent. Static rules stay in the system prompt.
+    // A continuing fire's thread already holds the intent.
     let user_message = build_trigger_user_message(
         &config.name,
         &config.id,
-        intent,
+        if continued_thread.is_some() {
+            CONTINUED_FIRE_NOTE
+        } else {
+            intent
+        },
         &invocation,
         event_payload,
         retry_of.as_ref(),
     );
+    if let Some(thread_id) = continued_thread {
+        let answered = answer_open_question(
+            &engine,
+            config,
+            thread_id,
+            &user_message,
+            queue_entry_id,
+            actor_email.clone(),
+        )
+        .await?;
+        if answered {
+            return Ok(());
+        }
+    }
 
     log!(
         "[Scheduler] Executing LLM trigger '{}': {}",
@@ -516,6 +551,8 @@ async fn execute_llm_task(
             external_cancel,
             queue_entry_id,
             retry_of,
+            target,
+            actor_email,
         )
         .await;
     let result = match result {
@@ -597,6 +634,71 @@ async fn execute_llm_task(
     log!("[Scheduler] Trigger '{}' completed", config.name);
 
     Ok(())
+}
+
+/// The intent line of a fire that continues the open thread holding its
+/// continue key (ADR 0623). The thread's first message holds the intent.
+const CONTINUED_FIRE_NOTE: &str = "This fire continues this thread: it carries the same continue \
+     key as the fire that started it. Follow the intent from the thread's first message. If this \
+     arrived as the answer to your open question, judge whether it really answers it, and ask \
+     again if it does not.";
+
+/// Deliver a continuing fire as the free-text answer to the question its
+/// thread waits on. `false` when no question is open, so the fire runs as a
+/// message instead. The answer names the trigger, and the actor email when
+/// the trigger has an actor field.
+async fn answer_open_question(
+    engine: &SharedEngine,
+    config: &TriggerConfig,
+    thread_id: uuid::Uuid,
+    text: &str,
+    queue_entry_id: uuid::Uuid,
+    actor_email: Option<String>,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    use crate::engine::agent_question::{
+        answer_pending_question, lookup_active_question_tool_use_id, AnswerResult,
+    };
+    use crate::engine::thread_events::{AnswerKind, EngineReason, MessageOrigin};
+    let Some(tool_use_id) = lookup_active_question_tool_use_id(engine.pool(), thread_id).await
+    else {
+        return Ok(false);
+    };
+    let origin = MessageOrigin::engine(EngineReason::Scheduler {
+        trigger_id: config.id.clone(),
+        trigger_name: Some(config.name.clone()),
+        actor_email,
+    });
+    let answer = AnswerKind::FreeText {
+        text: text.to_string(),
+        image_hashes: Vec::new(),
+    };
+    match answer_pending_question(engine, thread_id, tool_use_id, answer, Some(origin)).await {
+        AnswerResult::Resumed => {
+            engine
+                .thread_queue
+                .record_entry_thread(queue_entry_id, thread_id)
+                .await;
+            engine
+                .record_trigger_completed(
+                    &config.id,
+                    &config.name,
+                    "Answered the open question in its thread",
+                    Some(thread_id),
+                )
+                .await?;
+            Ok(true)
+        }
+        // Answered or overtaken in the meantime: the fire runs as a message.
+        AnswerResult::Conflict(reason) => {
+            log!(
+                "[Scheduler] Trigger '{}' could not answer the question on thread {}: {}",
+                config.name,
+                thread_id,
+                reason
+            );
+            Ok(false)
+        }
+    }
 }
 
 /// Strip characters that could break out of the header's quoted label and

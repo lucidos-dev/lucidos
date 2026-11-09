@@ -53,6 +53,8 @@ import { syncClientUpdateFromBuild } from './client-update';
 import { loadPreferences, refreshActiveTheme } from './preferences';
 import { loadChatModels } from './models';
 import { loadReleaseNotices } from './releaseNotices';
+import { loadOperators } from './operators';
+import { loadReaderDevices, readIsMine } from './reader-devices';
 import { loadArtifacts, refreshArtifacts } from './artifacts';
 import { refreshAppUI, captureAppUI } from './apps';
 import { clearWipIfMatches } from './wipPreview';
@@ -73,6 +75,7 @@ import { clearDraft, setDraft } from '../composeDrafts';
 import { removeThreadNavEntries } from './thread-navigation';
 import { isComposeFocusedHere } from '../../components/chat/promptFocus';
 import { formatBytes } from '../../utils/formatBytes';
+import { snapshotCaptureFailureMessage } from './snapshot-capture-failure';
 import { errorDetail } from '../../utils/errorDetail';
 import { routeThreadNavigation } from './navigation-request';
 import { isForThisDevice, type DeviceScopeActor } from './device-scope';
@@ -879,12 +882,13 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // other is a read landing before the reload that carries its row, where
       // the id was never in the set to leave it. The engine emits this only on
       // a real unread to read flip, so a redundant write cannot double it.
-      if (typeof data.id === 'string') dropNotificationToast(data.id);
+      // On a team gateway another person's read leaves this page's toast.
+      if (typeof data.id === 'string' && readIsMine(data.actor)) dropNotificationToast(data.id);
       handleNotificationSSE();
       break;
 
     case 'NotificationsAllRead':
-      dropAllNotificationToasts();
+      if (readIsMine(data.actor)) dropAllNotificationToasts();
       handleNotificationSSE();
       break;
 
@@ -1006,6 +1010,13 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
     case 'LanguageSet':
     case 'TimezoneSet':
       void loadPreferences();
+      break;
+
+    case 'OperatorsChanged':
+      // A device moved between people, so this page's person may hold others,
+      // and every people list on screen is stale.
+      void loadReaderDevices();
+      void loadOperators();
       break;
 
     case 'ReleaseNoticeResolved':
@@ -1269,7 +1280,7 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       break;
     case 'SnapshotCaptureFailed':
       snapshotsVersion.value++;
-      showToast('Snapshot capture failed. Review snapshot status before trying again.', 'error', { title: 'Workspace snapshots' });
+      showToast(snapshotCaptureFailureMessage(data.reason), 'error', { title: 'Workspace snapshots' });
       break;
 
     case 'BackupProgress': {

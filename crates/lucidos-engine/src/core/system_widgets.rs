@@ -112,13 +112,13 @@ mod tests {
             for attr in [
                 r#"viewBox="0 0 24 24""#,
                 r#"fill="none""#,
-                r#"stroke-width="2""#,
+                r#"stroke-width="1.5""#,
                 r#"stroke-linecap="round""#,
                 r#"stroke-linejoin="round""#,
             ] {
                 assert!(root.contains(attr), "{} root sets {attr}", widget.id);
             }
-            for banned in ["<text", "Gradient", "<image", "<script"] {
+            for banned in ["<text", "Gradient", "<image", "<script", "fill-opacity"] {
                 assert!(!svg.contains(banned), "{} has no {banned}", widget.id);
             }
             hues.extend(hex_colours(&svg).into_iter().map(str::to_string));

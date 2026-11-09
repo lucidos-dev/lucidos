@@ -301,10 +301,10 @@ impl LucidosEngine {
         &self,
         user_message: &str,
         model_override: Option<&str>,
-        trigger: Option<TriggerContext>, // None for user-driven chat; Some when fired by the scheduler
-        app_context: Option<AppContext>, // app context if chatting from within an app
-        file_context: Option<String>,    // file path if user is viewing a file
-        reasoning_effort: Option<&str>,  // unified reasoning level: none/low/medium/high/xhigh/max
+        mut trigger: Option<TriggerContext>, // None for user-driven chat; Some when fired by the scheduler
+        app_context: Option<AppContext>,     // app context if chatting from within an app
+        file_context: Option<String>,        // file path if user is viewing a file
+        reasoning_effort: Option<&str>, // unified reasoning level: none/low/medium/high/xhigh/max
         // Backend to serve the model, when it has more than one route. Honoured
         // or refused, never substituted. `None` lets the row's own preferred
         // provider decide, then its first configured route.
@@ -1249,16 +1249,12 @@ impl LucidosEngine {
         } else {
             let (user_thread_event, user_meta) = if let Some(ref tc) = trigger {
                 build_trigger_started_event(
-                    &tc.trigger_id,
-                    &tc.trigger_name,
-                    &tc.invocation,
+                    tc,
                     user_message,
-                    tc.go_to_review,
                     // Already resolved above (trigger pin, else account
                     // preference). The same three values the loop is about to
                     // call with, so the starter event records the actual run.
                     &resolved,
-                    tc.retry_of.as_ref(),
                 )
             } else {
                 let is_cc = use_coding_agent == Some(true);
@@ -1326,12 +1322,17 @@ impl LucidosEngine {
                     return Err(e);
                 }
             };
+            if let Some(tc) = trigger.as_ref() {
+                self.copy_trigger_ceiling(thread_id, &tc.trigger_id).await;
+            }
             emit_result.event_id
         };
         // Recorded, and the thread is registered, so a later input now queues
         // behind this turn rather than racing it. Release it, and the gate.
+        // The thread now holds its continue key, so a racing fire finds it.
         drop(input_turn.take());
         drop(turn_start);
+        drop(trigger.as_mut().and_then(|tc| tc.continue_key.take()));
 
         // Publish this turn's anchor on the handle. Everything below stamps
         // `request_event_id: Some(origin_id)` on its events and on its own

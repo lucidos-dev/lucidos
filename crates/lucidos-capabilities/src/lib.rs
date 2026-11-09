@@ -523,6 +523,15 @@ const TRIGGER_SIDE_EFFECT_GRANT_ARG: Arg = Arg {
     description:
         "Irreversible side-effect categories this trigger may perform unattended, e.g. [\"email\"].",
 };
+const TRIGGER_PERMISSION_WAIT_ARG: Arg = Arg {
+    name: "permission_wait",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Body,
+    description: "How long an unattended fire's parked permission card waits: \"deny\", minutes \
+                  (1-1440) or \"indefinite\". Omitted = the workspace preference.",
+};
 const TRIGGER_MCP_SERVERS_ARG: Arg = Arg {
     name: "mcp_servers",
     ty: ArgType::Json,
@@ -531,6 +540,22 @@ const TRIGGER_MCP_SERVERS_ARG: Arg = Arg {
     loc: ArgIn::Body,
     description:
         "MCP server ids its fires use, e.g. [\"slack\"]. Only these run silently in its threads.",
+};
+const TRIGGER_CONTINUE_KEY_ARG: Arg = Arg {
+    name: "continue_key",
+    ty: ArgType::Json,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Body,
+    description: "Payload paths whose values name one thread: a fire with the same values continues it. A part may list alternatives. e.g. [\"payload.repository.full_name\", [\"payload.issue.number\", \"payload.pull_request.number\"]].",
+};
+const TRIGGER_ACTOR_ARG: Arg = Arg {
+    name: "actor",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Body,
+    description: "Intent triggers: the payload path of the email of the person behind a fire, e.g. \"payload.sender.email\". The fire records it, so the thread credits that operator. Null clears.",
 };
 const TRIGGER_MODEL_ARG: Arg = Arg {
     name: "model",
@@ -580,6 +605,8 @@ pub const TRIGGER_CREATE_LLM_SCHEMA: &str = r#"{
   "go_to_review": {"type":"boolean","description":"Threads this trigger spawns land in REVIEW, not ARCHIVE. Default false."},
   "group_id": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Trigger-group id, organizational only. Null for ungrouped."},
   "mcp_servers": {"anyOf":[{"type":"null"},{"type":"array","items":{"type":"string"}}],"description":"MCP server ids its fires call; any other is refused."},
+  "continue_key": {"anyOf":[{"type":"null"},{"type":"array","items":{"anyOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}]}}],"description":"Intent triggers: payload paths naming one work item; a part may list alternatives. A fire with the same values continues its open thread. Null clears."},
+  "actor": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Intent triggers: payload path of the email of the person behind a fire. The thread credits that operator. Null clears."},
   "model": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Model id, a Lucidos Agent rung, else REFUSED. Null = account default (on update, clears a pin). Set only if asked."},
   "reasoning_effort": {"anyOf":[{"type":"null"},{"type":"string","enum":["none","low","medium","high","xhigh","max"]}],"description":"Thinking budget for the intent. Null = account default (on update, clears a pin)."},
   "provider": {"anyOf":[{"type":"null"},{"type":"string","enum":["vertex","anthropic","openai","openrouter","xai","opencode-free","local","claude-gateway"]}],"description":"Backend for the pinned model, one of its routes; needs model. Null = its preferred provider. Set only if asked."}
@@ -609,7 +636,10 @@ const TRIGGERS_OPS: &[Operation] = &[
             TRIGGER_GO_TO_REVIEW_ARG,
             TRIGGER_GROUP_ID_ARG,
             TRIGGER_SIDE_EFFECT_GRANT_ARG,
+            TRIGGER_PERMISSION_WAIT_ARG,
             TRIGGER_MCP_SERVERS_ARG,
+            TRIGGER_CONTINUE_KEY_ARG,
+            TRIGGER_ACTOR_ARG,
             TRIGGER_SLUG_ARG,
             TRIGGER_MODEL_ARG,
             TRIGGER_REASONING_EFFORT_ARG,
@@ -655,7 +685,10 @@ const TRIGGERS_OPS: &[Operation] = &[
             TRIGGER_GO_TO_REVIEW_ARG,
             TRIGGER_GROUP_ID_ARG,
             TRIGGER_SIDE_EFFECT_GRANT_ARG,
+            TRIGGER_PERMISSION_WAIT_ARG,
             TRIGGER_MCP_SERVERS_ARG,
+            TRIGGER_CONTINUE_KEY_ARG,
+            TRIGGER_ACTOR_ARG,
             TRIGGER_SLUG_ARG,
             TRIGGER_MODEL_ARG,
             TRIGGER_REASONING_EFFORT_ARG,
@@ -1749,10 +1782,10 @@ const WIDGET_PARAMS_ARG: Arg = Arg {
     loc: ArgIn::Body,
     description: "Widget params, a JSON object. One set is one instance.",
 };
-const WIDGET_SIZE_ARG: Arg = Arg {
+pub const WIDGET_SIZE_ARG: Arg = Arg {
     name: "size",
     ty: ArgType::Str,
-    enum_values: &["small", "medium", "large"],
+    enum_values: &["small", "medium", "large", "xl"],
     required: true,
     loc: ArgIn::Body,
     description: "One the widget declares. Only a size the user named this turn.",
@@ -1813,7 +1846,7 @@ const DASHBOARD_TILES_ARG: Arg = Arg {
 };
 /// The arrange action's LLM shape: `tiles` is an array, which a `Json` arg
 /// cannot describe.
-pub const DASHBOARD_ARRANGE_LLM_SCHEMA: &str = r#"{"dashboard":{"type":"string","enum":["phone","desktop"]},"tiles":{"type":"array","description":"Tiles in order.","items":{"type":"object","properties":{"app_id":{"type":"string"},"params":{"type":"object"},"size":{"enum":["quarter","small","medium","large"]}},"required":["app_id","size"]}}}"#;
+pub const DASHBOARD_ARRANGE_LLM_SCHEMA: &str = r#"{"dashboard":{"type":"string","enum":["phone","desktop"]},"tiles":{"type":"array","description":"Tiles in order.","items":{"type":"object","properties":{"app_id":{"type":"string"},"params":{"type":"object"},"size":{"enum":["quarter","small","medium","large","xl"]}},"required":["app_id","size"]}}}"#;
 
 const fn widget_op(
     action: &'static str,
@@ -2104,6 +2137,23 @@ const THREADS_OPS: &[Operation] = &[
         llm_schema: Some(
             r#"{"state":{"type":"string","enum":["off","on"]}}"#,
         ),
+        llm: None,
+        cli: Some(false),
+        sdk: Some(false),
+    },
+    Operation {
+        action: "context_ceiling",
+        summary: "Set the context size where a thread's coding-agent session hands off: \
+                  'off', '<N>k' or '<P>%'. Lower only: your own, or a child's to at most \
+                  yours. (requires: thread_id, ceiling)",
+        method: Method::Put,
+        path: "/threads/:thread_id/context-ceiling",
+        args: &[],
+        cli_name: "context-ceiling",
+        sdk_name: "contextCeiling",
+        mutating: true,
+        llm_alias: Some("set_context_ceiling"),
+        llm_schema: Some(r#"{"ceiling":{"type":"string"}}"#),
         llm: None,
         cli: Some(false),
         sdk: Some(false),
@@ -3001,7 +3051,7 @@ const WEBHOOK_SIGNING_SECRET_ARG: Arg = Arg {
     enum_values: &[],
     required: false,
     loc: ArgIn::Body,
-    description: "Save the secret the `hmac` block names, instead of pointing at one you saved earlier. `{\"mode\":\"generate\"}` mints 32 bytes and prints them ONCE, which is right for GitHub, where you choose the secret. `{\"mode\":\"provided\",\"value\":\"...\"}` stores a secret the sender issued, which is the only option for Slack and Stripe. The value is stored byte for byte, so a value with surrounding whitespace is refused rather than trimmed. On `create` it refuses to overwrite an existing credential; on `update` it replaces the value, which is how you rotate.",
+    description: "Save the secret the `hmac` block names, instead of pointing at one you saved earlier. `{\"mode\":\"generate\"}` mints 32 bytes and prints them ONCE, which is right for GitHub, where you choose the secret. `{\"mode\":\"provided\",\"value\":\"...\"}` stores a secret the sender issued, which is the only option for Slack and Stripe. For Slack, create the hook first, then paste its URL into Event Subscriptions: Slack checks the URL at once, and a hook verifying `X-Slack-Signature` answers that `url_verification` challenge. The value is stored byte for byte, so a value with surrounding whitespace is refused rather than trimmed. On `create` it refuses to overwrite an existing credential; on `update` it replaces the value, which is how you rotate.",
 };
 
 /// Request headers copied into the event payload, under `headers`.

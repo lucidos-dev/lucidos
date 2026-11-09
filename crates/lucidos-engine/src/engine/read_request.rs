@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::engine::chat::agent_archive::agent_thread_actor;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventMeta, MessageOrigin, ThreadEvent};
+use crate::gateway_operators::Reader;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -122,21 +123,28 @@ pub(crate) enum ReplySeen {
     UnknownThread,
 }
 
-/// Record that the user saw the reply a pending read request points at, as of
-/// the thread's `seen_version`. Records nothing when no request is pending, so
-/// a second device seeing the same reply adds no event.
+/// Record that `reader` saw the reply a pending read request points at, as
+/// of the thread's `seen_version`. Records nothing when no request is pending
+/// for them, so a second device seeing the same reply adds no event.
+///
+/// The team's sighting clears the request. A person's, on a team gateway,
+/// clears it for that person only (ADR 0623).
 pub(crate) async fn record_reply_seen(
     pool: &PgPool,
     bus: &EventBus,
     thread_id: Uuid,
     seen_version: i64,
     actor: MessageOrigin,
+    reader: &Reader,
 ) -> Result<ReplySeen, BoxError> {
-    let pending: Option<bool> =
-        sqlx::query_scalar("SELECT read_requested FROM thread_summaries WHERE thread_id = $1")
-            .bind(thread_id)
-            .fetch_optional(pool)
-            .await?;
+    let pending: Option<bool> = sqlx::query_scalar(
+        "SELECT read_requested AND NOT (reply_seen_devices && COALESCE($2::text[], '{}')) \
+         FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .bind(reader.devices())
+    .fetch_optional(pool)
+    .await?;
     match pending {
         None => Ok(ReplySeen::UnknownThread),
         Some(false) => Ok(ReplySeen::NothingPending),
@@ -144,7 +152,10 @@ pub(crate) async fn record_reply_seen(
             let emitted = bus
                 .emit(BusEvent::Thread {
                     thread_id,
-                    event: ThreadEvent::ThreadReplySeen { seen_version },
+                    event: ThreadEvent::ThreadReplySeen {
+                        seen_version,
+                        personal: matches!(reader, Reader::Person { .. }),
+                    },
                     meta: EventMeta::with_actor(Some(actor)),
                 })
                 .await?;

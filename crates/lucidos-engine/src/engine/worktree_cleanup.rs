@@ -1225,6 +1225,7 @@ fn disk_notification(title: &str, message: String) -> BusEvent {
         event_id: None,
         tap: SettingsPage::DISK_USAGE.tap(),
         actor: None,
+        audience: None,
     })
 }
 

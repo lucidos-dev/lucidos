@@ -891,6 +891,7 @@ const EVERY_ENGINE_REASON: { [K in EngineReason['kind']]: Extract<EngineReason, 
   main_check_flaky: { kind: 'main_check_flaky' },
   missing_hardening: { kind: 'missing_hardening' },
   missing_plan: { kind: 'missing_plan' },
+  context_ceiling: { kind: 'context_ceiling' },
   plugin_auto_update: {
     kind: 'plugin_auto_update', plugin_id: 'habit-tracker', marketplace_id: 'm1', marketplace_name: 'Example Market',
   },

@@ -1951,10 +1951,11 @@ async fn serve_one_response(response: String) -> String {
 /// account a bare-name flow connects. Every reader of `dropbox` asks for that
 /// one row.
 ///
-/// Binds the real `CALLBACK_PORT`, because that is what `prepare_oauth_flow`
-/// listens on.
+/// The gateway route delivers the callback in process. The own-listener route
+/// would bind the real `CALLBACK_PORT`, which a running gateway holds.
 #[tokio::test]
 async fn a_flow_started_with_a_legacy_prefix_connects_the_canonical_account() {
+    use crate::core::oauth_callback::{deliver_callback, CallbackDelivery};
     const ACCESS_TOKEN: &str = "granted-token";
     let (pool, db_name) = crate::test_support::setup_test_db().await;
     let (bus, _callback_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
@@ -1978,15 +1979,11 @@ async fn a_flow_started_with_a_legacy_prefix_connects_the_canonical_account() {
     // state and a code.
     let open_auth_url = async |auth_url: &str, _request_id: uuid::Uuid| -> Result<(), BoxError> {
         let state = authorize_param(auth_url, "state").expect("the URL carries a state");
-        send_callback_request(
-            std::net::SocketAddr::from(([127, 0, 0, 1], CALLBACK_PORT)),
-            format!(
-                "GET {CALLBACK_PATH}?code=granted-code&state={state} \
-                 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
-            ),
-            None,
-        )
-        .await;
+        let query = format!("code=granted-code&state={}", urlencoding::encode(&state));
+        assert!(matches!(
+            deliver_callback(&query),
+            CallbackDelivery::Accepted { ok: true, .. }
+        ));
         Ok(())
     };
     run_oauth_flow(
@@ -1995,7 +1992,7 @@ async fn a_flow_started_with_a_legacy_prefix_connects_the_canonical_account() {
         "oauth:Dropbox",
         "files.content.read",
         None,
-        CallbackRoute::OwnListener,
+        gateway_route(true, None),
         open_auth_url,
     )
     .await

@@ -3,6 +3,7 @@ import { lucidos } from '@lucidos/sdk';
 import type {
   EventSubscription,
   HistoricalTriggerInfo,
+  PermissionWait,
   SideEffectCategory,
   TriggerGroup,
   TriggerRun,
@@ -27,6 +28,8 @@ export function createTrigger(body: {
   /** Side-effect grant (ADR 0002, Phase 5) — irreversible categories this
    *  trigger may perform unattended. Omit/[] = none granted. */
   side_effect_grant?: SideEffectCategory[];
+  /** Permission wait for unattended fires. Omit for the workspace preference. */
+  permission_wait?: PermissionWait;
   /** Chat model this trigger's intent fires on. Omit for the account default. */
   model?: string;
   /** Thinking budget for this trigger's intent fires. Omit for the account default. */
@@ -52,6 +55,9 @@ export function updateTrigger(
     group_id?: string | null;
     /** Full replacement for the side-effect grant; send [] to clear all. */
     side_effect_grant?: SideEffectCategory[];
+    /** Set the permission wait, or clear it back to the workspace preference
+     *  (null). Absent leaves it unchanged. */
+    permission_wait?: PermissionWait | null;
     /** Pin the intent to a chat model (string) or clear it back to the account
      *  default (null). Absent leaves it unchanged. */
     model?: string | null;

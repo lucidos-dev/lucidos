@@ -31,7 +31,6 @@ const APP_SURFACES = [
   '../../dashboard/DashboardTile.tsx',
   '../../plugins/pluginCard.tsx',
   '../../layout/Drawer.tsx',
-  '../../widgets/InlineWidget.tsx',
   '../../widgets/WidgetPickerItems.tsx',
   '../../search/SearchEverywhere.tsx',
   '../../layout/ContentNav.tsx',

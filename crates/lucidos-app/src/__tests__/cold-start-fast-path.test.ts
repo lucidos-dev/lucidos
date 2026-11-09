@@ -6,13 +6,8 @@
  * with stub globals instead, which is worth the extraction: every rule in it is
  * a stand-down, and a scan can only prove the words are present.
  *
- * The `?pair=` stand-down is why this suite exists. A scanned QR lands on
- * `/~/?pair=<code>`, a public path where the gateway stamps the code into the
- * manifest `start_url` an Add-to-Home-Screen install launches with. This script
- * preserves the query through its redirect, so a phone that remembers a
- * workspace carried the code onto `/<slug>/`, which is gated. The unpaired
- * caller got the pairing shell there, its manifest carried no code, and the
- * installed app opened asking to be paired.
+ * A pairing launch stays on the picker after the head capture strips its URL.
+ * The captured flag protects both fragment links and legacy query input.
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -49,11 +44,12 @@ interface Env {
   hash?: string;
   /** Has the history bounce script above already stepped forward? */
   bouncing?: boolean;
+  pairingLaunch?: boolean;
 }
 
 /** Run the fast path against `env` and answer the URL it replaced with, if any. */
 function run(env: Env): string | null {
-  const { base = '/~/', pairingMeta = false, slug = 'demo', search = '', hash = '', bouncing = false } = env;
+  const { base = '/~/', pairingMeta = false, slug = 'demo', search = '', hash = '', bouncing = false, pairingLaunch = false } = env;
   let replaced: string | null = null;
   const document = {
     querySelector(selector: string) {
@@ -64,7 +60,7 @@ function run(env: Env): string | null {
   };
   const localStorage = { getItem: () => slug };
   const location = { search, hash, replace: (url: string) => void (replaced = url) };
-  const window = bouncing ? { lucidosHistoryBounce: true } : {};
+  const window = { lucidosHistoryBounce: bouncing, lucidosPairingLaunch: pairingLaunch };
   // The script under test is inline HTML, so only `new Function` can run it.
   // eslint-disable-next-line no-new-func
   new Function('document', 'localStorage', 'location', 'window', fastPathSource())(
@@ -82,6 +78,11 @@ describe('picker cold-start fast path', () => {
     expect(run({ search: '?notification=n1', hash: '#thread=t1' })).toBe(
       '/demo/?notification=n1#thread=t1',
     );
+  });
+
+  it('stays on a pairing launch after the head script erased its URL', () => {
+    expect(run({ pairingLaunch: true })).toBeNull();
+    expect(run({ hash: '#pair=01234567' })).toBeNull();
   });
 
   it('opens a remembered remote workspace with its @ intact', () => {

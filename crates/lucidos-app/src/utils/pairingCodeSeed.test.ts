@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   pairingCodeToAdopt,
+  hasUnspentPairingLaunch,
+  releasePairingLaunch,
   takePairingCodeFromUrl,
   takeUnspentPairingCodeFromUrl,
   resetPairingCodeSeedForTest,
@@ -184,4 +186,54 @@ describe('takeUnspentPairingCodeFromUrl', () => {
     expect(takeUnspentPairingCodeFromUrl()).toBe(CODE);
     expect(takeUnspentPairingCodeFromUrl()).toBe(CODE);
   });
+});
+
+describe('fragment pairing', () => {
+  beforeEach(resetPairingCodeSeedForTest);
+  it('prefers the fragment and erases both forms, preserving neighbours', () => {
+    currentUrl.value = `https://example.test/~/?pair=${CODE}&pick=#pair=${SECRET}&thread=demo`;
+    expect(takePairingCodeFromUrl()).toBe(SECRET);
+    expect(currentUrl.value).toBe('https://example.test/~/?pick=#thread=demo');
+  });
+  it('erases duplicate invalid tokens without falling back to a query credential', () => {
+    currentUrl.value = `https://example.test/~/?pair=${CODE}#pair=bad&pair=${SECRET}`;
+    expect(takePairingCodeFromUrl()).toBeNull();
+    expect(currentUrl.value).toBe('https://example.test/~/');
+  });
+});
+
+it('consumes the head capture once after the URL was erased', () => {
+  resetPairingCodeSeedForTest();
+  currentUrl.value = 'https://example.test/~/';
+  const boot = window as Window & { lucidosPairingSeed?: string };
+  boot.lucidosPairingSeed = SECRET;
+  expect(takePairingCodeFromUrl()).toBe(SECRET);
+  expect(boot.lucidosPairingSeed).toBeUndefined();
+  expect(takePairingCodeFromUrl()).toBe(SECRET);
+});
+
+it('blocks bundle redirects only while a captured launch token is unspent', () => {
+  resetPairingCodeSeedForTest();
+  stored.clear();
+  currentUrl.value = 'https://example.test/~/#pair=01234567';
+  const boot = window as Window & { lucidosPairingLaunch?: boolean };
+  boot.lucidosPairingLaunch = true;
+  expect(hasUnspentPairingLaunch()).toBe(true);
+  expect(takeUnspentPairingCodeFromUrl()).toBe(CODE);
+  expect(hasUnspentPairingLaunch()).toBe(false);
+  delete boot.lucidosPairingLaunch;
+});
+
+it('allows a verified paired browser to navigate without spending its install seed', () => {
+  resetPairingCodeSeedForTest();
+  stored.clear();
+  currentUrl.value = 'https://example.test/~/#pair=01234567';
+  const boot = window as Window & { lucidosPairingLaunch?: boolean };
+  boot.lucidosPairingLaunch = true;
+  expect(hasUnspentPairingLaunch()).toBe(true);
+  releasePairingLaunch();
+  expect(hasUnspentPairingLaunch()).toBe(false);
+  expect(stored.size).toBe(0);
+  expect(takePairingCodeFromUrl()).toBe(CODE);
+  delete boot.lucidosPairingLaunch;
 });

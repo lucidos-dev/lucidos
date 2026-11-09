@@ -1067,6 +1067,18 @@ export function setComposerEnterKey(mode: ComposerEnterKey): Promise<void> {
   });
 }
 
+// --- Context ceiling ---
+
+/** The workspace's *context ceiling* for a coding-agent thread that sets none:
+ *  `off`, a size such as `300k`, or a window share such as `30%`. */
+export function currentContextCeiling(): string {
+  return currentPreference('coding_agent_context_ceiling');
+}
+
+export function setContextCeiling(value: string): Promise<void> {
+  return savePreference('coding_agent_context_ceiling', value);
+}
+
 // --- Autocorrect ---
 
 /** Whether this device's prose fields autocorrect. A stored value wins on any

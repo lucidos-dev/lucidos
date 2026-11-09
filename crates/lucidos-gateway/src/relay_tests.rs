@@ -183,6 +183,10 @@ const ORIGIN_STATE_HEADERS: &[(&str, &str)] = &[
 fn engine(seen: Seen, held: tokio::sync::oneshot::Receiver<()>) -> axum::Router {
     let held = Arc::new(Mutex::new(Some(held)));
     let record = move |req: Request| {
+        // The gateway's own signal that operators changed, not a relayed call.
+        if req.uri().path() == "/api/v1/operators/changed" {
+            return req;
+        }
         let mut line = format!("{} {}\n", req.method(), req.uri());
         for (name, value) in req.headers() {
             line.push_str(&format!("{}: {}\n", name, value.to_str().unwrap_or("?")));
@@ -293,14 +297,12 @@ pub(crate) async fn paired() -> Paired {
             rotation: Default::default(),
         })
         .unwrap();
-    a.write_paired_devices_for_test(|paired| {
-        paired.devices.push(auth::PairedDevice {
-            id: "device-1".into(),
-            label: "My iPhone".into(),
-            credential_digest: auth::digest("cred-abc"),
-            paired_at: "2020-01-01T00:00:00Z".into(),
-            last_seen_at: None,
-        });
+    a.seed_device_for_test(auth::PairedDevice {
+        id: "device-1".into(),
+        label: "My iPhone".into(),
+        credential_digest: auth::digest("cred-abc"),
+        paired_at: "2020-01-01T00:00:00Z".into(),
+        last_seen_at: None,
     })
     .unwrap();
     Paired {
@@ -687,6 +689,29 @@ async fn unpair_on_b_refuses_the_very_next_relayed_request() {
     assert!(p.last_seen().is_none());
 }
 
+/// A request that passed auth just before the unpair must not bring back a
+/// person the unpair forgot.
+#[tokio::test]
+async fn an_ended_pairing_records_no_relayed_person() {
+    let p = paired().await;
+    assert!(p.b.paired_gateways().unpair(&p.pairing_id).unwrap());
+    let gateway = crate::gateway_protocol::AuthenticatedGateway {
+        pairing_id: p.pairing_id.clone(),
+        label: "laptop".into(),
+    };
+    let device = AuthenticatedDevice {
+        id: namespaced_device_id(&p.pairing_id, "device-1"),
+        label: "Phone".into(),
+    };
+    let operator = RelayedOperator {
+        id: "op-1".into(),
+        name: "Sam".into(),
+        emails: vec![],
+    };
+    record_relayed_operator(&p.b, &gateway, &device, operator);
+    assert!(p.b.directory().relayed.is_empty());
+}
+
 #[tokio::test]
 async fn a_claim_with_no_device_reaches_only_public_app_assets() {
     let p = paired().await;
@@ -854,4 +879,74 @@ async fn b_honours_a_local_browser_stamp_only_under_the_pairing_credential() {
 
     assert_eq!(to_b(&p, path, stamped(&p.credential)).await, 200);
     assert!(p.last_seen().unwrap().contains(LOCAL_STAMP));
+}
+
+// ── A's operator crosses the relay signed ───────────────────────────────────
+
+#[tokio::test]
+async fn a_relayed_device_arrives_with_as_operator() {
+    let p = paired().await;
+    let response = p.device_get("/dev@cloud/api/v1/threads/list", &[]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let relayed = p.b.directory().relayed;
+    assert_eq!(relayed.len(), 1, "{relayed:?}");
+    assert_eq!(
+        relayed[0].name,
+        crate::gateway_event_log::FIRST_OPERATOR_NAME
+    );
+    assert_eq!(
+        relayed[0].device_id,
+        namespaced_device_id(&p.pairing_id, "device-1")
+    );
+    assert!(relayed[0]
+        .operator_id
+        .starts_with(&format!("{}:", p.pairing_id)));
+    // The engine never sees the operator headers: B's own log is the record.
+    let seen = p.last_seen().unwrap();
+    assert!(!seen.contains(HEADER_RELAY_OPERATOR), "{seen}");
+}
+
+#[tokio::test]
+async fn an_unsigned_or_forged_operator_names_nobody() {
+    let p = paired().await;
+    let path = "/dev/api/v1/threads/list";
+    let claim = fresh(Some(device("device-1")));
+    let operator = RelayedOperator {
+        id: "op-1".into(),
+        name: "Sam".into(),
+        emails: vec!["sam@example.com".into()],
+    }
+    .encode();
+
+    let mut unsigned = credential_and_claim(&p.credential, &claim, &p.credential);
+    unsigned.insert(HEADER_RELAY_OPERATOR, operator.parse().unwrap());
+    assert_eq!(to_b(&p, path, unsigned).await, 200);
+
+    let mut forged = credential_and_claim(&p.credential, &claim, &p.credential);
+    forged.insert(HEADER_RELAY_OPERATOR, operator.parse().unwrap());
+    let signature = sign_operator("not-the-credential", &claim.encode(), &operator);
+    forged.insert(HEADER_RELAY_OPERATOR_SIGNATURE, signature.parse().unwrap());
+    assert_eq!(to_b(&p, path, forged).await, 200);
+
+    assert!(p.b.directory().relayed.is_empty());
+
+    let mut signed = credential_and_claim(&p.credential, &claim, &p.credential);
+    signed.insert(HEADER_RELAY_OPERATOR, operator.parse().unwrap());
+    let signature = sign_operator(&p.credential, &claim.encode(), &operator);
+    signed.insert(HEADER_RELAY_OPERATOR_SIGNATURE, signature.parse().unwrap());
+    assert_eq!(to_b(&p, path, signed).await, 200);
+    assert_eq!(p.b.directory().relayed[0].name, "Sam");
+    assert_eq!(p.b.directory().relayed[0].emails, vec!["sam@example.com"]);
+}
+
+#[test]
+fn an_operator_round_trips_its_emails_and_an_older_shape_has_none() {
+    let operator = RelayedOperator {
+        id: "op-1".into(),
+        name: "Sam | K".into(),
+        emails: vec!["sam@example.com".into(), "s,k@example.org".into()],
+    };
+    assert_eq!(RelayedOperator::decode(&operator.encode()), Some(operator));
+    let older = RelayedOperator::decode("op-1|Sam").unwrap();
+    assert!(older.emails.is_empty(), "an older gateway signs no emails");
 }

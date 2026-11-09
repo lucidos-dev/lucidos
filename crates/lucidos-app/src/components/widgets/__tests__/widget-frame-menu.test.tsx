@@ -18,6 +18,7 @@ vi.mock('../../../hooks/useOnScreenInTranscript', () => ({
 }));
 
 import { WidgetFrame } from '../WidgetFrame';
+import { WidgetBox } from '../WidgetBox';
 import { APP_FRAME_MENU_EVENT } from '../../../store/actions/widget-frame-bridge';
 
 let host: HTMLElement;
@@ -60,6 +61,32 @@ describe('WidgetFrame and the widget menu', () => {
 
     act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="inline" size="large" />, host); });
     expect(lastPush()).toMatchObject({ place: 'inline', size: 'large' });
+  });
+
+  it('tells the frame when its box pans sideways, and when it stops', () => {
+    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="inline" size="xl" />, host); });
+    loadedFrame();
+    expect(lastPush()).not.toHaveProperty('pans');
+
+    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="inline" size="xl" pans />, host); });
+    expect(lastPush()).toMatchObject({ size: 'xl', pans: true });
+
+    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="inline" size="xl" />, host); });
+    expect(lastPush()).not.toHaveProperty('pans');
+  });
+
+  it('a widget box whose scroller overflows tells its frame it pans', () => {
+    // jsdom lays nothing out, so the scroller answers as a host too narrow for XL.
+    const scroll = vi.spyOn(HTMLElement.prototype, 'scrollWidth', 'get').mockReturnValue(684);
+    const client = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(375);
+    try {
+      act(() => { render(<WidgetBox appId="fare-grid" reveal="on-load" place="inline" size="xl" />, host); });
+      loadedFrame();
+      expect(lastPush()).toMatchObject({ size: 'xl', pans: true });
+    } finally {
+      scroll.mockRestore();
+      client.mockRestore();
+    }
   });
 
   it("hands the frame's menu request to onMenu, with its point or none", () => {

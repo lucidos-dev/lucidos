@@ -10,6 +10,7 @@ import { coldStartFocus, offerWithheldThread, openHomeOnColdStart } from './cold
 import { focusThread, focusThreadOrBootstrap } from './threads';
 import { focusedThreadId, threadMap, threadsLoaded, toasts } from '../store';
 import { makeThreadState } from './threads-test-helpers';
+import { toastTap } from '../../components/shared/toastTap';
 
 describe('coldStartFocus', () => {
   it('opens Home when this device stored no focus', () => {
@@ -99,9 +100,11 @@ describe('offerWithheldThread', () => {
     expect(toasts.value).toHaveLength(1);
   });
 
-  it('opens the thread from the offer, revealing its pane', () => {
+  it('opens the thread from an explicit button, not a tap on the card', () => {
     stop = offerWithheldThread('t1');
     threadsLoaded.value = true;
+    expect(toastTap(toasts.value[0])).toBeNull();
+    expect(toasts.value[0].action?.label).toBe('Open thread');
     toasts.value[0].action?.onClick();
     expect(focusThreadOrBootstrap).toHaveBeenCalledWith('t1');
   });

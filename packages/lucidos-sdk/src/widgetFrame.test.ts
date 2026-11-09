@@ -20,6 +20,7 @@ import {
   WIDGET_SIZE_ATTRIBUTE,
   _resetWidgetFrameForTesting,
   contentHeight,
+  inSidewaysBox,
   installWidgetFrame,
   widget,
 } from './widgetFrame';
@@ -71,6 +72,16 @@ describe('installWidgetFrame', () => {
     ]);
   });
 
+  it('a report names the size the widget laid out for, and a new size reports again', () => {
+    installWidgetFrame();
+    mark({ place: 'inline', size: 'medium' });
+    mark({ place: 'inline', size: 'large' });
+    expect(posted).toEqual([
+      { type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, height: 200, size: 'medium' },
+      { type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, height: 200, size: 'large' },
+    ]);
+  });
+
   it('a dashboard tile stamps its size and place, and lucidos.widget reads them', () => {
     const root = document.documentElement;
     installWidgetFrame();
@@ -86,6 +97,16 @@ describe('installWidgetFrame', () => {
     expect(root.hasAttribute(WIDGET_SIZE_ATTRIBUTE)).toBe(false);
     expect(widget.size()).toBeNull();
     expect(widget.place()).toBe('inline');
+  });
+
+  it('only a box the host pans hands its sideways drags to the host', () => {
+    installWidgetFrame();
+    mark({ place: 'inline', size: 'xl' });
+    expect(inSidewaysBox()).toBe(false);
+    mark({ place: 'inline', size: 'xl', pans: true });
+    expect(inSidewaysBox()).toBe(true);
+    mark({ place: 'option', pans: true });
+    expect(inSidewaysBox()).toBe(false);
   });
 
   it('a repeat push writes nothing to <html>, and leaves a size the widget pinned itself', async () => {
@@ -159,7 +180,7 @@ describe('installWidgetFrame', () => {
     expect(heard).toEqual(['small', 'medium']);
   });
 
-  describe('a finger held on a dashboard tile', () => {
+  describe('a finger held on a widget box', () => {
     const finger = (type: string, x = 0) => {
       const e = new Event(type, { bubbles: true });
       Object.assign(e, { isPrimary: true, button: 0, pointerType: 'touch', pointerId: 1, screenX: x, screenY: 0 });
@@ -188,6 +209,18 @@ describe('installWidgetFrame', () => {
       expect(menus()).toEqual([{ type: WIDGET_MENU_MESSAGE_TYPE, held: true }]);
       window.dispatchEvent(finger('pointerup'));
       expect(menus()).toHaveLength(1);
+    });
+
+    it("a hold on a thread card opens its menu, as on a tile, and a mouse press never does", () => {
+      installWidgetFrame();
+      mark({ place: 'inline', size: 'medium', menu: true });
+      document.body.dispatchEvent(Object.assign(finger('pointerdown'), { pointerType: 'mouse' }));
+      window.dispatchEvent(Object.assign(finger('pointerup'), { pointerType: 'mouse' }));
+      vi.advanceTimersByTime(LONG_PRESS_DELAY_MS);
+      expect(menus()).toHaveLength(0);
+      document.body.dispatchEvent(finger('pointerdown'));
+      vi.advanceTimersByTime(LONG_PRESS_DELAY_MS);
+      expect(menus()).toEqual([{ type: WIDGET_MENU_MESSAGE_TYPE, held: true }]);
     });
 
     it('a new press ends one whose lift was lost before its delay', () => {
@@ -228,7 +261,7 @@ describe('installWidgetFrame', () => {
       expect(root.style.getPropertyValue('user-select')).toBe('none');
       document.body.dispatchEvent(finger('pointerdown'));
       window.dispatchEvent(finger('pointerup'));
-      mark({ place: 'inline', menu: true });
+      mark({ place: 'option', menu: true });
       document.body.dispatchEvent(finger('pointerdown'));
       for (const property of ['user-select', '-webkit-user-select']) {
         expect(root.style.getPropertyValue(property)).toBe('');
@@ -242,7 +275,7 @@ describe('installWidgetFrame', () => {
       mark({ place: 'dashboard', size: 'small', menu: true });
       document.body.dispatchEvent(finger('pointerdown'));
       expect(root.style.getPropertyValue('user-select')).toBe('none');
-      mark({ place: 'inline', menu: true });
+      mark({ place: 'option', menu: true });
       document.body.dispatchEvent(finger('pointerdown'));
       expect(root.style.getPropertyValue('user-select')).toBe('text');
       expect(root.style.getPropertyPriority('user-select')).toBe('');
@@ -304,7 +337,7 @@ describe('installWidgetFrame', () => {
       expect(menus()).toHaveLength(0);
     });
 
-    it('posts none when the finger moves first, lifts first, or the frame is no tile', () => {
+    it('posts none when the finger moves first, lifts first, or the frame is an option', () => {
       installWidgetFrame();
       mark({ place: 'dashboard', size: 'small', menu: true });
       document.body.dispatchEvent(finger('pointerdown'));
@@ -313,7 +346,7 @@ describe('installWidgetFrame', () => {
       document.body.dispatchEvent(finger('pointerdown'));
       window.dispatchEvent(finger('pointerup'));
       vi.advanceTimersByTime(LONG_PRESS_DELAY_MS);
-      mark({ place: 'inline', menu: true });
+      mark({ place: 'option', menu: true });
       document.body.dispatchEvent(finger('pointerdown'));
       vi.advanceTimersByTime(LONG_PRESS_DELAY_MS);
       expect(menus()).toHaveLength(0);

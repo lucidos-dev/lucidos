@@ -1,0 +1,6 @@
+{
+  "name": "Factory",
+  "description": "The team's work items: who drives each one, which gates wait, and Take or Watch. Mine, Team and All views.",
+  "icon": "assets/icon.svg",
+  "reveal": "on-ready"
+}

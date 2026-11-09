@@ -15,9 +15,10 @@
 //! - [`turn_tail`]: the engine build state and the client URL, split the same
 //!   way, plus the struct carrying all three tail blocks.
 
-use crate::engine::thread_events::{ActorMode, MessageOrigin, TriggerInvocation};
+use crate::engine::thread_events::{ActorMode, EngineReason, MessageOrigin, TriggerInvocation};
 use crate::engine::types::*;
 use crate::engine::LucidosEngine;
+use crate::triggers::continue_key::FireTarget;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -151,11 +152,13 @@ impl PreEmittedOrigin {
 impl LucidosEngine {
     /// Process a trigger prompt (emits TriggerStarted instead of MessageReceived).
     /// `invocation` records which path fired this run (cron schedule or matched event).
+    /// `target` says whether the fire starts a thread or continues the open
+    /// thread holding its continue key (ADR 0623).
     /// `external_cancel`, when set, is forwarded into the per-thread cancellation
     /// token so the scheduler can stop an in-flight trigger cleanly (UI delete,
     /// disable, update) without aborting the agentic loop mid-tool.
     #[allow(clippy::too_many_arguments)]
-    pub async fn process_trigger(
+    pub(crate) async fn process_trigger(
         &self,
         trigger_id: &str,
         trigger_name: &str,
@@ -175,7 +178,23 @@ impl LucidosEngine {
         // See `TriggerContext::queue_entry_id`.
         queue_entry_id: Uuid,
         retry_of: Option<crate::engine::thread_events::RetryOf>,
+        target: FireTarget,
+        actor_email: Option<String>,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
+        // A continuing fire is engine input on someone else's thread, so it
+        // names its trigger as the origin. A new thread's `TriggerStarted`
+        // stamps that origin itself.
+        let (thread_id, continue_key, origin, mode) = match target {
+            FireTarget::NewThread(claim) => (None, claim, None, ActorMode::Agent),
+            FireTarget::Continue(thread_id) => {
+                let origin = MessageOrigin::engine(EngineReason::Scheduler {
+                    trigger_id: trigger_id.to_string(),
+                    trigger_name: Some(trigger_name.to_string()),
+                    actor_email: actor_email.clone(),
+                });
+                (Some(thread_id), None, Some(origin), ActorMode::Engine)
+            }
+        };
         // The trigger's own model when it pinned one, else the account's
         // trigger model, so a fire never starts on the chat default. The
         // resolver in `process_message_with_steps_internal` takes an explicit
@@ -203,35 +222,42 @@ impl LucidosEngine {
                     side_effect_grant,
                     mcp_servers,
                     queue_entry_id,
+                    continue_key,
+                    actor_email,
                 }),
                 None, // app_context
                 None, // file_context
                 reasoning_effort,
                 provider,
+                None, // user_images
+                None, // device_id
+                None, // use_coding_agent
+                None, // event_id
+                thread_id,
                 None,
                 None,
                 None,
                 None,
                 None,
                 None,
+                mode,
                 None,
                 None,
                 None,
                 None,
-                None,
-                ActorMode::Agent,
-                None,
-                None,
-                None,
-                None,
-                None,
+                origin,
                 None,
                 external_cancel,
                 crate::engine::FollowUpUrgency::Normal,
                 None,
             )
             .await?;
-        trigger_process_result(&self.pool, result).await
+        // A continuing fire may coalesce into a live turn. Then the thread's
+        // last `TriggerStarted` belongs to an earlier fire.
+        match thread_id {
+            None => trigger_process_result(&self.pool, result).await,
+            Some(_) => Ok(result),
+        }
     }
 
     // Public chat entry — surface every per-request knob (model / context /

@@ -56,6 +56,7 @@
       width: 100%;
       height: 100%;
       object-fit: contain;
+      transform: translateZ(0);
     }
     /* The SDK's own `button` and `input` rules pad and fill every control.
        Override them all here: their padding squeezes the icon to zero width,
@@ -224,11 +225,144 @@
     }
 
     function showPosition() {
+      scrub.value = String(video.currentTime);
       time.textContent = video.duration
         ? `${clock(video.currentTime)} / ${clock(video.duration)}`
         : clock(video.currentTime);
       const played = video.duration ? video.currentTime / video.duration : 0;
       scrub.style.setProperty('--played', String(played));
+    }
+
+    // Safari stops drawing a video while it is scrolled out of view. Back in
+    // view, inside our iframe on a transformed pane, it sometimes never resumes
+    // while the clock runs on. A seek to the current position draws again
+    // (docs/temporary-measures.md § Video frame stall repaint).
+    const STALL_SECONDS = 1.5;
+    let lastFrameTime = 0;
+    let onScreen = false;
+
+    function watchFrames() {
+      video.requestVideoFrameCallback((_now, frame) => {
+        lastFrameTime = frame.mediaTime;
+        watchFrames();
+      });
+    }
+
+    function settleFrameClock() {
+      lastFrameTime = video.currentTime;
+    }
+
+    function isInline() {
+      return !video.webkitDisplayingFullscreen
+        && document.fullscreenElement !== video
+        && document.pictureInPictureElement !== video
+        && (!video.webkitPresentationMode || video.webkitPresentationMode === 'inline');
+    }
+
+    // A full screen request takes a moment to open, and the video still reads
+    // inline meanwhile. Unloading or hiding it then cancels the request, so
+    // release and repaint wait it out. A count, since a second tap can start
+    // a request while the first one still waits.
+    let fullScreenRequestsPending = 0;
+
+    // Rebuild the layer Safari drops while the page or the frame is hidden.
+    function repaint() {
+      if (fullScreenRequestsPending || !video.src || !isInline()) return;
+      video.style.display = 'none';
+      void video.offsetHeight;
+      video.style.display = '';
+      const target = Math.min(video.currentTime + 0.001, video.duration || Infinity);
+      if (video.paused && video.readyState > 0 && canSeekTo(target)) {
+        try {
+          video.currentTime = target;
+        } catch {
+          // Some media sources reject seeks. The layer was still rebuilt.
+        }
+      }
+      settleFrameClock();
+      showPosition();
+    }
+
+    function canSeekTo(seconds) {
+      const ranges = video.seekable;
+      for (let i = 0; i < ranges.length; i++) {
+        if (ranges.start(i) <= seconds && seconds <= ranges.end(i)) return true;
+      }
+      return false;
+    }
+
+    // Browsers present no frames for a video nobody can see, which is no
+    // stall. A server that ignores byte ranges leaves the clip unseekable, and
+    // a seek there rewinds to the start.
+    function repaintIfStalled() {
+      const watched = onScreen && !document.hidden && !video.webkitDisplayingFullscreen;
+      const stalled = watched
+        && !video.paused
+        && !video.seeking
+        && video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA
+        && video.currentTime - lastFrameTime > STALL_SECONDS;
+      if (!stalled || !canSeekTo(video.currentTime) || fullScreenRequestsPending) return;
+      settleFrameClock();
+      video.currentTime = video.currentTime;
+    }
+
+    // A decoded frame of a 4K clip holds tens of megabytes, and WebKit keeps
+    // every widget frame in the page's one content process. A thread of clips
+    // that all stay decoded runs it out of memory, and iOS kills the page. So a
+    // clip out of sight lets go of its media and reloads at its position.
+    let url = '';
+    let hostVisible = true;
+    // A clip starts released and loads once it is first on screen.
+    let released = true;
+    // Null when the clip had no metadata yet, so its own fragment still decides
+    // where it starts.
+    let releasedAt = null;
+    // Until the reload reaches its metadata, currentTime still reads 0, so
+    // the position lives here.
+    let resumeAt = null;
+
+    // The time fragment makes Safari draw that frame before playing. A clip
+    // URL with a fragment of its own keeps it and seeks at its metadata.
+    function sourceAt(seconds) {
+      return url.includes('#') ? url : `${url}#t=${seconds}`;
+    }
+
+    // Seekable ranges can still be empty at loadedmetadata. Try again at
+    // canplay, then drop the target even when it is out of range.
+    function resume(lastChance) {
+      if (resumeAt === null) return;
+      if (!url.includes('#')) {
+        resumeAt = null;
+      } else if (canSeekTo(resumeAt)) {
+        video.currentTime = resumeAt;
+        resumeAt = null;
+      } else if (lastChance) {
+        resumeAt = null;
+      }
+    }
+
+    function release() {
+      if (released || fullScreenRequestsPending || !isInline()) return;
+      video.pause();
+      released = true;
+      releasedAt = resumeAt ?? (video.readyState > 0 ? video.currentTime : null);
+      resumeAt = null;
+      video.removeAttribute('src');
+      video.load();
+    }
+
+    // release() skips a clip in PiP or full screen, so leaving that mode while
+    // out of sight releases it.
+    function releaseIfHidden() {
+      if (!onScreen || !hostVisible) release();
+    }
+
+    function show() {
+      if (!onScreen || !hostVisible) return;
+      if (!released) return repaint();
+      resumeAt = releasedAt === null ? null : Math.max(releasedAt, 0.001);
+      video.src = sourceAt(resumeAt ?? 0.001);
+      released = false;
     }
 
     function fail(message) {
@@ -247,24 +381,55 @@
       });
     }
 
-    // iOS has no element full screen, only the video's own player. A refusal
-    // keeps the player, which still works in place.
+    // Safari's own video player comes first wherever it exists: an iPhone has
+    // no other full screen. A request can also stall without an answer, so
+    // one that has not opened after a while says so. Either failure keeps the
+    // player, which still works in place.
+    const FULL_SCREEN_WAIT_MS = 2000;
+
     function enterFullScreen() {
-      if (video.requestFullscreen) {
-        video.requestFullscreen().catch((e) => lucidos.ui.toast(`Could not go full screen: ${e.message}`, 'error'));
-      } else if (video.webkitEnterFullscreen) {
-        video.webkitEnterFullscreen();
+      let answered = false;
+      const settle = () => {
+        if (answered) return;
+        answered = true;
+        fullScreenRequestsPending -= 1;
+      };
+      video.addEventListener('webkitbeginfullscreen', settle, { once: true });
+      document.addEventListener('fullscreenchange', settle, { once: true });
+      const refused = (reason) => {
+        settle();
+        lucidos.ui.toast(`Could not go full screen: ${reason}`, 'error');
+        releaseIfHidden();
+      };
+      fullScreenRequestsPending += 1;
+      // Only Safari's own player is known to stick until Lucidos restarts.
+      let neverOpened = 'it never opened';
+      try {
+        if (video.webkitEnterFullscreen) {
+          neverOpened = 'it never opened. iOS may be stuck: close and reopen Lucidos';
+          video.webkitEnterFullscreen();
+        } else if (document.fullscreenEnabled && video.requestFullscreen) {
+          video.requestFullscreen().catch((e) => refused(e.message));
+        } else {
+          return refused('this browser has no full screen for video');
+        }
+      } catch (e) {
+        return refused(e.message);
       }
+      setTimeout(() => {
+        video.removeEventListener('webkitbeginfullscreen', settle);
+        document.removeEventListener('fullscreenchange', settle);
+        if (answered) return;
+        if (!isInline()) return settle();
+        refused(neverOpened);
+      }, FULL_SCREEN_WAIT_MS);
     }
 
     const { clip } = lucidos.params();
     if (typeof clip !== 'string' || clip.trim() === '') {
       fail('No clip to play.');
     } else {
-      // The time fragment makes Safari draw the first frame before playing. A
-      // clip URL with a fragment of its own keeps it.
-      const url = clipUrl(clip.trim());
-      video.src = url.includes('#') ? url : `${url}#t=0.001`;
+      url = clipUrl(clip.trim());
       stage.addEventListener('click', () => {
         if (!video.controls) toggle();
       });
@@ -273,7 +438,11 @@
       // Full screen shows the video alone, so it takes the browser's controls.
       document.addEventListener('fullscreenchange', () => {
         video.controls = document.fullscreenElement === video;
+        releaseIfHidden();
       });
+      for (const event of ['webkitpresentationmodechanged', 'webkitendfullscreen', 'leavepictureinpicture']) {
+        video.addEventListener(event, releaseIfHidden);
+      }
       video.addEventListener('play', () => {
         player.classList.add('playing', 'started');
         play.setAttribute('aria-label', 'Pause');
@@ -290,14 +459,43 @@
           player.style.setProperty('--ratio', `${video.videoWidth} / ${video.videoHeight}`);
         }
         scrub.max = String(video.duration || 0);
+        resume(false);
         showPosition();
       });
+      video.addEventListener('canplay', () => resume(true));
       video.addEventListener('timeupdate', () => {
-        scrub.value = String(video.currentTime);
         showPosition();
       });
-      video.addEventListener('error', () => fail(`Could not load ${clip}.`));
+      if ('requestVideoFrameCallback' in video) {
+        watchFrames();
+        video.addEventListener('play', settleFrameClock);
+        video.addEventListener('seeking', settleFrameClock);
+        video.addEventListener('timeupdate', repaintIfStalled);
+      }
+      new IntersectionObserver(entries => {
+        for (const entry of entries) {
+          const wasOnScreen = onScreen;
+          onScreen = entry.isIntersecting;
+          if (!onScreen) release();
+          else if (!wasOnScreen) show();
+          settleFrameClock();
+        }
+      }, { threshold: 0.01 }).observe(video);
+      lucidos.widget.onVisibility(visible => {
+        hostVisible = visible;
+        if (visible) show();
+        else release();
+      });
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') repaint();
+        else settleFrameClock();
+      });
+      window.addEventListener('pageshow', repaint);
+      video.addEventListener('error', () => {
+        if (!released) fail(`Could not load ${clip}.`);
+      });
       scrub.addEventListener('input', () => {
+        resumeAt = null;
         video.currentTime = Number(scrub.value);
         showPosition();
       });

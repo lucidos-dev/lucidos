@@ -44,6 +44,7 @@ describe('a successor session draws one card', () => {
       type: 'handoff_session',
       checkpoint: 'phase-commit',
       progress: '4/7',
+      opening: 'narrative',
       message: OPENING,
       seq: 1,
     }]);
@@ -87,8 +88,39 @@ describe('the card reads as a fresh session card', () => {
   });
 
   it('names no checkpoint when the handoff ran at none', () => {
-    const s = card({ type: 'handoff_session', message: OPENING });
+    const s = card({ type: 'handoff_session', opening: 'narrative', message: OPENING });
     expect(s).toContain('Carried on from a handoff.');
+  });
+
+  it('says Handed off from a brief when the session wrote no narrative', () => {
+    const s = card({ type: 'handoff_session', opening: 'brief', message: OPENING });
+    expect(s).toContain('Handed off from a brief');
+  });
+});
+
+describe('a handoff at the context ceiling', () => {
+  const crossing = { context_tokens: 352_000, ceiling: 300_000, window: 1_000_000 };
+  const card = (event: Extract<ResponseEvent, { type: 'handoff_session' }>) => JSON.stringify(HandoffSessionRow({ event }));
+
+  it('carries the crossing from the session start', () => {
+    const turn = successorTurn(ENGINE_OPENING);
+    const started = turn.steps[0].event as unknown as { continuity: Record<string, unknown> };
+    started.continuity = { ...HANDOFF, checkpoint: undefined, progress: undefined, crossing };
+    expect(cards(turn)[0].crossing).toEqual(crossing);
+  });
+
+  it('names the size and the ceiling, and that the session wrote the narrative', () => {
+    const s = card({ type: 'handoff_session', opening: 'narrative', crossing, message: OPENING });
+    expect(s).toContain("Handed off at the context ceiling: 352k tokens, past this thread's 300k.");
+    expect(s).toContain('The previous session wrote the handoff narrative.');
+    expect(s).toContain('"Handed off"');
+  });
+
+  it('says the session wrote no narrative when it started from a brief', () => {
+    const s = card({ type: 'handoff_session', opening: 'brief', crossing, message: OPENING });
+    expect(s).toContain("Handed off at the context ceiling: 352k tokens, past this thread's 300k.");
+    expect(s).toContain('The previous session did not write a handoff in its one turn, so this session started from a brief.');
+    expect(s).toContain('Handed off from a brief');
   });
 });
 

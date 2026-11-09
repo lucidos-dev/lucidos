@@ -1025,7 +1025,7 @@ fn the_idle_arm_covers_polled_tasks_before_it_idles() {
         .expect("run.rs must still classify the Result before acting on it");
     let arm = &RUN_SRC[classify..];
     let gate = arm
-        .find("let ended_cleanly = turn_ended_cleanly(&last_terminal_kind, is_resolution_session, keep_alive_turn);")
+        .find("let ended_cleanly = turn_ended_cleanly(&last_terminal_kind, is_resolution_session, keep_alive_turn || ceiling_turn);")
         .expect("the Result arm must still decide whether the turn ended cleanly");
     let arming = arm
         .find("self.arm_wait_for_running_background_tasks(thread_id, OwnerTurn::Ended)")
@@ -1085,6 +1085,96 @@ fn the_idle_arm_decides_before_it_idles_and_re_enters_after() {
         idle_emit < reenter,
         "a re-entry opens its own exchange after the idle"
     );
+}
+
+/// The ceiling re-entry's turn is the engine's (ADR 0629, I12). The flag the
+/// input arm sets for it reaches `turn_ended_cleanly`, so its end forces no
+/// read or wake decision. Only an ordinary clean turn end reads the ceiling,
+/// after the idle it counts as a turn (I1, I11). The send comes before the
+/// idle exit decides whether to keep the subprocess.
+#[test]
+fn the_ceiling_reentry_is_an_engine_turn_read_after_the_idle() {
+    const RUN_SRC: &str = include_str!("../run_session/run.rs");
+
+    let input_arm = RUN_SRC
+        .find("Some(mut user_input) = msg_rx.recv()")
+        .expect("run.rs must still forward input in its own arm");
+    let flag = input_arm
+        + RUN_SRC[input_arm..]
+            .find("ceiling_reentry_forwarded = true;")
+            .expect("the input arm must mark a forwarded ceiling re-entry");
+    let kind_check = RUN_SRC[input_arm..flag]
+        .rfind("if user_input.kind == crate::engine::AgentInputKind::CeilingReentry {")
+        .expect("only the ceiling re-entry sets the flag");
+    assert!(RUN_SRC[input_arm + kind_check..flag].lines().count() <= 2);
+
+    let classify = RUN_SRC
+        .find("let (terminal_kind, emit_idle) = classify_result(")
+        .expect("run.rs must still classify the Result before acting on it");
+    let arm = &RUN_SRC[classify..];
+    let find = |needle: &str| {
+        arm.find(needle)
+            .unwrap_or_else(|| panic!("the Result arm must still contain {needle}"))
+    };
+    let taken = find("let ceiling_turn = std::mem::take(&mut ceiling_reentry_forwarded);");
+    let clean = find("turn_ended_cleanly(&last_terminal_kind, is_resolution_session, keep_alive_turn || ceiling_turn)");
+    let idle_emit = find("self.emit_coding_agent_idled(");
+    const ORDINARY_END: &str = "let ceiling = if ended_cleanly && emit_idle {";
+    let gated = find(ORDINARY_END);
+    let read = find("crate::engine::context_ceiling::ceiling_crossing(self.pool(), thread_id, inputs.owed() > 0)");
+    let send = find("context_ceiling::record_ceiling_reentry(");
+    let head = find("requeue_at_head(&msg_tx, msg_rx, reentry);");
+    let idle_exit = find("match idle_action(");
+    assert!(
+        taken < clean,
+        "the turn consumes the flag it was forwarded under"
+    );
+    assert!(
+        idle_emit < gated,
+        "the ceiling counts the idle just recorded"
+    );
+    assert!(
+        arm[gated + ORDINARY_END.len()..read].trim().is_empty(),
+        "the reading is the clean-end gate's first statement"
+    );
+    assert!(read < send && send < head && head < idle_exit);
+}
+
+/// I3, I4: the re-entry turn ends in a handoff. A turn that wrote none gets
+/// the brief before anything reads the pending handoff, the idle included.
+/// Through the re-entry turn the input arm stays closed, so input waits for
+/// the successor, and no follow-up interrupts the turn.
+#[test]
+fn the_reentry_turn_holds_input_and_ends_in_a_handoff() {
+    const RUN_SRC: &str = include_str!("../run_session/run.rs");
+
+    assert!(
+        RUN_SRC.contains(
+            "Some(mut user_input) = msg_rx.recv(), if !handed_off && !ceiling_reentry_forwarded => {"
+        ),
+        "the input arm closes while the re-entry turn runs"
+    );
+    assert!(RUN_SRC.contains("s.in_ceiling_reentry = ceiling_reentry_forwarded;"));
+
+    let classify = RUN_SRC
+        .find("let (terminal_kind, emit_idle) = classify_result(")
+        .expect("run.rs must still classify the Result before acting on it");
+    let arm = &RUN_SRC[classify..];
+    let find = |needle: &str| {
+        arm.find(needle)
+            .unwrap_or_else(|| panic!("the Result arm must still contain {needle}"))
+    };
+    let terminal = find("event: terminal_event,");
+    let taken = find("let ceiling_turn = std::mem::take(&mut ceiling_reentry_forwarded);");
+    let settle = find("if ceiling_turn {\n");
+    let pending = find("handoff_pending: crate::engine::successor::handoff_pending(");
+    let idle_emit = find("self.emit_coding_agent_idled(");
+    assert!(
+        terminal < settle,
+        "a Stop's ResponseCanceled must come first, or it would withdraw the brief"
+    );
+    assert!(taken < settle && settle < pending && pending < idle_emit);
+    assert!(arm[settle..pending].contains("self.settle_owed_ceiling_handoff(thread_id).await;"));
 }
 
 /// The Result arm feeds the change gate the thread's live event waits (ADR

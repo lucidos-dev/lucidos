@@ -178,7 +178,8 @@ pub async fn removed_knowhow(
     trigger_id: &str,
 ) -> Result<Vec<RemovedKnowhow>, sqlx::Error> {
     // Two `TriggerUpdated` shapes do not count as an edit, since neither means
-    // anyone looked at the know-how. Pause and resume carry only `paused`. A
+    // anyone looked at the know-how. Pause and resume carry only `paused`, and
+    // the `previous` config the writer adds. A
     // plugin resync re-registers the trigger and carries `plugin_id`.
     let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
         "SELECT event_type, payload->'data' FROM events \
@@ -189,7 +190,7 @@ pub async fn removed_knowhow(
                WHERE u.event_type = 'TriggerUpdated' AND u.aggregate_id = $1 \
                  AND u.payload->'plugin_id' IS NULL \
                  AND EXISTS (SELECT 1 FROM jsonb_object_keys(u.payload) k \
-                     WHERE k NOT IN ('trigger_id', 'paused', 'actor'))), 0) \
+                     WHERE k NOT IN ('trigger_id', 'paused', 'actor', 'previous'))), 0) \
          ORDER BY sequence",
     )
     .bind(trigger_id)
@@ -266,11 +267,15 @@ mod tests {
             go_to_review: false,
             group_id: None,
             side_effect_grant: vec![],
+            permission_wait: None,
+            context_ceiling: None,
             mcp_servers: vec![],
             plugin_id: None,
             model: None,
             reasoning_effort: None,
             provider: None,
+            continue_key: None,
+            actor: None,
         }
     }
 
@@ -507,8 +512,11 @@ mod tests {
             let (bus, _rx) = EventBus::new(pool.clone());
             let data = tempfile::tempdir().unwrap();
             emit(&bus, update_removing_daily("t1")).await;
+            // The trigger writer adds the config before the change as `previous`.
             for paused in [true, false] {
-                let pause = json!({ "trigger_id": "t1", "paused": paused });
+                let pause = json!({
+                    "trigger_id": "t1", "paused": paused, "previous": { "name": "A" },
+                });
                 emit(&bus, trigger_updated("t1", pause)).await;
             }
 

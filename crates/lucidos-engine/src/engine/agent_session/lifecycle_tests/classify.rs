@@ -1198,7 +1198,10 @@ fn only_a_clean_turn_end_arms_the_background_wait() {
         !turn_ended_cleanly(&generated, true, false),
         "merge resolution"
     );
-    assert!(!turn_ended_cleanly(&generated, false, true), "keep-alive");
+    assert!(
+        !turn_ended_cleanly(&generated, false, true),
+        "a keep-alive or a ceiling re-entry"
+    );
 
     let stopped = classify_result(true, None, false, None, false).0;
     let redirected = classify_result(

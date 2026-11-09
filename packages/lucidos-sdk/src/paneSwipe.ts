@@ -335,19 +335,21 @@ export function trackPaneSwipe(
  * `yieldToWidePage` gives every sideways drag to a page wider than the frame.
  * The preview passes it, since an artifact is arbitrary HTML, often a fixed
  * layout or a wide table. An app is written against the claim rules instead.
+ * `hostPansSideways` gives every sideways drag to a host scroller around the
+ * frame, so the browser's native pan reaches it.
  */
 export function installFramePaneSwipe(
   win: Window,
   handlers: PaneSwipeHandlers,
-  { yieldToWidePage }: { yieldToWidePage: boolean },
+  { yieldToWidePage, hostPansSideways = () => false }: { yieldToWidePage: boolean; hostPansSideways?: () => boolean },
 ): () => void {
   return trackPaneSwipe(win, handlers, {
     // The frame is full-bleed in its pane, so its width is the pane's.
     paneWidth: () => win.innerWidth,
     textFieldFocused,
     styleOf: computedStyleOf,
-    pageScrollsSideways: () => yieldToWidePage
-      && pageScrollsSideways(win.document, (el) => win.getComputedStyle(el).overflowX),
+    pageScrollsSideways: () => hostPansSideways() || (yieldToWidePage
+      && pageScrollsSideways(win.document, (el) => win.getComputedStyle(el).overflowX)),
   });
 }
 
@@ -356,12 +358,13 @@ export function installFramePaneSwipe(
  * the drag and the release to the host, which moves the panes.
  *
  * No-op when there is no parent window: the SDK loaded at the top level has no
- * host to swipe.
+ * host to swipe. `hostPansSideways` says the frame sits in a box the host
+ * scrolls sideways, such as an XL widget box.
  */
-export function installAppPaneSwipe(): () => void {
+export function installAppPaneSwipe(hostPansSideways?: () => boolean): () => void {
   if (typeof window === 'undefined' || window.parent === window) return () => {};
   return installFramePaneSwipe(window, {
     onDrag: (dx) => postToHost({ type: APP_SWIPE_MESSAGE_TYPE, dx }),
     onRelease: (paneDelta) => postToHost({ type: APP_SWIPE_END_MESSAGE_TYPE, paneDelta }),
-  }, { yieldToWidePage: false });
+  }, { yieldToWidePage: false, hostPansSideways });
 }

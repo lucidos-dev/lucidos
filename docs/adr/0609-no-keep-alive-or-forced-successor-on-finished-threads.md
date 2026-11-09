@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-10-31
+- **Amended by**: [0629: A coding-agent session hands off at an engine-enforced context ceiling](0629-engine-enforced-context-ceiling.md)
 
 ## Context
 

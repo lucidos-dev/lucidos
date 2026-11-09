@@ -62,9 +62,9 @@ fn making_guidance(automatic: bool) -> String {
          border inside the widget. Keep the accent for the one thing that matters. Animate what \
          a tap changes, on the --duration-* tokens, and stay calm under data-motion=\"reduce\". \
          Read data through lucidos.* and listen on lucidos.sse instead of baking it into the \
-         HTML. It takes all three sizes unless create_app sizes narrows them. Arrange a \
-         dashboard or resize a card only when the user asks in this turn, and never choose a \
-         size yourself.\n\n",
+         HTML. It takes small, medium and large unless create_app sizes changes them or adds \
+         xl. Arrange a dashboard or resize a card only when the user asks in this turn, and \
+         never choose a size yourself.\n\n",
     );
     text
 }
@@ -95,10 +95,14 @@ pub fn widgets_list(widgets: &[App]) -> String {
 }
 
 /// One widget as the list carries it: its line, naming its tile sizes
-/// only when it narrows them from all three, then one line per param.
+/// only when it differs from an undeclared widget's, then one line per param.
 pub fn widget_line(widget: &App) -> String {
     let built_in = if widget.built_in { ", built in" } else { "" };
-    let sizes = if widget.sizes.len() < WidgetSize::ALL.len() {
+    let mut declared = widget.sizes.clone();
+    declared.sort();
+    let mut undeclared = WidgetSize::UNDECLARED.to_vec();
+    undeclared.sort();
+    let sizes = if declared != undeclared {
         let names: Vec<&str> = widget.sizes.iter().map(|s| s.as_str()).collect();
         format!(", sizes {}", names.join(", "))
     } else {
@@ -187,16 +191,21 @@ mod tests {
         }
     }
 
-    /// A widget that takes every size lists none; one that narrows them lists
-    /// what it takes.
+    /// A widget that declares no sizes lists none; one that narrows them or
+    /// opts into XL lists what it takes.
     #[test]
-    fn the_list_names_sizes_only_for_a_widget_that_narrows_them() {
+    fn the_list_names_sizes_only_for_a_widget_that_changes_them() {
         assert!(!widget_line(&player()).contains("sizes"));
         let clock = App {
             sizes: vec![WidgetSize::Small, WidgetSize::Large],
             ..player()
         };
         assert!(widget_line(&clock).contains("built in, sizes small, large):"));
+        let film = App {
+            sizes: vec![WidgetSize::Medium, WidgetSize::Large, WidgetSize::Xl],
+            ..player()
+        };
+        assert!(widget_line(&film).contains("built in, sizes medium, large, xl):"));
     }
 
     /// The chat agent arranges a dashboard or resizes a card only when asked,

@@ -40,24 +40,14 @@ pub(crate) fn lookup_repo_commands_in_cache(
 //     `ExitPlanMode` line never suppresses the card.
 // A card offers no "Always allow" broad button for these tools. For in-thread
 // persistence, use the session-allow button: the engine intercepts it before
-// CC's gate. See `input_touches_protected_path` for the
-// related per-input filter (Bash commands targeting `.claude/` / `.git/`
-// paths, which empirically still surface a card even with bare `Bash` in
-// `--allowedTools`).
+// CC's gate. See `input_touches_protected_path` for the related per-input
+// filter (Bash commands writing under `.claude/` / `.git/`).
 pub(crate) const BROAD_ALLOW_INEFFECTIVE: &[&str] =
     &["Edit", "ExitPlanMode", "NotebookEdit", "Write"];
 
-/// Substrings that mark a path CC treats specially for destructive Bash
-/// commands. Empirically (probed 2026-05-16): `Bash rm -rf .../.claude/...`
-/// surfaces a permission card even when bare `Bash` is in `--allowedTools`,
-/// so persisting a Broad (`Bash`) or Narrow (`Bash(rm:*)`) grant from that
-/// card lies about future suppression — the next `Bash rm -rf` on the same
-/// path will prompt again. We probed `.git/` only by analogy with the
-/// long-standing comment chain; CC's full rule set isn't publicly
-/// documented. Read/Edit/cat on the same paths auto-approved silently
-/// under bare allowlist entries — the trigger is the tool+path combination,
-/// not the path alone. Session scope is unaffected because the engine
-/// intercepts the MCP permission server call before CC's gate fires.
+/// Directories no persisted Bash grant may write under: Claude Code's own
+/// settings and hooks, and git metadata, whose hooks and config run on later
+/// git calls. Read through [`input_touches_protected_path`].
 pub(crate) const CC_PROTECTED_PATH_MARKERS: &[&str] = &[".claude/", ".git/"];
 
 // Tools whose `AllowScope::Session` pattern is per-file, derived from the
@@ -149,12 +139,9 @@ impl GrantOffer {
 ///          the permission prompt regardless of `--allowedTools`, so the
 ///          bare entry never suppresses anything. Applies to `Broad` only
 ///          (the Narrow scope already returns `None` for these tools).
-///       2. The tool is `Bash` and the command references `.claude/` or
-///          `.git/` (per `input_touches_protected_path`) — CC keeps
-///          surfacing the card for those Bash commands even with bare
-///          `Bash` in `--allowedTools`, so persisting `Bash` or
-///          `Bash(<token>:*)` would lie about future suppression for that
-///          exact path. Applies to both `Broad` and `Narrow`.
+///       2. The tool is `Bash` and the command may write under `.claude/`
+///          or `.git/` (per `input_touches_protected_path`). No persisted
+///          line covers such a write. Applies to both `Broad` and `Narrow`.
 ///       3. The tool is `file_change`.
 ///
 ///     A Codex `command_execution` persists Claude Code's `Bash` line, so it
@@ -250,22 +237,16 @@ pub(crate) fn derive_allow_pattern(
     }
 }
 
-/// True when a `Bash` command references a path CC keeps under special
-/// permission routing (`.claude/` or `.git/`). The empirically verified
-/// trigger is `Bash rm -rf` targeting those paths — that card fires even
-/// when bare `Bash` is in `--allowedTools`, so persisting a Broad
-/// (`Bash`) or Narrow (`Bash(rm:*)`) grant from it lies about future
-/// suppression. We scan the entire command string rather than restricting
-/// to known destructive verbs because (a) CC's full rule set isn't
-/// publicly documented, and (b) the false-positive cost is only "hide a
-/// button on a card that wouldn't have appeared anyway." Session scope is
-/// unaffected: the engine intercepts before CC's gate.
+/// True when a `Bash` command may WRITE under `.claude/` or `.git/`
+/// ([`command_guard::command_may_write_under`]). No persisted grant covers
+/// such a write: it could widen the agent's own permissions or plant a git
+/// hook. A command that only mentions or reads those paths is not touched.
+/// The engine matches every Bash grant itself. A mention refused here would
+/// card on every call, with no "Always allow" to stop it (ADR 0634).
 ///
-/// Restricted to `Bash` because that's the only tool we've empirically
-/// observed surfacing the card on these paths under the user's current
-/// bare-allowlist setup — see `CC_PROTECTED_PATH_MARKERS` for the probing
-/// summary. If CC tightens later, widen this match arm; do not pre-add
-/// branches that the UI would never reach in practice.
+/// Session scope is unaffected: the engine intercepts before CC's gate.
+///
+/// [`command_guard::command_may_write_under`]: crate::engine::command_guard::command_may_write_under
 pub(crate) fn input_touches_protected_path(tool_name: &str, input: &serde_json::Value) -> bool {
     if tool_name != "Bash" {
         return false;
@@ -273,8 +254,12 @@ pub(crate) fn input_touches_protected_path(tool_name: &str, input: &serde_json::
     input
         .get("command")
         .and_then(|v| v.as_str())
-        .map(|s| CC_PROTECTED_PATH_MARKERS.iter().any(|m| s.contains(m)))
-        .unwrap_or(false)
+        .is_some_and(|command| {
+            crate::engine::command_guard::command_may_write_under(
+                command,
+                CC_PROTECTED_PATH_MARKERS,
+            )
+        })
 }
 
 /// Narrow `--allowedTools`-style sub-scope for tools whose input carries a

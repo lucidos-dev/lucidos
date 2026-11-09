@@ -53,6 +53,9 @@ export type ThreadAggregate = {
   /** Whether the thread's agent asked the user to read its latest reply,
    *  still unseen (ADR 0409). Optional only so test fixtures needn't set it. */
   readRequested?: boolean;
+  /** The devices that saw that reply, on a team gateway (ADR 0623). Optional
+   *  only so test fixtures needn't set it. */
+  replySeenDevices?: string[];
   /** Whether an Apply Now is running on the thread, from its
    *  `ApplyNowStarted` to its `ApplyNowEnded` (ADR 0437). Optional only so
    *  test fixtures needn't set it. */
@@ -120,6 +123,12 @@ export type ThreadAggregate = {
  *
  *  Used only to decide whether the overlay CHANGED anything, which gates a
  *  `threadMap` flush. */
+function sameDevices(a: string[] | undefined, b: string[] | undefined): boolean {
+  const prev = a ?? [];
+  const next = b ?? [];
+  return prev.length === next.length && next.every((device, i) => prev[i] === device);
+}
+
 function sameWaits(a: EventWaitSummary[], b: EventWaitSummary[]): boolean {
   return a.length === b.length && a.every((w, i) => w.wait_id === b[i].wait_id);
 }
@@ -185,6 +194,7 @@ export function applyAggregateToMeta(meta: ThreadMeta, agg: ThreadAggregate): bo
   if (meta.attentionDescendantCount !== agg.attentionDescendantCount) { meta.attentionDescendantCount = agg.attentionDescendantCount; changed = true; }
   if (!!meta.isStoppedChild !== !!agg.isStoppedChild) { meta.isStoppedChild = !!agg.isStoppedChild; changed = true; }
   if (!!meta.readRequested !== !!agg.readRequested) { meta.readRequested = !!agg.readRequested; changed = true; }
+  if (!sameDevices(meta.replySeenDevices, agg.replySeenDevices)) { meta.replySeenDevices = agg.replySeenDevices ?? []; changed = true; }
   if (!!meta.applyInFlight !== !!agg.applyInFlight) { meta.applyInFlight = !!agg.applyInFlight; changed = true; }
   if (meta.liveEventWaitCount !== agg.liveEventWaitCount) { meta.liveEventWaitCount = agg.liveEventWaitCount; changed = true; }
   if (agg.liveEventWaits !== undefined && !sameWaits(meta.liveEventWaits, agg.liveEventWaits)) { meta.liveEventWaits = agg.liveEventWaits; changed = true; }
@@ -303,6 +313,10 @@ export type ThreadMeta = {
    *  reply, and they have not seen it yet (ADR 0409). Lists a settled thread
    *  under Review. Absent reads as false. */
   readRequested?: boolean;
+  /** The devices that saw the reply a read request points at, on a team
+   *  gateway (ADR 0623). A person with a device here no longer lists the
+   *  thread under Review. Absent reads as empty. */
+  replySeenDevices?: string[];
   /** Whether the engine has an Apply Now running on this thread (ADR 0437).
    *  The one source of "applying", beside a click still waiting for its
    *  answer (`applyNowRequests`). Absent reads as false. */

@@ -182,10 +182,14 @@ fn test_trigger_config(id: &str) -> crate::triggers::TriggerConfig {
         go_to_review: false,
         group_id: None,
         side_effect_grant: vec![],
+        permission_wait: None,
+        context_ceiling: None,
         mcp_servers: vec![],
         plugin_id: None,
         model: None,
         reasoning_effort: None,
+        continue_key: None,
+        actor: None,
     }
 }
 
@@ -331,6 +335,7 @@ async fn materialize_trigger_thread(bus: &EventBus, thread_id: Uuid, trigger_id:
             go_to_review: false,
             model: None,
             reasoning_effort: None,
+            continue_key: None,
         },
         meta: crate::engine::thread_events::EventMeta {
             channel: Some(crate::engine::thread_events::EventChannel::Trigger),

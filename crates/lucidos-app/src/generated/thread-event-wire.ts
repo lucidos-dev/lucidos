@@ -356,6 +356,20 @@ export type CaptureFormat =
   | 'jpeg'
   | 'webp';
 
+/** A session's context reading past its effective ceiling, as
+ *  `ContextCeilingReached` records it. */
+export interface CeilingCrossing {
+  context_tokens: number;
+  /** The effective ceiling, in tokens. */
+  ceiling: number;
+  window?: number;
+}
+
+/** Where a thread's `ContextCeilingSet` came from. */
+export type CeilingSource =
+  | 'thread'
+  | 'trigger';
+
 /** How far a flow's work has come at a checkpoint: `done` units of `total`. */
 export interface CheckpointProgress {
   done: number;
@@ -498,6 +512,9 @@ export type EngineReason =
       kind: 'scheduler';
       trigger_id: string;
       trigger_name?: string;
+      /** The email the trigger's *actor* field resolved to (ADR 0623). The
+       *  email, never the operator: a display maps it through the gateway. */
+      actor_email?: string;
     }
   /** Engine auto-retriggered `/harden` because the marker was stale. */
   | { kind: 'harden_retrigger' }
@@ -529,6 +546,9 @@ export type EngineReason =
   /** Engine held a turn-end proposal because the branch's plan marker does
    *  not satisfy the gate, and told the agent how to set one. */
   | { kind: 'missing_plan' }
+  /** The session grew past its *context ceiling*, so the engine asked the
+   *  agent to hand off: the *ceiling re-entry* (ADR 0629). */
+  | { kind: 'context_ceiling' }
   /** Historical: the engine used to silently apply marketplace plugin updates
    *  in the background and stamped the resulting `PluginInstalled` event with
    *  this reason. That behavior was retired: the engine now checks for
@@ -653,6 +673,12 @@ export interface GrantOffer {
   /** "Allow for this thread": a pattern for this thread's session set. */
   session?: string;
 }
+
+/** Why a session handed off. Absent on handoffs recorded before the field. */
+export type HandoffCause =
+  | 'checkpoint'
+  | 'user'
+  | 'context-ceiling';
 
 /** The retired *handoff consent* that let a child's legacy successor thread start
  *  under its parent (ADR 0507). Kept so legacy `SuccessorThreadSpawned` events
@@ -958,11 +984,20 @@ export type SessionContinuity =
       checkpoint?: string;
       /** The checkpoint's progress, as `<done>/<total>`. */
       progress?: string;
+      /** The ceiling the previous session crossed, when it handed off at its
+       *  *context ceiling*. */
+      crossing?: CeilingCrossing;
       opening: HandoffOpening;
       /** The opening itself, which the transcript folds under the session's
        *  card. The first input may also carry the message that started it. */
       message: string;
     };
+
+/** When a *successor session* starts. */
+export type SessionStart =
+  | 'now'
+  | 'after-this-turn'
+  | 'on-next-input';
 
 /** One pending change held by a sub-thread of the thread a
  *  `ChildThreadCompleted` reports on: any descendant, not the thread itself.
@@ -1007,14 +1042,15 @@ export type ThreadReachVerb =
   | 'detach-child'
   | 'spawn-successor';
 
-/** The size of any dashboard tile. A widget shows at one of its three
+/** The size of any dashboard tile. A widget shows at one of its four
  *  `WidgetSize`s, and an *app shortcut* is always a quarter: half a small
  *  cell's edge on each side. */
 export type TileSize =
   | 'quarter'
   | 'small'
   | 'medium'
-  | 'large';
+  | 'large'
+  | 'xl';
 
 /** One row of a *Todo list*. `content` is the imperative form ("Run tests");
  *  `active_form` is the present-continuous form ("Running tests") shown only
@@ -1126,12 +1162,13 @@ export interface WidgetEmbed {
   label?: string;
 }
 
-/** One of the three sizes a widget takes as a tile on a dashboard: one cell,
- *  two cells wide, or two by two (ADR 0432). */
+/** One of the four sizes a widget takes as a tile on a dashboard: one cell,
+ *  two cells wide, two by two, or four by two (ADR 0432). */
 export type WidgetSize =
   | 'small'
   | 'medium'
-  | 'large';
+  | 'large'
+  | 'xl';
 
 export type ThreadEvent =
   | {
@@ -1692,6 +1729,10 @@ export type ThreadEvent =
    *  session's `SessionStarted`. */
   | {
       type: 'SessionHandedOff';
+      cause?: HandoffCause;
+      starts?: SessionStart;
+      /** The ceiling the session crossed, on a `context-ceiling` handoff. */
+      crossing?: CeilingCrossing;
       opening: HandoffOpening;
       /** The opening itself: the *handoff narrative* or *handoff brief*,
        *  framed for the new session. */
@@ -1763,6 +1804,52 @@ export type ThreadEvent =
       coding_agent?: CodingAgent;
       coding_agent_model?: string;
       reasoning_effort?: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The thread's *context ceiling* was set: on the thread itself, or copied
+   *  from its trigger at creation (ADR 0629). The newest one wins. A thread
+   *  with none inherits its parent's, else the workspace preference. The
+   *  actor rides the meta, and only a person raises a ceiling. */
+  | {
+      type: 'ContextCeilingSet';
+      ceiling: string;
+      source: CeilingSource;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The session grew past its context ceiling, and the engine sent the
+   *  *ceiling re-entry* (ADR 0629). Once per session, at the turn end that
+   *  crossed it. */
+  | {
+      type: 'ContextCeilingReached';
+      /** The session's context size at that turn end, in tokens. */
+      context_tokens: number;
+      /** The effective ceiling it crossed, in tokens. */
+      ceiling: number;
+      /** The window the cap read, absent when no capture recorded one. */
+      window?: number;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** A person chose *Return to the old session* on a pending ceiling
+   *  handoff (ADR 0629). The handoff no longer stands, and the thread's next
+   *  input resumes the old session. A raising `ContextCeilingSet` and a
+   *  `SuccessorOfferDeclined` at the session's size precede it. */
+  | {
+      type: 'SessionHandoffWithdrawn';
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -1992,7 +2079,9 @@ export type ThreadEvent =
        *  emits `Some("engine_restart_interrupt")` when a mid-turn-crashed
        *  session is surfaced to the UI as "interrupted, click to continue"
        *  instead of being auto-spawned. The frontend reads this field to
-       *  render the continue affordance. */
+       *  render the continue affordance. An engine turn stamps
+       *  `"cache_keep_alive"` or `"ceiling_reentry"`, so no trigger or event
+       *  wait reads its idle as the agent finishing. */
       reason?: string;
       /** Absolute filesystem path of the worktree the agent ran in for this
        *  turn. Phase 6.1 of the CC resume architecture: persisted so that
@@ -2171,13 +2260,17 @@ export type ThreadEvent =
       actor?: MessageOrigin;
     }
   /** The user saw the reply a read request pointed at: its end stayed on
-   *  screen for the seen dwell. Clears `read_requested`. Recorded only while
+   *  screen for the seen dwell. Clears `read_requested`, or with `personal`
+   *  adds the actor's device to `reply_seen_devices`. Recorded only while
    *  the thread's summary still reads `seen_version`, so a duplicate or a
    *  sighting older than a newer request records nothing. */
   | {
       type: 'ThreadReplySeen';
       /** The thread's `summary_version` when the client saw the reply. */
       seen_version: number;
+      /** Seen by one person on a team gateway, so the request stays for the
+       *  others (ADR 0623). Absent means seen for everyone. */
+      personal?: boolean;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -2191,6 +2284,66 @@ export type ThreadEvent =
   | {
       type: 'ThreadTriageProposed';
       entries: TriageProposalEntry[];
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** Someone became the *driver* of this work item (ADR 0623), on its
+   *  family root. The actor names them: a device, or a trigger fire whose
+   *  actor email an operator holds. Recorded by Take, Take over, and by
+   *  answering a gate. Projects nothing: `engine::work_item` folds it. */
+  | {
+      type: 'WorkItemDriverTaken';
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The work item's driver gave the role up, on its family root. The work
+   *  item has no driver until someone takes it. */
+  | {
+      type: 'WorkItemDriverReleased';
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** A gate waited on its driver past `driver_timeout_hours`, so it now
+   *  reaches the whole team. Recorded once per gate, on the family root.
+   *  The driver keeps the work item. */
+  | {
+      type: 'WorkItemGateEscalated';
+      /** The thread the question card is on: the root or a sub-thread. */
+      gate_thread_id: string;
+      tool_use_id: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The actor started watching this work item: its gate pushes reach them
+   *  beside the driver. Recorded on the family root. */
+  | {
+      type: 'WorkItemWatched';
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The actor stopped watching this work item, from any of their devices. */
+  | {
+      type: 'WorkItemUnwatched';
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -2297,6 +2450,10 @@ export type ThreadEvent =
        *  the thread's memory. `None` means nothing was pinned, so the row
        *  decided. */
       provider?: string;
+      /** The *continue key* this fire claimed for a NEW thread. A later fire
+       *  with the same key continues this thread until it is archived.
+       *  `None` on an unkeyed fire, and on a fire that continued a thread. */
+      continue_key?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -3778,6 +3935,9 @@ const THREAD_EVENT_TYPE_FLAGS = {
   HandoffCheckpointReached: true,
   SuccessorOfferDeclined: true,
   SuccessorRequested: true,
+  ContextCeilingSet: true,
+  ContextCeilingReached: true,
+  SessionHandoffWithdrawn: true,
   CodingAgentCompacted: true,
   CodingAgentTextStreamed: true,
   CodingAgentThoughtStreamed: true,
@@ -3804,6 +3964,11 @@ const THREAD_EVENT_TYPE_FLAGS = {
   ParentWakeNotRequested: true,
   ThreadReplySeen: true,
   ThreadTriageProposed: true,
+  WorkItemDriverTaken: true,
+  WorkItemDriverReleased: true,
+  WorkItemGateEscalated: true,
+  WorkItemWatched: true,
+  WorkItemUnwatched: true,
   ThreadStarted: true,
   ThreadDiscarded: true,
   HomeThreadCreated: true,

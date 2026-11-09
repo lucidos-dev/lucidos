@@ -44,6 +44,13 @@ The vendored copy is a temporary measure. It goes when an `ort-sys` release
 lets a build name its download origin. The hosts-block leg passing with the
 patch removed verifies that.
 
+## Addendum: the release API is a second route to the mirror
+
+On 2026-11-08 every `github.com/.../releases/download/` URL on the mirror
+returned 504, while the release API served the same asset (HTTP 200, full
+size). The build script now tries the API route after the download route and
+before pyke. The SHA-256 check covers it like every other source.
+
 ## Alternatives considered
 
 - A wrapper setting `ORT_LIB_LOCATION`: plain `cargo` would still need pyke,

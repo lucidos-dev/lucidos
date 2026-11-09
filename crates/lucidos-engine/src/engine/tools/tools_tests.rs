@@ -576,7 +576,8 @@ fn tap_thread_id(args: &serde_json::Value, caller: Uuid) -> Option<String> {
     match parsed.tap {
         crate::scheduler::notifications::Tap::Navigate { to } => to.id,
         crate::scheduler::notifications::Tap::Modal
-        | crate::scheduler::notifications::Tap::RestoreSnapshot { .. } => None,
+        | crate::scheduler::notifications::Tap::RestoreSnapshot { .. }
+        | crate::scheduler::notifications::Tap::UndoConfigChange { .. } => None,
     }
 }
 

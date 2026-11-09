@@ -70,10 +70,12 @@ import { MobileAccessPage } from './MobileAccessPage';
 import { usePairedDevices, revokePaired } from './pairedDevices';
 import { pairedRows, pairingIsKnown } from '../../store/actions/pairedDevices';
 import { SectionHeader } from '../shared/SectionHeader';
+import { DevicePersonPicker, PeopleSection } from './PeopleSection';
 import { buildDeviceRows, isUnusedDevice, deviceRowName, deviceRowSummary, submittedDeviceName, type DeviceRowModel } from './deviceList';
 import { LocaleSection } from './LocaleSection';
 import { CodingAgentBinariesSection } from './CodingAgentBinariesSection';
 import { CodingAgentPermissionSection } from './CodingAgentPermissionSection';
+import { CodingAgentContextCeilingSection } from './CodingAgentContextCeilingSection';
 import { CacheKeepAlivePointer, CacheKeepAliveSection } from './CacheKeepAliveSection';
 import { IntelligenceLinkRow, IntelligencePage } from './IntelligencePage';
 import { SystemPage } from './SystemPage';
@@ -309,6 +311,7 @@ function DeviceRow({ row, editingId, setEditingId, onRevoke, gatewayAnswered }: 
         </SkText>
       </div>
       <div class="list-row-actions">
+        {!sk && row?.paired && <DevicePersonPicker deviceId={row.paired.id} />}
         {/* Push is per WORKSPACE, so it hangs off the engine row. A device that
             only paired has none yet, and the toggle STILL renders, off and
             disabled: leaving it out asks the reader why this one row has no
@@ -867,51 +870,54 @@ export function SettingsView() {
       });
     }
     return (
-      <div class="list-rows" data-search-anchor="devices:list">
-        {/* A gateway that broke is not a deployment that never had one, so it
-            says so instead of silently dropping the pairing column. The engine
-            half below still renders: push and preferences are unaffected. */}
-        {paired.paired.status === 'failed' && (
-          <LoadableError noun="paired devices" error={paired.paired.error} />
-        )}
-        <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf containerClass="list-rows" row={() => <DeviceRow />} />}>
-          {loadable.status === 'loaded'
-            ? (() => {
-                const rows = buildDeviceRows(loadable.data, rowsPaired, getDeviceId());
-                if (rows.length === 0) {
-                  return <div class="empty-state">No devices registered</div>;
-                }
-                const unused = rows.filter(isUnusedDevice);
-                const drawRow = (row: DeviceRowModel) => (
-                  <DeviceRow
-                    key={row.id}
-                    row={row}
-                    editingId={editingId}
-                    setEditingId={setEditingId}
-                    onRevoke={revoke}
-                    gatewayAnswered={pairingIsKnown(paired.paired)}
-                  />
-                );
-                return (
-                  <>
-                    {rows.filter((row) => !isUnusedDevice(row)).map(drawRow)}
-                    {unused.length > 0 && (
-                      <>
-                        <SectionHeader
-                          title="Unused devices"
-                          count={unused.length}
-                          collapsed={!unusedDevicesOpen}
-                          onToggle={() => setUnusedDevicesOpen((open) => !open)}
-                        />
-                        <Disclosure open={unusedDevicesOpen}>{unused.map(drawRow)}</Disclosure>
-                      </>
-                    )}
-                  </>
-                );
-              })()
-            : null}
-        </LoadingFade>
-      </div>
+      <>
+        <div class="list-rows" data-search-anchor="devices:list">
+          {/* A gateway that broke is not a deployment that never had one, so it
+              says so instead of silently dropping the pairing column. The engine
+              half below still renders: push and preferences are unaffected. */}
+          {paired.paired.status === 'failed' && (
+            <LoadableError noun="paired devices" error={paired.paired.error} />
+          )}
+          <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf containerClass="list-rows" row={() => <DeviceRow />} />}>
+            {loadable.status === 'loaded'
+              ? (() => {
+                  const rows = buildDeviceRows(loadable.data, rowsPaired, getDeviceId());
+                  if (rows.length === 0) {
+                    return <div class="empty-state">No devices registered</div>;
+                  }
+                  const unused = rows.filter(isUnusedDevice);
+                  const drawRow = (row: DeviceRowModel) => (
+                    <DeviceRow
+                      key={row.id}
+                      row={row}
+                      editingId={editingId}
+                      setEditingId={setEditingId}
+                      onRevoke={revoke}
+                      gatewayAnswered={pairingIsKnown(paired.paired)}
+                    />
+                  );
+                  return (
+                    <>
+                      {rows.filter((row) => !isUnusedDevice(row)).map(drawRow)}
+                      {unused.length > 0 && (
+                        <>
+                          <SectionHeader
+                            title="Unused devices"
+                            count={unused.length}
+                            collapsed={!unusedDevicesOpen}
+                            onToggle={() => setUnusedDevicesOpen((open) => !open)}
+                          />
+                          <Disclosure open={unusedDevicesOpen}>{unused.map(drawRow)}</Disclosure>
+                        </>
+                      )}
+                    </>
+                  );
+                })()
+              : null}
+          </LoadingFade>
+        </div>
+        <PeopleSection />
+      </>
     );
   }
 
@@ -981,6 +987,7 @@ export function SettingsView() {
       <>
         <CodingAgentBinariesSection />
         <CodingAgentPermissionSection />
+        <CodingAgentContextCeilingSection />
         <CacheKeepAlivePointer />
         <div class="settings-section">
           <div class="settings-section-title" data-search-anchor="coding-agents:intelligence">Intelligence ladders</div>
@@ -1041,7 +1048,7 @@ export function SettingsView() {
               With the guard off, it does not gate a coding agent's tools. Claude Code asks
               through its own permissions list below. Codex asks when a command has to
               escape its sandbox. With the guard on, it also judges those commands, unless
-              you turn off Enabled for coding agents. Lucidos answers the plain reads for
+              you turn off Answer coding-agent questions. Lucidos answers the plain reads for
               you, whatever these toggles say.
             </p>
             <p>
@@ -1070,19 +1077,32 @@ export function SettingsView() {
         </div>
         <div class="settings-row settings-row-child" data-search-anchor="command-safety:coding-agents">
           <span class="settings-row-label">
-            Enabled for coding agents
-            <Explainer title="Enabled for coding agents">
+            Answer coding-agent questions
+            <Explainer title="Answer coding-agent questions">
               <p>
-                The guard also judges the commands of <strong>Claude Code</strong> and{' '}
-                <strong>Codex</strong>. A command it places as safe or reversible runs
-                without asking you. Irreversible and catastrophic commands still ask.
+                When <strong>Claude Code</strong> or <strong>Codex</strong> asks to run a
+                command, the guard can answer for you. A command it places as safe or
+                reversible runs. An irreversible or catastrophic one never runs unasked.
+              </p>
+              <p>
+                It sees only what would otherwise ask you. The Claude Code permission mode
+                and the Coding agent permissions list settle the rest first.
               </p>
               <p>
                 Nothing takes a checkpoint first, so a wrong reversible call has no undo.
               </p>
               <p>
-                Off, the guard leaves Claude Code commands to you, and answers only the
-                Codex commands it places as safe.
+                Off, the guard runs no Claude Code command for you, so what Claude Code
+                asks reaches you.
+              </p>
+              <p>
+                Whatever these switches say, the guard refuses a catastrophic command it
+                recognises, such as wiping a disk, without asking.
+              </p>
+              <p>
+                <strong>Codex is different.</strong> It asks only when its own sandbox
+                blocked a command, such as <code>ps</code> on macOS. You never chose that
+                block, so the guard lets a safe one run whatever these switches say.
               </p>
             </Explainer>
           </span>

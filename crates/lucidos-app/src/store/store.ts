@@ -57,12 +57,12 @@ import { displaySection, EVENT_CHANNELS } from '../generated/thread-lifecycle';
 import type { EventChannel, ArchiveState, DisplaySection } from '../generated/thread-lifecycle';
 import type { UnproposedReason } from '../generated/thread-event-wire';
 import { resetContentScroll } from './savedScroll';
-import type { Change, ChangelogRelease, PendingCommits, ReleaseNoticeView, ThreadContext } from '../api/client';
+import type { Change, ChangelogRelease, PendingCommits, ReaderDevices, ReleaseNoticeView, ThreadContext } from '../api/client';
 import type { UpdateRelay, ReleaseCheck } from '../api/client/control';
 import type { ApplyEstimates, LandingLane, MainCheck } from '../api/client/changes';
 import type { EnvironmentVariable, IntelligenceLadder, ModelInfo, ResponseStyle } from '../api/types';
 import type { ChunkGate } from '../utils/lazyComponent';
-import { markSwUpdateDismissed, markEngineVersionDismissed } from '../hooks/sw-update';
+import { markSwUpdateDismissed, markEngineVersionDismissed, markBuildFailureDismissed } from '../hooks/sw-update';
 import { parseRepoPath } from './repoPath';
 import { archivePending } from './rowIntents';
 import { withoutPendingReads, withPendingReadsShown, type PendingReads } from './notificationReads';
@@ -510,6 +510,10 @@ export const whatsNewTargetRelease = signal<string | null>(null);
  *  phone too, which is the opposite of {@link whatsNewSeenRelease} and is
  *  deliberate: a notice asks for work on the workspace, done once. */
 export const releaseNoticeView = signal<Loadable<ReleaseNoticeView>>({ status: 'not-loaded' });
+/** The devices whose reads count as this page's: its person's, on a team
+ *  gateway (ADR 0623). Decides which read requests are still this person's
+ *  to read. Reloaded on `OperatorsChanged`. */
+export const readerDevices = signal<Loadable<ReaderDevices>>({ status: 'not-loaded' });
 export const engineVersion = signal<string | null>(null);
 export const latestEngineVersion = signal<string | null>(null);
 /** The newest client build id in this checkout, from the engine's `/health`.
@@ -1210,7 +1214,19 @@ export function threadInReview(thread: ThreadState): boolean {
 /** A read request whose turn has ended: Review lists it, and the reply's end
  *  coming into view clears it. A wait it still holds does not matter. */
 export function readRequestStanding(thread: ThreadState): boolean {
-  return thread.meta.readRequested === true && !isMidTurn(effectiveThreadStatus(thread));
+  return readRequestedForMe(thread.meta) && !isMidTurn(effectiveThreadStatus(thread));
+}
+
+/** Whether a read request is still this person's to read. On a team gateway
+ *  one person's sighting leaves it for the others (ADR 0623). Until the
+ *  page knows its person, and for a page reading as the team, every
+ *  pending request counts. */
+export function readRequestedForMe(meta: Pick<ThreadMeta, 'readRequested' | 'replySeenDevices'>): boolean {
+  if (meta.readRequested !== true) return false;
+  const reader = readerDevices.value;
+  const mine = reader.status === 'loaded' ? reader.data.devices : null;
+  if (mine === null) return true;
+  return !(meta.replySeenDevices ?? []).some((device) => mine.includes(device));
 }
 
 /** Ids of threads where the agent is stuck waiting on the user (see
@@ -2590,6 +2606,8 @@ export function dismissToast(idOrKey: number | string) {
     // one is being announced; this only has to spend it. See
     // `noteAnnouncedEngineVersion`.
     markEngineVersionDismissed();
+  } else if (idOrKey === BUILD_FAILED_TOAST_KEY) {
+    markBuildFailureDismissed();
   }
 }
 
@@ -3007,6 +3025,10 @@ export function engineNewVersionReady(): boolean {
 // `initiateEngineRestart` can dismiss it when a switch begins, with no import
 // cycle. The progress dialog then replaces it as the version surface.
 export const NEW_VERSION_TOAST_KEY = 'engine-new-version';
+
+// Toast key for the poll-driven build-failed toast, here for the same reason:
+// `dismissToast` records its dismissal with no import cycle.
+export const BUILD_FAILED_TOAST_KEY = 'engine-build-failed';
 
 // Toast key for a failed thread-list refresh. Both surfacing sites share it,
 // so a sustained outage replaces one toast rather than stacking a new one on

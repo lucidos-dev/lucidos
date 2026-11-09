@@ -424,14 +424,12 @@ fn the_callback_port_binds_both_loopback_families() {
 fn workspace_gateway() -> (GatewayState, tempfile::TempDir, Seen) {
     let state = GatewayState::for_tests();
     state
-        .write_paired_devices_for_test(|paired| {
-            paired.devices.push(crate::auth::PairedDevice {
-                id: "device-1".into(),
-                label: "My iPhone".into(),
-                credential_digest: crate::auth::digest("cred-abc"),
-                paired_at: "2020-01-01T00:00:00Z".into(),
-                last_seen_at: None,
-            });
+        .seed_device_for_test(crate::auth::PairedDevice {
+            id: "device-1".into(),
+            label: "My iPhone".into(),
+            credential_digest: crate::auth::digest("cred-abc"),
+            paired_at: "2020-01-01T00:00:00Z".into(),
+            last_seen_at: None,
         })
         .unwrap();
     let dir = test_engine::scratch();

@@ -856,7 +856,7 @@ const PERMISSION_ASK_RULE: &str = "\n\n\
 /// the same from the `request_read` tool's own description.
 const READ_DECISION_RULE: &str = "\n\n\
     READ DECISION: End every turn that asks no question with `lucidos request-read yes|no`, \
-    in its own message, then answer once. Yes for an answer and no change (an investigation, a \
+    in a prose-free message, then answer once. Yes for an answer and no change (investigation, \
     review), or one read later. Else no.";
 
 /// Backend-independent, riding [`append_backend_rules`] like the rules above.
@@ -881,6 +881,25 @@ const SUCCESSOR_SESSION_RULE: &str = "\n\n\
     Lucidos thread, advice to run `/clear` or write a handoff file means the same. A HANDOFF \
     CHECKPOINT is a `lucidos successor offer --at <name>` step in a repo flow: run it and follow \
     it. Setup: `lucidos knowhow read system-knowhow/coding-agent-flows`.";
+
+/// The *ceiling re-entry*: what a session past its *context ceiling* is told
+/// at the turn end that crossed it (ADR 0629). The turn is the handoff alone.
+pub(crate) fn ceiling_reentry_prompt(
+    crossing: crate::engine::context_ceiling::CeilingCrossing,
+) -> String {
+    let thousands = |tokens: u64| tokens.div_ceil(1_000);
+    let sections = crate::engine::successor::NARRATIVE_SECTIONS.join(", ");
+    format!(
+        "CONTEXT CEILING: This session's context holds {}k tokens, past this thread's context \
+         ceiling of {}k. Hand off to a fresh session now, and do no more work on the task.\n\n\
+         1. Commit any finished work.\n\
+         2. Write a handoff narrative to a file. Give it these markdown headings: {sections}.\n\
+         3. Run `lucidos successor start --narrative <file>`, then end your turn.\n\n\
+         Ask no question in this turn. The fresh session reads your narrative first.",
+        thousands(crossing.context_tokens),
+        thousands(crossing.ceiling),
+    )
+}
 
 /// Told only to a sub-thread's session whose parent declared no wake mode. The
 /// chat agent learns the same from the `wake_parent` tool's own description.
@@ -2973,14 +2992,15 @@ mod tests {
     }
 
     /// An agent that wrote its answer beside the read decision's call then
-    /// wrote it again after the call, and the user read it twice.
+    /// wrote it again after the call, and the user read it twice. Other tool
+    /// calls may share its message, so it batches with a skill's last step.
     #[test]
     fn the_read_decision_comes_before_the_answer_in_every_flavor() {
         for (label, base) in all_prompt_flavors() {
             for (backend, backend_label) in all_backends() {
                 let built = append_backend_rules(base.clone(), backend);
                 assert!(
-                    built.contains("in its own message, then answer once"),
+                    built.contains("in a prose-free message, then answer once"),
                     "{label}/{backend_label}"
                 );
             }

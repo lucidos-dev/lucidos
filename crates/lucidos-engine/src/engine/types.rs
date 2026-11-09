@@ -494,7 +494,9 @@ impl AgentUserInput {
                 input: RedeliveredInput::Message { .. },
                 ..
             } => self.origin_event_id,
-            AgentInputKind::ReentryFromEngine | AgentInputKind::Redelivered { .. } => None,
+            AgentInputKind::ReentryFromEngine
+            | AgentInputKind::CeilingReentry
+            | AgentInputKind::Redelivered { .. } => None,
         }
     }
 }
@@ -514,6 +516,9 @@ pub enum AgentInputKind {
     /// `PreEmittedOrigin::is_engine_reentry` origin lands here, which is why the
     /// name says engine rather than child.
     ReentryFromEngine,
+    /// The *ceiling re-entry* (ADR 0629): a `ReentryFromEngine` whose turn is
+    /// the engine's, so its end forces no read or wake decision.
+    CeilingReentry,
     /// An input a session dropped before its agent read it, sent again by the
     /// next session (`agent_session::stranded_follow_ups`). A message is like
     /// `User` and the rest like `ReentryFromEngine`, each with a note that it
@@ -904,6 +909,9 @@ pub struct AgentSession {
     /// takes it at the turn's `Result`: the turn ends on the pick's *quiet
     /// reply* when it has one, and an empty reply counts as finished.
     pub quiet_answer_pending: Option<QuietPick>,
+    /// The turn in flight is the *ceiling re-entry*. A follow-up never
+    /// interrupts it: input waits for the successor session.
+    pub in_ceiling_reentry: bool,
     /// Paired ToolCalled / ToolResult counter, mirrored from the local
     /// counter inside `run_session`. Read by the external watchdog
     /// (`external_watchdog::tick`) — which lives outside `run_session`'s
@@ -1061,6 +1069,7 @@ impl AgentSession {
             last_event_at: Arc::new(AtomicI64::new(0)),
             question_resume_pending: false,
             quiet_answer_pending: None,
+            in_ceiling_reentry: false,
             tools_in_flight: Arc::new(AtomicI32::new(0)),
             question_flushes: Default::default(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,

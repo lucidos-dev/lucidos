@@ -316,6 +316,7 @@ fn thread_event_type_name_extraction() {
                 go_to_review: false,
                 model: None,
                 reasoning_effort: None,
+                continue_key: None,
             },
             "TriggerStarted",
         ),

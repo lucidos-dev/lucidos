@@ -116,7 +116,18 @@ function installProbe(autostartKey: string): void {
         visibleList,
         async sweep(stepFraction: number) {
             const list = visibleList()!;
-            const twoFrames = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+            // A frame takes about 16 ms. One that has not come in 5 s means the
+            // page is not painting, so the sweep names the state and stops.
+            const frame = () => new Promise<void>((resolve, reject) => {
+                const stalled = setTimeout(() => reject(new Error(
+                    `sweep: no frame in 5 s at scrollTop ${list.scrollTop} of ${max()} (scrollHeight ${list.scrollHeight}, ` +
+                    `${mountedRows()} rows mounted, ${steps} steps taken, connected ${list.isConnected}, ` +
+                    `visibility ${document.visibilityState})`,
+                )), 5000);
+                requestAnimationFrame(() => { clearTimeout(stalled); resolve(); });
+            });
+            const twoFrames = async () => { await frame(); await frame(); };
+            let steps = 0;
             const seen = new Map<string, number>();
             const mismatches: { id: string; was: number; now: number; scrollTop: number }[] = [];
             let peakRows = 0;
@@ -137,16 +148,24 @@ function installProbe(autostartKey: string): void {
             // page for the whole test timeout, so the sweep names it instead.
             if (!(step > 0)) throw new Error(`sweep: the list has no height (clientHeight ${list.clientHeight})`);
             const max = () => list.scrollHeight - list.clientHeight;
+            // A sweep down and up takes about 2 * max / step steps. A list that
+            // keeps growing under the sweep would never end it.
+            const stepLimit = Math.ceil(max() / step) * 4 + 10;
+            const counted = () => {
+                if (++steps > stepLimit) throw new Error(`sweep: over ${stepLimit} steps, the list keeps growing (scrollHeight ${list.scrollHeight})`);
+            };
             const stillThere = (at: number) => {
                 if (!list.isConnected) throw new Error(`sweep: the list was replaced while sweeping, at scrollTop ${at}`);
             };
             for (let top = 0; top <= max(); top += step) {
+                counted();
                 list.scrollTop = top;
                 await twoFrames();
                 stillThere(top);
                 check();
             }
             for (let top = max(); top >= 0; top -= step) {
+                counted();
                 list.scrollTop = top;
                 await twoFrames();
                 stillThere(top);

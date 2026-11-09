@@ -250,6 +250,28 @@ pub(crate) fn cmd_archive(ws: &Workspace, thread: &str) -> Result<(), BoxError> 
     send_and_print("POST", &url, http_client()?.post(&url))
 }
 
+/// `lucidos threads context-ceiling`: set a thread's context ceiling. The
+/// engine parses the value and decides who may set it.
+pub(crate) fn cmd_context_ceiling(
+    ws: &Workspace,
+    ceiling: &str,
+    thread: Option<&str>,
+) -> Result<(), BoxError> {
+    let target = match thread {
+        Some(t) => t.trim().to_string(),
+        None => source_thread_id_from_env().ok_or(
+            "LUCIDOS_THREAD_ID is not set, so there is no thread to default to. \
+             Pass --thread <uuid>.",
+        )?,
+    };
+    if uuid::Uuid::parse_str(&target).is_err() {
+        return Err(format!("--thread takes a thread's uuid, and '{target}' is not one.").into());
+    }
+    let url = format!("{}/api/v1/threads/{target}/context-ceiling", ws.base_url());
+    let body = serde_json::json!({ "ceiling": ceiling.trim() });
+    send_and_print("PUT", &url, http_client()?.put(&url).json(&body))
+}
+
 /// Default `--event-id` from the spawning event, the way `spawn-thread`
 /// defaults `--caller-event-id`.
 pub(crate) fn event_id_from_env() -> Option<String> {

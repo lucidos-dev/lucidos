@@ -1,6 +1,6 @@
 import { test, expect, Page } from './fixtures';
 import { randomUUID } from 'crypto';
-import { apiRequest, assertHealthy, navigateToApp, isMobileViewport, hideDashboardRail, rightClickInsideFrame } from './helpers';
+import { apiRequest, assertHealthy, navigateToApp, isMobileViewport, hideDashboardRail, openWidgetCardMenu, rightClickInsideFrame } from './helpers';
 import { psql } from './db-helpers';
 
 /**
@@ -34,43 +34,30 @@ const SHORT_WIDGET = '<!doctype html><html><head><script src="/api/v1/sdk.js"></
 const TALL_WIDGET = '<!doctype html><html><head><script src="/api/v1/sdk.js"></script></head>'
   + '<body><h1>Fares</h1><div style="height: 3000px"></div></body></html>';
 
-const ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8"><rect width="8" height="8" fill="teal"/></svg>';
-
-async function writeWidget(
-  page: Page,
-  appId: string,
-  threadId: string,
-  html: string,
-  { name = WIDGET_NAME, icon = false }: { name?: string; icon?: boolean } = {},
-): Promise<void> {
+async function writeWidget(page: Page, appId: string, threadId: string, html: string): Promise<void> {
   await writeFile(page, `apps/${appId}/index.html`, html);
-  if (icon) await writeFile(page, `apps/${appId}/assets/icon.svg`, ICON_SVG);
   await writeFile(page, `apps/${appId}/manifest.json`, JSON.stringify({
-    name,
+    name: WIDGET_NAME,
     description: 'Fares by date',
     kind: 'widget',
     origin_thread_id: threadId,
-    ...(icon ? { icon: 'assets/icon.svg' } : {}),
   }));
 }
 
-function seedThreadShowingWidget(threadId: string, appId: string | string[], { legacyPin = false }: { legacyPin?: boolean } = {}): void {
+function seedThreadShowingWidget(threadId: string, appId: string, { legacyPin = false }: { legacyPin?: boolean } = {}): void {
   const now = new Date().toISOString();
-  const appIds = Array.isArray(appId) ? appId : [appId];
   psql([
     `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_change_state, coding_agent_is_external_repo) `
       + `VALUES ('${threadId}', '${THREAD_TITLE}', 'chat', '${now}', 2, false, true, 'idle', 'inbox', false, 0, 'none', false)`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) `
       + `VALUES ('${randomUUID()}', 'MessageReceived', '{"text":"compare the fares","mode":"human","channel":"chat"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
-    ...appIds.flatMap((id) => [
+    `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) `
+      + `VALUES ('${randomUUID()}', 'WidgetShown', '{"app_id":"${appId}"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+    // Nothing writes a pin any more, but old rows remain.
+    ...(legacyPin ? [
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) `
-        + `VALUES ('${randomUUID()}', 'WidgetShown', '{"app_id":"${id}"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
-      // Nothing writes a pin any more, but old rows remain.
-      ...(legacyPin ? [
-        `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) `
-          + `VALUES ('${randomUUID()}', 'WidgetPinned', '{"app_id":"${id}"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
-      ] : []),
-    ]),
+        + `VALUES ('${randomUUID()}', 'WidgetPinned', '{"app_id":"${appId}"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+    ] : []),
   ].join(';\n'));
 }
 
@@ -109,7 +96,7 @@ test.describe('Widgets', () => {
     seedThreadShowingWidget(threadId, appId, { legacyPin: true });
     await openThread(page, threadId);
 
-    await expect(card(page).locator('.widget-bar-name')).toHaveText(WIDGET_NAME, { timeout: 15_000 });
+    await expect(card(page)).toHaveAttribute('aria-label', WIDGET_NAME, { timeout: 15_000 });
     await expect(card(page).locator('iframe[data-role="app-ui-frame"]')).toHaveAttribute(
       'src', new RegExp(`/app/${appId}/`),
     );
@@ -117,8 +104,9 @@ test.describe('Widgets', () => {
     await expect(card(page).locator('.widget-box-fade')).toHaveCount(0);
     await expect(page.locator('.widget-chip, .widget-shelf')).toHaveCount(0);
 
-    // Its menu offers no pin.
-    await card(page).getByRole('button', { name: `${WIDGET_NAME} widget actions` }).click();
+    // It draws no bar, and its menu offers no pin.
+    await expect(card(page).locator('.widget-bar')).toHaveCount(0);
+    await openWidgetCardMenu(page, card(page));
     await expect(page.getByRole('menuitem', { name: 'Open in Canvas' })).toBeVisible();
     await expect(page.getByRole('menuitem', { name: /pin|shelf/i })).toHaveCount(0);
     await page.keyboard.press('Escape');
@@ -137,14 +125,14 @@ test.describe('Widgets', () => {
     await writeWidget(page, appId, threadId, SHORT_WIDGET);
     seedThreadShowingWidget(threadId, appId);
     await openThread(page, threadId);
-    await expect(card(page).locator('.widget-bar-name')).toHaveText(WIDGET_NAME, { timeout: 15_000 });
+    await expect(card(page)).toHaveAttribute('aria-label', WIDGET_NAME, { timeout: 15_000 });
     await expect(card(page).frameLocator('iframe').locator('html')).toHaveAttribute('data-widget-place', 'inline');
 
     const menu = await rightClickInsideFrame(page, card(page).locator('.widget-frame'));
     await expect(menu.getByRole('menuitem', { name: 'Open in Canvas' })).toBeVisible();
   });
 
-  test('a tall widget is clipped to its box under a fade, and ⋯ › Open in Canvas shows it whole', async ({ page }) => {
+  test("a tall widget is clipped to its box under a fade, and its menu's Open in Canvas shows it whole", async ({ page }) => {
     await writeWidget(page, appId, threadId, TALL_WIDGET);
     seedThreadShowingWidget(threadId, appId);
     await openThread(page, threadId);
@@ -158,22 +146,30 @@ test.describe('Widgets', () => {
     expect(frameBox && boxBox).toBeTruthy();
     expect(frameBox!.height).toBeLessThanOrEqual(boxBox!.height);
 
-    await card(page).getByRole('button', { name: `${WIDGET_NAME} widget actions` }).click();
+    await openWidgetCardMenu(page, card(page));
     await page.getByRole('menuitem', { name: 'Open in Canvas' }).click();
     await expect(page.locator(`.app-ui-inline iframe[data-role="app-ui-frame"][src*="${appId}"]:visible`))
       .toHaveCount(1, { timeout: 15_000 });
   });
 
-  test("a card's bar shows its widget's app icon, or the monogram tile without one", async ({ page }) => {
-    const plainId = `${appId}-plain`;
-    await writeWidget(page, appId, threadId, SHORT_WIDGET, { icon: true });
-    await writeWidget(page, plainId, threadId, SHORT_WIDGET, { name: 'Ferry times' });
-    seedThreadShowingWidget(threadId, [appId, plainId]);
+  /** The card is a bare box like a dashboard tile, centred in its turn's
+   *  content column: its parent's content box. */
+  test('centres the card in its turn, with no bar and no shadow', async ({ page }) => {
+    await writeWidget(page, appId, threadId, SHORT_WIDGET);
+    seedThreadShowingWidget(threadId, appId);
     await openThread(page, threadId);
-
-    await expect(page.locator(`.inline-widget:visible .app-icon-image img[src*="/app/${appId}/assets/icon.svg"]`).first())
-      .toBeVisible({ timeout: 15_000 });
-    const plain = page.locator('.inline-widget:visible', { hasText: 'Ferry times' }).first();
-    await expect(plain.locator('.app-icon-monogram')).toHaveText('F');
+    await expect(card(page)).toHaveAttribute('aria-label', WIDGET_NAME, { timeout: 15_000 });
+    const geo = await card(page).evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      const parent = el.parentElement!.getBoundingClientRect();
+      const pad = getComputedStyle(el.parentElement!);
+      return {
+        left: r.left - parent.left - parseFloat(pad.paddingLeft),
+        right: parent.right - parseFloat(pad.paddingRight) - r.right,
+        shadow: getComputedStyle(el).boxShadow,
+      };
+    });
+    expect(Math.abs(geo.left - geo.right)).toBeLessThanOrEqual(1);
+    expect(geo.shadow).toBe('none');
   });
 });

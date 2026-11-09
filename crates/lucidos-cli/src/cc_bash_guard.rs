@@ -1,5 +1,6 @@
-//! PreToolUse hook for Claude Code's `Bash` tool — blocks the kill patterns
-//! that have caught the engine's CC subprocesses by accident.
+//! PreToolUse hook for Claude Code's `Bash` tool. It blocks the kill patterns
+//! that have caught the engine's CC subprocesses by accident. It also sends
+//! back a `cd` plus output redirection, which CC would put to the user.
 //!
 //! Background: a CC subprocess's argv names tools like `cargo` and `rustc`
 //! (its `--allowedTools` list, for one). So a CC session running
@@ -47,6 +48,15 @@ const MSG_FULL_CMDLINE_KILL: &str =
      capture the PID at launch (`cargo build & PID=$!; kill $PID`). The guard \
      reads the command as text, so a quoted mention trips it too: rephrase it.";
 
+const MSG_CD_WITH_REDIRECT: &str =
+    "Refusing a `cd` combined with an output redirection (`>`, `>>`, `&>`, \
+     `tee`). Claude Code's own safety check stops every such command for \
+     manual approval, whatever the allow rules say, so the user would get a \
+     permission card. Drop the `cd` and use absolute paths: \
+     `cat > /tmp/dir/file.html` rather than `cd /tmp/dir && cat > file.html`. \
+     The guard reads the command as text, so a `>` inside a heredoc body \
+     counts too: write that file without the `cd`.";
+
 #[derive(Debug, Deserialize)]
 struct HookPayload {
     tool_input: BashToolInput,
@@ -70,7 +80,97 @@ pub(crate) fn decide(command: &str) -> GuardDecision {
     if matches_full_cmdline_kill(command) {
         return GuardDecision::Block(MSG_FULL_CMDLINE_KILL);
     }
+    if matches_cd_with_redirect(command) {
+        return GuardDecision::Block(MSG_CD_WITH_REDIRECT);
+    }
     GuardDecision::Allow
+}
+
+/// A `cd` in command position anywhere in the command, plus an unquoted
+/// output redirection or a `tee` anywhere in it. CC's check reads the whole
+/// compound command, so order and statement do not matter.
+fn matches_cd_with_redirect(cmd: &str) -> bool {
+    runs_cd(cmd) && (has_output_redirect(cmd) || runs_tee(cmd))
+}
+
+fn runs_cd(cmd: &str) -> bool {
+    in_command_position(cmd, "cd")
+}
+
+fn runs_tee(cmd: &str) -> bool {
+    in_command_position(cmd, "tee")
+}
+
+/// Words after which the next word is still a command name.
+const COMMAND_PREFIXES: [&str; 11] = [
+    "if", "elif", "while", "until", "do", "then", "else", "!", "time", "builtin", "command",
+];
+
+/// True when `word` is a `NAME=value` assignment prefix.
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && name.bytes().all(is_word_char)
+    })
+}
+
+/// True when `word` starts a command: at the start, after `;`, `&`, `|`, `(`,
+/// `{`, a backtick or a newline, or after a [`COMMAND_PREFIXES`] word or an
+/// assignment.
+fn in_command_position(cmd: &str, word: &str) -> bool {
+    let mut offset = 0;
+    while let Some(pos) = find_word(&cmd[offset..], word) {
+        let start = offset + pos;
+        offset = start + word.len();
+        let lead = cmd[..start].trim_end_matches([' ', '\t']);
+        let after_keyword = lead
+            .rsplit(|c: char| c.is_whitespace() || ";&|(".contains(c))
+            .next()
+            .is_some_and(|last| COMMAND_PREFIXES.contains(&last) || is_assignment(last));
+        if lead.is_empty() || lead.ends_with([';', '&', '|', '(', '{', '`', '\n']) || after_keyword
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when `cmd` holds a `>` outside quotes that writes a file: `>`, `>>`,
+/// `2>`, `&>`, `>|`, `>&file`. A descriptor copy (`2>&1`, `>&2`, `>&-`) and a
+/// process substitution (`>(…)`) write no file. A newline ends any quote, so
+/// a stray apostrophe in a comment or heredoc cannot hide a later redirect.
+fn has_output_redirect(cmd: &str) -> bool {
+    let bytes = cmd.as_bytes();
+    let mut quote = None;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if std::mem::take(&mut escaped) {
+            continue;
+        }
+        match (quote, b) {
+            (_, b'\n') => quote = None,
+            (Some(b'\''), b'\'') => quote = None,
+            (Some(b'\''), _) => {}
+            (_, b'\\') => escaped = true,
+            (None, b'"' | b'\'') => quote = Some(b),
+            (Some(b'"'), b'"') => quote = None,
+            (None, b'>') if bytes.get(i.wrapping_sub(1)) != Some(&b'>') => {
+                let mut next = i + 1;
+                if matches!(bytes.get(next), Some(b'>' | b'|')) {
+                    next += 1;
+                }
+                let copies_descriptor = bytes.get(next) == Some(&b'&')
+                    && bytes
+                        .get(next + 1)
+                        .is_some_and(|c| c.is_ascii_digit() || *c == b'-');
+                if !copies_descriptor && bytes.get(next) != Some(&b'(') {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Option letters that take a value in both procps and BSD `pkill`/`pgrep`.
@@ -639,6 +739,73 @@ mod tests {
         // `pkill foo` then a separate `pkill claude` in next statement is still blocked.
         // But pkill foo on its own should be allowed.
         assert_allowed("pkill foo");
+    }
+
+    #[test]
+    fn blocks_the_cd_heredoc_command_that_prompted_the_user() {
+        let cmd = "mkdir -p /tmp/toast-open && cd /tmp/toast-open && for v in a b; do\n\
+                   label=$([ $v = a ] && echo \"Open\" || echo \"Open thread\")\n\
+                   cat > $v.html <<EOF\n<div>$label</div>\nEOF\n\
+                   echo \"\" > $v.css\ndone; cd - >/dev/null";
+        let GuardDecision::Block(msg) = decide(cmd) else {
+            panic!("expected block");
+        };
+        assert!(msg.contains("absolute paths"), "{}", msg);
+    }
+
+    #[test]
+    fn blocks_cd_with_any_output_redirection() {
+        assert_blocked("cd /tmp/x && echo hi > out.txt");
+        assert_blocked("cd /tmp/x && echo hi >> out.txt");
+        assert_blocked("cd /tmp/x; make 2> err.log");
+        assert_blocked("cd /tmp/x && make &> build.log");
+        assert_blocked("cd /tmp/x && echo hi >| out.txt");
+        assert_blocked("echo hi > /tmp/x/out.txt && cd /tmp/x");
+        assert_blocked("(cd crates && ls) > /tmp/list.txt");
+        assert_blocked("for d in a b; do cd $d; ls > list.txt; done");
+        assert_blocked("if true; then cd /tmp; fi; echo x > y");
+        assert_blocked("cd /tmp/x && echo hi | tee out.txt");
+        assert_blocked("cd crates && cargo build >&build.log");
+        assert_blocked("builtin cd /tmp/x && echo hi > out.txt");
+        assert_blocked("command cd /tmp/x && echo hi > out.txt");
+        assert_blocked("if cd /tmp; then echo x > out; fi");
+        assert_blocked("while cd ..; do ls > list.txt; done");
+        assert_blocked("TMPDIR=/tmp cd /tmp && echo x > out");
+    }
+
+    #[test]
+    fn blocks_cd_redirect_after_a_stray_apostrophe() {
+        assert_blocked("cd /tmp/x\n# don't clobber\nls > out.txt");
+        assert_blocked("cd /tmp/x && cat <<EOF\nit's\nEOF\nls > out.txt");
+    }
+
+    #[test]
+    fn allows_cd_with_descriptor_copies_only() {
+        assert_allowed("cd crates && cargo build 2>&1 | tail -5");
+        assert_allowed("cd crates && echo oops >&2");
+        assert_allowed("cd crates && diff <(ls) >(cat)");
+        assert_allowed("cd crates && exec 3>&-");
+    }
+
+    #[test]
+    fn allows_redirection_without_cd() {
+        assert_allowed("echo hi > /tmp/out.txt");
+        assert_allowed("cat > /tmp/x/a.html <<EOF\n<div>x</div>\nEOF");
+        assert_allowed("git -C crates log > /tmp/log.txt");
+        assert_allowed("echo hi | tee /tmp/out.txt");
+    }
+
+    #[test]
+    fn allows_cd_without_redirection() {
+        assert_allowed("cd crates && cargo test");
+        assert_allowed(r#"cd crates && echo "a > b""#);
+        assert_allowed("cd crates && echo 'a > b'");
+    }
+
+    #[test]
+    fn ignores_cd_and_tee_outside_command_position() {
+        assert_allowed("echo cd > /tmp/note.txt");
+        assert_allowed("grep -r tee src > /tmp/hits.txt");
     }
 
     #[test]

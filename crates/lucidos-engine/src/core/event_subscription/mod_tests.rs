@@ -342,6 +342,36 @@ fn the_gate_admits_ordinary_lifecycle_and_per_action_events() {
     assert!(is_subscribable(&ThreadEvent::ThreadArchived));
 }
 
+/// An engine turn's idle records no work the user asked for, so the gate
+/// drops it. A ceiling re-entry is one, like a keep-alive (ADR 0629).
+#[test]
+fn engine_turn_idles_are_never_subscribable() {
+    use crate::engine::thread_events::{CEILING_REENTRY_IDLE_REASON, KEEP_ALIVE_IDLE_REASON};
+    let idle = |reason: Option<&str>| ThreadEvent::CodingAgentIdled {
+        has_changes: false,
+        is_external_repo: false,
+        requires_restart: false,
+        cc_session_id: None,
+        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        reason: reason.map(str::to_string),
+        worktree_path: None,
+        worktree_head_sha: None,
+        bg_bash_pending: false,
+    };
+    assert!(is_subscribable(&idle(None)), "the agent's own idle fires");
+    for reason in [KEEP_ALIVE_IDLE_REASON, CEILING_REENTRY_IDLE_REASON] {
+        assert!(
+            !is_subscribable(&idle(Some(reason))),
+            "the gate admitted {reason}"
+        );
+        assert!(
+            crate::engine::thread_events::not_an_engine_turn_idle_sql("")
+                .contains(&format!("'{reason}'")),
+            "the SQL scans disagree with the predicate on {reason}"
+        );
+    }
+}
+
 /// No agent, trigger or event wait may see a side question (ADR 0320): the
 /// gate drops each one, both surfaces refuse the name, and no list offers it.
 #[test]

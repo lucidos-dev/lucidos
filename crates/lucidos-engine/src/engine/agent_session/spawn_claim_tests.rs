@@ -301,3 +301,27 @@ async fn an_apply_hands_the_thread_to_its_merge_session_without_a_gap() {
         Err(ClaimRefused::LiveSession)
     ));
 }
+
+/// I4: only a real run settles the handoff a session past its ceiling owes.
+/// A keep-alive claim never does, so a beat never ends the session it keeps.
+#[test]
+fn only_a_run_claim_settles_an_owed_ceiling_handoff() {
+    assert!(ClaimFor::Run.settles_owed_handoff());
+    assert!(!ClaimFor::KeepAlive.settles_owed_handoff());
+    assert!(!ClaimFor::Apply.settles_owed_handoff());
+}
+
+/// I4: the claim settles the owed handoff before it reads the backend, which
+/// a pending handoff names.
+#[test]
+fn the_claim_settles_the_owed_handoff_before_it_reads_the_backend() {
+    let src = include_str!("spawn_claim.rs");
+    let settle = src
+        .find("self.settle_owed_ceiling_handoff(thread_id).await;")
+        .expect("the claim settles an owed handoff");
+    let backend = src
+        .find("resolve_thread_coding_agent(self.pool(), thread_id, requested_coding_agent)")
+        .expect("the claim reads the backend");
+    assert!(settle < backend);
+    assert!(src[..settle].contains("if purpose.settles_owed_handoff() {"));
+}

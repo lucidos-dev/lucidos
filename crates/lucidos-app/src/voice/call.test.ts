@@ -9,7 +9,13 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { SPEECH_GATE_DEFAULTS } from './speechGate';
 import { observeSourceGeneration } from '../utils/restoreSourceGeneration';
-import { CAPTURE_FRAME_MS, PREROLL_FRAMES_MAX, type CallRunner, createCallRunner } from './call';
+import {
+  CAPTURE_FRAME_MS,
+  ONSET_RUNS_HELD,
+  PREROLL_FRAMES_MAX,
+  type CallRunner,
+  createCallRunner,
+} from './call';
 import {
   BARGE_IN_QUIET_MS,
   LANDING_BOUND_MS,
@@ -85,12 +91,19 @@ class FakeDevice implements AudioDevice {
   closeError: unknown = null;
   note: string | null = null;
 
+  /** Whether the talker's audio is still sounding. Tests set it. */
+  playing = false;
+
   play(pcm: ArrayBuffer): void {
     this.played.push(pcm);
   }
 
   stopPlayback(): void {
     this.stops++;
+  }
+
+  isPlaying(): boolean {
+    return this.playing;
   }
 
   playbackGaps(): PlaybackGaps {
@@ -625,6 +638,75 @@ describe('audio still leaving the speaker as the floor flips', () => {
     h.speak(SPEECH_GATE_DEFAULTS.framesToOpen);
     expect(h.last().utteranceCount).toBe(1);
     expect(h.last().utterance).toBe('live');
+  });
+});
+
+/**
+ * What goes up to the provider while the talker speaks.
+ *
+ * Echo cancellation leaves a residue of the talker's own voice, and the
+ * provider's VAD hears it as the caller. Answered, it is the talker replying to
+ * itself. So over the talker only the caller's own speech goes up.
+ */
+describe('audio sent over the talker', () => {
+  const { threshold, framesToOpen } = SPEECH_GATE_DEFAULTS;
+  const loud = threshold * 2;
+  const quiet = (step: number) => threshold * step * 0.01;
+  const firstSample = (pcm: ArrayBuffer) => new DataView(pcm).getInt16(0, true);
+  const asSent = (rms: number) => firstSample(floatToPcm16(new Float32Array(1).fill(rms)));
+  const onsetFramesMax = framesToOpen * ONSET_RUNS_HELD;
+
+  async function talkerSpeaking(): Promise<Harness> {
+    const h = await liveCall();
+    h.socket().say({ type: 'talker_transcript', text: 'here is the answer' });
+    expect(h.last().phase).toBe('speaking');
+    return h;
+  }
+
+  it('sends no echo the gate calls quiet', async () => {
+    const h = await talkerSpeaking();
+    h.hush(GAVE_UP_THE_FLOOR);
+    expect(h.socket().audio).toHaveLength(0);
+  });
+
+  /** The loud frames before the gate opens are held too. The bound keeps the
+   *  newest frames, so the oldest quiet ones are the ones that go. */
+  it('sends the held onset first, oldest first, when the caller cuts in', async () => {
+    const h = await talkerSpeaking();
+    h.hush(GAVE_UP_THE_FLOOR);
+    const steps = Array.from({ length: onsetFramesMax + 5 }, (_, i) => i + 1);
+    for (const step of steps) h.capture(quiet(step));
+    h.speak(framesToOpen + 1);
+    expect(h.socket().cuts()).toEqual(['barge_in']);
+
+    const quietKept = steps.slice(-(onsetFramesMax - (framesToOpen - 1)));
+    expect(h.socket().audio.map(firstSample)).toEqual([
+      ...quietKept.map((step) => asSent(quiet(step))),
+      ...Array<number>(framesToOpen + 1).fill(asSent(loud)),
+    ]);
+  });
+
+  it('drops the held echo when the talker finishes uncut', async () => {
+    const h = await talkerSpeaking();
+    h.hush(5);
+    h.socket().say({ type: 'talker_turn_ended' });
+    h.hush(1);
+    expect(h.socket().audio).toHaveLength(1);
+  });
+
+  /** The turn ends when the words are generated. Seconds of them can still be
+   *  queued in the speaker, and their echo is just as much echo. */
+  it('holds echo until the reply has finished playing', async () => {
+    const h = await talkerSpeaking();
+    h.device().playing = true;
+    h.socket().say({ type: 'talker_turn_ended' });
+    expect(h.last().phase).toBe('listening');
+    h.hush(GAVE_UP_THE_FLOOR);
+    expect(h.socket().audio).toHaveLength(0);
+
+    h.device().playing = false;
+    h.hush(1);
+    expect(h.socket().audio).toHaveLength(1);
   });
 });
 

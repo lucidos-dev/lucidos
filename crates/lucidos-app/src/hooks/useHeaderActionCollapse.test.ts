@@ -130,14 +130,12 @@ describe('computeHeaderCollapse', () => {
   // right edge must stay at least a gap left of the cluster, at every container
   // width and through all three arms of the clamp.
   //
-  // The reserve is sized for the widest cluster this row can hold, so the two
-  // middle arms are slack by construction and the interesting one is the floor:
-  // there the box stops shrinking and the cluster keeps coming, which is the
-  // regime the collapse exists for.
+  // The reserve holds overflow and bell. Optional actions fold on the middle
+  // arm before entering the fixed title span.
   const SPAN = 320;                    // --desktop-nav-span, 20rem
   const SPAN_MAX = 576;                // --desktop-content-title-span-max, 36rem
-  const MIN_SPAN = 128;                // --desktop-nav-min-span, 8rem
-  const RESERVE = 3 * ICON + 4 * GAP;  // --content-side-reserve
+  const MIN_SPAN = 2 * ICON + 2.1 * 16; // two chevrons and the mark tap target
+  const RESERVE = 2 * ICON + 3 * GAP;  // --content-side-reserve
   const UNFOLDED = 7 * ICON + 8 * GAP; // --content-unfolded-reserve
 
   const clamp = (min: number, value: number, max: number) => Math.max(min, Math.min(value, max));
@@ -180,37 +178,27 @@ describe('computeHeaderCollapse', () => {
     }
   });
 
-  it('the reserve holds two icons and the bell, so mid-widths never fold them', () => {
-    // The claim --content-side-reserve is sized on: two context icons riding
-    // the row plus the bell, and the two gaps between them, plus the two gaps
-    // the fit model charges the centred box.
-    const widest = appUiInput({ actionWidths: [ICON, ICON] });
-    expect(iconsRowWidth(widest, 0) + 2 * GAP).toBe(RESERVE);
-
-    // The clamp's middle arm: the box takes exactly what the two reserves
-    // leave, so the cluster has exactly the reserve and fits without folding.
+  it('folds two optional icons before they displace the fixed title span', () => {
+    const input = appUiInput({ actionWidths: [ICON, ICON] });
+    expect(iconsRowWidth(input, 2) + 2 * GAP).toBe(RESERVE);
     for (const w of [400, 450, 500, 550]) {
       const centreWidth = boxWidth(w);
-      expect(centreWidth, `container ${w} is off the middle arm`).toBe(w - 2 * RESERVE);
       expect(computeHeaderCollapse({
-        ...widest,
-        containerWidth: w,
-        centreWidth,
-        leadingWidth: (w - centreWidth) / 2,
-      })).toEqual({ collapsed: 0, titleEllipsized: false });
+        ...input, containerWidth: w, centreWidth, leadingWidth: (w - centreWidth) / 2,
+      })).toEqual({ collapsed: 2, titleEllipsized: false });
     }
   });
 
   it('a third icon rides only where the box leaves more than the reserve', () => {
     // Room alone decides. On the middle arm a third icon would cross the
-    // reserve, so two fold into ⋯ and the cluster is three boxes again. Where
+    // reserve, so all three fold into ⋯ and the cluster is two boxes again. Where
     // the box sits at its span cap, the row has room and nothing folds.
     const three = appUiInput({ actionWidths: [ICON, ICON, ICON] });
     for (const w of [400, 450, 500, 550]) {
       const centreWidth = boxWidth(w);
       expect(computeHeaderCollapse({
         ...three, containerWidth: w, centreWidth, leadingWidth: (w - centreWidth) / 2,
-      })).toEqual({ collapsed: 2, titleEllipsized: false });
+      })).toEqual({ collapsed: 3, titleEllipsized: false });
     }
     const wide = 2000;
     const capped = boxWidth(wide);
@@ -241,10 +229,10 @@ describe('computeHeaderCollapse', () => {
   });
 
   it('folds on the min-span arm, where the box stops giving way', () => {
-    // A Canvas pane at its floor (360px) with two context actions: the box is
+    // A hypothetical row below the Canvas floor with two actions: the box is
     // pinned at MIN_SPAN, so the cluster would reach it and the icons go into ⋯
     // instead. This is the whole reason the measurement survives the centring.
-    const w = 360;
+    const w = 260;
     const centreWidth = boxWidth(w);
     expect(centreWidth).toBe(MIN_SPAN);
     const input = {

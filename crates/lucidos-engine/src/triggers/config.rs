@@ -1,5 +1,9 @@
 use crate::core::event_subscription::EventSubscription;
+use crate::core::permission_wait::PermissionWait;
 use crate::engine::command_guard::SideEffectCategory;
+use crate::engine::context_ceiling::ContextCeiling;
+use crate::triggers::actor::{ActorField, ACTOR_FIELD_KEY};
+use crate::triggers::continue_key::ContinueKeySpec;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -130,6 +134,13 @@ pub struct TriggerConfig {
     /// irreversible side-effect — the command guard fails the trigger if its
     /// intent tries to. Only consulted when the `command_guard` preference is on.
     pub side_effect_grant: Vec<SideEffectCategory>,
+    /// The trigger's **permission wait**: how long a coding-agent card its runs
+    /// park waits for an answer. Its sub-threads inherit it. `None` reads the
+    /// workspace preference `unattended_permission_wait`.
+    pub permission_wait: Option<PermissionWait>,
+    /// The trigger's **context ceiling** (ADR 0629), copied onto each thread it
+    /// fires. `None` leaves those threads on the workspace preference.
+    pub context_ceiling: Option<ContextCeiling>,
     /// The MCP server ids this trigger's fires use (ADR 0430). A fire enables
     /// each in its thread before round 1, and only these servers' tools run
     /// silently in it. Any other MCP call in the fire is refused.
@@ -159,6 +170,13 @@ pub struct TriggerConfig {
     /// running it somewhere else: a trigger fires unattended, so a silent move
     /// to another vendor is one nobody would notice. Intent-only, like `model`.
     pub provider: Option<String>,
+    /// The **continue key** spec (ADR 0623). A fire whose key matches an open
+    /// thread continues it. `None` starts a new thread on every fire.
+    /// Intent-only: a script fire starts no thread.
+    pub continue_key: Option<ContinueKeySpec>,
+    /// The **actor** field (ADR 0623): the payload path of the email of the
+    /// person behind a fire. `None` credits nobody. Intent-only.
+    pub actor: Option<ActorField>,
 }
 
 /// True if `effort` is a reasoning tier a trigger may pin. Shares the closed set
@@ -402,6 +420,46 @@ pub(crate) fn parse_side_effect_grant(field: Option<&Value>) -> Vec<SideEffectCa
     out
 }
 
+/// Read a stored `permission_wait`. Absent or null reads as `None`. So does a
+/// value the parser refuses, so one bad row can never wedge the in-memory
+/// config: the API refuses it at the boundary.
+pub(crate) fn parse_permission_wait(
+    field: Option<&Value>,
+    trigger_id: &str,
+) -> Option<PermissionWait> {
+    let value = field.filter(|v| !v.is_null())?;
+    PermissionWait::from_json(value)
+        .map_err(|e| {
+            log!(
+                "[Triggers] Ignored permission_wait on {}: {}",
+                trigger_id,
+                e
+            )
+        })
+        .ok()
+}
+
+/// Read a stored `context_ceiling`, like [`parse_permission_wait`]: absent,
+/// null or refused reads as `None`.
+pub(crate) fn parse_context_ceiling(
+    field: Option<&Value>,
+    trigger_id: &str,
+) -> Option<ContextCeiling> {
+    let value = field.filter(|v| !v.is_null())?;
+    value
+        .as_str()
+        .ok_or_else(|| format!("a context ceiling is a string (got {value})"))
+        .and_then(ContextCeiling::parse)
+        .map_err(|e| {
+            log!(
+                "[Triggers] Ignored context_ceiling on {}: {}",
+                trigger_id,
+                e
+            )
+        })
+        .ok()
+}
+
 /// A submitted or stored list of MCP server ids: trimmed, blanks dropped, and
 /// each id kept once, in its first position. Shared by the HTTP handlers, the
 /// triggers LLM tool and the event readers, so none of them can disagree.
@@ -494,6 +552,8 @@ impl TriggerConfig {
             .map(String::from)
             .unwrap_or_else(|| slugify_trigger_name_with_fallback(&name, &id));
         let side_effect_grant = parse_side_effect_grant(payload.get("side_effect_grant"));
+        let permission_wait = parse_permission_wait(payload.get("permission_wait"), &id);
+        let context_ceiling = parse_context_ceiling(payload.get("context_ceiling"), &id);
         let mcp_servers = parse_mcp_servers(payload.get("mcp_servers"));
         // Plugin provenance (ADR 0019) — present only on plugin-auto-registered
         // triggers; absent on user-created ones (→ None, never plugin-managed).
@@ -511,6 +571,8 @@ impl TriggerConfig {
         let reasoning_effort = read_trimmed_string(payload, "reasoning_effort")
             .filter(|e| is_valid_reasoning_effort(e));
         let provider = read_trimmed_string(payload, "provider").filter(|p| is_valid_provider(p));
+        let continue_key = ContinueKeySpec::from_stored(payload.get("continue_key"), &id);
+        let actor = ActorField::from_stored(payload.get(ACTOR_FIELD_KEY), &id);
 
         Ok(TriggerConfig {
             id,
@@ -527,11 +589,15 @@ impl TriggerConfig {
             go_to_review,
             group_id,
             side_effect_grant,
+            permission_wait,
+            context_ceiling,
             mcp_servers,
             plugin_id,
             model,
             reasoning_effort,
             provider,
+            continue_key,
+            actor,
         })
     }
 
@@ -657,6 +723,35 @@ impl TriggerConfig {
         }
     }
 
+    /// This config as a `TriggerCreated` payload. Both
+    /// [`Self::from_created_payload`] and [`Self::apply_update`] read it back
+    /// to this config, which is what a trigger Undo relies on (ADR 0623).
+    pub fn to_created_payload(&self) -> Value {
+        serde_json::json!({
+            "trigger_id": self.id,
+            "name": self.name,
+            "slug": self.slug,
+            "schedule": self.schedule,
+            "timezone": self.timezone,
+            "run": self.run,
+            "on": self.on,
+            "paused": self.paused,
+            "app_id": self.app_id,
+            "go_to_review": self.go_to_review,
+            "group_id": self.group_id,
+            "side_effect_grant": self.side_effect_grant,
+            "permission_wait": self.permission_wait,
+            "context_ceiling": self.context_ceiling,
+            "mcp_servers": self.mcp_servers,
+            "plugin_id": self.plugin_id,
+            "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
+            "provider": self.provider,
+            "continue_key": self.continue_key,
+            ACTOR_FIELD_KEY: self.actor,
+        })
+    }
+
     /// Apply a partial update from a TriggerUpdated event payload.
     /// Only fields present in the payload are updated.
     ///
@@ -730,10 +825,27 @@ impl TriggerConfig {
         if payload.get("side_effect_grant").is_some() {
             self.side_effect_grant = parse_side_effect_grant(payload.get("side_effect_grant"));
         }
+        // permission_wait: a value replaces it, null clears it back to the
+        // workspace preference, and absent leaves it as-is.
+        if payload.get("permission_wait").is_some() {
+            self.permission_wait = parse_permission_wait(payload.get("permission_wait"), &self.id);
+        }
+        // context_ceiling: the same three cases as permission_wait.
+        if payload.get("context_ceiling").is_some() {
+            self.context_ceiling = parse_context_ceiling(payload.get("context_ceiling"), &self.id);
+        }
         // mcp_servers: full replacement when present, like `on`; `[]` or null
         // clears it, and absent leaves it as-is.
         if payload.get("mcp_servers").is_some() {
             self.mcp_servers = parse_mcp_servers(payload.get("mcp_servers"));
+        }
+        // continue_key: full replacement when present; `[]` or null clears.
+        if payload.get("continue_key").is_some() {
+            self.continue_key = ContinueKeySpec::from_stored(payload.get("continue_key"), &self.id);
+        }
+        // actor: a path replaces it, null or "" clears, absent leaves it.
+        if payload.get(ACTOR_FIELD_KEY).is_some() {
+            self.actor = ActorField::from_stored(payload.get(ACTOR_FIELD_KEY), &self.id);
         }
         // model / reasoning_effort: explicit null clears back to the account
         // default, a string sets, absent leaves as-is. The same triple

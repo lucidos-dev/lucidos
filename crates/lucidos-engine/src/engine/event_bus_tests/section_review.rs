@@ -310,6 +310,7 @@ async fn trigger_threads_skip_review() {
             go_to_review: false,
             model: None,
             reasoning_effort: None,
+            continue_key: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),
@@ -371,6 +372,7 @@ async fn trigger_with_go_to_review_surfaces_first_response_in_review() {
             go_to_review: true,
             model: None,
             reasoning_effort: None,
+            continue_key: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),
@@ -431,6 +433,7 @@ async fn trigger_followup_response_goes_to_review() {
             go_to_review: false,
             model: None,
             reasoning_effort: None,
+            continue_key: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),
@@ -549,6 +552,7 @@ async fn engine_message_received_does_not_promote_trigger_thread_to_review() {
             go_to_review: false,
             model: None,
             reasoning_effort: None,
+            continue_key: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),

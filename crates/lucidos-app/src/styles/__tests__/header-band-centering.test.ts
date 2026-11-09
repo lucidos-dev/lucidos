@@ -300,8 +300,12 @@ describe('on the overlay build the leading control only steps sideways', () => {
     // length, so this is the drift check that makes the copy safe. Horizontal
     // only: the row keeps the base rule's bar centring, so the hamburger stays
     // on the bar's one line.
-    expect(rule.props.get('left')).toBe(`max(${base}, var(--titlebar-lights-reserve))`);
-    expect([...rule.props.keys()], 'horizontal-only here too').toEqual(['left']);
+    expect(rule.props.get('left')).toBeUndefined();
+    expect(rule.props.get('padding-left')).toBe('var(--content-leading-inset)');
+    expect(rule.props.get('--content-leading-inset')).toBe(
+      'max(0px, calc(var(--titlebar-lights-reserve) - var(--divider-x) - var(--divider-width)))',
+    );
+    expect([...rule.props.keys()], 'horizontal-only here too').toEqual(['--content-leading-inset', 'padding-left']);
   });
 
   it('the drawer row leads with the toggle\'s room, which carries the lights reserve', () => {

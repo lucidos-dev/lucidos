@@ -405,25 +405,85 @@ fn derive_allow_pattern_narrow_remains_none_for_path_tools() {
     );
 }
 
-/// `Bash rm -rf .../.claude/...` triggers the permission card even with
-/// bare `Bash` in `--allowedTools` — so persisting a Broad (`Bash`) or
-/// Narrow (`Bash(rm:*)`) grant from that card lies about future
-/// suppression. The engine refuses to derive a pattern; the UI hides the
-/// misleading buttons. Session scope is unaffected because the engine
-/// intercepts before CC's gate. See `CC_PROTECTED_PATH_MARKERS` for the
-/// probing notes.
+/// A write under `.claude/` or `.git/` is protected: no persisted grant
+/// covers it, so it could not widen the agent's permissions or plant a hook.
 #[test]
-fn input_touches_protected_path_detects_dot_claude_in_bash_command() {
-    let input = serde_json::json!({
-        "command": "rm -rf /Users/me/.claude/skills/grill"
-    });
-    assert!(input_touches_protected_path("Bash", &input));
+fn input_touches_protected_path_detects_a_write_under_a_protected_dir() {
+    for command in [
+        "rm -rf /Users/me/.claude/skills/grill",
+        "echo '{}' > .claude/settings.json",
+        "cat a >> .git/config",
+        "cp hook.sh .git/hooks/pre-commit",
+        "mv x .claude/settings.local.json",
+        "sed -i s/a/b/ .claude/rules/x.md",
+        "tee .git/config < cfg",
+        "mkdir -p .claude/hooks",
+        "touch .git/hooks/post-merge",
+        "git status && rm .git/index.lock",
+        "find .claude/ -name '*.md' -delete",
+        "find . -path '*/.git/*' -exec rm {} +",
+        "sort -o .claude/x.md y",
+        "git add .claude/rules/x.md",
+        "bash -c 'echo x > .claude/settings.json'",
+        "python3 - <<'EOF'\nopen('.claude/settings.json', 'w').write('{}')\nEOF",
+        "cat $(echo .claude/x)",
+        // Quote shapes the masking must read as the shell does, so a write
+        // never hides inside what only looks like one quoted argument.
+        "echo $'\\''\nrm -rf .claude/x\necho '\nx'",
+        "echo \\$'a\\'\nrm -rf .claude/x\necho '\nx'",
+        "cat <<EOF\n'\nEOF\nrm -rf .claude/x\necho '\nx'",
+        "echo it\\'s; rm -rf .claude/x",
+        // A read hands the path to a later writing segment.
+        "grep -rl foo .claude/rules | xargs sed -i 's/foo/bar/'",
+        "find .claude/ -name '*.json' | xargs rm",
+        "echo 'echo {} > .claude/settings.json' | sh",
+        "N=.claude/settings.json; tee \"$N\" < cfg",
+        // A heredoc body that runs as code.
+        "cat <<'EOF' | sh\necho '{}' > .claude/settings.local.json\nEOF",
+        "python3 - <<EOF\nfile = open('.claude/settings.json', 'w')\nEOF",
+        "cat > /tmp/f.sh <<'EOF'\necho x > .git/hooks/pre-commit\nEOF\nbash /tmp/f.sh",
+        // A shell wrapper with a preamble or operands keeps its shell head.
+        "sh -c 'cp \"$1\" \"$2\"' _ hook.sh .git/hooks/pre-commit",
+        ">.claude/settings.json bash -c true",
+        "X=\"$(cp cfg .claude/settings.json)\"; bash -c true",
+        // A comment, where a quote is text.
+        "echo hi #'\nrm -rf .claude/hooks\n# '",
+        "mkdir -p \"/tmp/x; cat \"; cp cfg \"/tmp/x; cat /../..$PWD/.claude/settings.json\"; : '<<'",
+        // A function that shadows a read-only head.
+        "ls() { rm -rf \"$@\"; }; ls .claude/hooks",
+        "ls () ( rm -rf \"$@\" ); ls .claude/hooks",
+        // A head no table proves read-only.
+        "psql -Atc 'select 1' | grep -o '\\.claude/[^ ]*'",
+        "N=/tmp/n.md; cat > \"$N\" <<'EOF'\nSee .claude/rules/x.md.\nEOF\nlucidos successor start --narrative \"$N\"",
+    ] {
+        let input = serde_json::json!({ "command": command });
+        assert!(input_touches_protected_path("Bash", &input), "{command}");
+    }
 }
 
+/// A command that only mentions or reads a protected path is not protected.
+/// The engine matches every Bash grant itself, so refusing one of these
+/// carded it on every call with no "Always allow" (ADR 0634).
 #[test]
-fn input_touches_protected_path_detects_dot_git_in_bash_command() {
-    let input = serde_json::json!({"command": "cat .git/HEAD"});
-    assert!(input_touches_protected_path("Bash", &input));
+fn input_touches_protected_path_ignores_a_mention_or_a_read() {
+    for command in [
+        "cat .git/HEAD",
+        "grep -n x .claude/rules/a.md",
+        "wc -l .claude/rules/frontend.md",
+        "ls .claude/skills",
+        "find . -name '*.ts' -not -path '*/.git/*'",
+        "git log --oneline -- .claude/",
+        "git diff main -- .claude/rules/x.md | head -20",
+        "grep -o '\\.claude/[^ ]*\\|\\.git/[^ ]*' /tmp/q.txt | head",
+        "N=\"${TMPDIR:-/tmp}/handoff.md\"; cat > \"$N\" <<'EOF'\n# Handoff\nSee `.claude/rules/dev-runtime.md`.\nEOF",
+        "cat > /tmp/kh/msg.md <<'EOF'\nTouches .git/hooks and .claude/settings.json.\nEOF",
+        "zsh -lc 'grep -rn TODO .claude/rules'",
+        "/bin/zsh -lc 'bash -c \"cat .claude/rules/a.md\"'",
+        "cd /repo && grep -rn x .claude/rules",
+    ] {
+        let input = serde_json::json!({ "command": command });
+        assert!(!input_touches_protected_path("Bash", &input), "{command}");
+    }
 }
 
 #[test]
@@ -480,7 +540,7 @@ fn derive_allow_pattern_broad_returns_none_when_bash_command_touches_dot_claude(
     assert_eq!(
         derive_allow_pattern("Bash", &input, AllowScope::Broad, &TrustedHeads::NONE),
         None,
-        "broad Bash must be suppressed for `.claude/` commands — CC routes them through the prompt regardless of --allowedTools"
+        "no persisted Bash line covers a write under `.claude/`"
     );
 }
 
@@ -492,7 +552,7 @@ fn derive_allow_pattern_narrow_returns_none_when_bash_command_touches_dot_claude
     assert_eq!(
         derive_allow_pattern("Bash", &input, AllowScope::Narrow, &TrustedHeads::NONE),
         None,
-        "narrow Bash(rm:*) must be suppressed for `.claude/` commands — same reason as broad"
+        "no persisted Bash(rm:*) line covers a write under `.claude/`"
     );
 }
 

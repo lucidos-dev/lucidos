@@ -1,4 +1,3 @@
-import { showEngineBuildLog } from '../../store/actions/engine-update';
 /**
  * The *activity group*: the Lucidos menu's rows for work in flight, one per
  * job. A tap unfolds the job's detail under its row, the way the Workspaces
@@ -31,7 +30,7 @@ import {
   type MainCheckLine,
 } from '../../store/actions/landingLaneRow';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
-import { openEngineVersionToast } from '../../store/actions/engine-update';
+import { openEngineVersionToast, showEngineBuildLog } from '../../store/actions/engine-update';
 import { focusPane } from '../../store/actions/pane';
 import {
   describedItems,
@@ -71,6 +70,7 @@ export interface ActivityGroupProps {
   onOpenFixThread: (threadId: string) => void;
   onCloseMainCheck: (checkId: string) => void;
   onOpenPending: () => void;
+  onShowBuildLog: () => void;
 }
 
 /** The pending row reopens the toast offering Rebuild. */
@@ -121,10 +121,11 @@ function note(text: string): VNode {
   return <p class="brand-menu-activity-note">{text}</p>;
 }
 
-function backgroundBody(activity: BackgroundActivity, commits: PendingCommits | null): VNode {
+function backgroundBody(activity: BackgroundActivity, props: ActivityGroupProps): VNode {
+  const { commits } = props;
   const primary = activityAction(activity.action);
   const secondary = activity.kind === 'engine-build'
-    ? { label: 'Show build log', onClick: showEngineBuildLog }
+    ? { label: 'Show build log', onClick: props.onShowBuildLog }
     : activityAction(activity.secondaryAction);
   // A build names what it brings when git can count it, and otherwise says
   // what follows it.
@@ -314,7 +315,7 @@ function landingLaneBody(body: LaneView, props: ActivityGroupProps): VNode {
 function activityBody(body: ActivityBody, props: ActivityGroupProps): VNode {
   switch (body.kind) {
     case 'background':
-      return backgroundBody(body.activity, props.commits);
+      return backgroundBody(body.activity, props);
     case 'apply-thread':
       return threadLink(body.thread, props.onOpenThread);
     case 'apply-all':
@@ -457,6 +458,11 @@ export function ActivityMenuGroup({ onClose }: { onClose: () => void }) {
       // The mark lives in the thread pane, so the toast lands there too.
       focusPane('thread');
       openEngineVersionToast();
+    },
+    // The menu paints above the modal band, so it closes before the log opens.
+    onShowBuildLog: () => {
+      onClose();
+      showEngineBuildLog();
     },
   });
 }

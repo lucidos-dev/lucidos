@@ -16,7 +16,8 @@
 // Every link tap leaves a breadcrumb in the engine log (`traceAppLink`). A
 // frame has no log of its own that anyone can read on a phone.
 
-import { onHostPush, tellHost } from './_bridge';
+import { onHostPush } from './_bridge';
+import { traceToHost } from './hostTrace';
 import { inDesktopApp, inIOSStandalone } from './platform';
 
 /** Push channel carrying the host's answer. The host imports this constant
@@ -91,24 +92,9 @@ export function openSafariNow(url: string): boolean {
   return openTabNow(SAFARI_SCHEME_PREFIX + url);
 }
 
-/** Longest text a breadcrumb carries for one value. The engine refuses a whole
- *  client log over 4 KB, and a `data:` href can be megabytes. */
-const MAX_TRACE_TEXT_LEN = 200;
-
-/** Leave a `[Client/app-link]` breadcrumb in the engine log. Fire-and-forget:
- *  it runs after the tap's own work and never throws into it. */
+/** Leave a `[Client/app-link]` breadcrumb in the engine log. */
 export function traceAppLink(step: string, detail: Record<string, unknown> = {}): void {
-  try {
-    const shortened: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(detail)) {
-      shortened[key] = typeof value === 'string' && value.length > MAX_TRACE_TEXT_LEN
-        ? `${value.slice(0, MAX_TRACE_TEXT_LEN)}…`
-        : value;
-    }
-    tellHost('log.app-link', { step, ...shortened });
-  } catch {
-    // Telemetry must never break a tap.
-  }
+  traceToHost('log.app-link', step, detail);
 }
 
 /** Listen for the host's answer. Returns the teardown. */

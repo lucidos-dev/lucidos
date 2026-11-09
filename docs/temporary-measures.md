@@ -220,6 +220,46 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Status:** `active`.
 - **Investigation:** none.
 
+### Video frame stall repaint
+
+- **Added:** 2026-11-08
+- **Lives in:** `repaint`, `watchFrames`, `settleFrameClock` and `repaintIfStalled` in
+  `system-widgets/lucidos-video-player/index.html`.
+- **Impermanent because:** Safari stops drawing a video while it is scrolled
+  out of view. On iPhone, inside a widget iframe on the transformed thread
+  pane, it sometimes never resumes once back in view. The clock and scrubber
+  run on over one frozen frame. The player watches presented frames through
+  `requestVideoFrameCallback`. When the clock gets 1.5 s ahead of the last
+  frame, it seeks to the current position, which makes Safari draw again.
+  A clip out of sight lets go of its media and reloads at its position on
+  return, so it draws afresh. That is a permanent memory measure, not part of
+  this one. A page shown again rebuilds the video layer and nudges
+  paused media by 0.001 s, keeping the controls in sync. This path works
+  without frame callbacks.
+- **Removal / resolution condition:** remove the repaint and frame-watch functions and play a
+  video-only clip in a thread on a current iOS Safari. Leave it on screen
+  through a long play, and hide and show the page. A scroll away no longer
+  tests this, since it reloads the clip. It must keep drawing in both cases.
+  Then delete them and their listeners.
+- **Status:** `active`.
+- **Investigation:** none.
+
+### Video full screen trace
+
+- **Added:** 2026-11-08
+- **Lives in:** `enterFullScreen` in
+  `system-widgets/lucidos-video-player/index.html`.
+- **Impermanent because:** on iPhone the full screen button stopped working
+  for a whole app session. The native player request was accepted and then
+  never opened. The toast carried a trace of what fired meanwhile.
+- **Removal / resolution condition:** a restart of the Lucidos app fixed
+  full screen in the video player and the tour carousel alike. iOS was
+  stuck, and the player was never the cause. The trace, the readiness
+  line and the removed `translateZ(0)` rule are gone or restored.
+- **Status:** `resolved` 2026-11-08. The SDK now traces full screen in every
+  app frame to the engine log. The toast says iOS may be stuck.
+- **Investigation:** none.
+
 ### Stale debug object prune
 
 - **Added:** 2026-10-10
@@ -234,6 +274,23 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   the generations of `lucidos_engine-*` objects. One generation means upstream
   cleans up, so delete the library, its test, its call sites and the
   `dev-runtime.md` bullet.
+- **Status:** `active`.
+- **Investigation:** none.
+
+### Stale incremental dir prune
+
+- **Added:** 2026-11-09
+- **Lives in:** `prune_stale_incremental` in `scripts/lib/stale_incremental.sh`,
+  called by `scripts/with-build-slot.sh`.
+- **Impermanent because:** cargo clears the session dirs inside an incremental
+  crate dir and never removes the crate dir of a configuration that stopped
+  being built. One main checkout reached 110 GB (ADR 0635).
+- **Removal / resolution condition:** stable cargo removes unused units from a
+  build dir by itself. Verify on a toolchain bump: build the engine, change
+  `RUSTFLAGS` and build again, wait out cargo's gc window, then count the
+  `incremental/api-*` dirs. One dir means upstream cleans up, so delete the
+  library, its tests, the call in `with-build-slot.sh` and the
+  `stale_incremental*.sh` entry in `dev-runtime.md`'s `paths:`.
 - **Status:** `active`.
 - **Investigation:** none.
 
@@ -1202,9 +1259,10 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 ### Legacy paired-device store seed
 
 - **Added:** 2026-08-25
-- **Lives in:** `gateway/auth.rs::legacy_paired_devices_path` and
-  `::load_or_seed`, called once from `server.rs::run` before the state is
-  built. Paired with the "read-only seed" bullet in ADR 0132 § Consequences.
+- **Lives in:** `gateway/auth.rs::legacy_paired_devices_path` and the
+  `legacy` parameter of `gateway_event_log::open`, called once from
+  `server.rs::run` before the state is built. Paired with the "read-only seed"
+  bullet in ADR 0132 § Consequences.
 - **Impermanent because:** ADR 0132 moved the paired-device store from the
   machine-global `~/.lucidos/paired-devices.json` to each gateway's own data
   dir. Moving the path alone would refuse every device paired before the
@@ -1215,8 +1273,10 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   gateway at or past the release carrying ADR 0132, so each has written its own
   store. Check the oldest version the front door still offers: an install older
   than the seed is the only one needing it. Then:
-  - Delete both functions, or keep `load_or_seed` without its `legacy` parameter.
-  - Delete the four seed tests in `auth.rs`.
+  - Delete `legacy_paired_devices_path` and the `legacy` parameter of
+    `gateway_event_log::open`.
+  - Delete `the_legacy_store_seeds_and_is_never_written` in
+    `gateway_event_log_tests.rs`.
   - Drop the seed bullet from ADR 0132 § Consequences.
   - Drop the boot log line in `server.rs`.
 

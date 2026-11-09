@@ -44,22 +44,25 @@ pub struct AppManifest {
     pub transparent: bool,
 }
 
-/// One of the three sizes a widget takes as a tile on a dashboard: one cell,
-/// two cells wide, or two by two (ADR 0432).
+/// One of the four sizes a widget takes as a tile on a dashboard: one cell,
+/// two cells wide, two by two, or four by two (ADR 0432).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WidgetSize {
     Small,
     Medium,
     Large,
+    Xl,
 }
 
 impl WidgetSize {
     /// Smallest first, the order the fallback walks.
-    pub const ALL: [Self; 3] = [Self::Small, Self::Medium, Self::Large];
+    pub const ALL: [Self; 4] = [Self::Small, Self::Medium, Self::Large, Self::Xl];
 
-    /// What a widget that declares no sizes supports: every size, medium
-    /// first because `default_of` starts a tile at the first.
+    /// What a widget that declares no sizes supports: small, medium and
+    /// large, medium first because `default_of` starts a tile at the first.
+    /// XL is opt-in: a box four cells wide stretches a widget written
+    /// without it in mind.
     pub const UNDECLARED: [Self; 3] = [Self::Medium, Self::Small, Self::Large];
 
     pub fn as_str(self) -> &'static str {
@@ -67,11 +70,20 @@ impl WidgetSize {
             Self::Small => "small",
             Self::Medium => "medium",
             Self::Large => "large",
+            Self::Xl => "xl",
         }
     }
 
     pub fn parse(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|size| size.as_str() == name)
+    }
+
+    /// Every size name, for an error that tells the caller what to use:
+    /// "small, medium, large or xl".
+    pub fn choices() -> String {
+        let names = Self::ALL.map(Self::as_str);
+        let (last, rest) = names.split_last().expect("ALL is not empty");
+        format!("{} or {last}", rest.join(", "))
     }
 
     /// The size a new tile of a widget declaring `declared` starts at: its
@@ -93,7 +105,7 @@ impl WidgetSize {
     }
 }
 
-/// The size of any dashboard tile. A widget shows at one of its three
+/// The size of any dashboard tile. A widget shows at one of its four
 /// `WidgetSize`s, and an *app shortcut* is always a quarter: half a small
 /// cell's edge on each side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -103,11 +115,18 @@ pub enum TileSize {
     Small,
     Medium,
     Large,
+    Xl,
 }
 
 impl TileSize {
     /// Smallest first.
-    pub const ALL: [Self; 4] = [Self::Quarter, Self::Small, Self::Medium, Self::Large];
+    pub const ALL: [Self; 5] = [
+        Self::Quarter,
+        Self::Small,
+        Self::Medium,
+        Self::Large,
+        Self::Xl,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -115,6 +134,7 @@ impl TileSize {
             Self::Small => "small",
             Self::Medium => "medium",
             Self::Large => "large",
+            Self::Xl => "xl",
         }
     }
 
@@ -125,6 +145,7 @@ impl TileSize {
             Self::Small => Some(WidgetSize::Small),
             Self::Medium => Some(WidgetSize::Medium),
             Self::Large => Some(WidgetSize::Large),
+            Self::Xl => Some(WidgetSize::Xl),
         }
     }
 }
@@ -135,6 +156,7 @@ impl From<WidgetSize> for TileSize {
             WidgetSize::Small => Self::Small,
             WidgetSize::Medium => Self::Medium,
             WidgetSize::Large => Self::Large,
+            WidgetSize::Xl => Self::Xl,
         }
     }
 }
@@ -150,7 +172,7 @@ pub struct WidgetTile {
 /// The one check of a manifest's `sizes` and `transparent`, shared by the
 /// loader, `create_app` and the plugin installer. Only a widget takes either.
 /// Sizes are known names, at least one, with no duplicate. A widget that
-/// declares none supports all three and starts medium.
+/// declares none supports small, medium and large, and starts medium.
 pub fn check_widget_manifest(kind: AppKind, manifest: &AppManifest) -> Result<WidgetTile, String> {
     if kind != AppKind::Widget {
         if manifest.sizes.is_some() {
@@ -182,7 +204,10 @@ pub fn parse_widget_sizes(names: &[String]) -> Result<Vec<WidgetSize>, String> {
     let mut sizes = Vec::with_capacity(names.len());
     for name in names {
         let size = WidgetSize::parse(name).ok_or_else(|| {
-            format!("\"{name}\" is not a widget size. Use small, medium or large")
+            format!(
+                "\"{name}\" is not a widget size. Use {}",
+                WidgetSize::choices()
+            )
         })?;
         if sizes.contains(&size) {
             return Err(format!("\"sizes\" names \"{name}\" twice"));
@@ -297,7 +322,7 @@ pub enum NewAppKind {
     App,
     Widget {
         origin_thread_id: uuid::Uuid,
-        /// The sizes it declares; `None` writes none, which reads as all three.
+        /// The sizes it declares; `None` writes none, which reads as small, medium and large.
         sizes: Option<Vec<WidgetSize>>,
     },
 }
@@ -1473,7 +1498,7 @@ pub(crate) mod tests {
     }
 
     /// The one tile check: known names, at least one, no duplicate, and only
-    /// on a widget. None declared reads as all three (ADR 0432).
+    /// on a widget. None declared reads as small, medium and large (ADR 0432).
     #[test]
     fn the_widget_manifest_check_refuses_every_bad_sizes_shape() {
         let widget = |json: &str| check_widget_manifest(AppKind::Widget, &manifest(json));
@@ -1506,23 +1531,47 @@ pub(crate) mod tests {
         }
     }
 
-    /// A widget that declares no sizes takes every size and starts medium,
-    /// as a WidgetKit widget does. A declared list is the whole choice.
+    /// A widget that declares no sizes takes small, medium and large and
+    /// starts medium, as a WidgetKit widget does. XL is opt-in. A declared
+    /// list is the whole choice.
     #[test]
-    fn an_undeclared_widget_takes_all_three_sizes_and_starts_medium() {
+    fn an_undeclared_widget_takes_three_sizes_without_xl_and_starts_medium() {
         use WidgetSize::*;
         let mut undeclared = WidgetSize::UNDECLARED.to_vec();
         assert_eq!(WidgetSize::default_of(&undeclared), Medium);
         assert_eq!(WidgetSize::default_of(&[]), Medium);
         undeclared.sort();
-        assert_eq!(undeclared, WidgetSize::ALL.to_vec());
+        assert_eq!(undeclared, vec![Small, Medium, Large]);
+        assert!(!WidgetSize::UNDECLARED.contains(&Xl));
         assert_eq!(WidgetSize::default_of(&[Large, Small]), Large);
     }
 
-    /// A widget with no sizes takes all three, a bad list loads with the
+    /// The literal pins the wording an agent reads in a size error.
+    #[test]
+    fn a_size_error_names_every_size() {
+        assert_eq!(WidgetSize::choices(), "small, medium, large or xl");
+    }
+
+    /// `xl` is a known name, and `ALL` and the tile sizes agree on it.
+    #[test]
+    fn a_manifest_may_declare_xl() {
+        let names = |sizes: &[&str]| sizes.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            parse_widget_sizes(&names(&["medium", "xl"])).unwrap(),
+            vec![WidgetSize::Medium, WidgetSize::Xl]
+        );
+        let err = parse_widget_sizes(&names(&["huge"])).unwrap_err();
+        assert!(err.contains("xl"), "{err}");
+        for size in WidgetSize::ALL {
+            assert_eq!(TileSize::from(size).widget_size(), Some(size));
+            assert_eq!(WidgetSize::parse(size.as_str()), Some(size));
+        }
+    }
+
+    /// A widget with no sizes takes the undeclared three, a bad list loads with the
     /// default rather than dropping the widget, and an app carries none.
     #[test]
-    fn a_widget_loads_its_sizes_and_a_bad_list_falls_back_to_all_three() {
+    fn a_widget_loads_its_sizes_and_a_bad_list_falls_back_to_the_undeclared_three() {
         let tmp = tempfile::tempdir().unwrap();
         let manager = AppManager::new(tmp.path()).unwrap();
         write_manifest(
@@ -1567,6 +1616,10 @@ pub(crate) mod tests {
         assert_eq!(Medium.fit(&[Small, Large]), Small);
         assert_eq!(Small.fit(&[Medium, Large]), Medium);
         assert_eq!(Medium.fit(&[Large]), Large);
+        assert_eq!(Xl.fit(&[Small, Medium, Large]), Large);
+        assert_eq!(Xl.fit(&[Small, Medium]), Medium);
+        assert_eq!(Large.fit(&[Small, Xl]), Small);
+        assert_eq!(Small.fit(&[Xl]), Xl);
     }
 
     /// `create_app` writes the sizes it is given, and refuses none on an app.

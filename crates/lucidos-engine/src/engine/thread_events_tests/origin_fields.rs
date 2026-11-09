@@ -176,11 +176,13 @@ fn trigger_started_can_carry_scheduler_origin() {
             reason: EngineReason::Scheduler {
                 trigger_id: id.clone(),
                 trigger_name: Some("nightly".into()),
+                actor_email: None,
             },
         }),
         go_to_review: false,
         model: None,
         reasoning_effort: None,
+        continue_key: None,
     };
     let json = serde_json::to_value(&event).unwrap();
     assert_eq!(json["type"], "TriggerStarted");

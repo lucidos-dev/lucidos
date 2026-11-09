@@ -802,6 +802,11 @@ fn event_trigger_skip_reason(
     }
 }
 
+/// Whether dispatch fires no event trigger at all for an event at `depth`.
+pub(crate) fn event_dispatch_skipped(is_shutting_down: bool, depth: u32, ceiling: u32) -> bool {
+    event_trigger_skip_reason(is_shutting_down, depth, ceiling).is_some()
+}
+
 /// The event type the cap report itself is carried on.
 ///
 /// A persisted frame is subscribable (ADR 0113), so the report is a triggerable
@@ -885,6 +890,7 @@ async fn report_depth_cap(
                     event_id: None,
                     tap: crate::scheduler::notifications::Tap::Modal,
                     actor: None,
+                    audience: None,
                 },
             ))
             .await
@@ -1186,17 +1192,36 @@ pub(super) async fn check_task_health_and_restart(
     }
 }
 
-/// Run the production catch-up choke point against a pre-restore minute slot.
+/// An hourly cron whose latest slot falls 90 to 150 seconds before
+/// `restored_at`, so no slot fires between the restore and the assertion.
+/// The restore floor drops that slot; the catch-up grace keeps `permits_slot`
+/// as the backstop should the floor regress.
+#[cfg(test)]
+fn pre_restore_hourly_cron(restored_at: chrono::DateTime<chrono::Utc>) -> String {
+    use chrono::Timelike;
+    format!(
+        "0 {} * * * *",
+        (restored_at - chrono::Duration::seconds(90)).minute()
+    )
+}
+
+/// Run the production catch-up choke point against a pre-restore slot.
 #[cfg(test)]
 pub(crate) async fn assert_snapshot_catch_up_excluded(engine: &SharedEngine) {
     let id = "snapshot-combined-cron";
+    let restored_at = crate::core::snapshot::boundary::read(engine.pool())
+        .await
+        .unwrap()
+        .expect("restore boundary installed")
+        .restored_at;
+    let expression = pre_restore_hourly_cron(restored_at);
     let config = TriggerConfig::from_created_payload(&serde_json::json!({
-        "trigger_id": id, "name": "Synthetic cron", "schedule": ["0 * * * * *"],
+        "trigger_id": id, "name": "Synthetic cron", "schedule": [expression],
         "timezone": "UTC", "run": {"type":"intent", "intent":"Synthetic fixture"}
     }))
     .unwrap();
     let configs = Arc::new(std::sync::RwLock::new(HashMap::from([(id.into(), config)])));
-    let schedule = crate::engine::tools::scheduler::parse_standard_cron("0 * * * * *").unwrap();
+    let schedule = crate::engine::tools::scheduler::parse_standard_cron(&expression).unwrap();
     settle_missed_slots(
         None,
         &[schedule],
@@ -1217,6 +1242,42 @@ pub(crate) async fn assert_snapshot_catch_up_excluded(engine: &SharedEngine) {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// The latest slot of `expression` at or before `now`.
+    fn latest_slot(
+        expression: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> chrono::DateTime<chrono::Utc> {
+        let schedule = crate::engine::tools::scheduler::parse_standard_cron(expression).unwrap();
+        schedule
+            .after(&(now - chrono::Duration::hours(2)))
+            .take_while(|slot| *slot <= now)
+            .last()
+            .expect("a slot inside two hours")
+    }
+
+    #[test]
+    fn snapshot_fixture_cron_never_ticks_between_restore_and_assertion() {
+        use chrono::TimeZone;
+        let base = chrono::Utc.with_ymd_and_hms(2026, 11, 8, 9, 59, 0).unwrap();
+        let assertion_delay = chrono::Duration::seconds(30);
+        for offset_ms in (0..120_000).step_by(500) {
+            let restored_at = base + chrono::Duration::milliseconds(offset_ms);
+            let now = restored_at + assertion_delay;
+            let slot = latest_slot(&pre_restore_hourly_cron(restored_at), now);
+            assert!(
+                slot < restored_at,
+                "slot {slot} fires after restore {restored_at}"
+            );
+            assert!(
+                now - slot < chrono::Duration::minutes(super::MISSED_TASK_GRACE_MINUTES),
+                "slot {slot} is past catch-up grace at {now}"
+            );
+        }
+        // A minute cron ticks inside the window, so it cannot serve here.
+        let restored_at = base + chrono::Duration::seconds(59);
+        assert!(latest_slot("0 * * * * *", restored_at + assertion_delay) > restored_at);
+    }
 
     /// Insert a tracked task that observes the cancel token and records when it
     /// was woken. Returns the task_id and a flag the task flips on cancel.

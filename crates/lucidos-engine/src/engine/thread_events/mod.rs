@@ -38,7 +38,8 @@ pub use channel::{EventChannel, FireRetry, RetryOf, RetrySkipReason, TriggerInvo
 pub use dashboard::{ArrangedTile, Dashboard, LegacyArrangedTile};
 pub use event::{RecoveredCompose, ThreadEvent};
 pub use event_impl::{
-    not_a_keep_alive_idle_sql, KEEP_ALIVE_ENDING_EVENT_TYPES, KEEP_ALIVE_IDLE_REASON,
+    not_an_engine_turn_idle_sql, CEILING_REENTRY_IDLE_REASON, KEEP_ALIVE_ENDING_EVENT_TYPES,
+    KEEP_ALIVE_IDLE_REASON,
 };
 pub use expected_wake::{PlannedWake, WakeBucket, WakeSource};
 pub use form_request::FormRequestOutcome;
@@ -51,8 +52,9 @@ pub use meta::EventMeta;
 pub(crate) use question::with_image_note;
 pub use question::{AnswerKind, OwnerApproval, QuestionOption, WidgetEmbed};
 pub use session::{
-    ChildCompletionStatus, FreshSessionReason, HandoffConsent, HandoffOpening, IntegratedBranch,
-    SessionContinuity, SessionEndReason, SubThreadPendingChange, VoiceSessionEndReason, WakeMode,
+    ChildCompletionStatus, FreshSessionReason, HandoffCause, HandoffConsent, HandoffOpening,
+    IntegratedBranch, SessionContinuity, SessionEndReason, SessionStart, SubThreadPendingChange,
+    VoiceSessionEndReason, WakeMode,
 };
 pub use todo::{TodoItem, TodoStatus};
 pub use triage::TriageProposalEntry;

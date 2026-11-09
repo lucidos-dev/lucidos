@@ -32,8 +32,8 @@ describe('a widget box keeps its controls above its frame', () => {
   });
 
   it('puts the frame on the bottom layer and every other child above it', () => {
-    const frame = Number(rule('.widget-box > .widget-frame').props.get('z-index'));
-    const controls = Number(rule('.widget-box > :not(.widget-frame)').props.get('z-index'));
+    const frame = Number(rule('.widget-box > .widget-box-scroll').props.get('z-index'));
+    const controls = Number(rule('.widget-box > :not(.widget-box-scroll)').props.get('z-index'));
     expect(controls).toBeGreaterThan(frame);
   });
 });

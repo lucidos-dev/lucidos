@@ -66,6 +66,8 @@ export type Tap =
   | { kind: 'modal' }
   /** Requests normal restore admission and confirmation; never auto-restores. */
   | { kind: 'restore-snapshot'; workspace_id: string; handle: string }
+  /** Opens a confirmation to undo a config change; never undoes on its own. */
+  | { kind: 'undo-config-change'; event_id: string }
   | { kind: 'navigate'; to: NavigateUi };
 
 export interface Notification {

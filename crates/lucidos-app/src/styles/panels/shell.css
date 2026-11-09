@@ -89,11 +89,39 @@
 :is(.backup-reminder, .slowness-banner, .ingress-banner, .refusal-banner) .action-btn {
     display: inline-flex;
     align-items: center;
-    min-height: 1.75rem;
+    min-height: var(--banner-button-height);
     padding: 0 0.75rem;
     border-radius: var(--radius-control);
     font-size: var(--font-size-sm);
     font-weight: 600;
+}
+
+/* The controls sit on the sentence's FIRST line, never the middle of a wrapped
+   block, where they float beside the second line and read as detached. Each
+   control centres in a first row as tall as the bar's tallest control, and
+   the sentence pads its first line into that row. A one-line bar looks the
+   same as a centred one. */
+:is(.backup-reminder, .slowness-banner, .ingress-banner, .refusal-banner) {
+    --banner-first-row: var(--banner-button-height);
+    align-items: flex-start;
+    line-height: var(--banner-line-height);
+}
+
+/* The close X is the tallest control on the bars that carry one. */
+:is(.backup-reminder, .slowness-banner) {
+    --banner-first-row: calc(var(--icon-size-sm) + 2 * var(--space-sm));
+}
+
+:is(.backup-reminder-text, .slowness-banner-text, .ingress-banner-text, .refusal-banner-text) {
+    padding-block: calc((var(--banner-first-row) - 1em * var(--banner-line-height)) / 2);
+}
+
+:is(.backup-reminder, .slowness-banner, .ingress-banner, .refusal-banner) > .surface-icon {
+    margin-top: calc((var(--banner-first-row) - var(--icon-size-md)) / 2);
+}
+
+:is(.backup-reminder, .slowness-banner, .ingress-banner, .refusal-banner) > .action-btn {
+    margin-top: calc((var(--banner-first-row) - var(--banner-button-height)) / 2);
 }
 
 .backup-reminder {
@@ -146,10 +174,9 @@
    deliberately the still one, unlike the Settings row's, which blinks because it
    is the only thing on that row that changed. */
 .connection-banner {
-    /* Stated rather than inherited, and only on this bar: the dot's offset
-       below is derived from it, so the value the sentence is actually set in
-       has to be one this file can name. The backup reminder is left on the
-       document's own, which is what it has always rendered at. */
+    /* Stated rather than inherited: the dot's offset below is derived from
+       it, so the value the sentence is actually set in has to be one this
+       file can name. */
     line-height: var(--banner-line-height);
 }
 
@@ -223,7 +250,6 @@
 .ingress-banner,
 .refusal-banner {
     background: color-mix(in srgb, var(--accent-red) var(--banner-tint-strength), var(--bg-secondary));
-    line-height: var(--banner-line-height);
 }
 
 /* Takes the slack so the button sits at the trailing edge, and wraps rather
@@ -838,41 +864,19 @@
             calc(var(--header-lead-inset) + 2 * var(--header-icon-box) + 0.25rem),
             var(--brand-trail-end)
         );
-        /* The content pane's copy of the reserve above, and the same rule: room
-           kept at EACH end of the row for the centred title cluster to clear,
-           sized to the WIDER of the two ends. The leading end is described
-           below. The trailing one is the actions cluster on the clamp's
-           middle arm,
-           which is three boxes (two context icons riding the row, plus the
-           bell) and the two gaps between them. A third icon rides only where
-           the box sits at its span cap and leaves more room; anywhere tighter,
-           `useHeaderActionCollapse` folds two of them into ⋯ first. The last two gaps are the clearance between that cluster and
-           the title box: two rather than one because that is what the collapse
-           measurement charges (`computeFitsInOneRow` gives the centred box a
-           gap at each of its sides, and the reserve is symmetric, so both land
-           on the wider end). Sizing it to exactly what the measurement wants is
-           what keeps the two from disagreeing, which would show as the ⋯
-           appearing at a width the stylesheet says has room to spare.
-
-           Sized to the trailing end on both sides, deliberately. The leading
-           end (the hamburger and Refresh) is narrower.
-           Spending that difference on the title would stop it being centred on
-           the pane, which is the whole point of the arrangement.
-
-           The gap term is a literal rather than --pane-header-gap because a
-           custom property is substituted on the element that DECLARES it, and
-           that one is declared on .pane-header, not here (same reason
-           --brand-side-reserve above spells it out). It is a copy of this row's
-           own `gap`, so styles/__tests__/content-header-title-centring.test.ts
-           checks the two agree. */
-        --content-side-reserve: calc(3 * var(--header-icon-box) + 4 * 0.25rem);
+        /* Keep navigation stable across action sets. Reserve the persistent
+           leading pair (hamburger and Refresh) and trailing pair (overflow
+           and bell), with the gaps charged by the collapse measurement.
+           Optional actions fold before entering this fixed title span.
+           The literal gap matches the row: :root cannot read its local token. */
+        --content-side-reserve: calc(2 * var(--header-icon-box) + 3 * 0.25rem + var(--header-padding-x));
         /* The room a wide pane keeps at each end before the Canvas title grows
            past --desktop-nav-span. Seven boxes: a file preview's six actions,
            the widest set any content view shows, plus the bell. Eight gaps: the
            six between them and the two the collapse measurement charges, as
            above. So the title grows only out of room no cluster needs, and no
            action folds that the fixed span let ride. */
-        --content-unfolded-reserve: calc(7 * var(--header-icon-box) + 8 * 0.25rem);
+        --content-unfolded-reserve: calc(7 * var(--header-icon-box) + 8 * 0.25rem + var(--header-padding-x));
         /* How far the Canvas title may grow on a wide pane. The cap keeps the
            chevrons from drifting out to the row's ends. */
         --desktop-content-title-span-max: 36rem;
@@ -894,8 +898,8 @@
            8rem against a natural 6.6rem left 1.4rem of slack, and that slack is
            what pushed the back chevron onto the drawer toggle at a narrow pane.
            The Canvas row shares this token and holds a title rather than a
-           mark. It never reaches the floor: its own pane floor keeps it on the
-           clamp's middle arm (store/paneMinimums.ts). */
+           mark. Its inset row can reach this floor with the dashboard toggle
+           docked (store/paneMinimums.ts). */
         --desktop-nav-min-span: calc(2 * var(--header-icon-box) + var(--header-mark-tap));
         /* Half the reclaimed macOS title-bar band. A header region centered on
            the header alone (translateY(-50%)) reads as sitting LOW on the
@@ -1050,8 +1054,8 @@
        the rail is hidden (.dashboard-rail-toggle-slot), widens that end by its box
        and a gap. Both content reserves grow by exactly that. */
     :root[data-dashboard-rail-toggle]:not([data-dashboard-rail]) {
-        --content-side-reserve: calc(4 * var(--header-icon-box) + 5 * 0.25rem);
-        --content-unfolded-reserve: calc(8 * var(--header-icon-box) + 9 * 0.25rem);
+        --content-side-reserve: calc(3 * var(--header-icon-box) + 4 * 0.25rem + var(--header-padding-x));
+        --content-unfolded-reserve: calc(8 * var(--header-icon-box) + 9 * 0.25rem + var(--header-padding-x));
     }
 
     /* With the Canvas hidden, the toggle docks at the Conversation row's
@@ -1142,8 +1146,8 @@
         opacity: 0;
     }
 
-    /* Content-side header region, pinned between the split divider and the
-       header's right padding. Two in-flow children held apart by
+    /* Content-side header region, spanning from the split divider to the
+       header edge. Two in-flow children held apart by
        space-between, the hamburger leading and the action icons trailing (both
        flex-shrink:0), with the title cluster absolutely centred OVER them on
        this row's own middle (see .pane-header-content-title below, which says
@@ -1168,13 +1172,16 @@
        slide under the icons. Derive the reserve from the controls, as the
        token does. */
     .app-header .content-header-elements {
+        --content-leading-inset: 0px;
+        --content-compact-breakpoint: 34rem;
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 0.25rem;
         position: absolute;
         left: calc(var(--divider-x) + var(--divider-width));
-        right: var(--header-padding-x);
+        right: 0;
+        padding-right: var(--header-padding-x);
         top: 50%;
         transform: translateY(calc(-50% - var(--header-band-lift)));
         /* Clips at its own box plus ring room. The row is exactly one icon
@@ -1182,7 +1189,7 @@
            clip-path, not `overflow: clip`: the packaged macOS webview makes a
            `clip` box a scroll container (see .pane-header-brand). */
         clip-path: inset(calc(-1 * var(--focus-ring-width)));
-        transition: left var(--duration-slow) ease, padding-right var(--duration-slow) ease,
+        transition: left var(--duration-slow) ease, padding-left var(--duration-slow) ease, padding-right var(--duration-slow) ease,
                     opacity var(--duration-slow) ease, visibility var(--duration-slow);
     }
 
@@ -1190,50 +1197,27 @@
        hidden. Padding rather than a moved `right`, so the title stays centred
        on the pane. */
     :root[data-dashboard-rail-toggle]:not([data-dashboard-rail]) .app-header .content-header-elements {
-        padding-right: calc(var(--header-icon-box) + var(--pane-header-gap));
+        padding-right: calc(var(--header-padding-x) + var(--header-icon-box) + var(--pane-header-gap));
     }
 
     /* The same slot in the Conversation row while the Canvas is hidden.
-       That row runs to the header's edge, where the Canvas row stops
-       --header-padding-x short, so it keeps that padding too.
+       Both rows reach the header edge and inset controls with padding.
        `useHeaderActionCollapse` reads this padding and folds the actions
        short of it. */
     :root[data-dashboard-rail-toggle][data-content-collapsed]:not([data-dashboard-rail]) .app-header .pane-header-brand {
         padding-right: calc(var(--header-padding-x) + var(--header-icon-box) + var(--pane-header-gap));
     }
 
-    /* Packaged macOS: the row never starts left of the traffic lights, whatever
-       the divider is doing. It steps past the same lights reserve the drawer
-       toggle's --header-lead-inset does, so the header's left-most slot
-       clears the lights in every state that can hold it, and it is needed here
-       for the same reason as there: this row's leading control is the
-       hamburger, and a --header-icon-box centred on the bar reaches up into the
-       reclaimed band, so wherever the row starts is where a control paints.
-
-       Maximizing the Canvas pane is what makes that reachable. Collapsing the
-       Conversation side takes --split-ratio to 0 and hides the drawer with it,
-       so --co, --ddo and --divider-x are all 0 and the base rule lands the
-       hamburger at the window's own left edge, directly on the lights.
-
-       A `max()` rather than a rule gated on [data-thread-collapsed], because
-       the collapse is not the only way under the reserve: --split-ratio is a
-       persisted RATIO and nothing re-clamps it when the window shrinks, so a
-       divider dropped at the Conversation pane's floor on a very wide display
-       (store/paneMinimums.ts clamps the drag in px, against the container it
-       was dragged in) reopens proportionally narrower in a small window. Rare,
-       but a floor written as a floor covers it for free, where an attribute
-       gate would have to enumerate it.
-
-       The inner term is a copy of the base rule's `left`, which CSS cannot hand
-       back as a resolved length; the drift check is in
-       styles/__tests__/header-band-centering.test.ts.
-
-       Horizontal only, like the toggle's step: the row keeps the base
-       rule's bar centring (--header-band-lift), so the hamburger stays on the
-       line every other control in the bar sits on. `left` already transitions
-       there, so the step rides the collapse animation instead of jumping. */
+    /* Keep the row on the pane axis. Packaged macOS steps its leading
+       controls past the traffic lights with padding, leaving the title axis
+       independent of that asymmetric control inset. */
     :root[data-titlebar-overlay] .app-header .content-header-elements {
-        left: max(calc(var(--divider-x) + var(--divider-width)), var(--titlebar-lights-reserve));
+        --content-leading-inset: max(0px, calc(var(--titlebar-lights-reserve) - var(--divider-x) - var(--divider-width)));
+        padding-left: var(--content-leading-inset);
+    }
+
+    :root[data-thread-collapsed] .app-header .content-header-elements {
+        left: calc(var(--divider-width) + var(--space-xs));
     }
 
     .app-header .content-header-elements > .hamburger-panel,
@@ -1250,6 +1234,8 @@
         place-items: center;
         flex-shrink: 0;
         margin-inline-end: auto;
+        width: var(--header-icon-box);
+        min-width: 0;
     }
 
     /* The arrow and the check share one cell and crossfade, as on the phone
@@ -1786,10 +1772,9 @@
        flex zone, and it is a DERIVED reserve rather than a guessed one (see
        --content-side-reserve). Twice the reserve plus the min span is inside
        MIN_CONTENT_PANE_REM (store/paneMinimums.ts), so the min-span arm
-       engages only below this pane's floor, or near it while the dashboard rail's
-       toggle docks and widens the reserve. There the ends do reach the
-       clusters, and `useHeaderActionCollapse` is what pulls the actions
-       into the ⋯ menu instead.
+       can engage near the pane floor with the dashboard toggle docked, since
+       the row also gives up its edge insets. The collapse hook keeps actions
+       clear on either arm.
 
        As tall as the row, by construction rather than by luck: the row's height
        is its tallest in-flow child, the hamburger, and this box's tallest
@@ -1812,7 +1797,7 @@
         transform: translate(-50%, -50%);
         width: clamp(
             var(--desktop-nav-min-span),
-            calc(100% - 2 * var(--content-side-reserve)),
+            calc(100% - 2 * max(var(--content-side-reserve), calc(var(--content-leading-inset) + 2 * var(--header-icon-box) + 3 * 0.25rem))),
             clamp(
                 var(--desktop-nav-span),
                 calc(100% - 2 * var(--content-unfolded-reserve)),
@@ -1841,6 +1826,61 @@
     .app-header .content-header-actions {
         position: relative;
         z-index: 1;
+    }
+
+    /* At narrow pane widths, optional actions share the leading overflow
+       slot with Refresh. The bell and dashboard toggle keep their own slots.
+       Only the chevrons use the mobile button width; other controls keep
+       their desktop targets. */
+    .app-header .content-header-elements:has([data-compact]) {
+        --content-side-reserve: max(calc(var(--header-icon-box) + 3 * 0.15rem + var(--header-padding-x)), calc(var(--content-leading-inset) + 2 * var(--header-icon-box) + 3 * 0.15rem));
+        gap: 0.15rem;
+    }
+
+    :root[data-dashboard-rail-toggle]:not([data-dashboard-rail]) .app-header .content-header-elements:has([data-compact]) {
+        --content-side-reserve: calc(2 * var(--header-icon-box) + 3 * 0.15rem + max(var(--header-padding-x), var(--content-leading-inset)));
+        padding-right: calc(var(--header-padding-x) + var(--header-icon-box) + 0.15rem);
+    }
+
+    .app-header .content-header-elements:has([data-compact]) > .content-refresh-btn {
+        width: 0;
+        padding-inline: 0;
+        margin-inline-end: 0;
+        pointer-events: none;
+        visibility: hidden;
+    }
+
+    /* Refresh feedback occupies the overflow's icon slot while it runs. */
+    .app-header .content-header-elements:has([data-compact]) > .content-refresh-btn:not([data-state="idle"]) {
+        position: absolute;
+        left: calc(var(--content-leading-inset) + var(--header-icon-box) + 0.15rem);
+        width: var(--header-icon-box);
+        visibility: visible;
+        z-index: 2;
+    }
+
+    .app-header .content-header-elements:has(> .content-refresh-btn:not([data-state="idle"])) .content-header-actions[data-compact] > .content-header-more svg {
+        visibility: hidden;
+    }
+
+    .app-header .content-header-elements:has([data-compact]) .pane-header-content-title {
+        width: min(var(--desktop-nav-span), max(0rem, calc(100% - 2 * var(--content-side-reserve))));
+        gap: 0.15rem;
+    }
+
+    .app-header .content-header-elements:has([data-compact]) .pane-header-content-title > .icon-btn {
+        width: 1.75rem;
+    }
+
+    .app-header .content-header-actions[data-compact] {
+        margin-left: auto;
+    }
+
+    /* No transition: the ⋯ lands in its new slot in one frame, so a resize
+       never shows it trailing the pointer or gliding across the row. */
+    .app-header .content-header-actions[data-compact] > .content-header-more {
+        position: absolute;
+        left: calc(var(--content-leading-inset) + var(--header-icon-box) + 0.15rem - var(--content-actions-offset));
     }
 
     .app-header .pane-header-content-title .pane-header-title-text,

@@ -55,7 +55,8 @@ thread, on both layouts.
 2. **The thread card is a tile.** A widget in a reply draws as a bar over a
    widget box. The box is the one a dashboard tile draws, from the same
    component and the same cell edge. The bar holds the icon, the name, the
-   S · M · L pill, "+ Dashboard" and the ⋯ menu.
+   S · M · L pill, "+ Dashboard" and the ⋯ menu. [ADR 0632](0632-inline-widgets-are-bare-centred-boxes.md)
+   drops the bar: the card is the bare box, and the widget menu holds its size.
 3. **The card's size is the user's, per thread.** It starts at the widget's
    default size. A pick records `InlineWidgetSized`, and
    `widgets(action="size")` does the same from the prompt.

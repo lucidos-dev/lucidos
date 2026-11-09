@@ -324,6 +324,9 @@ async fn wave4_mutating_endpoint_events_persist_with_actor() {
         },
         SystemEvent::RepositoryRemoved {
             repo_id: "repo-id-1".into(),
+            name: None,
+            root_path: None,
+            description: None,
             actor: Some(actor.clone()),
         },
         SystemEvent::CredentialCreated {
@@ -337,6 +340,7 @@ async fn wave4_mutating_endpoint_events_persist_with_actor() {
         },
         SystemEvent::CredentialDeleted {
             service_name: "openai".into(),
+            metadata: None,
             actor: Some(actor.clone()),
         },
         SystemEvent::OAuthAccountDeleted {

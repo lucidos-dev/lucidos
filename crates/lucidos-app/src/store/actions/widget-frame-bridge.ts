@@ -2,14 +2,17 @@ import {
   WIDGET_CONTENT_SIZE_MESSAGE_TYPE,
   WIDGET_MENU_MESSAGE_TYPE,
   type ContentSize,
+  type WidgetSize,
 } from '@lucidos/widget-frame';
+import { WIDGET_SIZES } from '@lucidos/engine-constants';
 import { appFrameFor } from '../../utils/appFrame';
 import { topPanelOverlay } from '../overlayStack';
 import { notePressOwesClick } from '../../utils/pointerPress';
 import type { ViewportPoint } from '../../hooks/useAnchoredPopover';
 
 /** Dispatched on the sending frame's own element, and bubbles to the
- *  `WidgetFrame` around it. `detail` is the `ContentSize` in CSS pixels.
+ *  `WidgetFrame` around it. `detail` is the `ContentSize`: CSS pixels, and
+ *  the widget size laid out for when the report names a valid one.
  *  Keyed to the element, so a frame that has since been replaced cannot
  *  resize its successor. */
 export const APP_FRAME_SIZE_EVENT = 'lucidos-app-frame-size';
@@ -24,6 +27,7 @@ const MAX_REPORTED_PX = 20_000;
 
 const isLength = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0;
 const isCoordinate = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+const isWidgetSize = (v: unknown): v is WidgetSize => WIDGET_SIZES.includes(v as WidgetSize);
 const clamp = (v: number, min: number, max: number) => Math.min(Math.max(v, min), max);
 
 /** A point in the frame's own viewport, placed in the host's and clamped into
@@ -46,11 +50,12 @@ function inTopPanel(frame: HTMLIFrameElement): boolean {
  *  0402). A message from any frame that is not a mounted app frame, such as a
  *  nested embed, is ignored. */
 export function handleWidgetFrameMessage(event: MessageEvent): void {
-  const data = event.data as { type?: unknown; height?: unknown; at?: unknown; held?: unknown } | null;
+  const data = event.data as { type?: unknown; height?: unknown; size?: unknown; at?: unknown; held?: unknown } | null;
   if (!data || typeof data !== 'object') return;
   if (data.type === WIDGET_CONTENT_SIZE_MESSAGE_TYPE) {
     if (!isLength(data.height)) return;
     const size: ContentSize = { height: Math.min(data.height, MAX_REPORTED_PX) };
+    if (isWidgetSize(data.size)) size.size = data.size;
     appFrameFor(event.source)?.dispatchEvent(new CustomEvent(APP_FRAME_SIZE_EVENT, { detail: size, bubbles: true }));
   } else if (data.type === WIDGET_MENU_MESSAGE_TYPE) {
     const frame = appFrameFor(event.source);

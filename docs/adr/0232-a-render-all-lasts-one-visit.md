@@ -1,6 +1,6 @@
 # 0232: A render-all lasts one visit, and a gesture at the top asks again
 
-- **Status**: Accepted
+- **Status**: Accepted. A deep link no longer sets a render-all: ADR 0631 supersedes that half. The chevron's render-all and the one-visit rule stand.
 - **Date**: 2026-09-20
 
 ## Context
@@ -131,3 +131,5 @@ report needs. Not ruled out.
 **Drop the persist entirely, so a deep link never renders all.** Rejected: that
 is the snap-back to the tail the persist was added to stop, and it happens
 while the reader is mid-read.
+*Superseded by ADR 0631.* A deep link now claims its target turn instead. That
+floor stops the snap-back as well, without drawing the older turns.

@@ -18,7 +18,7 @@
  *
  * iOS gives a home-screen app its own storage container, so the credential
  * cookie taken in Safari never reaches it. Pairing the tab therefore enrols the
- * wrong device. `InstallFirst` says so and shows the install steps. The gateway
+ * wrong device. `InstallFirst` says so and shows the install steps. The head script
  * has already put the scanned code in the manifest's `start_url`, so the app
  * pairs itself the first time it opens.
  *
@@ -30,6 +30,7 @@ import { useEffect, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import {
   isPairingSecret,
+  releasePairingLaunch,
   PAIRING_CODE_DIGITS,
   takePairingCodeFromUrl,
   takeUnspentPairingCodeFromUrl,
@@ -104,7 +105,10 @@ export function PairingGate({ children }: { children: ComponentChildren }) {
       .then((body) => {
         if (!live) return;
         if (!body) setState('unreachable');
-        else setState(body.paired ? 'paired' : 'unpaired');
+        else {
+          if (body.paired) releasePairingLaunch();
+          setState(body.paired ? 'paired' : 'unpaired');
+        }
       })
       .catch(() => live && setState('unreachable'));
     return () => {
@@ -123,7 +127,12 @@ export function PairingGate({ children }: { children: ComponentChildren }) {
   }, [state]);
 
   if (state === 'checking') return null;
-  if (state === 'unpaired') return <DesktopPairing onPaired={() => setState('paired')} />;
+  if (state === 'unpaired') {
+    return <DesktopPairing onPaired={() => {
+      releasePairingLaunch();
+      setState('paired');
+    }} />;
+  }
   return <>{children}</>;
 }
 

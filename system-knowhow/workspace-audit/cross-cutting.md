@@ -24,6 +24,8 @@ scan retired-tools "execute_intent" $all
 
 ## Checks
 
+- **Pairing links in recipes.** Generate fresh device links with `lucidos pair`; never copy credentials into query URLs or workspace files.
+
 - **Cleanup authority.** Workspace review is read-only. Refuse recipes that use local tokens for manual deletion or infer ownership from workspace names.
 
 - **Restore authority inferred from a caller-provided workspace.** Review snapshot recipes against `system-knowhow/backups/workspace-snapshots.md` and `system-knowhow/lucidos-cli.md`.

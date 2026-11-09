@@ -51,14 +51,12 @@ async fn pair() -> Pair {
     a.peer_connection()
         .trust_for_test(cert.cert.pem().as_bytes());
     add_remote(&a, "cloud", &b_address, &credential);
-    a.write_paired_devices_for_test(|paired| {
-        paired.devices.push(auth::PairedDevice {
-            id: "device-1".into(),
-            label: "My iPhone".into(),
-            credential_digest: auth::digest(DEVICE_CREDENTIAL),
-            paired_at: "2020-01-01T00:00:00Z".into(),
-            last_seen_at: None,
-        });
+    a.seed_device_for_test(auth::PairedDevice {
+        id: "device-1".into(),
+        label: "My iPhone".into(),
+        credential_digest: auth::digest(DEVICE_CREDENTIAL),
+        paired_at: "2020-01-01T00:00:00Z".into(),
+        last_seen_at: None,
     })
     .unwrap();
     Pair {

@@ -235,6 +235,11 @@ mod tests {
             .iter()
             .map(|s| s.as_str().to_string())
             .collect();
+        let widget_sizes: Vec<&str> = crate::core::apps::WidgetSize::ALL
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(WIDGET_SIZE_ARG.enum_values, widget_sizes.as_slice());
         assert_eq!(names(&schema["dashboard"]["enum"]), dashboards);
         assert_eq!(
             names(&schema["tiles"]["items"]["properties"]["size"]["enum"]),
@@ -763,6 +768,7 @@ mod tests {
         // the caller or one of its children (ADR 0310). `drafts` and
         // `held_messages` say what a thread holds that nothing has sent.
         // `cache_keep_alive` is the per-thread keep-alive switch (ADR 0554).
+        // `context_ceiling` sets a thread's context ceiling (ADR 0629).
         // `triage` and `apply_triage` are thread triage (ADR 0349).
         assert_eq!(
             threads.actions(),
@@ -775,6 +781,7 @@ mod tests {
                 "detach_child",
                 "archive",
                 "cache_keep_alive",
+                "context_ceiling",
                 "triage",
                 "apply_triage"
             ]

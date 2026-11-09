@@ -156,6 +156,7 @@ pub(crate) async fn notify(
             event_id: None,
             tap: notice.tap,
             actor,
+            audience: None,
         }))
         .await;
     if let Err(e) = emitted {
@@ -193,7 +194,9 @@ mod tests {
     fn tap_target(tap: &Tap) -> (NavigateTarget, Option<String>) {
         match tap {
             Tap::Navigate { to } => (to.target, to.id.clone()),
-            Tap::Modal | Tap::RestoreSnapshot { .. } => panic!("the notice must navigate"),
+            Tap::Modal | Tap::RestoreSnapshot { .. } | Tap::UndoConfigChange { .. } => {
+                panic!("the notice must navigate")
+            }
         }
     }
 

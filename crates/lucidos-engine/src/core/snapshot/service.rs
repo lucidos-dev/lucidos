@@ -1,5 +1,6 @@
 //! The credential boundary shared by snapshot callers. Detailed errors from
-//! archive primitives are deliberately discarded here, including on join errors.
+//! archive primitives never leave here, including on join errors. Each one is
+//! logged redacted, and callers see only a slug.
 use super::{
     check,
     handle::Handle,
@@ -20,6 +21,30 @@ use crate::{
 use chrono::Utc;
 use sqlx::PgPool;
 use std::path::Path;
+
+/// Log a failed step's cause, redacted, and return the slug callers see.
+fn step_failed<E: std::fmt::Display>(
+    step: &'static str,
+    slug: &'static str,
+) -> impl FnOnce(E) -> BoxError {
+    move |error| {
+        crate::log!(
+            "[Snapshots] {step} failed: {}",
+            crate::core::redact_postgres_secrets(&error.to_string())
+        );
+        slug.into()
+    }
+}
+
+/// A floor refusal tells the user how much to free. Any other error stays opaque.
+fn capture_failure(error: &BoxError) -> super::jobs::Failure {
+    match error.downcast_ref::<store::DiskFloorRefused>() {
+        Some(refusal) => super::jobs::Failure::DiskFloor {
+            needed_bytes: refusal.needed_bytes,
+        },
+        None => super::jobs::Failure::CaptureFailed,
+    }
+}
 
 /// Own both locks for the entire operation, including MAC key creation.
 /// Capture tasks retain ownership if their caller stops waiting.
@@ -224,6 +249,7 @@ impl Session {
             {
                 return Err("snapshot_job_action_refused".into());
             }
+            let request_handle = job.handle.clone();
             request.handle = job.handle.clone();
             request.actor = job.actor.clone();
             if let Some(events) = &self.events {
@@ -237,9 +263,15 @@ impl Session {
                 Ok(manifest) => super::jobs::State::Completed {
                     manifest: Box::new(manifest),
                 },
-                Err(_) => super::jobs::State::Failed {
-                    reason: super::jobs::Failure::CaptureFailed,
-                },
+                Err(error) => {
+                    let reason = capture_failure(&error);
+                    crate::log!(
+                        "[Snapshots] Capture job {id} for {} failed: {reason:?} ({})",
+                        request_handle.as_str(),
+                        crate::core::redact_postgres_secrets(&error.to_string())
+                    );
+                    super::jobs::State::Failed { reason }
+                }
             };
             self.complete_job(id, state).await
         })
@@ -273,9 +305,15 @@ impl Session {
                 Ok(Ok(manifest)) => super::jobs::State::Completed {
                     manifest: Box::new(manifest),
                 },
-                _ => super::jobs::State::Failed {
+                Ok(Err(_)) => super::jobs::State::Failed {
                     reason: super::jobs::Failure::CheckFailed,
                 },
+                Err(error) => {
+                    crate::log!("[Snapshots] Check job {id} worker failed: {error}");
+                    super::jobs::State::Failed {
+                        reason: super::jobs::Failure::CheckFailed,
+                    }
+                }
             };
             self.complete_job(id, state).await
         })
@@ -370,7 +408,7 @@ impl Session {
 
     pub fn check(&self, handle: &Handle, database_url: &str) -> Result<Manifest, BoxError> {
         check::check(&self.store, handle, &self.key, database_url)
-            .map_err(|_| "snapshot_check_failed".into())
+            .map_err(step_failed("Snapshot check", "snapshot_check_failed"))
     }
 
     pub fn set_keep(&self, handle: &Handle, keep: bool) -> Result<Manifest, BoxError> {
@@ -595,13 +633,16 @@ impl Session {
                 worker.fault("recovery-verify")?;
                 tokio::task::spawn_blocking(move || worker.check(&manifest.handle, &database_url))
                     .await
-                    .map_err(|_| "snapshot_check_failed")?
+                    .map_err(step_failed(
+                        "Recovery check worker",
+                        "snapshot_check_failed",
+                    ))?
             } else {
                 Ok(manifest)
             }
         })
         .await
-        .map_err(|_| "snapshot_capture_failed")?;
+        .map_err(step_failed("Capture worker", "snapshot_capture_failed"))?;
         drop(self);
         result
     }
@@ -619,20 +660,26 @@ impl Session {
         let db_bytes: i64 = sqlx::query_scalar("SELECT pg_database_size(current_database())")
             .fetch_one(pool)
             .await
-            .map_err(|_| "snapshot_size_failed")?;
+            .map_err(step_failed("Database size query", "snapshot_size_failed"))?;
         let workspace_path = workspace.to_owned();
         let file_bytes =
             tokio::task::spawn_blocking(move || backup::snapshot_file_estimate(&workspace_path))
                 .await
-                .map_err(|_| "snapshot_size_failed")?
-                .map_err(|_| "snapshot_size_failed")?;
+                .map_err(step_failed("File size worker", "snapshot_size_failed"))?
+                .map_err(step_failed("File size estimate", "snapshot_size_failed"))?;
         self.store
             .preflight_space(file_bytes.saturating_add(db_bytes.max(0) as u64))
-            .map_err(|_| "snapshot_disk_floor")?;
-        let partial = self
-            .store
-            .begin(&request.handle)
-            .map_err(|_| "snapshot_capture_failed")?;
+            .map_err(|error| {
+                if error.is::<store::DiskFloorRefused>() {
+                    error
+                } else {
+                    step_failed("Disk space query", "snapshot_disk_floor")(error)
+                }
+            })?;
+        let partial = self.store.begin(&request.handle).map_err(step_failed(
+            "Partial directory creation",
+            "snapshot_capture_failed",
+        ))?;
         let captured = self
             .capture_into(pool, database_url, workspace, &partial, request, mode)
             .await;
@@ -660,7 +707,7 @@ impl Session {
     ) -> Result<Manifest, BoxError> {
         let db = backup::capture::capture_database(pool, database_url, &partial.join("db.dump"))
             .await
-            .map_err(|_| "snapshot_capture_failed")?;
+            .map_err(step_failed("Database dump", "snapshot_capture_failed"))?;
         let workspace_path = workspace.to_owned();
         let output = partial.to_path_buf();
         let url = database_url.to_owned();
@@ -685,8 +732,11 @@ impl Session {
             Ok((files, components))
         })
         .await
-        .map_err(|_| "snapshot_capture_failed")?
-        .map_err(|_| "snapshot_capture_failed")?;
+        .map_err(step_failed(
+            "File capture worker",
+            "snapshot_capture_failed",
+        ))?
+        .map_err(step_failed("File capture", "snapshot_capture_failed"))?;
         if matches!(mode, CaptureMode::Recovery(_)) && files.files_changed_during_read != 0 {
             return Err("snapshot_recovery_files_changed".into());
         }
@@ -733,10 +783,10 @@ impl Session {
             restore_id,
         };
         let signed = AuthenticatedManifest::seal(manifest.clone(), &self.key)
-            .map_err(|_| "snapshot_capture_failed")?;
+            .map_err(step_failed("Manifest signing", "snapshot_capture_failed"))?;
         self.store
             .publish(&signed, &self.key)
-            .map_err(|_| "snapshot_capture_failed")?;
+            .map_err(step_failed("Snapshot publish", "snapshot_capture_failed"))?;
         Ok(manifest)
     }
 }

@@ -226,9 +226,8 @@ async function boot() {
   // is a no-op everywhere else.
   adoptDeviceIdFromUrl();
 
-  // A scanned pairing QR arrives as `?pair=<code>`. Read and strip it here, so
-  // the code never survives into a reload, a bookmark or an installed PWA's
-  // start URL. `PairingGate` asks the same memoized function for the value.
+  // Consume the head script's captured pairing seed. The memoized read also
+  // strips legacy URLs when running without that bootstrap script.
   takePairingCodeFromUrl();
 
   // Packaged desktop: the shell keeps the launch window hidden until a page says

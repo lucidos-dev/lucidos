@@ -50,10 +50,10 @@ pub(super) fn render(root: &Path) -> String {
         TurnIncomplete, AwaitingLanding, IntegratedIntoParent, CarriedBySuccessor);
     block!(EngineReason;
         ContinuationStarted, OrphanRecovery,
-        Scheduler { trigger_id: String::new(), trigger_name: None },
+        Scheduler { trigger_id: String::new(), trigger_name: None, actor_email: None },
         HardenRetrigger, StaleSession, ArchivedBranchWork, UnmergedIntegratedWork,
         SuccessorResidue, SuccessorSession, MergeConflict, MainCheckRed, MainCheckFlaky,
-        MissingHardening, MissingPlan,
+        MissingHardening, MissingPlan, ContextCeiling,
         PluginAutoUpdate { plugin_id: String::new(), marketplace_id: String::new(), marketplace_name: String::new() },
         PluginSetup { plugin_id: String::new(), plugin_name: String::new(), version: String::new(),
             occasion: events::PluginSetupOccasion::FreshInstall, confirmed_on_device_id: None },
@@ -63,9 +63,11 @@ pub(super) fn render(root: &Path) -> String {
         CacheKeepAlive);
     block!(SessionContinuity; First, Resumed,
         Fresh { reason: events::FreshSessionReason::ChangeApplied },
-        Handoff { checkpoint: None, progress: None, opening: events::HandoffOpening::Narrative, message: String::new() });
+        Handoff { checkpoint: None, progress: None, crossing: None, opening: events::HandoffOpening::Narrative, message: String::new() });
     block!(FreshSessionReason; ChangeApplied, ChangeDiscarded, SessionEnded, BranchGone, ResumeFailed, NoResumableSession);
     block!(HandoffOpening; Narrative, Brief);
+    block!(HandoffCause; Checkpoint, User, ContextCeiling);
+    block!(SessionStart; Now, AfterThisTurn, OnNextInput);
     let manifest = serde_json::json!({
         "schema_version": 1,
         "documents": { "system-knowhow/thread-events.md": fragments },

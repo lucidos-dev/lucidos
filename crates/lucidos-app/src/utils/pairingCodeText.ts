@@ -29,7 +29,8 @@ export function pairingCodeFromText(text: string): string | null {
   if (!raw) return null;
   if (raw.includes('://')) {
     try {
-      return pairingCodeToAdopt(new URL(raw).search);
+      const url = new URL(raw);
+      return pairingCodeToAdopt(url.search, url.hash);
     } catch {
       return null;
     }

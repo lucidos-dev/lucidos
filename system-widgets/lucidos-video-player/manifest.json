@@ -6,7 +6,8 @@
   "reusable": true,
   "sizes": [
     "medium",
-    "large"
+    "large",
+    "xl"
   ],
   "params": {
     "clip": {

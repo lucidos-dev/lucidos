@@ -13,6 +13,7 @@
 // `installNotificationToastLifetime` at the foot of this file enforces.
 
 import { confirmSnapshotRestore } from './restore-snapshot';
+import { confirmConfigUndo } from './undo-config-change';
 import { effect, untracked } from '@preact/signals';
 import type { PresenceOutcome } from '@lucidos/event-stream';
 import type { Loadable, Notification } from '../types';
@@ -137,6 +138,10 @@ export function dispatchDeepLink(target: DeepLinkTarget): boolean {
       if (action.notification) markReadOptimistic(action.notification, target.restoreGeneration);
       void confirmSnapshotRestore(action.tap);
       return dispatched();
+    case 'undo-config-change':
+      if (action.notification) markReadOptimistic(action.notification, target.restoreGeneration);
+      void confirmConfigUndo(action.tap);
+      return dispatched();
     case 'view-notification':
       // viewNotification opens the detail in the content pane AND marks the row
       // read. It's async (fetches the full row), but the open + mark-read are
@@ -224,7 +229,7 @@ export function presentInAppNotification({ title, body, target }: InAppNotificat
   // A notification action opens on a tap anywhere on the card,
   // beside the toast's built-in X. The tap runs the deep link (the detail in the
   // content pane for `modal`, the destination for `navigate`, or confirmation
-  // for `restore-snapshot`) and marks the
+  // for `restore-snapshot` and `undo-config-change`) and marks the
   // notification read. The X dismisses WITHOUT marking read, leaving the row on
   // the bell badge and in the panel. There is deliberately no "OK" button:
   // marking read without opening would bury an unanswered question.

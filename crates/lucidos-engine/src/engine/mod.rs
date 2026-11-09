@@ -27,11 +27,13 @@ pub(crate) mod command_judge;
 pub use command_judge::{classify_for_eval as classify_command_for_eval, EvalVerdict};
 pub(crate) mod command_judge_questions;
 pub mod command_permission;
+pub mod config_change;
 /// `pub(crate)` for the cost helpers: `tool_definitions_chars`,
 /// `estimate_tokens_from_chars` and `agent_context_char_budget` are what the
 /// MCP surface is capped and reported by, and it lives outside `engine`. The
 /// cap, the report and the request packer must share one definition of cost.
 pub(crate) mod context;
+pub mod context_ceiling;
 pub mod db_health;
 pub mod engine_version;
 /// The eval-only full-capture gate (ADR 0110). Inert without
@@ -109,6 +111,7 @@ pub(crate) mod user_profile;
 pub mod widget_embed;
 pub mod widget_guidance;
 pub mod widgets;
+pub mod work_item;
 pub mod worktree_cleanup;
 
 pub(crate) use agentic_loop::{

@@ -41,6 +41,16 @@ describe('handleWidgetFrameMessage', () => {
     expect(dispatched().detail).toEqual({ height: 120 });
   });
 
+  it('carries the laid-out widget size', () => {
+    handleWidgetFrameMessage(message({ type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, height: 120, size: 'large' }));
+    expect(dispatched().detail).toEqual({ height: 120, size: 'large' });
+  });
+
+  it('drops a laid-out size that is not a widget size', () => {
+    handleWidgetFrameMessage(message({ type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, height: 120, size: 'huge' }));
+    expect(dispatched().detail).toEqual({ height: 120 });
+  });
+
   it('dispatches a menu request at the point in the viewport', () => {
     handleWidgetFrameMessage(message({ type: WIDGET_MENU_MESSAGE_TYPE, at: { x: 40, y: 24 } }));
     expect(dispatched().type).toBe(APP_FRAME_MENU_EVENT);

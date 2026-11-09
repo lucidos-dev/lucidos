@@ -10,7 +10,7 @@ import { DASHBOARD_STEPS_PER_CELL, WIDGET_SIZE_CELLS } from '../../utils/dashboa
 import { AppIcon } from '../shared/AppIcon';
 import { OverflowMenu, type OverflowMenuContext } from '../shared/OverflowMenu';
 import { SkBlock } from '../shared/Skeleton';
-import { useObjectMenu } from '../shared/useObjectMenu';
+import { isMenuKey, useObjectMenu } from '../shared/useObjectMenu';
 import { WidgetBox } from '../widgets/WidgetBox';
 import { WidgetSizePill } from '../widgets/WidgetSizePill';
 import type { FrameState } from '../widgets/widgetFrameState';
@@ -28,11 +28,15 @@ export const SIZE_SPANS: Record<TileSize, { columns: number; rows: number }> = {
   small: widgetSpan('small'),
   medium: widgetSpan('medium'),
   large: widgetSpan('large'),
+  xl: widgetSpan('xl'),
 };
 
-function gridPlace(size: TileSize, order?: number) {
+/** The tile's grid place. A span wider than the grid would add implicit
+ *  columns, so it stops at `steps`, the grid's step count. The box then
+ *  scrolls its widget sideways (`WidgetBox`). */
+function gridPlace(size: TileSize, steps: number, order?: number) {
   const span = SIZE_SPANS[size];
-  return { order, gridColumn: `span ${span.columns}`, gridRow: `span ${span.rows}` };
+  return { order, gridColumn: `span ${Math.min(span.columns, steps)}`, gridRow: `span ${span.rows}` };
 }
 
 /** What edit mode adds to a tile, and what it may do. */
@@ -82,6 +86,8 @@ function tileMenuItems(ctx: OverflowMenuContext, target: DashboardTileTarget, on
 interface TileProps<T extends Tile> {
   tile: T;
   order: number;
+  /** The grid's step count, the most a tile can span. */
+  steps: number;
   dashboardHidden: boolean;
   actions: TileDashboardActions;
   editing: TileEditing | null;
@@ -129,11 +135,6 @@ function EditControls({ name, editing, children }: { name: string; editing: Tile
   );
 }
 
-/** The keyboard's menu key, or Shift+F10 where the keyboard has none. */
-function isMenuKey(e: KeyboardEvent): boolean {
-  return e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10');
-}
-
 /** Hands the drag its tile box in the commit that draws the shield, so a press
  *  on a shield on screen always finds its tile. A passive effect would run a
  *  frame later, and a press in that gap would start no drag. */
@@ -149,7 +150,7 @@ function useRegisteredTile(register: TileEditing['register'] | undefined, key: s
  *  with no frame. A tap opens the app in the Canvas. A right-click, a finger
  *  held on it or the menu key opens its menu. No frame mounts, so a
  *  shortcut costs no renderer process (ADR 0227). */
-function AppShortcutTile({ tile, order, actions, editing }: TileProps<AppDashboardTile>) {
+function AppShortcutTile({ tile, order, steps, actions, editing }: TileProps<AppDashboardTile>) {
   const [box, setBox] = useState<HTMLDivElement | null>(null);
   const key = dashboardTileKey(tile);
   const name = tile.label ?? tile.name;
@@ -167,7 +168,7 @@ function AppShortcutTile({ tile, order, actions, editing }: TileProps<AppDashboa
       data-dashboard-tile={key}
       data-kind="app"
       data-size={tile.size}
-      style={gridPlace(tile.size, order)}
+      style={gridPlace(tile.size, steps, order)}
       {...(editing ? {} : menu.press)}
       onClick={editing ? undefined : menu.onClick}
       onKeyDown={editing ? undefined : (e) => {
@@ -206,7 +207,7 @@ function AppShortcutTile({ tile, order, actions, editing }: TileProps<AppDashboa
  *  right-click or a finger held on it opens the tile menu, which ends in Edit
  *  dashboard. In edit mode a shield covers the frame, so a drag moves the tile
  *  instead of reaching the widget, and a press opens no menu. */
-function WidgetTile({ tile, order, dashboardHidden, actions, editing, onFrameState }: TileProps<WidgetDashboardTile>) {
+function WidgetTile({ tile, order, steps, dashboardHidden, actions, editing, onFrameState }: TileProps<WidgetDashboardTile>) {
   const [box, setBox] = useState<HTMLDivElement | null>(null);
   const key = dashboardTileKey(tile);
   const name = tile.label ?? tile.name;
@@ -231,7 +232,7 @@ function WidgetTile({ tile, order, dashboardHidden, actions, editing, onFrameSta
       class={classes}
       data-dashboard-tile={key}
       data-kind="widget"
-      style={gridPlace(tile.size, order)}
+      style={gridPlace(tile.size, steps, order)}
       {...(editing ? {} : menu.press)}
       onClickCapture={editing ? undefined : menu.onClick}
       appId={tile.app_id}
@@ -260,9 +261,9 @@ function WidgetTile({ tile, order, dashboardHidden, actions, editing, onFrameSta
 }
 
 /** The skeleton drawn from the tile's own box, at a typical first dashboard. */
-export function TileSkeleton({ size }: { size: TileSize }) {
+export function TileSkeleton({ size, steps }: { size: TileSize; steps: number }) {
   return (
-    <div class="dashboard-tile widget-box" data-size={size} style={gridPlace(size)}>
+    <div class="dashboard-tile widget-box" data-size={size} style={gridPlace(size, steps)}>
       <SkBlock w="100%" h="100%" />
     </div>
   );

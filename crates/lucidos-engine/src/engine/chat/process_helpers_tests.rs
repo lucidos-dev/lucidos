@@ -225,6 +225,20 @@ async fn arm_redirect_skips_plain_claude_code_mid_turn() {
     );
 }
 
+/// I3: no follow-up cuts the ceiling re-entry short, urgent or on Codex. The
+/// input waits in the channel for the successor session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arm_redirect_never_interrupts_the_ceiling_reentry() {
+    for (mut session, _msg_rx) in [codex_in_flight_session(), claude_code_in_flight_session()] {
+        let thread_id = Uuid::new_v4();
+        session.in_ceiling_reentry = true;
+        let mut sessions = HashMap::from([(thread_id, session)]);
+        let idle = arm_followup_redirect(&mut sessions, thread_id, true, true, &None);
+        assert!(idle.is_none());
+        assert!(!sessions[&thread_id].redirect_followup_pending);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn arm_redirect_fires_for_urgent_claude_code_mid_turn() {
     let thread_id = Uuid::new_v4();

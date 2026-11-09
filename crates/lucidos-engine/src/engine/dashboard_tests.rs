@@ -6,7 +6,7 @@ use crate::core::devices::DeviceStore;
 use crate::engine::home_thread::ensure_home_thread;
 use crate::test_support::{setup_test_db, teardown_test_db};
 use Dashboard::{Desktop, Phone};
-use WidgetSize::{Large, Medium, Small};
+use WidgetSize::{Large, Medium, Small, Xl};
 
 fn pin(app_id: &str) -> ThreadEvent {
     ThreadEvent::WidgetPinned {
@@ -874,7 +874,12 @@ async fn an_app_add_refuses_params_an_unknown_id_and_a_repeat_and_a_deleted_app_
 /// unchanged, since the new size type is a superset of the old one.
 #[test]
 fn an_old_arranged_tile_reads_into_the_tile_size() {
-    for (name, size) in [("small", Small), ("medium", Medium), ("large", Large)] {
+    for (name, size) in [
+        ("small", Small),
+        ("medium", Medium),
+        ("large", Large),
+        ("xl", Xl),
+    ] {
         let tile: ArrangedTile =
             serde_json::from_value(json!({"app_id": "clock", "size": name})).unwrap();
         assert_eq!(tile.size, TileSize::from(size));

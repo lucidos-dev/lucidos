@@ -4637,6 +4637,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures",
+ "hmac",
  "image",
  "lucidos-engine",
  "lucidos-local-token",

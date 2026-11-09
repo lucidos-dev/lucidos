@@ -164,6 +164,100 @@ async fn trigger_side_effect_grant_round_trips() {
     delete_trigger(&client, &trigger_id).await;
 }
 
+/// Poll `GET /api/v1/triggers` until the trigger named `name` lists `expected`
+/// as its `permission_wait` (`Null` = absent, the workspace preference).
+async fn poll_permission_wait(
+    client: &reqwest::Client,
+    name: &str,
+    expected: &serde_json::Value,
+) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let listed: serde_json::Value = client
+            .get(format!("{}/api/v1/triggers", base_url()))
+            .send()
+            .await
+            .expect("GET /triggers failed")
+            .json()
+            .await
+            .expect("Invalid JSON");
+        let found = listed["triggers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"].as_str() == Some(name))
+            .cloned();
+        if let Some(ref t) = found {
+            if &t["permission_wait"] == expected {
+                return t["id"].as_str().unwrap().to_string();
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Trigger '{name}' permission_wait did not become {expected} within 5s \
+             (last saw {found:?})",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// The *permission wait* round-trips in its one wire form: minutes as a
+/// number, the others as strings. Null clears it, and a refused value saves
+/// nothing.
+#[tokio::test]
+async fn trigger_permission_wait_round_trips() {
+    let client = user_client().await;
+    set_timezone_utc(&client).await;
+    let name = unique_marker("e2e-permission-wait");
+
+    let created: serde_json::Value = client
+        .post(format!("{}/api/v1/triggers", base_url()))
+        .json(&json!({
+            "name": name,
+            "run": { "type": "intent", "intent": "noop" },
+            "cron_expressions": ["0 0 8 * * *"],
+            "permission_wait": 15,
+        }))
+        .send()
+        .await
+        .expect("POST /triggers failed")
+        .json()
+        .await
+        .expect("Invalid JSON");
+    assert_eq!(created["success"], true, "{created:?}");
+    let trigger_id = poll_permission_wait(&client, &name, &json!(15)).await;
+
+    let put = |body: serde_json::Value| {
+        let client = client.clone();
+        let url = format!("{}/api/v1/triggers?id={}", base_url(), trigger_id);
+        async move {
+            client
+                .put(url)
+                .json(&body)
+                .send()
+                .await
+                .expect("PUT /triggers failed")
+                .json::<serde_json::Value>()
+                .await
+                .expect("Invalid JSON")
+        }
+    };
+
+    let res = put(json!({ "permission_wait": "indefinite" })).await;
+    assert_eq!(res["success"], true, "{res:?}");
+    poll_permission_wait(&client, &name, &json!("indefinite")).await;
+
+    let refused = put(json!({ "permission_wait": "forever" })).await;
+    assert_ne!(refused["success"], true, "{refused:?}");
+    poll_permission_wait(&client, &name, &json!("indefinite")).await;
+
+    let res = put(json!({ "permission_wait": null })).await;
+    assert_eq!(res["success"], true, "{res:?}");
+    poll_permission_wait(&client, &name, &serde_json::Value::Null).await;
+
+    delete_trigger(&client, &trigger_id).await;
+}
+
 /// `side_effect_grant` is a typed serde enum, so an unknown category fails to
 /// deserialize at the `Json` extractor before the handler runs. Note: axum
 /// 0.7's `Json` rejects a valid-JSON-but-wrong-shape body (a `JsonDataError`)

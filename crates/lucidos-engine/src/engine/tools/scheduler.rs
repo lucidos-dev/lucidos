@@ -4,7 +4,8 @@ use crate::engine::trigger_writes::TriggerWrite;
 use crate::llm::tool_names as tn;
 use crate::triggers::{
     normalize_mcp_servers, normalize_route_setting, resolve_trigger_provider_update,
-    validate_trigger_provider, validate_trigger_reasoning_effort, EventSubscription, TriggerRun,
+    validate_trigger_provider, validate_trigger_reasoning_effort, ActorField, ContinueKeySpec,
+    EventSubscription, TriggerRun, ACTOR_FIELD_KEY,
 };
 // Lets the never-fires diagnosis and the AND-footgun check read a parsed
 // schedule's day-of-month / month / day-of-week ordinal sets, instead of
@@ -131,7 +132,9 @@ impl LucidosEngine {
         &self,
         name: &str,
         args: &serde_json::Value,
+        thread_id: uuid::Uuid,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let actor = Some(super::agent_tool_actor(thread_id));
         // Defense in depth: the prompt envelope asks the LLM not to call these
         // during a trigger fire; this enforces it even when the LLM ignores it.
         let active_id = crate::scheduler::user_tasks::current_trigger_id();
@@ -318,9 +321,23 @@ impl LucidosEngine {
                 if !mcp_servers.is_empty() {
                     event_payload["mcp_servers"] = serde_json::json!(mcp_servers);
                 }
+                match ContinueKeySpec::parse(args.get("continue_key"))
+                    .and_then(|spec| ContinueKeySpec::check_run(spec.as_ref(), &run).map(|()| spec))
+                {
+                    Ok(Some(spec)) => event_payload["continue_key"] = serde_json::json!(spec),
+                    Ok(None) => {}
+                    Err(e) => return Ok(format!("Error: {e}")),
+                }
+                match ActorField::parse(args.get("actor"))
+                    .and_then(|field| ActorField::check_run(field.as_ref(), &run).map(|()| field))
+                {
+                    Ok(Some(field)) => event_payload[ACTOR_FIELD_KEY] = serde_json::json!(field),
+                    Ok(None) => {}
+                    Err(e) => return Ok(format!("Error: {e}")),
+                }
 
                 self.trigger_registry_writer()
-                    .write_created_minting_slug(&trigger_id_str, event_payload, name, None)
+                    .write_created_minting_slug(&trigger_id_str, event_payload, name, actor)
                     .await?;
 
                 let trigger_desc = trigger_description(&cron_display, &subscriptions);
@@ -390,9 +407,19 @@ impl LucidosEngine {
                         } else {
                             format!("  MCP servers: {}\n", config.mcp_servers.join(", "))
                         };
+                        let key_display = config
+                            .continue_key
+                            .as_ref()
+                            .map(|spec| format!("  Continue key: {}\n", serde_json::json!(spec)))
+                            .unwrap_or_default();
+                        let actor_display = config
+                            .actor
+                            .as_ref()
+                            .map(|field| format!("  Actor: {}\n", field.0))
+                            .unwrap_or_default();
                         result.push_str(&format!(
-                            "- **{}** (ID: {}) [{}]\n{}{}{}  Status: {}\n  Last run: {}\n  Run: {}\n\n",
-                            config.name, config.id, trigger_type, schedule_display, event_display, mcp_display, status, last_run, run_info
+                            "- **{}** (ID: {}) [{}]\n{}{}{}{}{}  Status: {}\n  Last run: {}\n  Run: {}\n\n",
+                            config.name, config.id, trigger_type, schedule_display, event_display, mcp_display, key_display, actor_display, status, last_run, run_info
                         ));
                     }
                     Ok(result)
@@ -527,6 +554,22 @@ impl LucidosEngine {
                     Ok(ids) => ids,
                     Err(e) => return Ok(e),
                 };
+                // Some(None) = clear, Some(Some(spec)) = set, None = absent.
+                let new_continue_key: Option<Option<ContinueKeySpec>> =
+                    match args.get("continue_key") {
+                        Some(raw) => match ContinueKeySpec::parse(Some(raw)) {
+                            Ok(spec) => Some(spec),
+                            Err(e) => return Ok(format!("Error: {e}")),
+                        },
+                        None => None,
+                    };
+                let new_actor: Option<Option<ActorField>> = match args.get("actor") {
+                    Some(raw) => match ActorField::parse(Some(raw)) {
+                        Ok(field) => Some(field),
+                        Err(e) => return Ok(format!("Error: {e}")),
+                    },
+                    None => None,
+                };
 
                 if new_name.is_none()
                     && new_run.is_none()
@@ -540,6 +583,8 @@ impl LucidosEngine {
                     && new_reasoning_effort.is_none()
                     && new_provider.is_none()
                     && new_mcp_servers.is_none()
+                    && new_continue_key.is_none()
+                    && new_actor.is_none()
                 {
                     return Ok(
                         "Error: At least one field besides trigger_id must be provided".to_string(),
@@ -601,6 +646,14 @@ impl LucidosEngine {
                     update_payload["mcp_servers"] = serde_json::json!(ids);
                     updated_fields.push("mcp_servers");
                 }
+                if let Some(ref spec) = new_continue_key {
+                    update_payload["continue_key"] = serde_json::json!(spec);
+                    updated_fields.push("continue_key");
+                }
+                if let Some(ref field) = new_actor {
+                    update_payload[ACTOR_FIELD_KEY] = serde_json::json!(field);
+                    updated_fields.push("actor");
+                }
 
                 // Ensure trigger still has at least one firing mechanism
                 let updated_schedule = new_cron
@@ -614,8 +667,15 @@ impl LucidosEngine {
                             .to_string(),
                     );
                 }
+                let mut next = existing.clone();
+                next.apply_update(&update_payload);
+                if let Err(e) = ContinueKeySpec::check_run(next.continue_key.as_ref(), &next.run)
+                    .and_then(|()| ActorField::check_run(next.actor.as_ref(), &next.run))
+                {
+                    return Ok(format!("Error: {e}"));
+                }
 
-                self.emit_trigger_write(TriggerWrite::Updated, &trigger_id, update_payload, None)
+                self.emit_trigger_write(TriggerWrite::Updated, &trigger_id, update_payload, actor)
                     .await?;
 
                 let display_name = new_name.unwrap_or(&existing.name);
@@ -663,7 +723,7 @@ impl LucidosEngine {
                         "name": existing.name,
                         "self_deleting": self_deleting,
                     }),
-                    None,
+                    actor,
                 )
                 .await?;
 
@@ -699,7 +759,7 @@ impl LucidosEngine {
                 // the next tool call in this same turn reads it. `pause_trigger`
                 // followed by `run_trigger` is the agent-side twin of the HTTP
                 // race, and it would otherwise fire the trigger it just paused.
-                self.emit_trigger_write(TriggerWrite::Updated, &trigger_id, payload, None)
+                self.emit_trigger_write(TriggerWrite::Updated, &trigger_id, payload, actor)
                     .await?;
                 let action = if paused { "Paused" } else { "Resumed" };
                 Ok(format!(
@@ -767,7 +827,7 @@ impl LucidosEngine {
                     None => None,
                 };
                 match self
-                    .create_trigger_group_serialized(raw_name, explicit_order, None)
+                    .create_trigger_group_serialized(raw_name, explicit_order, actor)
                     .await
                 {
                     Ok(c) => Ok(format!(
@@ -792,7 +852,7 @@ impl LucidosEngine {
                 };
                 let raw_new_name = args["name"].as_str().unwrap_or("");
                 match self
-                    .rename_trigger_group_serialized(&group_id, raw_new_name, None)
+                    .rename_trigger_group_serialized(&group_id, raw_new_name, actor)
                     .await
                 {
                     Ok(_) => Ok(format!(
@@ -852,7 +912,7 @@ impl LucidosEngine {
                         .emit(BusEvent::System(SystemEvent::TriggerGroupReordered {
                             group_id,
                             payload,
-                            actor: None,
+                            actor: actor.clone(),
                         }))
                         .await?;
                 }
@@ -897,7 +957,7 @@ impl LucidosEngine {
                     .emit(BusEvent::System(SystemEvent::TriggerGroupDeleted {
                         group_id: group_id.clone(),
                         payload,
-                        actor: None,
+                        actor,
                     }))
                     .await?;
                 Ok(format!(

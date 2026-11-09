@@ -43,3 +43,7 @@ describe('pairingCodeFromText', () => {
     }
   });
 });
+
+it('reads a fragment pairing URL', () => {
+  expect(pairingCodeFromText('https://example.test/~/#pair=01234567')).toBe('01234567');
+});

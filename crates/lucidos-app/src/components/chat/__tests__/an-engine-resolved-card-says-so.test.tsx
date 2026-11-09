@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { render } from 'preact';
 import {
   CommandPermissionBody,
+  PLAIN_RESOLUTION_NOTES,
   PermissionBody,
   engineResolutionNote,
 } from '../PermissionCard';
@@ -52,6 +53,15 @@ describe('engineResolutionNote', () => {
     expect(engineResolutionNote({ allowed: false, reason: 'One sentence' })).toBe('One sentence');
   });
 
+  // The first matching opening wins, so a prefix would shadow a longer one.
+  it('has no opening that is a prefix of another', () => {
+    for (const [a] of PLAIN_RESOLUTION_NOTES) {
+      for (const [b] of PLAIN_RESOLUTION_NOTES) {
+        if (a !== b) expect(b.startsWith(a), `"${a}" shadows "${b}"`).toBe(false);
+      }
+    }
+  });
+
   it('draws nothing for a user click, or for no reason at all', () => {
     expect(engineResolutionNote({ allowed: false, reason: 'User denied' })).toBeNull();
     expect(engineResolutionNote({ allowed: true })).toBeNull();
@@ -72,6 +82,27 @@ describe('the coding-agent card', () => {
     render(<PermissionBody event={event} resolved={{ allowed: false, reason: UNATTENDED }} />, host);
     expect(note()).toContain('nobody was there to ask');
     expect(host.querySelector('.permission-btn-picked')).toBeNull();
+  });
+
+  // A parked card that ran out its wait was shown to someone, so it never
+  // claims nobody was there to ask.
+  it('says a parked card ran out its permission wait', () => {
+    const expired = 'Auto-denied: nobody answered this permission card within its permission wait';
+    render(<PermissionBody event={event} resolved={{ allowed: false, reason: expired }} />, host);
+    expect(note()).toBe('Refused by Lucidos: nobody answered this card within its permission wait.');
+    expect(note()).not.toContain('nobody was there to ask');
+    expect(host.querySelector('.permission-btn-picked')).toBeNull();
+  });
+
+  // An ungranted side effect was refused by policy, not for want of someone
+  // to ask, and an engine-started run has no trigger to blame.
+  it('says an unattended run had no permission for a side effect', () => {
+    const ungranted =
+      'Auto-denied: this unattended coding-agent session has no side-effect grant for sending ' +
+      "email. A trigger's side-effect grant can allow it. A run the engine started has none.";
+    render(<PermissionBody event={event} resolved={{ allowed: false, reason: ungranted }} />, host);
+    expect(note()).toBe('Refused by Lucidos: this unattended run has no permission for this kind of action.');
+    expect(note()).not.toContain('nobody was there to ask');
   });
 
   it('still marks Deny when the user pressed it', () => {

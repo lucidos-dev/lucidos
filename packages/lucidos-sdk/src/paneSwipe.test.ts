@@ -388,6 +388,19 @@ describe('installAppPaneSwipe', () => {
     expect(postMessage).toHaveBeenLastCalledWith({ type: APP_SWIPE_END_MESSAGE_TYPE, paneDelta: 0 }, HOST_ORIGIN);
   });
 
+  it('leaves a sideways drag to a host that pans the frame sideways', () => {
+    const postMessage = vi.fn();
+    (window as unknown as { parent: unknown }).parent = { postMessage };
+    vi.stubGlobal('location', { origin: HOST_ORIGIN });
+    cleanup = installAppPaneSwipe(() => true);
+    window.dispatchEvent(touch('touchstart', [[200, 100]], { target: chain({}) }));
+    const move = touch('touchmove', [[180, 100]]);
+    window.dispatchEvent(move);
+    window.dispatchEvent(touch('touchend', []));
+    expect(move.defaultPrevented).toBe(false);
+    expect(postMessage).not.toHaveBeenCalled();
+  });
+
   it('does nothing at the top level, where there is no host', () => {
     (window as unknown as { parent: unknown }).parent = window;
     const add = vi.spyOn(window, 'addEventListener');

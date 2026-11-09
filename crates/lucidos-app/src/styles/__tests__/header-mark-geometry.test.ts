@@ -562,11 +562,13 @@ describe('the nav chevrons are pinned to one shared span', () => {
     ).toBe('var(--mobile-header-icon-box)');
   });
 
-  it('the content pane does not size its cluster differently', () => {
-    // The whole point is that both panes use the same box. A width or a
-    // transform here would move the content pane's chevrons off the thread
-    // pane's, which is what the fixed span exists to prevent.
+  it('the content span clears edge controls without the brand floor', () => {
     const title = block(markCss, '.header-title-cluster {');
+    expect(decl(title, '--header-nav-cluster-width')).toBe(
+      'max(0rem, calc(100% - 2 * var(--header-nav-edge-reserve)))',
+    );
+    expect(decl(title, 'left'), 'inherit the shared centered position').toBeNull();
+    expect(decl(title, '--content-title-reclaim')).toBeNull();
     expect(decl(title, 'width')).toBeNull();
     expect(decl(title, 'max-width')).toBeNull();
     expect(decl(title, 'transform')).toBeNull();

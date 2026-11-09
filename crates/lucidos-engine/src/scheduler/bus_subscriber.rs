@@ -330,7 +330,7 @@ impl<E: SchedulerEffects> BusSubscriber<E> {
                  FROM events \
                  WHERE sequence > $1 AND sequence <= $2 AND event_type = ANY($3) AND {} \
                  ORDER BY sequence LIMIT $4",
-                crate::engine::thread_events::not_a_keep_alive_idle_sql("")
+                crate::engine::thread_events::not_an_engine_turn_idle_sql("")
             ))
             .bind(after)
             .bind(window.through)

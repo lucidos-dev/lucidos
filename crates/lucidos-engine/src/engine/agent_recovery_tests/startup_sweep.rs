@@ -1004,6 +1004,7 @@ mod settle_stranded_trigger_runs_sweep {
                 go_to_review,
                 model: None,
                 reasoning_effort: None,
+                continue_key: None,
             },
         )
         .await;
@@ -1247,6 +1248,7 @@ mod cut_trigger_fire_shapes {
                 go_to_review: false,
                 model: None,
                 reasoning_effort: None,
+                continue_key: None,
             },
         )
         .await

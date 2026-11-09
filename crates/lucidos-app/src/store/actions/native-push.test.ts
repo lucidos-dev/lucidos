@@ -57,6 +57,7 @@ vi.mock('../../utils/liveness', () => ({
   postClientLog: vi.fn(),
 }));
 
+import { DEVICE_ID_KEY } from '../../utils/deviceIdKey';
 import {
   handleNativePushRequested,
   handleNativePushDismiss,
@@ -78,6 +79,7 @@ function emit(overrides: Partial<NativePushRequestedPayload> = {}): void {
     app_id: overrides.app_id ?? null,
     tap: overrides.tap ?? null,
     sent_at_ms: overrides.sent_at_ms ?? Date.now(),
+    audience: overrides.audience ?? null,
   });
 }
 
@@ -122,6 +124,16 @@ describe('NativePushRequested → native desktop banner', () => {
     emit();
     await flush();
     expect(showNativeNotification).not.toHaveBeenCalled();
+  });
+
+  it("skips a banner meant for other devices (a work item's audience)", async () => {
+    localStorage.setItem(DEVICE_ID_KEY, 'this-mac');
+    emit({ audience: ['someone-elses-phone'] });
+    await flush();
+    expect(showNativeNotification).not.toHaveBeenCalled();
+    emit({ audience: ['this-mac'] });
+    await flush();
+    expect(showNativeNotification).toHaveBeenCalledTimes(1);
   });
 
   it('drops a stale frame (late SSE-queue flush) past the freshness budget', async () => {
@@ -291,6 +303,7 @@ function emitDismiss(overrides: Partial<NativePushDismissRequestedPayload> = {})
     notification_id:
       'notification_id' in overrides ? (overrides.notification_id as string | null) : 'notif-1',
     sent_at_ms: overrides.sent_at_ms ?? Date.now(),
+    audience: overrides.audience ?? null,
   });
 }
 
@@ -310,6 +323,16 @@ describe('NativePushDismissRequested → remove native desktop banner', () => {
       workspace: 'myws',
       notificationId: 'n-7',
     });
+  });
+
+  it("keeps a banner when another person read it (a team gateway)", async () => {
+    localStorage.setItem(DEVICE_ID_KEY, 'this-mac');
+    emitDismiss({ audience: ['someone-elses-phone'] });
+    await flush();
+    expect(dismissNativeNotification).not.toHaveBeenCalled();
+    emitDismiss({ audience: ['this-mac', 'my-phone'] });
+    await flush();
+    expect(dismissNativeNotification).toHaveBeenCalledTimes(1);
   });
 
   it('scopes a mark-all-read dismiss to this workspace', async () => {

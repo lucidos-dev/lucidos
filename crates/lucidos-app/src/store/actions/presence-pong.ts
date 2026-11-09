@@ -12,6 +12,7 @@ import type { Tap } from '@lucidos/sdk';
 import { getDeviceId } from './devices';
 import { submitPong } from './event-stream';
 import { presentInAppNotification } from './in-app-notification-toast';
+import { isInAudience } from './push-audience';
 
 export interface PresenceCheckPayload {
   notification_id: string;
@@ -24,6 +25,9 @@ export interface PresenceCheckPayload {
   deadline_ms: number;
   /** Engine wall-clock at emit time. Drives the freshness gate. */
   sent_at_ms: number;
+  /** The devices this push is for (a work item's driver and watchers).
+   *  Absent means every device. */
+  audience?: string[] | null;
 }
 
 /** Act on a `PresenceCheck`, answer it, and return the outcome sent.
@@ -33,6 +37,12 @@ export interface PresenceCheckPayload {
  *  top of it, typically an iOS PWA flushing its SSE queue after a push tap. */
 export function handlePresenceCheck(payload: PresenceCheckPayload): PresenceOutcome | null {
   if (Date.now() - payload.sent_at_ms > payload.deadline_ms) return null;
+  // A push for other people's devices: show nothing, and say so at once so
+  // the engine need not wait out the deadline.
+  if (!isInAudience(payload.audience)) {
+    submitPong(payload.notification_id, { device_id: getDeviceId(), outcome: 'not_shown' });
+    return 'not_shown';
+  }
   const outcome = presentInAppNotification({
     title: payload.title,
     body: payload.body,

@@ -1172,7 +1172,24 @@
    bottom slot, over the composer's top edge. It renders inside `.prompt-area`,
    so it rides a growing prompt. The down chevron stands one slot higher. */
 .follow-toggle { bottom: calc(100% + var(--scroll-chevron-inset)); }
+/* A menu open in the composer rises over the toggle's slot. The toggle steps
+   down to the base layer, so the menu, later in the tree, paints over it. */
+.prompt-area:has([data-overlay-panel]):not(:has(.modal-overlay)) .follow-toggle { z-index: auto; }
 .scroll-to-bottom { bottom: calc(var(--scroll-chevron-inset) + var(--scroll-chevron-size) + var(--scroll-chevron-stack-gap)); }
+
+/* The compose view puts the destination row above the prompt box, inside
+   `.prompt-area`. The toggle still stands on the prompt box itself, where a
+   thread shows it, so it anchors to the box. Everything above the box keeps
+   its right side clear of it: the row, a URL pill, an image strip. A browser
+   without anchor positioning keeps the area's top. */
+.prompt-area { anchor-scope: --prompt-box; }
+.prompt-area .prompt-box { anchor-name: --prompt-box; }
+@supports (anchor-name: --prompt-box) {
+    .compose-empty .follow-toggle { bottom: calc(anchor(--prompt-box top) + var(--scroll-chevron-inset)); }
+    .compose-empty .prompt-input-container > :has(~ .prompt-box) {
+        max-width: calc(100% - var(--scroll-chevron-size) - var(--scroll-chevron-stack-gap));
+    }
+}
 
 .scroll-to-top.visible,
 .scroll-to-bottom.visible,

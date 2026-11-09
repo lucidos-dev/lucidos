@@ -192,6 +192,14 @@ test.describe('the follow toggle floats with the down chevron', () => {
       page.locator('.prompt-area:visible .prompt-box').first().boundingBox(),
     ]);
     expect(m!.y + m!.height, 'the magnet sits on the prompt box').toBeLessThan(box!.y);
+    // On the box, as in a thread, not over the destination row above it.
+    const anchors = await page.evaluate(() => CSS.supports('anchor-name: --a'));
+    if (anchors) {
+      const inset = await lengthPx(page, 'var(--scroll-chevron-inset)');
+      expect(box!.y - (m!.y + m!.height), 'the gap to the prompt box').toBeCloseTo(inset, 0);
+      const row = await page.locator('.prompt-area:visible .input-toggles-wrapper').first().boundingBox();
+      expect(row!.x + row!.width, 'the destination row runs under the magnet').toBeLessThanOrEqual(m!.x + 0.5);
+    }
     await expect(page.locator('.scroll-to-bottom.visible')).toHaveCount(0);
   });
 });

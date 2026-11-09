@@ -51,9 +51,10 @@ impl LucidosEngine {
         &self,
         tool: &str,
         args: &serde_json::Value,
+        thread_id: uuid::Uuid,
     ) -> ToolOutcome {
         let legacy = grouped_legacy_name(tool, args)?;
-        super::to_outcome(self.execute_scheduler_tool(legacy, args).await)
+        super::to_outcome(self.execute_scheduler_tool(legacy, args, thread_id).await)
     }
 
     /// Grouped `preferences` tool → the existing preferences handler. `device_id`

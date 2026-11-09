@@ -243,12 +243,21 @@ fn is_hop_by_hop(name_lower: &str) -> bool {
 
 /// The address the hook socket binds.
 ///
-/// Loopback only, always. `tailscale funnel` proxies from this machine, so it
+/// Loopback by default. `tailscale funnel` proxies from this machine, so it
 /// reaches loopback, while nothing else on the network can address the socket
 /// directly. That is the same reasoning that makes a loopback peer address
-/// prove nothing about a caller (ADR 0094).
-pub fn bind_addr(port: u16) -> SocketAddr {
-    SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port))
+/// prove nothing about a caller (ADR 0094). `LUCIDOS_HOOK_BIND_ADDR` widens it
+/// for a container (ADR 0624).
+pub fn bind_addr(configured: Option<&str>, port: u16) -> SocketAddr {
+    crate::net_config::side_bind_addr("LUCIDOS_HOOK_BIND_ADDR", configured, port)
+}
+
+/// The same answer, read from this process's environment.
+pub fn resolved_bind_addr(port: u16) -> SocketAddr {
+    bind_addr(
+        std::env::var("LUCIDOS_HOOK_BIND_ADDR").ok().as_deref(),
+        port,
+    )
 }
 
 #[cfg(test)]
@@ -284,9 +293,10 @@ mod tests {
     }
 
     #[test]
-    fn the_socket_binds_loopback_whatever_the_port() {
-        assert_eq!(bind_addr(5261).to_string(), "127.0.0.1:5261");
-        assert!(bind_addr(9000).ip().is_loopback());
+    fn the_socket_binds_loopback_unless_an_address_is_set() {
+        assert_eq!(bind_addr(None, 5261).to_string(), "127.0.0.1:5261");
+        assert!(bind_addr(Some("nonsense"), 9000).ip().is_loopback());
+        assert_eq!(bind_addr(Some("0.0.0.0"), 5262).to_string(), "0.0.0.0:5262");
     }
 
     #[test]

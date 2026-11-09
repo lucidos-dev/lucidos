@@ -18,6 +18,9 @@ const MIRROR_BASE_URL: &str = "https://github.com/lucidos-dev/onnxruntime-mirror
 const ORT_ENV_MIRROR_URL: &str = "LUCIDOS_ORT_MIRROR_URL";
 #[cfg(feature = "download-binaries")]
 const UPSTREAM_PATH_MARKER: &str = "msort-binary/";
+// A source label: the text after it is the mirror URL to resolve through the release API.
+#[cfg(feature = "download-binaries")]
+const VIA_RELEASE_API: &str = "release API for ";
 const DIST_TABLE: &str = include_str!("dist.txt");
 
 #[path = "src/internal/dirs.rs"]
@@ -29,14 +32,15 @@ use self::dirs::cache_dir;
 mod download;
 
 #[cfg(feature = "download-binaries")]
-fn fetch_once(source_url: &str) -> Result<Vec<u8>, download::FetchError> {
-	let resp = ureq::AgentBuilder::new()
+fn get(url: &str, accept: &str) -> Result<ureq::Response, download::FetchError> {
+	ureq::AgentBuilder::new()
 		.try_proxy_from_env(true)
 		.timeout_connect(std::time::Duration::from_secs(30))
 		.timeout_read(std::time::Duration::from_secs(60))
 		.timeout(std::time::Duration::from_secs(600))
 		.build()
-		.get(source_url)
+		.get(url)
+		.set("Accept", accept)
 		.call()
 		.map_err(|err| match err {
 			ureq::Error::Status(status, _) => download::FetchError::http(status, err.to_string()),
@@ -44,11 +48,32 @@ fn fetch_once(source_url: &str) -> Result<Vec<u8>, download::FetchError> {
 				&error,
 				matches!(error.kind(), ureq::ErrorKind::Dns | ureq::ErrorKind::ConnectionFailed),
 			),
-		})?;
+		})
+}
 
+/// The mirror's `/releases/download/` route can fail while the release API serves the same asset.
+#[cfg(feature = "download-binaries")]
+fn fetch_via_release_api(mirror_url: &str) -> Result<Vec<u8>, download::FetchError> {
+	let missing = |what: &str| download::FetchError::http(404, format!("{what} for {mirror_url}"));
+	let (endpoint, asset) = download::release_api_endpoint(mirror_url).ok_or_else(|| missing("no release API endpoint"))?;
+	let release = get(&endpoint, "application/vnd.github+json")?.into_string().map_err(download::FetchError::io)?;
+	let asset_url = download::asset_api_url(&release, &asset).ok_or_else(|| missing("asset not listed"))?;
+	read_body(get(&asset_url, "application/octet-stream")?)
+}
+
+#[cfg(feature = "download-binaries")]
+fn read_body(resp: ureq::Response) -> Result<Vec<u8>, download::FetchError> {
 	let mut buffer = Vec::new();
 	resp.into_reader().read_to_end(&mut buffer).map_err(download::FetchError::io)?;
 	Ok(buffer)
+}
+
+#[cfg(feature = "download-binaries")]
+fn fetch_once(source_url: &str) -> Result<Vec<u8>, download::FetchError> {
+	match source_url.strip_prefix(VIA_RELEASE_API) {
+		Some(mirror_url) => fetch_via_release_api(mirror_url),
+		None => read_body(get(source_url, "*/*")?),
+	}
 }
 
 #[cfg(feature = "download-binaries")]
@@ -63,14 +88,17 @@ fn mirror_url(upstream_url: &str) -> Option<String> {
 #[cfg(feature = "download-binaries")]
 fn fetch_verified(upstream_url: &str, hash: &str) -> Vec<u8> {
 	let mirror = mirror_url(upstream_url);
-	let sources = mirror.iter().cloned().chain([upstream_url.to_owned()]);
+	let sources = mirror
+		.iter()
+		.flat_map(|url| [url.clone(), format!("{VIA_RELEASE_API}{url}")])
+		.chain([upstream_url.to_owned()]);
 	download::fetch_sources(
 		sources,
 		fetch_once,
 		|url, bytes| {
 			let verified = verify_file(bytes, hash);
 			if verified {
-				let name = if mirror.as_deref() == Some(url) { "the Lucidos mirror" } else { "upstream" };
+				let name = if mirror.as_deref().is_some_and(|m| url.ends_with(m)) { "the Lucidos mirror" } else { "upstream" };
 				println!("fetched ONNX Runtime from {name}: {url}");
 			}
 			verified

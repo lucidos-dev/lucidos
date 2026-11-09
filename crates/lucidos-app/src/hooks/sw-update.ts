@@ -127,6 +127,27 @@ export function wasEngineVersionDismissed(versionId: string): boolean {
   return dismissedBuild(ENGINE_SWITCH_DISMISSED_KEY) === versionId;
 }
 
+/** The **announced build failure id**: which failure the build-failed toast on
+ *  screen reports. Same role as the announced engine version id: the keyed
+ *  dismiss knows only the toast key, so the poll records what it is about.
+ *
+ *  Held in memory for this page, unlike the version slots. A failure is an error
+ *  that still stands, so a reload may show it once more. */
+let announcedBuildFailureId: string | null = null;
+let dismissedBuildFailureId: string | null = null;
+
+export function noteAnnouncedBuildFailure(failureId: string): void {
+  announcedBuildFailureId = failureId;
+}
+
+export function markBuildFailureDismissed(): void {
+  dismissedBuildFailureId = announcedBuildFailureId;
+}
+
+export function wasBuildFailureDismissed(failureId: string): boolean {
+  return dismissedBuildFailureId === failureId;
+}
+
 /** Safety net (ms): if a new worker is detected but never claims the page
  *  (delayed/dropped `controllerchange`, e.g. a wedged SW), stop waiting, bust
  *  the cached shell, and reload anyway so the click can't hang on a stale build.

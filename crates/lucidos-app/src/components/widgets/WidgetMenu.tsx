@@ -4,16 +4,21 @@ import {
   makeAppFromWidget,
   makeWidgetReusable,
   openWidgetInCanvas,
+  sizeWidgetCards,
   stopReusingWidget,
 } from '../../store/actions/widget-actions';
 import { removeFromDashboard } from '../../store/actions/dashboards';
 import { homeThreadId } from '../../store/actions/homeThread';
 import type { Dashboard } from '../../generated/thread-event-wire';
+import type { WidgetSize } from '../../store/types';
 import { DashboardItem, Item, tileRef, type Run, type WidgetInstance } from './DashboardItem';
+import { offeredSizes, WidgetSizePill } from './WidgetSizePill';
 
 /** The widget instance a menu acts on, in the thread it is shown in. */
 export interface WidgetMenuTarget extends WidgetInstance {
   threadId: string;
+  /** The sizes the widget declares, which the menu's size row offers. */
+  sizes: readonly WidgetSize[];
   reusable: boolean;
   /** Set when a plugin ships the widget, which then stays reusable. */
   originPluginId?: string;
@@ -48,12 +53,28 @@ function MakeAppItem({ widget: w, threadId, run }: { widget: WidgetInstance; thr
   );
 }
 
-/** The widget menu's items in a thread: the ⋯ in a widget's bar, or a
- *  right-click or long press on its card. Each item is also an agent action
- *  and a CLI verb. */
+/** The card's size choice, the menu's first row. A pick resizes the card and
+ *  leaves the menu open, so the next size is one tap away. */
+function SizeRow({ widget: w, size }: { widget: WidgetMenuTarget; size: WidgetSize }) {
+  const pick = (next: WidgetSize) =>
+    void sizeWidgetCards({ appId: w.appId, threadId: w.threadId, params: w.params }, w.name, next);
+  return (
+    <>
+      <div class="widget-menu-size">
+        <span>Size</span>
+        <WidgetSizePill name={w.name} sizes={w.sizes} current={size} onPick={pick} />
+      </div>
+      <div class="thread-overflow-divider" role="separator" />
+    </>
+  );
+}
+
+/** The widget menu's items in a thread: a right-click or a long press on a
+ *  widget's card opens it. Each item is also an agent action and a CLI verb. */
 export function widgetMenuItems({ run }: OverflowMenuContext, w: WidgetMenuTarget) {
   return (
     <>
+      {w.size && offeredSizes(w.sizes).length > 0 && <SizeRow widget={w} size={w.size} />}
       <OpenInCanvasItem widget={w} run={run} />
       {!w.builtIn && !w.originPluginId && (
         <Item

@@ -27,7 +27,7 @@ async fn summary_version(pool: &PgPool, thread_id: Uuid) -> i64 {
 
 async fn see(pool: &PgPool, bus: &EventBus, thread_id: Uuid) -> ReplySeen {
     let version = summary_version(pool, thread_id).await;
-    record_reply_seen(pool, bus, thread_id, version, device())
+    record_reply_seen(pool, bus, thread_id, version, device(), &Reader::Team)
         .await
         .unwrap()
 }
@@ -78,7 +78,7 @@ async fn a_sighting_is_recorded_once_per_request() {
     assert_eq!(count_events(&pool, thread_id, "ThreadReplySeen").await, 1);
 
     assert_eq!(
-        record_reply_seen(&pool, &bus, Uuid::new_v4(), 0, device())
+        record_reply_seen(&pool, &bus, Uuid::new_v4(), 0, device(), &Reader::Team)
             .await
             .unwrap(),
         ReplySeen::UnknownThread
@@ -119,7 +119,7 @@ async fn a_sighting_older_than_a_new_request_clears_nothing() {
         .unwrap();
 
     assert_eq!(
-        record_reply_seen(&pool, &bus, thread_id, seen_at, device())
+        record_reply_seen(&pool, &bus, thread_id, seen_at, device(), &Reader::Team)
             .await
             .unwrap(),
         ReplySeen::Stale
@@ -157,6 +157,82 @@ async fn a_request_names_the_asking_thread() {
     .await
     .unwrap();
     assert_eq!(source, Some(thread_id.to_string()));
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+fn person(device_id: &str, devices: &[&str]) -> Reader {
+    Reader::Person {
+        device_id: device_id.into(),
+        devices: devices.iter().map(|d| d.to_string()).collect(),
+    }
+}
+
+async fn see_as(pool: &PgPool, bus: &EventBus, thread_id: Uuid, reader: &Reader) -> ReplySeen {
+    let Reader::Person { device_id, .. } = reader else {
+        panic!("a person reads here");
+    };
+    let version = summary_version(pool, thread_id).await;
+    let actor = MessageOrigin::Device {
+        device_id: device_id.clone(),
+    };
+    record_reply_seen(pool, bus, thread_id, version, actor, reader)
+        .await
+        .unwrap()
+}
+
+async fn seen_devices(pool: &PgPool, thread_id: Uuid) -> (bool, Vec<String>) {
+    sqlx::query_as(
+        "SELECT read_requested, reply_seen_devices FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// On a team gateway a sighting is one person's: Sam reading on one device
+/// clears the request on Sam's other device, and leaves it for Kim.
+#[tokio::test]
+async fn a_person_sees_a_reply_for_themselves_only() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_chat_thread(&bus, thread_id).await;
+    let sam_phone = person("sam-phone", &["sam-phone", "sam-laptop"]);
+    let sam_laptop = person("sam-laptop", &["sam-phone", "sam-laptop"]);
+    let kim = person("kim-phone", &["kim-phone"]);
+
+    record_agent_read_decision(&bus, thread_id, ReadDecision::Requested)
+        .await
+        .unwrap();
+    assert_eq!(
+        see_as(&pool, &bus, thread_id, &sam_phone).await,
+        ReplySeen::Cleared
+    );
+    assert_eq!(
+        seen_devices(&pool, thread_id).await,
+        (true, vec!["sam-phone".to_string()])
+    );
+    assert_eq!(
+        see_as(&pool, &bus, thread_id, &sam_laptop).await,
+        ReplySeen::NothingPending
+    );
+    assert_eq!(
+        see_as(&pool, &bus, thread_id, &kim).await,
+        ReplySeen::Cleared
+    );
+    assert_eq!(
+        seen_devices(&pool, thread_id).await,
+        (true, vec!["sam-phone".to_string(), "kim-phone".to_string()])
+    );
+
+    // A new request is unread for everyone again.
+    record_agent_read_decision(&bus, thread_id, ReadDecision::Requested)
+        .await
+        .unwrap();
+    assert_eq!(seen_devices(&pool, thread_id).await, (true, vec![]));
 
     pool.close().await;
     teardown_test_db(&db_name).await;

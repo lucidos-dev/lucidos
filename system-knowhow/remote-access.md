@@ -1,6 +1,6 @@
 ---
 name: Remote Access & HTTPS
-description: Use when the user wants to reach Lucidos from a phone, tablet or another machine. Covers "remote access", "Mobile Access", "Expose", "tailscale serve", "tailscale funnel", "expose a webhook". Also "HTTPS", "not secure warning", "add to home screen", "certificate", "mkcert".
+description: Use to reach Lucidos from a phone, tablet, another machine or a Kubernetes pod. Covers "remote access", "Mobile Access", "Expose", "tailscale serve", "tailscale funnel", "expose a webhook". Also "HTTPS", "not secure warning", "add to home screen", "certificate", "mkcert".
 ---
 
 # Remote Access & HTTPS
@@ -176,6 +176,8 @@ on the gateway's own port would put both one auth bug away from the internet.
 
 The hook port is the gateway's plus ten: **5261** in dev, **5262** packaged.
 `LUCIDOS_HOOK_PORT` overrides it, and `0` switches the socket off.
+It binds loopback unless `LUCIDOS_HOOK_BIND_ADDR` says otherwise (§ In a
+container).
 
 ```bash
 tailscale funnel --bg 5262   # packaged: publish ONLY the hook socket
@@ -474,7 +476,10 @@ Point Lucidos at the pair:
   detected automatically and exported as `LUCIDOS_TLS_CERT` / `LUCIDOS_TLS_KEY`.
 - **Headless install**:
   `./install.sh --tls-cert <cert.pem> --tls-key <key.pem>` writes them into the
-  service environment. Both or neither: a lone flag is refused.
+  service environment. Both or neither: a lone flag is refused. A re-run
+  without TLS flags, such as the update command in Settings, keeps the pair
+  the service has; `--no-tls` drops it. Baked provider keys are kept the
+  same way, and `--no-provider-keys` drops them.
 - A Lucidos process serves https **iff both** variables point at readable files.
   TLS material is read at process start, so **restart the gateway** after a
   change; a live socket cannot be re-bound. See
@@ -678,12 +683,10 @@ carry a Copy button, hidden where the browser has no clipboard (a plain-HTTP
 LAN address is not a secure context). The address card is text, never a link:
 following it here would spend a single-use code on a device already paired.
 
-**The QR encodes `<reachable-origin>/~/?pair=<secret>`.** It carries the long
+**The QR encodes `<reachable-origin>/~/#pair=<secret>`.** It carries the long
 *pairing secret*, never the digits, so it works through a tunnel or proxy too.
-Scanning it opens the picker, whose pairing screen reads the parameter and
-pairs at once. It then
-strips the code from the address bar, so a reload, bookmark or shared link
-cannot keep it. On a phone the scan lands somewhere else: see § A phone
+The first head script captures and strips the fragment before resource requests or redirects.
+The pairing screen redeems it through a POST body. Legacy query links remain accepted. On a phone the scan lands somewhere else: see § A phone
 installs before it pairs.
 
 **The address is the hard part.** The machine minting a code usually reads this
@@ -722,7 +725,7 @@ installed PWA captures links inside its own scope.
 
 So the pairing screen shows a phone browser the **install steps**, not the code
 form. Add Lucidos to the home screen and open it. The code rode into the
-manifest's `start_url`, and the app spends it on sight with nothing typed. To
+client-created manifest's fragment `start_url`, and the app spends it on sight with nothing typed. To
 pair the browser anyway, tap **Pair this browser instead**.
 
 **That code is fixed at install time, and still lasts five minutes.** A slower
@@ -792,6 +795,43 @@ A device used on one day and never again drops off the list by itself after a
 week. Most are automated browser runs, since every fresh browser profile
 arrives as a new device. A device someone named, paired, or turned push on for
 never drops off this way. See *one-off device* in the glossary.
+
+### People: whose device is which
+
+Below the list, **People** names the people who pair devices to this machine,
+an *operator* in the glossary. People belong to the gateway, so every
+workspace it serves sees the same people. A personal machine has one person,
+who holds every device, and shows only **Add a person**. Once a second person
+exists:
+
+- Each paired device row gets a person picker.
+- **Settings → Access → Pair a device** asks who the code is for. The device
+  that uses it joins that person. Without a choice, it joins the first person.
+- Each person row has **Add email**, **Rename** and **Remove**. An email is how
+  Lucidos recognises that person when they write from an issue tracker or a
+  chat tool. **Remove** revokes every device of that person, then forgets
+  them. That is how a team offboards someone.
+
+A person grants nothing. Every paired device can still do everything, whoever
+it belongs to (ADR 0623).
+
+A device that reaches this machine through a paired gateway shows as its
+person on the other gateway, "Sam via laptop". When that person has an email
+that a person here also has, it is the same person: one human who pairs their
+own laptop and server counts once. So give your person the same email on both
+gateways. Ending the gateway pairing forgets the people it relayed.
+
+The gateway keeps devices and people in its *gateway event log*, in its data
+directory, so they work while Postgres is down. The same list is on the
+gateway API: `GET` and `POST /~/api/v1/auth/operators`, `PUT` and `DELETE
+/~/api/v1/auth/operators/{id}`, `POST /~/api/v1/auth/operators/{id}/emails`,
+`DELETE /~/api/v1/auth/operators/{id}/emails/{email}`, and `PUT
+/~/api/v1/auth/devices/{id}/operator` with `{"operator_id": "..."}`. A
+pairing code names its person with `POST
+/~/api/v1/auth/pairing-code?operator=<id>`.
+
+A device that reaches this machine through a *gateway pairing* shows as its
+person on the other gateway, such as "Sam via laptop".
 
 ### Pair a gateway
 
@@ -1075,6 +1115,35 @@ bound beyond loopback. `tailscale serve` does not, since it proxies locally.
   to all interfaces.
 - A change takes effect only after a **restart** of the gateway. See
   [Restarting the gateway](#restarting-the-gateway).
+
+### In a container (Kubernetes, Docker)
+
+A Service or Ingress reaches the pod IP, never the pod's loopback. Each
+listener has its own bind setting, and each defaults to loopback, so a desktop
+install is unchanged. They take effect at gateway start.
+
+| Listener | Port (packaged) | Bind setting |
+|---|---|---|
+| Main (UI and API) | `LUCIDOS_GATEWAY_PORT`, 5252 | `LUCIDOS_GATEWAY_BIND_ALL=1` |
+| Public listener | `LUCIDOS_PUBLIC_PORT`, 5282 | `LUCIDOS_PUBLIC_BIND_ADDR=0.0.0.0` |
+| Hook socket | `LUCIDOS_HOOK_PORT`, 5262 | `LUCIDOS_HOOK_BIND_ADDR=0.0.0.0` |
+
+- `LUCIDOS_GATEWAY_BIND_ALL=1` binds `[::]`, dual-stack. On a node with IPv6
+  switched off, set `LUCIDOS_GATEWAY_BIND_ADDR=0.0.0.0` instead.
+- The two `*_BIND_ADDR` settings take an IP literal: `0.0.0.0`, `::`, or the
+  pod IP. A value that is not an IP logs a line and stays on loopback.
+- **Point a public Ingress at the public listener**, not the main port. Every
+  request there counts as public, so a typed pairing code is refused.
+- **Point a webhook Ingress at the hook socket only.** It answers one route and
+  404s the rest, so a public path reaches no workspace.
+
+> **Warning: a UI bound beyond loopback must sit behind an authenticating
+> proxy.** Binding the main port or the public listener to `0.0.0.0` makes the
+> whole gateway reachable from the pod network. Pairing is then the only gate.
+> Put an identity proxy, proxy auth or mTLS in front, exactly as
+> [Public only behind a front door you own](#public-only-behind-a-front-door-you-own)
+> requires. The hook socket is the one exception: every delivery authenticates
+> by its own token or signature.
 
 ### Restarting the gateway
 

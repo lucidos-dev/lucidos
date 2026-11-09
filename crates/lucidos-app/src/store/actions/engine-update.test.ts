@@ -8,6 +8,9 @@ vi.mock('./chat-changes', () => ({
 // The engine-version dismissal is keyed on the ANNOUNCED VERSION id: the on-disk
 // build when one is switchable, the checkout's HEAD when the version exists only
 // in source. Mock it so each test controls what has been dismissed.
+// The build-failure dismissal keeps its real in-memory semantics, so a test can
+// dismiss through the store and watch the next poll respect it.
+const buildFailure = vi.hoisted(() => ({ announced: null as string | null, dismissed: null as string | null }));
 vi.mock('../../hooks/sw-update', () => ({
   noteAnnouncedEngineVersion: vi.fn(),
   wasEngineVersionDismissed: vi.fn(() => false),
@@ -16,6 +19,9 @@ vi.mock('../../hooks/sw-update', () => ({
   // dismiss-defer tests.
   markEngineVersionDismissed: vi.fn(),
   markSwUpdateDismissed: vi.fn(),
+  noteAnnouncedBuildFailure: (id: string) => { buildFailure.announced = id; },
+  markBuildFailureDismissed: () => { buildFailure.dismissed = buildFailure.announced; },
+  wasBuildFailureDismissed: (id: string) => buildFailure.dismissed === id,
 }));
 
 import { engineBuildLogOpen } from '../engineBuildLog';
@@ -33,6 +39,11 @@ const mockWasDismissed = vi.mocked(wasEngineVersionDismissed);
 const mockNoteAnnounced = vi.mocked(noteAnnouncedEngineVersion);
 const mockMarkDismissed = vi.mocked(markEngineVersionDismissed);
 const mockRebuild = vi.mocked(rebuildEngine);
+
+beforeEach(() => {
+  buildFailure.announced = null;
+  buildFailure.dismissed = null;
+});
 
 function status(over: Partial<{
   build_id: string;
@@ -416,6 +427,41 @@ describe('the build-failed toast says what broke, and what to do', () => {
   const failedWith = (build_failure?: BuildFailure) =>
     status({ source_behind_head: true, build_state: 'failed', build_failure });
   const failedToast = () => toasts.value.find((t) => t.key === 'engine-build-failed');
+
+  it('stays dismissed while the same failure stands', async () => {
+    mockStatus.mockResolvedValue(failedWith({ summary: 'error: boom', repeatable: false }));
+    await checkEngineVersion();
+    dismissToast('engine-build-failed');
+    await checkEngineVersion();
+    expect(failedToast()).toBeUndefined();
+  });
+
+  it('shows a retry that fails the same way, when the user never dismissed it', async () => {
+    const failed = failedWith({ summary: 'error: boom', repeatable: false });
+    mockStatus.mockResolvedValue(failed);
+    await checkEngineVersion();
+    mockStatus.mockResolvedValue(status({ source_behind_head: true, build_state: 'building' }));
+    await checkEngineVersion();
+    expect(failedToast()).toBeUndefined();
+    mockStatus.mockResolvedValue(failed);
+    await checkEngineVersion();
+    expect(failedToast()?.message).toContain('error: boom');
+  });
+
+  it.each([
+    ['a different cause', { head_commit: 'head777', summary: 'error: other' }],
+    ['a newer source', { head_commit: 'head888', summary: 'error: boom' }],
+  ])('comes back for %s', async (_, next) => {
+    mockStatus.mockResolvedValue(failedWith({ summary: 'error: boom', repeatable: false }));
+    await checkEngineVersion();
+    dismissToast('engine-build-failed');
+    mockStatus.mockResolvedValue({
+      ...failedWith({ summary: next.summary, repeatable: false }),
+      head_commit: next.head_commit,
+    });
+    await checkEngineVersion();
+    expect(failedToast()?.message).toContain(next.summary);
+  });
 
   it('names the actual error instead of pointing at a log', async () => {
     mockStatus.mockResolvedValue(failedWith({

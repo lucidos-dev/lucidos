@@ -266,6 +266,9 @@ pub struct HandoffVerdict {
     /// or a model with no price row. The agent then carries on.
     pub pays: Option<bool>,
     pub estimate: Option<HandoffEstimate>,
+    /// The session is past its *context ceiling* (ADR 0629), so the run hands
+    /// off whatever `pays` says.
+    pub past_ceiling: bool,
     /// Empty unless the run declared the default floor, and the thread can
     /// hand off and holds no open change.
     #[serde(flatten)]
@@ -306,6 +309,7 @@ async fn verdict_from(
         progress: run.progress,
         pays: None,
         estimate: None,
+        past_ceiling: super::context_ceiling::checkpoint_past_ceiling(pool, thread_id).await?,
         rungs: if eligible {
             offered
         } else {

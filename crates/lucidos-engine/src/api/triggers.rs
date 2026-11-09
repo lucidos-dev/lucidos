@@ -1,13 +1,16 @@
 use super::*;
 
+use crate::core::permission_wait::PermissionWait;
 use crate::core::prefs;
 use crate::engine::command_guard::SideEffectCategory;
+use crate::engine::context_ceiling::ContextCeiling;
 use crate::engine::tools::scheduler::validate_trigger_run;
 use crate::engine::trigger_writes::TriggerWrite;
 use crate::triggers::{
     is_valid_trigger_slug, normalize_mcp_servers, normalize_route_setting,
     resolve_trigger_provider_update, validate_trigger_provider, validate_trigger_reasoning_effort,
-    EventSubscription, TriggerConfig, TriggerRun, TriggerRunStatus,
+    ActorField, ContinueKeySpec, EventSubscription, TriggerConfig, TriggerRun, TriggerRunStatus,
+    ACTOR_FIELD_KEY,
 };
 
 #[derive(Serialize)]
@@ -62,6 +65,14 @@ pub struct TriggerInfo {
     /// side-effect categories it may perform unattended. Empty = none granted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub side_effect_grant: Vec<SideEffectCategory>,
+    /// How long a parked permission card waits on an unattended fire. Absent =
+    /// the workspace preference `unattended_permission_wait`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_wait: Option<PermissionWait>,
+    /// The context ceiling copied onto each fired thread (ADR 0629). Absent =
+    /// the workspace preference `coding_agent_context_ceiling`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_ceiling: Option<ContextCeiling>,
     /// The MCP server ids this trigger's fires use (ADR 0430). Empty = none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<String>,
@@ -82,6 +93,12 @@ pub struct TriggerInfo {
     /// preferred provider, then its first configured route.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// The continue key spec (ADR 0623). Absent = every fire starts a thread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continue_key: Option<ContinueKeySpec>,
+    /// The actor field (ADR 0623). Absent = fires credit nobody.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<ActorField>,
 }
 
 impl TriggerInfo {
@@ -117,11 +134,15 @@ impl TriggerInfo {
             go_to_review: config.go_to_review,
             group_id: config.group_id.clone(),
             side_effect_grant: config.side_effect_grant.clone(),
+            permission_wait: config.permission_wait,
+            context_ceiling: config.context_ceiling,
             mcp_servers: config.mcp_servers.clone(),
             plugin_id: config.plugin_id.clone(),
             model: config.model.clone(),
             reasoning_effort: config.reasoning_effort.clone(),
             provider: config.provider.clone(),
+            continue_key: config.continue_key.clone(),
+            actor: config.actor.clone(),
         }
     }
 }
@@ -183,6 +204,15 @@ pub struct CreateTriggerCronRequest {
     /// irreversible side-effect. Unknown category strings 4xx via serde.
     #[serde(default)]
     pub side_effect_grant: Vec<SideEffectCategory>,
+    /// The *permission wait*, checked by [`parse_permission_wait_arg`]. Omitted
+    /// or null = the workspace preference `unattended_permission_wait`.
+    #[serde(default)]
+    pub permission_wait: Option<serde_json::Value>,
+    /// The context ceiling copied onto each fired thread, read by
+    /// `ContextCeiling::parse`. Omitted or null = the workspace preference. An
+    /// agent may not set one above the workspace's.
+    #[serde(default)]
+    pub context_ceiling: Option<String>,
     /// The MCP server ids this trigger's fires use (ADR 0430). Only these
     /// servers' tools run silently in its threads. An id no server has yet is
     /// accepted, and each fire reports it.
@@ -203,6 +233,14 @@ pub struct CreateTriggerCronRequest {
     /// model pin and must name one of that model's routes.
     #[serde(default)]
     pub provider: Option<String>,
+    /// The continue key spec (ADR 0623), checked by [`ContinueKeySpec::parse`].
+    /// Omitted, null or `[]` = every fire starts a new thread.
+    #[serde(default)]
+    pub continue_key: Option<serde_json::Value>,
+    /// The actor field (ADR 0623), checked by [`ActorField::parse`]. Omitted,
+    /// null or blank = fires credit nobody.
+    #[serde(default)]
+    pub actor: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -240,6 +278,13 @@ pub struct UpdateTriggerCronRequest {
     /// = replace with the new set. Unknown category strings 4xx via serde.
     #[serde(default)]
     pub side_effect_grant: Option<Vec<SideEffectCategory>>,
+    /// None = field absent (don't change), Some(None) = explicitly null (back to
+    /// the workspace preference), Some(Some(v)) = set, checked like create.
+    #[serde(default, deserialize_with = "crate::api::deserialize_some")]
+    pub permission_wait: Option<Option<serde_json::Value>>,
+    /// Same triple state as [`Self::permission_wait`], for the context ceiling.
+    #[serde(default, deserialize_with = "crate::api::deserialize_some")]
+    pub context_ceiling: Option<Option<String>>,
     /// Full replacement for the MCP server ids. None = field absent (don't
     /// change), Some(empty) = clear, Some(non-empty) = replace.
     #[serde(default)]
@@ -257,6 +302,32 @@ pub struct UpdateTriggerCronRequest {
     /// clears the old pin: see [`resolve_trigger_provider_update`].
     #[serde(default, deserialize_with = "crate::api::deserialize_some")]
     pub provider: Option<Option<String>>,
+    /// Full replacement for the continue key spec. None = field absent (don't
+    /// change), null or `[]` = clear, a spec = replace.
+    #[serde(default, deserialize_with = "crate::api::deserialize_some")]
+    pub continue_key: Option<Option<serde_json::Value>>,
+    /// Same triple state as [`Self::continue_key`], for the actor field.
+    #[serde(default, deserialize_with = "crate::api::deserialize_some")]
+    pub actor: Option<Option<serde_json::Value>>,
+}
+
+/// Check a submitted permission wait. Absent or null reads as `None`, the
+/// workspace preference. Anything [`PermissionWait::from_json`] refuses is a 400.
+pub(crate) fn parse_permission_wait_arg(
+    raw: Option<&serde_json::Value>,
+) -> Result<Option<PermissionWait>, String> {
+    match raw {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => PermissionWait::from_json(value).map(Some),
+    }
+}
+
+/// Check a submitted context ceiling. Absent or null reads as `None`, the
+/// workspace preference.
+pub(crate) fn parse_context_ceiling_arg(
+    raw: Option<&str>,
+) -> Result<Option<ContextCeiling>, String> {
+    raw.map(ContextCeiling::parse).transpose()
 }
 
 /// Validate a slug submitted in a `TriggerUpdated` request. Trims whitespace
@@ -485,9 +556,42 @@ pub(super) async fn create_trigger(
         payload["side_effect_grant"] = serde_json::to_value(&request.side_effect_grant)
             .expect("SideEffectCategory serialization is infallible");
     }
+    match parse_permission_wait_arg(request.permission_wait.as_ref()) {
+        Ok(Some(wait)) => payload["permission_wait"] = wait.to_json(),
+        Ok(None) => {}
+        Err(e) => return ApiResult::err(e),
+    }
+    let ceiling = match parse_context_ceiling_arg(request.context_ceiling.as_deref()) {
+        Ok(ceiling) => ceiling,
+        Err(e) => return ApiResult::err(e),
+    };
+    if let Err(e) =
+        super::threads::context_ceiling::refuse_agent_trigger_raise(&state, &headers, ceiling).await
+    {
+        return ApiResult::err(e);
+    }
+    if let Some(ceiling) = ceiling {
+        payload["context_ceiling"] = serde_json::json!(ceiling);
+    }
     let mcp_servers = normalize_mcp_servers(request.mcp_servers.iter().map(String::as_str));
     if !mcp_servers.is_empty() {
         payload["mcp_servers"] = serde_json::json!(mcp_servers);
+    }
+    let continue_key = match ContinueKeySpec::parse(request.continue_key.as_ref())
+        .and_then(|spec| ContinueKeySpec::check_run(spec.as_ref(), &run).map(|()| spec))
+    {
+        Ok(spec) => spec,
+        Err(e) => return ApiResult::err(e),
+    };
+    if let Some(spec) = continue_key {
+        payload["continue_key"] = serde_json::json!(spec);
+    }
+    match ActorField::parse(request.actor.as_ref())
+        .and_then(|field| ActorField::check_run(field.as_ref(), &run).map(|()| field))
+    {
+        Ok(Some(field)) => payload[ACTOR_FIELD_KEY] = serde_json::json!(field),
+        Ok(None) => {}
+        Err(e) => return ApiResult::err(e),
     }
     // Model / reasoning effort: only stamped when the user picked something
     // other than Default, so a trigger on the account defaults keeps exactly the
@@ -677,9 +781,41 @@ pub(super) async fn update_trigger(
         update_payload["side_effect_grant"] =
             serde_json::to_value(grant).expect("SideEffectCategory serialization is infallible");
     }
+    if let Some(raw) = &request.permission_wait {
+        match parse_permission_wait_arg(raw.as_ref()) {
+            Ok(wait) => update_payload["permission_wait"] = serde_json::json!(wait),
+            Err(e) => return ApiResult::err(e),
+        }
+    }
+    if let Some(raw) = &request.context_ceiling {
+        let ceiling = match parse_context_ceiling_arg(raw.as_deref()) {
+            Ok(ceiling) => ceiling,
+            Err(e) => return ApiResult::err(e),
+        };
+        // Clearing back to the workspace's is never a raise past it.
+        if let Err(e) =
+            super::threads::context_ceiling::refuse_agent_trigger_raise(&state, &headers, ceiling)
+                .await
+        {
+            return ApiResult::err(e);
+        }
+        update_payload["context_ceiling"] = serde_json::json!(ceiling);
+    }
     if let Some(ref ids) = request.mcp_servers {
         update_payload["mcp_servers"] =
             serde_json::json!(normalize_mcp_servers(ids.iter().map(String::as_str)));
+    }
+    if let Some(raw) = &request.continue_key {
+        match ContinueKeySpec::parse(raw.as_ref()) {
+            Ok(spec) => update_payload["continue_key"] = serde_json::json!(spec),
+            Err(e) => return ApiResult::err(e),
+        }
+    }
+    if let Some(raw) = &request.actor {
+        match ActorField::parse(raw.as_ref()) {
+            Ok(field) => update_payload[ACTOR_FIELD_KEY] = serde_json::json!(field),
+            Err(e) => return ApiResult::err(e),
+        }
     }
     // Model / reasoning effort: same null-vs-absent semantics as app_id, so a
     // rename-only save leaves the trigger's model alone while an explicit null
@@ -729,6 +865,13 @@ pub(super) async fn update_trigger(
         return ApiResult::err(
             "Trigger must have at least one cron expression or an event subscription",
         );
+    }
+    let mut next = existing.clone();
+    next.apply_update(&update_payload);
+    if let Err(e) = ContinueKeySpec::check_run(next.continue_key.as_ref(), &next.run)
+        .and_then(|()| ActorField::check_run(next.actor.as_ref(), &next.run))
+    {
+        return ApiResult::err(e);
     }
 
     // Read-your-writes: the pause this request carries has to be visible to the
@@ -872,6 +1015,32 @@ mod tests {
         assert!(serde_json::from_value::<CreateTriggerCronRequest>(create.clone()).is_ok());
         create["side_effect_grant"] = grant["side_effect_grant"].clone();
         assert!(serde_json::from_value::<CreateTriggerCronRequest>(create).is_err());
+    }
+
+    /// The boundary accepts exactly what [`PermissionWait::from_json`] accepts,
+    /// and reads null as the workspace preference.
+    #[test]
+    fn a_permission_wait_is_checked_by_the_one_parser() {
+        use serde_json::json;
+        assert_eq!(parse_permission_wait_arg(None), Ok(None));
+        assert_eq!(parse_permission_wait_arg(Some(&json!(null))), Ok(None));
+        assert_eq!(
+            parse_permission_wait_arg(Some(&json!(15))),
+            Ok(Some(PermissionWait::Minutes(15)))
+        );
+        assert_eq!(
+            parse_permission_wait_arg(Some(&json!("indefinite"))),
+            Ok(Some(PermissionWait::Indefinite))
+        );
+        for refused in [json!(0), json!(1441), json!("forever"), json!(true)] {
+            assert!(
+                parse_permission_wait_arg(Some(&refused)).is_err(),
+                "{refused}"
+            );
+        }
+        let update: UpdateTriggerCronRequest =
+            serde_json::from_value(json!({ "permission_wait": null })).unwrap();
+        assert_eq!(update.permission_wait, Some(None), "null clears");
     }
 
     // --- Script paths at the create / update boundary ---

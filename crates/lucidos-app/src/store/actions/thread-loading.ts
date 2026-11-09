@@ -52,6 +52,7 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
       attentionDescendantCount: info.attention_descendant_count || 0,
       isStoppedChild: info.is_stopped_child === true,
       readRequested: info.read_requested === true,
+      replySeenDevices: info.reply_seen_devices ?? [],
       applyInFlight: info.apply_in_flight === true,
       liveEventWaitCount: info.live_event_wait_count || 0,
       codingAgentChangeState: info.coding_agent_change_state,
@@ -160,6 +161,7 @@ export function upsertThread(
       existing.meta.attentionDescendantCount = info.attention_descendant_count || 0;
       existing.meta.isStoppedChild = info.is_stopped_child === true;
       existing.meta.readRequested = info.read_requested === true;
+      existing.meta.replySeenDevices = info.reply_seen_devices ?? [];
       existing.meta.applyInFlight = info.apply_in_flight === true;
       existing.meta.liveEventWaitCount = info.live_event_wait_count || 0;
       // Absence is not emptiness: an older engine or a partial test fixture
@@ -548,11 +550,12 @@ const forcedRetries = new Set<string>();
  *  own "Taking too long?" fuse waits 8s. A link that gave up first reported a
  *  change the reader could see on screen a moment later.
  *
- *  THREE terms, because a fetch in flight is only the commonest of them.
+ *  FOUR terms, because a fetch in flight is only the commonest of them.
  *  `eventsLoaded` false covers the gaps BETWEEN attempts, where the retry
  *  backoff and the watchdog's restart leave no claim standing. The two claims
  *  cover the opposite shape, a thread already loaded and being caught up by a
  *  refresh. That is what an iOS PWA wake leaves on the thread the reader opens.
+ *  A history read covers a link paging toward an old target, one page a read.
  *
  *  False for a thread that has left the map, and for one whose load gave up and
  *  said so. Nothing more is coming for either, so the caller may conclude. */
@@ -561,7 +564,8 @@ export function threadEventsStillArriving(threadId: string): boolean {
   if (!thread || thread.eventsLoadFailed) return false;
   return !thread.eventsLoaded
     || loadingThreads.has(threadId)
-    || refreshAttempts.has(threadId);
+    || refreshAttempts.has(threadId)
+    || historyReadInFlight.has(threadId);
 }
 
 /** Threads whose events this device may have missed while it was not listening.

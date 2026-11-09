@@ -94,7 +94,7 @@ describe('the content title is centred on the row, not between the icons', () =>
     // it, give way to the reserves when it cannot, never squeeze below the
     // controls' own width.
     expect(desktopRule(TITLE).props.get('width')).toBe(
-      'clamp( var(--desktop-nav-min-span), calc(100% - 2 * var(--content-side-reserve)),'
+      'clamp( var(--desktop-nav-min-span), calc(100% - 2 * max(var(--content-side-reserve), calc(var(--content-leading-inset) + 2 * var(--header-icon-box) + 3 * 0.25rem))),'
       + ' clamp( var(--desktop-nav-span), calc(100% - 2 * var(--content-unfolded-reserve)),'
       + ' var(--desktop-content-title-span-max) ) )',
     );
@@ -190,16 +190,8 @@ describe('the reserve is derived from the controls, never guessed', () => {
     return value!;
   };
 
-  it('is three icon boxes and four gaps', () => {
-    // Three: two context icons riding the row plus the bell. That is the
-    // widest the cluster gets on the clamp's middle arm, since a third icon
-    // there makes the measurement fold two into ⋯. Four gaps: the
-    // two between those boxes, and the two the collapse measurement charges the
-    // centred box, one at each of its sides. Pinned as arithmetic on the icon
-    // box rather than as a length, because the lights reserve's own note
-    // applies here too in reverse: everything in this row is rem, so a px or
-    // eyeballed constant is right at exactly one ui-scale.
-    expect(reserve()).toBe('calc(3 * var(--header-icon-box) + 4 * 0.25rem)');
+  it('reserves the persistent pairs, folding optional actions first', () => {
+    expect(reserve()).toBe('calc(2 * var(--header-icon-box) + 3 * 0.25rem + var(--header-padding-x))');
   });
 
   it('counts the row\'s OWN gap, not a number that once matched it', () => {
@@ -209,21 +201,21 @@ describe('the reserve is derived from the controls, never guessed', () => {
     // it (the same reason --brand-side-reserve spells it out).
     const gap = desktopRule(ROW).props.get('gap');
     expect(gap, 'the row declares no gap').toBeDefined();
-    const term = /\+ 4 \* ([\d.]+rem)\)$/.exec(reserve())?.[1];
+    const term = /\+ 3 \* ([\d.]+rem) \+ var\(--header-padding-x\)\)$/.exec(reserve())?.[1];
     expect(term, `--content-side-reserve drifted from the row's ${gap} gap`).toBe(gap);
   });
 
-  it('is at least the widest cluster the collapse can leave standing', () => {
+  it('clears the minimal overflow and bell cluster', () => {
     // The claim the whole arrangement rests on, checked as numbers at the
-    // default 16px root: 3 boxes + 2 gaps of cluster, and the 2 gaps the fit
+    // default 16px root: 2 boxes + 1 gap of cluster, and the 2 gaps the fit
     // model adds, against the reserve. The unit suite
     // (hooks/useHeaderActionCollapse.test.ts) walks the same arithmetic from
     // the measurement's side; this end is the stylesheet's.
     const iconBox = parseFloat(desktopRoot().props.get('--header-icon-box')!);
     const gapRem = parseFloat(desktopRule(ROW).props.get('gap')!);
-    const widestCluster = 3 * iconBox + 2 * gapRem;
+    const widestCluster = 2 * iconBox + gapRem;
     const boxes = Number(/calc\((\d+) \* var\(--header-icon-box\)/.exec(reserve())?.[1]);
-    const gaps = Number(/\+ (\d+) \* [\d.]+rem\)$/.exec(reserve())?.[1]);
+    const gaps = Number(/\+ (\d+) \* [\d.]+rem \+ var\(--header-padding-x\)\)$/.exec(reserve())?.[1]);
     expect(boxes * iconBox + gaps * gapRem).toBeGreaterThanOrEqual(widestCluster + 2 * gapRem);
   });
 });
@@ -241,12 +233,12 @@ describe('the title grows only out of room no action cluster needs', () => {
     // the two the collapse measurement charges the centred box. Where the box
     // grows past --desktop-nav-span it leaves exactly this much at each end, so
     // growing never folds an action the 20rem box let ride.
-    expect(unfolded()).toBe('calc(7 * var(--header-icon-box) + 8 * 0.25rem)');
+    expect(unfolded()).toBe('calc(7 * var(--header-icon-box) + 8 * 0.25rem + var(--header-padding-x))');
   });
 
   it('counts the row\'s OWN gap, like the side reserve', () => {
     const gap = desktopRule(ROW).props.get('gap');
-    const term = /\+ 8 \* ([\d.]+rem)\)$/.exec(unfolded())?.[1];
+    const term = /\+ 8 \* ([\d.]+rem) \+ var\(--header-padding-x\)\)$/.exec(unfolded())?.[1];
     expect(term, `--content-unfolded-reserve drifted from the row's ${gap} gap`).toBe(gap);
   });
 

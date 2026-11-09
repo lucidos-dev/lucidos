@@ -2,7 +2,7 @@ import { test, expect } from './fixtures';
 import { randomUUID } from 'crypto';
 import {
   apiRequest, assertHealthy, clickVisibleElement, ensureMobileView,
-  navigateToApp, waitForExchangeCount, waitForVisibleElement,
+  countExchanges, navigateToApp, waitForVisibleElement,
 } from './helpers';
 import { clearNotifications, psql } from './db-helpers';
 
@@ -11,7 +11,7 @@ test.use({ reducedMotion: 'no-preference' });
 
 /** More exchanges than one page of events holds (`THREAD_EVENTS_PAGE_SIZE` is
  *  400 events, two per exchange here). So the thread opens on its newest page,
- *  and the deep link's render-all fetches the rest behind it. */
+ *  which already holds the question, and the link fetches nothing behind it. */
 const EXCHANGES = 260;
 
 /** A long thread waiting on a question, which is its last turn. Returns the
@@ -56,11 +56,11 @@ test.describe('A question notification into a long, unloaded thread', () => {
     threadId = null;
   });
 
-  test('lands on the question and stays there when the older history folds in', async ({ page }) => {
+  test('lands on the question and stays there without drawing the older history', async ({ page }) => {
     // The link lands and the ride glides to the question at the live edge. The
-    // older history then folds in above, and its hold corrects the offset
-    // mid-glide. The glide must carry on to the question. Stopped short, it
-    // leaves the reader tens of thousands of pixels up in old turns.
+    // link claims only the question's turn (ADR 0631), so the window draws a
+    // slice of the thread. A render-all drew every turn, and got the iOS page
+    // killed on a thread this long.
     await assertHealthy(page);
     clearNotifications();
     const seeded = seedLongQuestionThread();
@@ -78,9 +78,8 @@ test.describe('A question notification into a long, unloaded thread', () => {
     await waitForVisibleElement(page, '.notification-item', 10_000);
     await clickVisibleElement(page, '.notification-item', 'Long thread question');
 
-    // The whole history has folded in: every turn plus the question.
     await ensureMobileView(page, 'thread');
-    await waitForExchangeCount(page, EXCHANGES + 1, 20_000);
+    await waitForVisibleElement(page, `[data-event-id="${seeded.questionId}"]`, 20_000);
 
     // Where the question sits inside the transcript's viewport, once every
     // glide has had time to end. Polled, so it passes as soon as it settles
@@ -119,5 +118,6 @@ test.describe('A question notification into a long, unloaded thread', () => {
     // And it stays: nothing later carries the reader off it.
     await page.waitForTimeout(1500);
     expect(await questionInView(), `question left view, state: ${JSON.stringify(lastState)}`).toBe(true);
+    expect(await countExchanges(page), 'the link drew the whole thread').toBeLessThan(EXCHANGES / 2);
   });
 });

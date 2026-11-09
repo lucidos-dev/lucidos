@@ -69,6 +69,34 @@ The `push_notifications` **preference** (the "on" switch in settings) only recor
 
 ## §2: The fan-out rule
 
+**Step 0: the audience (team workspaces only).** Every notification records who it is for, as device ids on `NotificationCreated` and its row (ADR 0623). A producer may name them. Otherwise, a notification that opens a thread of a *work item* is for that work item's audience. The engine finds the thread from the tap's thread target, else from `event_id`. The audience is the devices of the work item's *driver* and *watchers*.
+
+- It is the whole team, as everywhere else, when the gateway knows fewer than two people. It is the whole team too when the work item has no driver, has an escalated gate, or names nobody who holds a device. So a gate always reaches someone, and a personal workspace pushes exactly as before.
+- Web push skips subscriptions outside the audience. `PresenceCheck` and `NativePushRequested` carry `audience` (device ids), and a page outside it shows nothing and pongs `not_shown`.
+- The inbox still lists every notification, but one outside your audience reads as read: it never lights your bell badge or your app badge.
+- A lookup that fails reaches the whole team.
+
+**Read state is per person on a team gateway.** With two or more people, a read from a device a person holds is that person's: it clears the notification on their other devices and leaves everyone else's unread. Mark all read works the same way, and so does clearing the in-app toast and the desktop banner: `NativePushDismissRequested` carries the reader's devices as `audience`. A caller no person holds reads and writes the team's shared flag, and so does the agent's `notifications` tool. With one person, everything reads the shared flag, as before. Each device's push badge counts what its own person has not read.
+
+**Work item notices (team workspaces only).** Three notifications reach one or a few people besides the gates:
+
+| Notice | Sent when | For |
+|---|---|---|
+| "Kim answered your gate" | someone answers a gate on a work item another person drives, and so takes it over | the person who drove it |
+| "Kim took over" | someone taps **Take** on a work item another person drives | the person who drove it |
+| "Work item done" | the work item's root thread is archived | its driver and watchers, except whoever archived it |
+
+Each opens the work item's root thread. Nobody hears one on a gateway with fewer than two people, and nobody whose person holds no device.
+
+**Config change notices (team workspaces only).** A *config change* posts a notification naming who made it: a repository, trigger, MCP server or credential added, changed or removed (`engine/config_change.rs`). It reaches everyone but the person who made it. A change by an agent, or by a device no person holds, reaches the whole team. A change nobody made posts nothing: an engine write, an identity collapse, a one-shot trigger deleting itself.
+
+Where the event recorded enough to invert it, the tap is `{"kind": "undo-config-change", "event_id": "<uuid>"}`. Tapping it, or **Undo** in the detail, asks to confirm and then calls `POST /api/v1/config-changes/:event_id/undo`. The engine writes the inverse through the same store, as the tapping device, so an undo is a config change of its own. It answers 409 `moved_on` when a later change touched the same thing, or the thing is already gone or already back. So an undo never overwrites someone's later edit. It answers 409 `not_undoable` for:
+
+- a credential value change, since a value never reaches an event;
+- an MCP server re-registration or removal, since its old env is sealed and its owned credentials are deleted.
+
+Undo restores a deleted credential's metadata with an empty value, for someone to enter again. It never overwrites a credential saved under the name since. A restored trigger keeps its slug unless another trigger took it, and then gets a fresh one. Only the engine writes this tap: a producer that sends one is refused.
+
 **Step A: global push check (once per notification).** Did a page already put this notification in front of the reader?
 
 The engine runs the PresenceCheck protocol (§3) to find out. Each page acts on the check first and then reports its outcome. After Step A, the engine has a boolean `push_allowed` and zero or more `PresencePong` records.
@@ -684,11 +712,17 @@ The page periodically pings the SW controller with `{ type: 'lucidos:ping' }`, a
 - **One silent window proves nothing either.** A worker cold-starting after a wake can miss the first ping and answer the next. A wedged worker misses every window, so a second probe still catches it.
 
 **Probe trigger points** (`store/startup.ts`, `checkSwHealth`):
-- 5 s after page mount (cold-start).
+- 5 s after page mount (cold-start), after the mount-time fetch-path run below.
 - On `visibilitychange → visible`, `window focus` and `pageshow`: the "user returns to Lucidos" path.
 - Every `SW_PROBE_INTERVAL_MS` (5 min) while `document.visibilityState === 'visible'`. The interval starts and stops on visibility, so hidden tabs don't burn CPU wakes.
 
 **Probe blindness on partial wedge.** The probe uses `message`, so it reads "healthy" when only `notificationclick` is broken. This layer cannot catch the partial wedge; Layer 3 exists for that.
+
+**Fetch-path wedge.** A worker can answer the ping while its own `fetch()` never settles. Every `GET /api/v1/*` it forwards then hangs, and the page shows a skeleton forever. An iOS PWA hit this after a notification tap.
+- `swFetchPathProbe.ts` runs at once on page mount, then after the ping probe at the other trigger points, one run at a time. A wedge strands the boot on its splash, so the mount run cannot wait. The probe requests `/api/v1/health` twice at once.
+- `sw.js` skips the plain request but forwards the one marked `?sw-fetch-probe=1` (`FETCH_PROBE_PARAM`) through its `fetch()`.
+- Plain answered and marked still silent after 4 s, in two windows in a row, page awake throughout: the page unregisters the worker and reloads. Both windows end inside the boot splash's 15 s cap. A failed plain request means the network is down, which proves nothing.
+- A sessionStorage guard allows one such reload per 60 s, so an unfixable wedge never loops. The page logs a `sw` / `fetch_path_slow` breadcrumb when the first window misses, and `sw` / `fetch_path_wedged` before the reload.
 
 ### Layer 3: Engine-scheduled wake-push (partial-wedge coverage, proactive)
 

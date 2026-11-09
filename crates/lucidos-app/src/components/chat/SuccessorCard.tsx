@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
-import { fetchThreadContext, declineSuccessorOffer, type SuccessorImplementer, type ThreadContext } from '../../api/client';
+import {
+  fetchThreadContext, declineSuccessorOffer, withdrawCeilingHandoff,
+  type CeilingHandoff, type SuccessorImplementer, type ThreadContext,
+} from '../../api/client';
 import {
   effectiveThreadStatus, focusedThreadId, showToast, successorCardPick, successorCardThreadId, successorOffer,
   threadMap, type SuccessorOffer,
@@ -17,12 +20,15 @@ import { formatTokens } from '../../utils/formatTokens';
 import { Disclosure } from '../shared/Disclosure';
 import { OptionIndicator } from './QuestionCard';
 
-type Choice = 'continue' | 'fresh' | 'stay';
+type Choice = 'continue' | 'fresh' | 'stay' | 'return';
 
-/** The events that change what the card says: a thread's context size, and a
- *  *Stay here* that hides it. The engine's verdict also reads whether the
- *  thread holds an open change, so the change state is part of the read key. */
-const CARD_EVENTS: ReadonlySet<string> = new Set(['ContextCaptured', 'CodingAgentCompacted', 'SuccessorOfferDeclined']);
+/** The events that change what the card says: a thread's context size, a
+ *  *Stay here* that hides it, and a ceiling handoff recorded or withdrawn.
+ *  The engine's verdict also reads whether the thread holds an open change,
+ *  so the change state is part of the read key. */
+const CARD_EVENTS: ReadonlySet<string> = new Set([
+  'ContextCaptured', 'CodingAgentCompacted', 'SuccessorOfferDeclined', 'SessionHandedOff', 'SessionHandoffWithdrawn',
+]);
 
 /** Whether `event` can change the card, as `MAIN_SESSION_CAPTURE` in
  *  `engine/successor.rs` reads it. An auxiliary or sub-agent capture leaves
@@ -57,6 +63,20 @@ export function successorFinding(context: ThreadContext): string {
   return `${size}, and every reply rereads all of it${ratio}.`;
 }
 
+/** What the card says about a handoff at the *context ceiling*. */
+export function ceilingFinding(handoff: CeilingHandoff): string {
+  const { context_tokens: size, ceiling } = handoff.crossing;
+  const from = handoff.opening === 'brief' ? 'a brief of that session' : "that session's handoff narrative";
+  return `The last session handed off at this thread's ${formatTokens(ceiling)} context ceiling, holding `
+    + `${formatTokens(size)} tokens. Your message goes to the fresh session, which starts from ${from}.`;
+}
+
+/** What the card shows: the offer of a successor session, or the handoff the
+ *  context ceiling already made. */
+type CardShown =
+  | { kind: 'offer'; offer: SuccessorOffer; finding: string }
+  | { kind: 'ceiling'; handoff: CeilingHandoff };
+
 /** The model and effort picked under the card, as the successor session will
  *  run them. `undefined` while nothing is picked, so it keeps the current pair. */
 function aimedImplementer(model: string | null, effort: string | null): SuccessorImplementer | undefined {
@@ -88,11 +108,13 @@ export function CardOption({ label, desc, busyDesc, busy, disabled, onPick }: {
   );
 }
 
-/** A card on top of the composer offering a *successor session* to a large
- *  coding-agent thread at a clean idle (`successorOffer`), once the user starts
- *  writing in the composer. It is drawn from the
- *  question card's option classes. */
-export function SuccessorCard() {
+/** A card on top of the composer, once the user starts writing in it. It
+ *  offers a *successor session* to a large coding-agent thread at a clean idle
+ *  (`successorOffer`). While a handoff at the *context ceiling* waits for the
+ *  next input, it says so instead: the message goes to the fresh session.
+ *  Drawn from the question card's option classes. `onSend` is the composer's
+ *  own Send. */
+export function SuccessorCard({ onSend }: { onSend: () => void }) {
   const threadId = focusedThreadId.value;
   const thread = threadId ? threadMap.value.get(threadId) : undefined;
   const eventsBump = threadId ? getThreadEventsBump(threadId) : 0;
@@ -135,7 +157,8 @@ export function SuccessorCard() {
 
   // The card waits until the user starts a message, and shuts if they clear it.
   const writing = threadId !== null && draftPresentThreadIds.value.has(threadId);
-  const offer = writing ? successorOffer(thread, context, Date.now()) : null;
+  const ceiling = writing ? context?.ceiling_handoff ?? null : null;
+  const offer = writing && !ceiling ? successorOffer(thread, context, Date.now()) : null;
   // Keyed on whether the card shows, not on its offer: a warm card turning
   // cold stays open and keeps its pick.
   const cardShows = offer !== null;
@@ -149,8 +172,11 @@ export function SuccessorCard() {
   }, [cardShows, threadId]);
 
   // The last card shown, so it keeps its words while it rolls shut.
-  const shown = useRef<{ threadId: string; offer: SuccessorOffer; finding: string } | null>(null);
-  if (threadId && offer && context) shown.current = { threadId, offer, finding: successorFinding(context) };
+  const shown = useRef<{ threadId: string; card: CardShown } | null>(null);
+  if (threadId && ceiling) shown.current = { threadId, card: { kind: 'ceiling', handoff: ceiling } };
+  else if (threadId && offer && context) {
+    shown.current = { threadId, card: { kind: 'offer', offer, finding: successorFinding(context) } };
+  }
   const last = shown.current;
 
   const pick = successorCardPick.value;
@@ -158,60 +184,99 @@ export function SuccessorCard() {
   const effort = pick && pick.threadId === threadId ? pick.effort : null;
   const aimed = aimedLabel(model, effort);
 
-  async function choose(target: { threadId: string; offer: SuccessorOffer }, choice: Choice): Promise<void> {
+  async function choose(target: string, choice: Choice): Promise<void> {
     if (choice === 'fresh') {
-      const source = threadMap.value.get(target.threadId);
+      const source = threadMap.value.get(target);
       if (source) startFreshDraft(source.meta);
       return;
     }
     setBusy(choice);
     try {
-      if (choice === 'continue') await continueInSuccessor(target.threadId, aimedImplementer(model, effort));
-      else await declineSuccessorOffer(target.threadId);
+      if (choice === 'continue') await continueInSuccessor(target, aimedImplementer(model, effort));
+      else if (choice === 'return') await withdrawCeilingHandoff(target);
+      else await declineSuccessorOffer(target);
     } catch (err) {
-      const what = choice === 'continue' ? 'continue in a fresh session' : 'keep this thread';
-      showToast(`Could not ${what}: ${errorDetail(err)}`, 'error');
+      showToast(`Could not ${CHOICE_FAILED[choice]}: ${errorDetail(err)}`, 'error');
     } finally {
       setBusy(null);
     }
   }
 
+  const startFresh = last && (
+    <CardOption
+      label="Start fresh"
+      desc="A plain thread on the same repo, no carry-over. Anything you typed moves to a new draft, unsent."
+      busyDesc=""
+      busy={false}
+      disabled={busy !== null}
+      onPick={() => void choose(last.threadId, 'fresh')}
+    />
+  );
+
   return (
-    <Disclosure open={offer !== null}>
-      {last && (
-        <div class="question-body successor-card protected-surface" data-offer={last.offer}>
+    <Disclosure open={offer !== null || ceiling !== null}>
+      {last?.card.kind === 'offer' && (
+        <div class="question-body successor-card protected-surface" data-offer={last.card.offer}>
           <div class="question-text">
-            <p>{last.finding}</p>
+            <p>{last.card.finding}</p>
             <p>{SUCCESSOR_QUESTION}</p>
           </div>
           <div class="question-options">
             <CardOption
               label="Continue with context"
               desc={`A fresh session in this thread, carrying what was learned. A message you type goes along as its first request.${aimed ? ` It runs on ${aimed}.` : ''}`}
-              busyDesc={last.offer === 'warm' ? 'Writing the handoff…' : 'Starting the fresh session…'}
+              busyDesc={last.card.offer === 'warm' ? 'Writing the handoff…' : 'Starting the fresh session…'}
               busy={busy === 'continue'}
               disabled={busy !== null}
-              onPick={() => void choose(last, 'continue')}
+              onPick={() => void choose(last.threadId, 'continue')}
             />
-            <CardOption
-              label="Start fresh"
-              desc="A plain thread on the same repo, no carry-over. Anything you typed moves to a new draft, unsent."
-              busyDesc=""
-              busy={false}
-              disabled={busy !== null}
-              onPick={() => void choose(last, 'fresh')}
-            />
+            {startFresh}
             <CardOption
               label="Stay here"
               desc="Hides this card until the thread has grown well past this size."
               busyDesc="Hiding this card…"
               busy={busy === 'stay'}
               disabled={busy !== null}
-              onPick={() => void choose(last, 'stay')}
+              onPick={() => void choose(last.threadId, 'stay')}
             />
+          </div>
+        </div>
+      )}
+      {last?.card.kind === 'ceiling' && (
+        <div class="question-body successor-card protected-surface" data-offer="ceiling">
+          <div class="question-text">
+            <p>{ceilingFinding(last.card.handoff)}</p>
+          </div>
+          <div class="question-options">
+            <CardOption
+              label="Send to the fresh session"
+              desc={`What Send does. The fresh session reads the ${last.card.handoff.opening === 'brief' ? 'brief' : 'narrative'}, then answers you.`}
+              busyDesc=""
+              busy={false}
+              disabled={busy !== null}
+              onPick={onSend}
+            />
+            {startFresh}
+            {last.card.handoff.raises_to !== null && (
+              <CardOption
+                label="Return to the old session"
+                desc={`Withdraws the handoff and raises this thread's ceiling to ${formatTokens(last.card.handoff.raises_to)}. Every reply rereads all ${formatTokens(last.card.handoff.crossing.context_tokens)}, and a cold cache rewrites it first.`}
+                busyDesc="Returning to the old session…"
+                busy={busy === 'return'}
+                disabled={busy !== null}
+                onPick={() => void choose(last.threadId, 'return')}
+              />
+            )}
           </div>
         </div>
       )}
     </Disclosure>
   );
 }
+
+/** What a failed choice could not do, as its toast says it. */
+const CHOICE_FAILED: Record<Exclude<Choice, 'fresh'>, string> = {
+  continue: 'continue in a fresh session',
+  stay: 'keep this thread',
+  return: 'return to the old session',
+};

@@ -460,6 +460,7 @@ fn trigger_started_with_details() {
         go_to_review: false,
         model: None,
         reasoning_effort: None,
+        continue_key: None,
     };
     let payload = event.to_payload(&EventMeta::NONE);
     assert_eq!(payload["trigger_id"], "t-1");
@@ -486,6 +487,7 @@ fn trigger_started_event_invocation_serializes_event_type_and_id() {
         go_to_review: false,
         model: None,
         reasoning_effort: None,
+        continue_key: None,
     };
     let payload = event.to_payload(&EventMeta::NONE);
     assert_eq!(payload["invocation"]["kind"], "Event");

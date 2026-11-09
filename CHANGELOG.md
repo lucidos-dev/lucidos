@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.57.0 — 2026-11-09
+
+### Added
+
+- Team workspaces. One shared workspace can run as a team's factory: people are groups of paired devices, Settings shows People, and the team workspace setup guide ships with a Factory app and source templates for ticket and chat intake.
+- Work items. A trigger fire with a continue key continues its open thread, each item has drivers and watchers, and gate escalations, notices and read state reach each person on their own devices.
+- A trigger can name the person behind a fire, and the thread credits them.
+- A config change made by one person notifies the team, with an Undo that never overwrites a later change.
+- Slack webhooks verify their signature and answer Slack's URL check.
+- A context ceiling for coding-agent threads. Set it as off, a token count or a percentage, and the session hands off to a fresh one at that size. You see the handoff in the thread.
+- A deep link to a turn draws from that turn and pages older history toward it, on desktop and phone.
+- An XL widget size, four tiles wide and two high. Where the host is narrower, the box scrolls sideways. The video player offers it.
+- When a snapshot is refused for low disk space, the notice says how much to free.
+
+### Changed
+
+- The workspace cleanup panel shows only when there is something to clean: harness workspaces, orphan databases, stray folders or items in Trash.
+- Pairing links carry their secret in the URL fragment, so it never reaches a server log.
+- A Bash grant covers a command that only reads from `.claude/` or `.git/`. Writes there still ask.
+- An unattended coding agent that hits a refused command parks one permission card when one of your devices can answer it. Trigger surfaces show the permission wait.
+- A coding agent that runs `cd` with an output redirect is told to rewrite the command.
+- An inline widget draws as a bare, centred box, and its menu opens from the keyboard.
+- The built-in sound and video player icons use a light outline.
+- The coding-agent guard switch in Settings says what it answers, and that the catastrophic floor holds with it off.
+- A re-run of the Linux install keeps the service's TLS pair and provider keys. `--no-provider-keys` skips them.
+- A release build refuses to change the bundled Postgres major version.
+
+### Fixed
+
+- The gateway refuses a Postgres data folder from another major version instead of creating a new one over it, and leaves it out of backups.
+- The app recovers by itself when its service worker stops answering.
+- A coding agent writing to its own scratch log is no longer blocked as out-of-workspace destruction.
+- An unattended deny card no longer blames a trigger or a person who is not there.
+- A banner's warning sign, close button and actions line up with its first line of text.
+- A voice call no longer cuts its own reply off when the phone speaker's echo reaches the microphone.
+- The video player keeps its place, releases and resumes media off screen, and redraws after a scroll on iPhone.
+- Content headers keep their title room, and the Canvas overflow button snaps to its slot on resize.
+- Everything above the prompt box stays clear of the follow toggle, and an open composer menu paints over it.
+- A dashboard tile in edit mode clips its widget to the rounded corner.
+- A widget box is covered while it relays out for a new size.
+- A dismissed build-failed toast stays dismissed, and the build log opens over the menu.
+- A scroll that starts on a menu row or inside an app no longer fires a tap.
+- The Started on Home toast shows its Open button.
+- ONNX Runtime downloads when the mirror route fails.
 ## v0.56.0 — 2026-11-05
 
 ### Added

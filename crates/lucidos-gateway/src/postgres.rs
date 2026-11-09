@@ -149,7 +149,8 @@ pub enum ProvisionErrorKind {
     /// has not finished coming up, an image pull failing on a flaky network.
     Transient,
     /// A condition no retry can change: an invalid workspace id, a `docker`
-    /// command that is not installed, a mis-staged bundled Postgres tree.
+    /// command that is not installed, a mis-staged bundled Postgres tree, a
+    /// data dir from another Postgres major.
     Terminal,
 }
 
@@ -1280,10 +1281,9 @@ fn teardown_embedded_workspace_with(
 ) -> Result<(), BoxError> {
     let data = embedded_data_dir(app_data);
     // Cleanup must observe the existing cluster, never provision or repair it.
-    // A missing version file does not establish database absence. In particular,
-    // lifecycle repair could move a foreign-major cluster aside and delete from
-    // its empty replacement while the original database still exists.
-    // An unavailable cluster leaves the recovery journal for a later retry.
+    // A missing version file does not establish database absence: a repair
+    // could `initdb` an empty cluster and "delete" from it while the original
+    // database still exists elsewhere. An unavailable cluster leaves the recovery journal for a later retry.
     let socket_dir = socket(&data).map_err(|e| -> BoxError { Box::new(e) })?;
     drop_database_embedded(bin, lib, &socket_dir, database)
 }
@@ -1296,13 +1296,12 @@ fn teardown_embedded_workspace_with(
 /// [`PG_USER`]. Both auth files are rewritten before every start, so a cluster
 /// an older build created with trust auth converges here, data intact.
 ///
-/// The lifecycle is **self-healing**, so a stale/orphaned cluster (e.g. left by
-/// a previous app version after an auto-update) can never block a fresh start:
+/// The lifecycle is **self-healing** where healing loses nothing, so a stale or
+/// orphaned same-major cluster never blocks a fresh start:
 ///
-///  * **Foreign-major data dir** — the bundled binaries physically cannot open a
-///    data dir from a different PostgreSQL major (the catalog format differs), so
-///    we tear down any orphan running on it, **move the old dir aside** (renamed,
-///    never deleted — recoverable), then `initdb` a fresh cluster in its place.
+///  * **Foreign-major data dir**: the bundled binaries cannot open a data dir
+///    from another PostgreSQL major, and no cross-major path exists. So this
+///    refuses it, terminally, and leaves it exactly as found (ADR 0626).
 ///  * **Adopt only when safe** — a reported-running cluster is adopted ONLY when
 ///    a real connection on `socket_dir` succeeds AND its major version matches
 ///    the bundled binaries. A cluster an older build started answers on TCP and
@@ -1321,32 +1320,8 @@ fn ensure_embedded_cluster(
 ) -> Result<(), ProvisionError> {
     let bundled = bundled_major(bin, lib)?;
 
-    // Foreign-major data dir: cannot be opened by the bundled binaries. Stop any
-    // orphan on it, move it aside (recoverable), then fall through to a fresh
-    // initdb. The common (same-major) case is left intact for a lossless restart.
-    if should_recreate_foreign(read_data_dir_major(data), bundled) {
-        let data_major = read_data_dir_major(data).unwrap_or(0); // present by definition here
-        crate::log!(
-            "[Gateway] embedded Postgres data dir {} is v{} but bundled binaries are v{} — recreating (old dir moved aside)",
-            data.display(),
-            data_major,
-            bundled
-        );
-        stop_cluster_robustly(bin, lib, data);
-        match move_data_dir_aside(data, data_major) {
-            Ok(moved) => crate::log!(
-                "[Gateway] moved foreign-version data dir to {}",
-                moved.display()
-            ),
-            Err(e) => {
-                return Err(ProvisionError::transient(format!(
-                    "could not move foreign-version data dir aside: {e}"
-                )))
-            }
-        }
-    }
-
-    // First run (or post-move-aside): initialize a fresh cluster.
+    // Only a dir with no PG_VERSION gets initdb, and the major check below
+    // never refuses one.
     if !data.join("PG_VERSION").exists() {
         initdb_cluster(bin, lib, data)?;
     }
@@ -1355,7 +1330,15 @@ fn ensure_embedded_cluster(
     // file-level copy of a live cluster is a torn read anyway, and the copy
     // that restores is the workspace's own `pg_dump`-backed backup. This runs
     // on every start, so a cluster older than the ADR converges on its next.
+    // It sets an attribute and reads no data, so a refused dir gets it too.
     crate::file_backup::exclude(data, "Postgres data dir");
+
+    // This check runs before any stop or start on `data`.
+    if let Some(data_major) = read_data_dir_major(data).filter(|&m| m != bundled) {
+        let refusal = foreign_major_refusal(data, data_major, bundled);
+        crate::log!("[Gateway] {}", refusal.message);
+        return Err(refusal);
+    }
 
     // Adopt an already-running cluster ONLY if it is reachable AND version-matched.
     if pg_ctl_status(bin, lib, data) {
@@ -1533,9 +1516,8 @@ fn os_user_name() -> Result<String, ProvisionError> {
     Ok(name.to_string_lossy().into_owned())
 }
 
-/// `initdb` a fresh cluster at `data` (peer auth on the socket, UTF-8). Used
-/// on first run and after a foreign-version data dir is moved aside.
-/// [`write_auth_files`] narrows its auth files before the first start.
+/// `initdb` a fresh cluster at `data` (peer auth on the socket, UTF-8), on
+/// first run only. [`write_auth_files`] narrows its auth files before the first start.
 fn initdb_cluster(bin: &Path, lib: &Path, data: &Path) -> Result<(), BoxError> {
     std::fs::create_dir_all(data)?;
     let mut cmd = Command::new(bin.join("initdb"));
@@ -1603,10 +1585,28 @@ fn should_adopt(reachable_major: Option<u16>, bundled_major: u16) -> bool {
     reachable_major == Some(bundled_major)
 }
 
-/// Whether an on-disk data dir must be recreated: it exists AND its major differs
-/// from the bundled binaries. An uninitialized dir (`None`) is NOT foreign.
-fn should_recreate_foreign(data_major: Option<u16>, bundled_major: u16) -> bool {
-    data_major.is_some_and(|m| m != bundled_major)
+/// The terminal refusal for a data dir from another Postgres major. Its message
+/// reaches the boot splash, so it says what to do and that nothing was lost.
+/// Newer data came from a newer Lucidos release, which the user can reinstall.
+/// Older data did not, since no shipped release bundled a major below 18.
+fn foreign_major_refusal(data: &Path, data_major: u16, bundled_major: u16) -> ProvisionError {
+    let way_back = if data_major > bundled_major {
+        format!(
+            "Install the Lucidos release that bundles Postgres {data_major} to open \
+             your workspaces again."
+        )
+    } else {
+        format!(
+            "No Lucidos release bundles Postgres {data_major}. Restore your workspaces \
+             from a backup, or dump this data with Postgres {data_major}'s own tools."
+        )
+    };
+    ProvisionError::terminal(format!(
+        "The Postgres data at {} is version {data_major}, but this Lucidos bundles \
+         Postgres {bundled_major}. Lucidos cannot move data between Postgres major \
+         versions yet, so it left the data untouched. {way_back}",
+        data.display()
+    ))
 }
 
 /// Parse a PostgreSQL major version from any of the shapes we read:
@@ -1621,32 +1621,6 @@ fn parse_pg_major(s: &str) -> Option<u16> {
     let n: u32 = digits.parse().ok()?;
     let major = if n >= 10_000 { n / 10_000 } else { n };
     u16::try_from(major).ok()
-}
-
-/// Move a foreign-version data dir aside (rename, never delete) so a fresh
-/// cluster can `initdb` in its place while the old data stays recoverable.
-///
-/// The copy keeps every credential the old cluster held, so the mover marks it
-/// rather than the caller (ADR 0153). No future caller can preserve a data dir
-/// and forget. A rename carries the exclusion with the inode, so there is work
-/// to do here only for a cluster older than the ADR. That is also the one
-/// upgrade that would otherwise strand a plaintext credential store in a
-/// file-level backup for ever.
-fn move_data_dir_aside(data: &Path, data_major: u16) -> Result<PathBuf, BoxError> {
-    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
-    let base = data
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("pgdata");
-    let aside = data.with_file_name(foreign_aside_dir_name(base, data_major, &ts));
-    std::fs::rename(data, &aside)?;
-    crate::file_backup::exclude(&aside, "preserved Postgres data dir");
-    Ok(aside)
-}
-
-/// Sibling name for a moved-aside foreign-version data dir.
-fn foreign_aside_dir_name(base: &str, major: u16, ts: &str) -> String {
-    format!("{base}.foreign-{major}-{ts}")
 }
 
 /// Stop the cluster at `data` as robustly as possible, only ever targeting THIS
@@ -2674,45 +2648,71 @@ mod tests {
         assert!(!should_adopt(None, 18));
     }
 
-    #[test]
-    fn should_recreate_foreign_only_for_a_mismatched_existing_dir() {
-        // Same major → keep (lossless restart of the existing data dir).
-        assert!(!should_recreate_foreign(Some(18), 18));
-        // Foreign major → recreate.
-        assert!(should_recreate_foreign(Some(17), 18));
-        // Uninitialized dir (first run) → not foreign, just initdb.
-        assert!(!should_recreate_foreign(None, 18));
+    /// A `bin` dir whose every Postgres tool appends its name and args to
+    /// `calls`. Only `postgres --version` answers, as v18.
+    fn logging_pg_bin(dir: &Path) -> PathBuf {
+        let bin = dir.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        for tool in ["postgres", "initdb", "pg_ctl", "psql"] {
+            let path = bin.join(tool);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\necho \"{tool} $*\" >> \"$(dirname \"$0\")/calls\"\n\
+                     [ \"{tool} $1\" = \"postgres --version\" ] && echo 'postgres (PostgreSQL) 18.4'\n\
+                     exit 0\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        bin
     }
 
+    /// No cross-major path exists, so a data dir from another major is refused
+    /// and left exactly as found: no stop, no rename, no `initdb` (ADR 0626).
     #[test]
-    fn foreign_aside_dir_name_is_stable_and_recoverable() {
-        assert_eq!(
-            foreign_aside_dir_name("pgdata", 17, "20260622-120000"),
-            "pgdata.foreign-17-20260622-120000"
-        );
-    }
+    fn ensure_embedded_cluster_refuses_a_foreign_major_data_dir_and_touches_nothing() {
+        for (data_major, way_back) in [(17, "from a backup"), (19, "bundles Postgres 19")] {
+            let root = tempfile::tempdir().unwrap();
+            let bin = logging_pg_bin(root.path());
+            let data = root.path().join("pgdata");
+            std::fs::create_dir(&data).unwrap();
+            std::fs::write(data.join("PG_VERSION"), format!("{data_major}\n")).unwrap();
+            std::fs::write(data.join("postmaster.pid"), "4242\n").unwrap();
 
-    /// A foreign-major upgrade keeps the old cluster for ever, and that copy
-    /// holds the credential store in plaintext. Excluding only the fresh
-    /// `pgdata` would strand it in the user's backup, so the mover marks what
-    /// it preserves (ADR 0153). Re-running the idempotent ensure is how the
-    /// test reads the state back: `AlreadySet` means the mark is there.
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn moving_a_foreign_data_dir_aside_excludes_the_copy_it_keeps() {
-        let parent = tempfile::tempdir().unwrap();
-        let data = parent.path().join("pgdata");
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::write(data.join("PG_VERSION"), "17\n").unwrap();
+            let err = ensure_embedded_cluster(&bin, &bin, &data, &root.path().join("socket"))
+                .expect_err("a foreign-major data dir must be refused");
 
-        let moved = move_data_dir_aside(&data, 17).expect("move aside");
-
-        assert!(moved.join("PG_VERSION").exists(), "the old data is kept");
-        assert_eq!(
-            lucidos_file_backup_exclusion::ensure_excluded(&moved).unwrap(),
-            lucidos_file_backup_exclusion::Exclusion::AlreadySet,
-            "the preserved copy must already carry the exclusion"
-        );
+            assert_eq!(err.kind, ProvisionErrorKind::Terminal, "{data_major}");
+            for needle in [
+                format!("version {data_major}"),
+                "Postgres 18".to_string(),
+                data.display().to_string(),
+                "untouched".to_string(),
+                way_back.to_string(),
+            ] {
+                assert!(
+                    err.message.contains(&needle),
+                    "{needle:?} missing: {}",
+                    err.message
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(data.join("PG_VERSION")).unwrap(),
+                format!("{data_major}\n")
+            );
+            assert!(data.join("postmaster.pid").exists(), "no teardown ran");
+            assert!(
+                !sibling_foreign_dir_exists(root.path()),
+                "nothing moved aside"
+            );
+            assert_eq!(
+                std::fs::read_to_string(bin.join("calls")).unwrap(),
+                "postgres --version\n",
+                "only the version probe may run"
+            );
+        }
     }
 
     #[test]
@@ -2874,8 +2874,8 @@ mod tests {
         Some((PathBuf::from(bin), PathBuf::from(lib)))
     }
 
-    /// A throwaway cluster: a parent dir holding `pgdata`, so a moved-aside
-    /// sibling lands inside it, and a cluster socket directory.
+    /// A throwaway cluster: a parent dir holding `pgdata`, so any sibling a
+    /// repair might create lands inside it, and a cluster socket directory.
     ///
     /// The run directory stands in for `~/.lucidos/run`. It sits in `/tmp` to
     /// fit `sun_path`. Its name holds a space and a quote, which the shell and
@@ -3145,39 +3145,51 @@ mod tests {
         stop_cluster_robustly(&bin, &lib, &c.data);
     }
 
-    /// A foreign-major data dir must NOT be adopted: tear down, move the old dir
-    /// aside (recoverable, never deleted), initdb a fresh bundled-version cluster.
+    /// A real cluster forged to a foreign major is refused, stays in place with
+    /// its data, and opens again once its major matches.
     #[test]
-    fn gated_foreign_version_recreates_and_moves_old_dir_aside() {
+    fn gated_foreign_version_is_refused_and_left_in_place() {
         let Some((bin, lib)) = gated_pg_dirs() else {
-            eprintln!("SKIP gated_foreign_version_recreates_and_moves_old_dir_aside: no LUCIDOS_PG_BIN_DIR/LIB");
+            eprintln!("SKIP gated_foreign_version_is_refused_and_left_in_place: no LUCIDOS_PG_BIN_DIR/LIB");
             return;
         };
         let c = gated_cluster();
 
-        // Init a real cluster, stop it, then forge a foreign-major PG_VERSION.
         ensure_embedded_cluster(&bin, &lib, &c.data, &c.socket_dir).unwrap();
+        psql_query_embedded(
+            &bin,
+            &lib,
+            &c.socket_dir,
+            PG_ADMIN_DATABASE,
+            "CREATE DATABASE kept",
+        )
+        .unwrap();
         stop_cluster_robustly(&bin, &lib, &c.data);
         let bundled = bundled_major(&bin, &lib).unwrap();
         std::fs::write(c.data.join("PG_VERSION"), format!("{}\n", bundled - 1)).unwrap();
 
-        // Recreate path: move the foreign dir aside + initdb fresh + start.
-        ensure_embedded_cluster(&bin, &lib, &c.data, &c.socket_dir).unwrap();
-
+        let err = ensure_embedded_cluster(&bin, &lib, &c.data, &c.socket_dir).unwrap_err();
+        assert_eq!(err.kind, ProvisionErrorKind::Terminal);
         assert!(
-            sibling_foreign_dir_exists(c.parent.path()),
-            "foreign-version data dir must be moved aside, not deleted"
+            !sibling_foreign_dir_exists(c.parent.path()),
+            "nothing moved aside"
         );
-        assert_eq!(
-            read_data_dir_major(&c.data),
-            Some(bundled),
-            "the recreated data dir must be the bundled major version"
-        );
+        assert!(!pg_ctl_status(&bin, &lib, &c.data), "nothing started");
 
+        std::fs::write(c.data.join("PG_VERSION"), format!("{bundled}\n")).unwrap();
+        ensure_embedded_cluster(&bin, &lib, &c.data, &c.socket_dir).unwrap();
+        let kept = psql_query_embedded(
+            &bin,
+            &lib,
+            &c.socket_dir,
+            PG_ADMIN_DATABASE,
+            "SELECT count(*) FROM pg_database WHERE datname = 'kept'",
+        );
         stop_cluster_robustly(&bin, &lib, &c.data);
+        assert_eq!(kept.unwrap(), "1", "the original cluster's data survived");
     }
 
-    /// Whether a `*.foreign-*` moved-aside sibling exists under `parent`.
+    /// Whether a `*.foreign-*` sibling of the data dir exists under `parent`.
     fn sibling_foreign_dir_exists(parent: &Path) -> bool {
         std::fs::read_dir(parent)
             .map(|rd| {

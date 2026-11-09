@@ -1,6 +1,6 @@
 use super::completion::{idle_exit, IdleExit};
 use super::idle_change_state::{resolve_idle_change_state, IdleChangeStateInput};
-use super::idle_snapshot::CodingAgentIdleSnapshot;
+use super::idle_snapshot::{CodingAgentIdleSnapshot, IdleTurn};
 use super::spawn_context::SpawnWorktreeContext;
 use crate::engine::agent_context::{
     prepend_user_device_preferences_context, ContextFingerprint, DeviceBlock, SentDeviceContexts,
@@ -846,9 +846,14 @@ impl LucidosEngine {
         // A conflict-resolution or orphan-recovery session never looks up a
         // session to resume, so it records no continuity either.
         let looks_up_resume = recovery_worktree.is_none() && !is_resolution_session;
-        // Its first session is the thread's *successor session*.
+        // Its first session is the thread's *successor session*. Read under
+        // the handoff lock, so a withdraw either lands first or sees this
+        // run's claim and refuses.
         let pending_handoff = if looks_up_resume {
-            crate::engine::successor::pending_handoff(self.pool(), thread_id).await?
+            let claim = crate::engine::successor::lock_handoff(self.pool(), thread_id).await?;
+            let pending = crate::engine::successor::pending_handoff(self.pool(), thread_id).await?;
+            claim.commit().await?;
+            pending
         } else {
             None
         };
@@ -1627,8 +1632,10 @@ impl LucidosEngine {
         // The session handed off: it forwards no more input.
         let mut handed_off = false;
         let mut proposed_change = false;
-        // The branch HEAD each turn-end re-entry last went out for.
+        // What each turn-end re-entry last went out for.
         let mut reentry_ledger = crate::engine::turn_end::ReentryLedger::default();
+        // The turn in flight reads the ceiling re-entry, so it is the engine's.
+        let mut ceiling_reentry_forwarded = false;
         let mut emitted_terminal_event = false; // Track whether ResponseGenerated/ResponseCanceled was emitted
                                                 // user_hit_stop: when true, the next Result emits ResponseCanceled (exchange:
                                                 // "Canceled") instead of ResponseGenerated. Reset on next user follow-up.
@@ -2617,7 +2624,14 @@ impl LucidosEngine {
                                         // Before `holds_live_wait`: the wait holds the
                                         // proposal, and keeps a waiting child unfinished.
                                         // Pinned by `the_idle_arm_covers_polled_tasks_before_it_idles`.
-                                        let ended_cleanly = turn_ended_cleanly(&last_terminal_kind, is_resolution_session, keep_alive_turn);
+                                        let ceiling_turn = std::mem::take(&mut ceiling_reentry_forwarded);
+                                        let ended_cleanly = turn_ended_cleanly(&last_terminal_kind, is_resolution_session, keep_alive_turn || ceiling_turn);
+                                        // A re-entry that ended without a handoff, by prose,
+                                        // a failure or a Stop, gets a brief one. Before the
+                                        // pending-handoff reads below and the idle.
+                                        if ceiling_turn {
+                                            self.settle_owed_ceiling_handoff(thread_id).await;
+                                        }
                                         if ended_cleanly {
                                             self.arm_wait_for_running_background_tasks(thread_id, OwnerTurn::Ended).await;
                                         }
@@ -2748,7 +2762,7 @@ impl LucidosEngine {
                                                     requires_restart: wt_requires_restart,
                                                     bg_bash_pending: bg_bash_running,
                                                     worktree_path: worktree_path.as_deref(),
-                                                    keep_alive: keep_alive_turn,
+                                                    turn: IdleTurn::of(keep_alive_turn, ceiling_turn),
                                                 },
                                                 &meta,
                                                 coding_agent,
@@ -2777,19 +2791,45 @@ impl LucidosEngine {
                                         // After the idle, so a re-entry opens its own
                                         // exchange. Before `terminate_decision`, which
                                         // then sees it queued and keeps the subprocess.
-                                        if let Some(hold) = held_proposal {
+                                        // Only an ordinary clean turn end reads the
+                                        // ceiling, after the idle it counts as a turn.
+                                        let ceiling = if ended_cleanly && emit_idle {
+                                            crate::engine::context_ceiling::ceiling_crossing(self.pool(), thread_id, inputs.owed() > 0).await
+                                        } else {
+                                            None
+                                        };
+                                        if ceiling.is_some() || held_proposal.is_some() {
                                             let gate = crate::engine::turn_end::TurnEndState::at_session_idle(
                                                 true,
                                                 idle_write == Some(IdleChangeWrite::Complete),
                                                 crate::engine::turn_end::SessionFacts {
                                                     head: branch_head_sha(&repo_root, &branch_name).await,
-                                                    held: Some(hold),
+                                                    held: held_proposal,
                                                 },
+                                                ceiling,
                                             );
-                                            if let Some(hold) = reentry_ledger.take_due(&gate) {
-                                                if let Err(e) = self.nudge_held_proposal_in_session(thread_id, hold, &msg_tx).await {
-                                                    log!("[AgentSession] Proposal-hold re-entry for thread {} not sent: {}", thread_id, e);
+                                            match reentry_ledger.take_due(&gate) {
+                                                Some(crate::engine::turn_end::DueReentry::Ceiling(crossing)) => {
+                                                    // At the head, ahead of input queued for the
+                                                    // successor. The input arm then closes until
+                                                    // the re-entry turn ends.
+                                                    match crate::engine::context_ceiling::record_ceiling_reentry(&self.event_bus, thread_id, crossing).await {
+                                                        Ok(reentry) => {
+                                                            let _sessions = self.agent_sessions.lock().await;
+                                                            requeue_at_head(&msg_tx, msg_rx, reentry);
+                                                        }
+                                                        Err(e) => {
+                                                            log!("[AgentSession] Ceiling re-entry for thread {} not sent: {}", thread_id, e);
+                                                            self.settle_owed_ceiling_handoff(thread_id).await;
+                                                        }
+                                                    }
                                                 }
+                                                Some(crate::engine::turn_end::DueReentry::Hold(hold)) => {
+                                                    if let Err(e) = self.nudge_held_proposal_in_session(thread_id, hold, &msg_tx).await {
+                                                        log!("[AgentSession] Proposal-hold re-entry for thread {} not sent: {}", thread_id, e);
+                                                    }
+                                                }
+                                                None => {}
                                             }
                                         }
 
@@ -2828,10 +2868,10 @@ impl LucidosEngine {
                             let pool = self.pool.clone();
                             let bus = self.event_bus.clone();
                             let pending = self.pending_cc_permission.clone();
-                            // An unattended session auto-resolves the card from
-                            // the inherited side-effect grant rather than
-                            // hanging, and that decision needs the trigger
-                            // registry and the workspace root.
+                            // An unattended session resolves the request from
+                            // the inherited side-effect grant, or parks a card
+                            // bounded by its permission wait. That decision
+                            // needs the trigger registry and the workspace root.
                             let trigger_configs = self.trigger_configs.clone();
                             let workspace_path = self.workspace_path.clone();
                             // A file write inside this session's own worktree
@@ -2840,13 +2880,14 @@ impl LucidosEngine {
                             // the MCP path resolves, and reading it here keeps
                             // the arm lock-free.
                             let session_worktree = worktree_path.clone();
-                            // The attended command gate's LLM half runs off the
-                            // engine, inside the spawned task below. Taken as an
-                            // Arc for the same reason the title task does, and
-                            // the select arm stays free of the classification.
-                            // `try_` so a bare test engine gets the static half
-                            // rather than a panic.
-                            let judge = self.try_clone_arc();
+                            // The attended command gate's LLM half and the
+                            // unattended park's push run off the engine, inside
+                            // the spawned task below. Taken as an Arc for the
+                            // same reason the title task does, and the select
+                            // arm stays free of the classification. `try_` so a
+                            // bare test engine gets the static half rather than
+                            // a panic.
+                            let engine = self.try_clone_arc();
                             // Disarm the watchdog while the card waits. The
                             // approval may arrive BEFORE the item's ToolUse,
                             // so the paired tool counter alone cannot cover
@@ -2863,7 +2904,7 @@ impl LucidosEngine {
                                         &trigger_configs,
                                         &workspace_path,
                                         session_worktree.as_deref(),
-                                        judge.as_deref(),
+                                        engine.as_ref(),
                                         crate::engine::cc_permission::CodingAgentPermissionInput {
                                             thread_id,
                                             tool_use_id: req.id,
@@ -2901,14 +2942,18 @@ impl LucidosEngine {
                     }
                 }
 
-                Some(mut user_input) = msg_rx.recv(), if !handed_off => {
-                    // After a handoff, input waits in the channel for the
-                    // successor session. The idle exit drains it there.
+                Some(mut user_input) = msg_rx.recv(), if !handed_off && !ceiling_reentry_forwarded => {
+                    // After a handoff, and through the ceiling re-entry turn,
+                    // input waits in the channel for the successor session.
+                    // The idle exit drains it there.
                     if crate::engine::successor::handoff_pending(self.pool(), thread_id).await {
                         handed_off = true;
                         let _sessions = self.agent_sessions.lock().await;
                         requeue_at_head(&msg_tx, msg_rx, user_input);
                         continue 'event_loop;
+                    }
+                    if user_input.kind == crate::engine::AgentInputKind::CeilingReentry {
+                        ceiling_reentry_forwarded = true;
                     }
                     // The input just left the channel and is about to reach the
                     // driver. It therefore moves from the "sent, not yet
@@ -2932,6 +2977,7 @@ impl LucidosEngine {
                         let mut sessions = self.agent_sessions.lock().await;
                         if let Some(s) = sessions.get_mut(&thread_id) {
                             s.is_waiting = false;
+                            s.in_ceiling_reentry = ceiling_reentry_forwarded;
                             if let Some(id) = user_input.origin_event_id {
                                 s.unforwarded_inputs.remove(&id);
                             }

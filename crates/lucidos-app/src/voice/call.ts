@@ -9,6 +9,7 @@
  * `AudioContext` anywhere.
  */
 import {
+  SPEECH_GATE_DEFAULTS,
   SPEECH_GATE_SHUT,
   type SpeechGateSettings,
   type SpeechGateState,
@@ -51,6 +52,17 @@ import { sourceGeneration } from '../utils/restoreSourceGeneration';
  * for the life of the page.
  */
 export const PREROLL_FRAMES_MAX = 200;
+
+/**
+ * How many gate-opening runs of audio wait while the talker speaks.
+ *
+ * Over the talker, a frame the gate calls quiet is held rather than sent. It
+ * is echo by our own definition, and the provider's VAD would hear it as the
+ * caller. The hold keeps the speech onset the gate spent deciding on, so a
+ * caller who cuts in loses no words. Three runs covers the run itself plus
+ * the softer start of a word below the threshold.
+ */
+export const ONSET_RUNS_HELD = 3;
 
 /** How long one captured frame lasts, which is the only clock a call reads. */
 export const CAPTURE_FRAME_MS = (CAPTURE_FRAME_SAMPLES / SAMPLE_RATE_HZ) * 1_000;
@@ -138,6 +150,16 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
    * never lands.
    */
   let preroll: ArrayBuffer[] = [];
+  /**
+   * Quiet frames captured over the talker, oldest first.
+   *
+   * Sent ahead of the frame that opens the gate, and dropped when the talker
+   * finishes without the caller cutting in. Capped at {@link ONSET_RUNS_HELD}
+   * gate-opening runs.
+   */
+  let onset: ArrayBuffer[] = [];
+  const gateSettings = options.speechGate ?? SPEECH_GATE_DEFAULTS;
+  const onsetFramesMax = gateSettings.framesToOpen * ONSET_RUNS_HELD;
   /** True once the handshake succeeded. A close before it is a refusal. */
   let handshook = false;
   /**
@@ -362,16 +384,11 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
   function captured(samples: Float32Array): void {
     if (!hearsTheCaller(state.phase)) return;
     const pcm = floatToPcm16(samples);
-    // A frame with nowhere to go is held, never dropped. That is what makes
-    // the bubble the gate raises a promise the words behind it can keep.
-    if (socket && isLive(state.phase)) {
-      socket.sendAudio(pcm);
-    } else {
-      if (preroll.length === PREROLL_FRAMES_MAX) preroll.shift();
-      preroll.push(pcm);
-    }
     const wasOpen = gate.open;
-    gate = stepSpeechGate(gate, frameEnergy(samples), options.speechGate);
+    gate = stepSpeechGate(gate, frameEnergy(samples), gateSettings);
+    // Routed before the edge reaches the reducer, so the phase that decides
+    // where this frame goes is the one it was captured in.
+    route(pcm);
     if (gate.open === wasOpen) {
       if (!gate.open) quietFrames += 1;
       return;
@@ -379,6 +396,29 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
     const quietMs = quietFrames * CAPTURE_FRAME_MS;
     quietFrames = 0;
     input({ kind: 'speech', open: gate.open, quietMs });
+  }
+
+  /** Send one captured frame, or hold it, by who has the floor. */
+  function route(pcm: ArrayBuffer): void {
+    // A frame with nowhere to go is held, never dropped. That is what makes
+    // the bubble the gate raises a promise the words behind it can keep.
+    if (!socket || !isLive(state.phase)) {
+      if (preroll.length === PREROLL_FRAMES_MAX) preroll.shift();
+      preroll.push(pcm);
+      return;
+    }
+    // Over the talker, only the caller's own speech goes up. A quiet frame
+    // there is echo, and the provider would answer it as a turn. The talker
+    // is heard until its audio drains, which outlasts its turn.
+    const talkerHeard = state.phase === 'speaking' || audio?.isPlaying() === true;
+    if (talkerHeard && !gate.open) {
+      if (onset.length === onsetFramesMax) onset.shift();
+      onset.push(pcm);
+      return;
+    }
+    if (gate.open) for (const held of onset) socket.sendAudio(held);
+    onset = [];
+    socket.sendAudio(pcm);
   }
 
   /** Send what the connect window captured, oldest first, and forget it. */
@@ -395,6 +435,7 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
     quietFrames = 0;
     // A dial that never landed holds audio nothing will ever read.
     preroll = [];
+    onset = [];
     handshook = false;
     socket?.close();
     socket = null;

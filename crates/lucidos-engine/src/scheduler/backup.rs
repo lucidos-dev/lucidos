@@ -412,6 +412,7 @@ async fn emit_backup_notification(
             event_id: None,
             tap,
             actor: None,
+            audience: None,
         }))
         .await
     {
@@ -709,7 +710,7 @@ mod tests {
                 assert_eq!(to.target, NavigateTarget::Settings);
                 to.settings_view
             }
-            Tap::Modal | Tap::RestoreSnapshot { .. } => None,
+            Tap::Modal | Tap::RestoreSnapshot { .. } | Tap::UndoConfigChange { .. } => None,
         }
     }
 

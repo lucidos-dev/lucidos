@@ -646,6 +646,31 @@ describe('the installed router', () => {
     });
   });
 
+  describe('log.app-fullscreen', () => {
+    const send = (args: unknown) => deliver(frame.contentWindow, { type: BRIDGE_TYPE, id: '', op: 'log.app-fullscreen', args });
+    const logged = () => fetchMock.mock.calls
+      .filter(([url]) => String(url).endsWith('/internal/client-log'))
+      .map(([, init]) => JSON.parse((init as RequestInit).body as string) as { category: string; message: string; data: Record<string, unknown> });
+
+    it('writes the frame step under the app the HOST mounted', async () => {
+      send({ step: 'never-opened', readyState: 4, app: 'forged' });
+
+      await vi.waitFor(() => expect(logged()).toHaveLength(1));
+      expect(logged()[0]).toEqual({
+        category: 'app-fullscreen',
+        message: 'never-opened',
+        data: { app: 'habit-tracker', readyState: 4 },
+      });
+    });
+
+    it('drops an oversized detail rather than lose the line to the engine 4 KB cap', async () => {
+      send({ step: 'request', error: 'x'.repeat(5000) });
+
+      await vi.waitFor(() => expect(logged()).toHaveLength(1));
+      expect(logged()[0].data).toEqual({ app: 'habit-tracker', detailDropped: true });
+    });
+  });
+
   it('answers the focused thread from the shell, null included', async () => {
     const posted: unknown[] = [];
     const win = frame.contentWindow as Window;

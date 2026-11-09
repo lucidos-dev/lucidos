@@ -48,6 +48,10 @@ use crate::engine::LucidosEngine;
 use crate::triggers::registry::materialize_trigger_event;
 use crate::triggers::TriggerConfig;
 
+/// The payload key holding a trigger's config before an update or delete, as
+/// a created payload. Undo writes it back (ADR 0623).
+pub(crate) const PREVIOUS_KEY: &str = "previous";
+
 /// Which lifecycle event a trigger write records, and the only way to reach
 /// the matching `SystemEvent::Trigger*` constructor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +182,42 @@ impl TriggerRegistryWriter<'_> {
             .await
     }
 
+    /// [`write`](Self::write) only when `applies` holds for the trigger's
+    /// current config, judged under the guard. `Ok(false)` when it does not.
+    ///
+    /// A create keeps the payload's slug unless another trigger now holds
+    /// it, and then mints a fresh one, so two triggers never share a slug.
+    pub(crate) async fn write_if(
+        &self,
+        write: TriggerWrite,
+        trigger_id: &str,
+        mut payload: Value,
+        actor: Option<MessageOrigin>,
+        applies: impl FnOnce(Option<&TriggerConfig>, &Value) -> bool,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let _guard = self.write_lock.lock().await;
+        {
+            let configs = self.trigger_configs.read().unwrap();
+            if !applies(configs.get(trigger_id), &payload) {
+                return Ok(false);
+            }
+            if write == TriggerWrite::Created {
+                let taken: std::collections::HashSet<String> =
+                    configs.values().map(|c| c.slug.clone()).collect();
+                let slug = payload.get("slug").and_then(Value::as_str);
+                if slug.is_some_and(|slug| taken.contains(slug)) {
+                    let name = payload["name"].as_str().unwrap_or(trigger_id).to_string();
+                    payload["slug"] = Value::String(crate::triggers::mint_unique_trigger_slug(
+                        &name, trigger_id, &taken,
+                    ));
+                }
+            }
+        }
+        self.emit_then_apply(write, trigger_id, payload, actor)
+            .await?;
+        Ok(true)
+    }
+
     /// The emit and the registry apply both writers share. The caller holds
     /// `write_lock` across this call.
     async fn emit_then_apply(
@@ -187,6 +227,18 @@ impl TriggerRegistryWriter<'_> {
         payload: Value,
         actor: Option<MessageOrigin>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut payload = payload;
+        if matches!(write, TriggerWrite::Updated | TriggerWrite::Deleted) {
+            let previous = self
+                .trigger_configs
+                .read()
+                .unwrap()
+                .get(trigger_id)
+                .map(TriggerConfig::to_created_payload);
+            if let (Some(previous), Some(obj)) = (previous, payload.as_object_mut()) {
+                obj.insert(PREVIOUS_KEY.to_string(), previous);
+            }
+        }
         let event = write.into_event(trigger_id.to_string(), payload.clone(), actor);
         self.event_bus.emit(BusEvent::System(event)).await?;
         materialize_trigger_event(

@@ -35,6 +35,9 @@ async fn repository_added_populates_repo_names_and_removed_retains_it() {
 
     bus.emit(BusEvent::System(SystemEvent::RepositoryRemoved {
         repo_id: repo_id.to_string(),
+        name: None,
+        root_path: None,
+        description: None,
         actor: None,
     }))
     .await

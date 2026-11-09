@@ -132,6 +132,11 @@ travel as the utterance.
 - A running doer round is no longer offered a cut reply. The transcript covers
   words the caller was never played, so a round told they heard it would make
   the claim the cut refuses.
+- The provider holds no cut of its own. Realtime opens with
+  `interrupt_response: false`, since its VAD hears the talker's echo through a
+  phone speaker and cut the reply on it. Over the talker the client also sends
+  only audio its own gate calls speech, so echo is never answered as a turn
+  (`docs/plans/2026-11-09-the-talker-never-cuts-itself-off.md`).
 
 ## Alternatives considered
 

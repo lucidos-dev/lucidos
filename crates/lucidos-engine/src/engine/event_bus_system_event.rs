@@ -47,6 +47,11 @@ pub enum SystemEvent {
         /// worktree cleanup, backup) pass `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
+        /// The devices this notification is for, when its producer names
+        /// them: a work item's role change tells one person (ADR 0623).
+        /// `None` lets the projection work it out from the thread it opens.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audience: Option<Vec<String>>,
     },
     NotificationRead {
         id: String,
@@ -197,7 +202,8 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A capture failed or was interrupted. Persisted; reason is a fixed safe code.
+    /// A capture failed or was interrupted. Persisted; reason is a fixed safe code,
+    /// plus the bytes to free for a disk floor refusal.
     SnapshotCaptureFailed {
         workspace_id: String,
         handle: crate::core::snapshot::handle::Handle,
@@ -765,6 +771,11 @@ pub enum SystemEvent {
         tap: Tap,
         deadline_ms: u32,
         sent_at_ms: i64,
+        /// The devices the push is for, when it is about a work item with a
+        /// driver (ADR 0623). A page outside it shows nothing and answers
+        /// `not_shown`. Absent means every device.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audience: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
@@ -792,6 +803,10 @@ pub enum SystemEvent {
         #[serde(default)]
         tap: Tap,
         sent_at_ms: i64,
+        /// The devices the banner is for, as on [`Self::PresenceCheck`].
+        /// Absent means every device.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audience: Option<Vec<String>>,
     },
     /// SSE-only, never persisted. The cross-device counterpart of a *read*: when
     /// a notification is read on one device, the engine broadcasts this so a
@@ -813,7 +828,16 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         notification_id: Option<Uuid>,
         sent_at_ms: i64,
+        /// The reader's devices on a team gateway (ADR 0623): one person's
+        /// read dismisses that person's banners only. Absent means everyone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audience: Option<Vec<String>>,
     },
+    /// The gateway changed its operators: a person, an email or a device moved
+    /// (ADR 0623). Transient. Every page reloads its own person's devices,
+    /// which decide its Review group on a team gateway. Aggregate `operator`,
+    /// id `all`.
+    OperatorsChanged,
     /// A plugin was installed (or updated — overwrite=true reuses this variant).
     /// `manifest` carries the full parsed manifest so future fields are additive.
     /// `files` are paths under `data/` so a future tracked-uninstall can derive
@@ -1034,8 +1058,17 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// A repository left the registry. `name`, `root_path` and `description`
+    /// are what Undo re-registers it from (ADR 0623). They are `None` on an
+    /// identity collapse, which a re-registration causes, and on older rows.
     RepositoryRemoved {
         repo_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        root_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
@@ -1055,9 +1088,13 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A credential entry was removed.
+    /// A credential entry was removed. `metadata` is everything but the value,
+    /// so Undo can restore the entry for someone to fill in again. `None` on
+    /// older rows.
     CredentialDeleted {
         service_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<crate::core::credentials::CredentialMetadata>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
@@ -1261,9 +1298,14 @@ pub enum SystemEvent {
     /// new command / args / env. The `mcp_servers` table drives which external
     /// tools the agent can call, so a registration changes the agent's own tool
     /// surface: it belongs on the timeline even though no UI lists it yet.
+    ///
+    /// `created` is true when no server held the id before. Only such a
+    /// registration can be undone: a re-registration's old env is sealed.
     McpServerRegistered {
         server_id: String,
         name: String,
+        #[serde(default)]
+        created: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
@@ -1284,9 +1326,13 @@ pub enum SystemEvent {
     /// auto-approve change. A disabled tool leaves every request, so this moves
     /// the agent's tool surface the way `McpServerRemoved` does for a whole
     /// server.
+    ///
+    /// `previous` is the set before, which Undo restores. `None` on older rows.
     McpServerDisabledToolsChanged {
         server_id: String,
         disabled_tools: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
@@ -2119,6 +2165,7 @@ impl SystemEvent {
             Self::PresenceCheck { .. } => "PresenceCheck",
             Self::NativePushRequested { .. } => "NativePushRequested",
             Self::NativePushDismissRequested { .. } => "NativePushDismissRequested",
+            Self::OperatorsChanged => "OperatorsChanged",
             Self::PluginInstalled { .. } => "PluginInstalled",
             Self::PluginLocalChangesMerged { .. } => "PluginLocalChangesMerged",
             Self::PluginUninstalled { .. } => "PluginUninstalled",
@@ -2310,6 +2357,7 @@ impl SystemEvent {
         "PresenceCheck",
         "NativePushRequested",
         "NativePushDismissRequested",
+        "OperatorsChanged",
         "PluginInstalled",
         "PluginLocalChangesMerged",
         "PluginUninstalled",
@@ -2411,6 +2459,7 @@ impl SystemEvent {
             | Self::NotificationsAllRead { .. }
             | Self::NativePushRequested { .. }
             | Self::NativePushDismissRequested { .. } => "notification",
+            Self::OperatorsChanged => "operator",
             Self::PreferencesChanged { .. }
             | Self::LanguageSet { .. }
             | Self::TimezoneSet { .. } => "preference",
@@ -2634,6 +2683,7 @@ impl SystemEvent {
             } => notification_id
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| "all".to_string()),
+            Self::OperatorsChanged => "all".to_string(),
             Self::PluginInstalled { id, .. } => id.clone(),
             Self::PluginLocalChangesMerged { id, .. } => id.clone(),
             Self::PluginUninstalled { id, .. } => id.clone(),

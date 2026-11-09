@@ -34,6 +34,7 @@ import {
   _resetStaleThreadEventsForTesting,
   _resetThreadEventsFailuresForTesting,
   clearThreadFetchGuards,
+  loadOlderThreadEvents,
   loadThreadEvents,
   markLoadedThreadsStale,
   refreshStaleThreadEvents,
@@ -342,6 +343,26 @@ describe('threadEventsStillArriving', () => {
 
     release!();
     await settle();
+    expect(threadEventsStillArriving('t1')).toBe(false);
+  });
+
+  it('is true while a page of older history is on its way', async () => {
+    // A deep link pages toward an old target, one read at a time. A deadline
+    // that fired mid-page cleared the link and stopped the paging short.
+    putThreads([['t1', {
+      ...loaded('t1'), hasOlderEvents: true, historyFloor: { created: '2026-01-01T00:00:00Z', sequence: 1 },
+    }]]);
+    let release: (() => void) | null = null;
+    fetchEvents.mockImplementation(() => new Promise((resolve) => {
+      release = () => resolve({ events: [], currentAggregate: null });
+    }));
+
+    const page = loadOlderThreadEvents('t1');
+    await settle();
+    expect(threadEventsStillArriving('t1')).toBe(true);
+
+    release!();
+    await page;
     expect(threadEventsStillArriving('t1')).toBe(false);
   });
 

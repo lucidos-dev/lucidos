@@ -45,6 +45,25 @@ impl FetchError {
     }
 }
 
+/// Maps a GitHub release download URL to the release API endpoint for its tag, plus the asset name.
+/// The API route serves the same bytes when the `/releases/download/` route fails.
+pub fn release_api_endpoint(download_url: &str) -> Option<(String, String)> {
+    let rest = download_url.strip_prefix("https://github.com/")?;
+    let (repo, tail) = rest.split_once("/releases/download/")?;
+    let (tag, asset) = tail.split_once('/')?;
+    Some((format!("https://api.github.com/repos/{repo}/releases/tags/{tag}"), asset.to_owned()))
+}
+
+/// Finds the API URL of the named asset in a release's JSON, without a JSON parser.
+pub fn asset_api_url(release_json: &str, asset: &str) -> Option<String> {
+    let compact: String = release_json.chars().filter(|c| !c.is_whitespace()).collect();
+    let before_name = &compact[..compact.find(&format!("\"name\":\"{asset}\""))?];
+    let url_start = before_name.rfind("\"https://api.github.com/")? + 1;
+    let url = &before_name[url_start..];
+    let url = &url[..url.find('"')?];
+    url.contains("/releases/assets/").then(|| url.to_owned())
+}
+
 pub fn fetch_sources(
     sources: impl IntoIterator<Item = String>,
     mut fetch: impl FnMut(&str) -> Result<Vec<u8>, FetchError>,
@@ -102,6 +121,36 @@ mod tests {
         assert_eq!(bytes, [42]);
         assert_eq!(calls, [vec!["mirror"; attempts], vec!["upstream"]].concat());
         assert_eq!(sleeps, if attempts == 3 { vec![2, 8] } else { vec![] });
+    }
+
+    const RELEASE_JSON: &str = r#"{
+      "url": "https://api.github.com/repos/o/r/releases/1",
+      "assets_url": "https://api.github.com/repos/o/r/releases/1/assets",
+      "name": "ONNX Runtime 1.20.0",
+      "assets": [
+        {"url": "https://api.github.com/repos/o/r/releases/assets/11", "id": 11, "name": "a.tgz"},
+        {
+          "url": "https://api.github.com/repos/o/r/releases/assets/22",
+          "id": 22,
+          "name": "b.tgz"
+        }
+      ]
+    }"#;
+
+    #[test]
+    fn release_download_url_maps_to_the_release_api() {
+        assert_eq!(
+            release_api_endpoint("https://github.com/o/r/releases/download/1.20.0/b.tgz"),
+            Some(("https://api.github.com/repos/o/r/releases/tags/1.20.0".into(), "b.tgz".into()))
+        );
+        assert_eq!(release_api_endpoint("https://example.com/mirror/1.20.0/b.tgz"), None);
+    }
+
+    #[test]
+    fn asset_url_is_found_by_name() {
+        assert_eq!(asset_api_url(RELEASE_JSON, "a.tgz").as_deref(), Some("https://api.github.com/repos/o/r/releases/assets/11"));
+        assert_eq!(asset_api_url(RELEASE_JSON, "b.tgz").as_deref(), Some("https://api.github.com/repos/o/r/releases/assets/22"));
+        assert_eq!(asset_api_url(RELEASE_JSON, "c.tgz"), None);
     }
 
     #[test]

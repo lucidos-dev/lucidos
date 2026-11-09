@@ -761,7 +761,7 @@ fn static_classify_at(
         // For Python only a destruction call is weighed, against its literals.
         out_of_workspace: if is_bash {
             command_names_path_outside(cmd, root, disk, home.as_deref())
-                || bash_destruction_scope_at(cmd, 0, root, disk, false)
+                || bash_destruction_scope_at(cmd, root, disk, false)
                     == Some(DestructionScope::OutOfWorkspace)
         } else {
             python_destruction_scope(cmd, root, disk, home.as_deref())
@@ -808,7 +808,7 @@ pub fn fallback_classify(ji: &JudgeInput, site: CommandSite<'_>) -> JudgedClassi
     );
     let scope = site.with_disk(|disk| {
         if is_bash {
-            bash_destruction_scope_at(&ji.command, 0, site.root(), disk, false)
+            bash_destruction_scope_at(&ji.command, site.root(), disk, false)
         } else {
             python_destruction_scope(&ji.command, site.root(), disk, home_dir().as_deref())
         }
@@ -882,13 +882,32 @@ static SOURCE_REMOVING_HEADS: &[&str] = &["mv"];
 /// no segment has a destruction shape.
 #[cfg(test)]
 fn bash_destruction_scope(command: &str) -> Option<DestructionScope> {
-    bash_destruction_scope_at(command, 0, None, None, false)
+    bash_destruction_scope_at(command, None, None, false)
 }
 
 /// True when `command` destroys anything if it starts outside the workspace,
 /// where every relative path resolves out there too.
 pub fn destroys_when_started_outside(command: &str) -> bool {
-    bash_destruction_scope_at(command, 0, None, None, true).is_some()
+    bash_destruction_scope_at(command, None, None, true).is_some()
+}
+
+/// Whether a truncation onto a scratch target may pass as no destruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScratchWrites {
+    /// Every truncation outside the workspace is destruction.
+    Destroy,
+    /// A private scratch target ([`private_scratch_target`]) is a log, not
+    /// destruction. `tmpdir_trusted` comes from the WHOLE command line.
+    Exempt { tmpdir_trusted: bool },
+}
+
+impl ScratchWrites {
+    fn exempts(self, target: &str) -> bool {
+        match self {
+            Self::Destroy => false,
+            Self::Exempt { tmpdir_trusted } => private_scratch_target(target, tmpdir_trusted),
+        }
+    }
 }
 
 /// How many directories the scan tracks a line through before it stops and
@@ -909,10 +928,25 @@ const MAX_TRACKED_CWDS: usize = 32;
 /// data/x/*` resolves its target before the link exists.
 fn bash_destruction_scope_at(
     command: &str,
+    root: Option<&Path>,
+    disk: Option<OnDisk<'_>>,
+    relative_paths_escape: bool,
+) -> Option<DestructionScope> {
+    let scratch = ScratchWrites::Exempt {
+        tmpdir_trusted: tmpdir_trusted_for(command),
+    };
+    destruction_scope_in(command, 0, root, disk, relative_paths_escape, scratch)
+}
+
+/// [`bash_destruction_scope_at`] at substitution depth `depth`. A body gets no
+/// scratch exemption: the line around it can lay down a link first.
+fn destruction_scope_in(
+    command: &str,
     depth: usize,
     root: Option<&Path>,
     disk: Option<OnDisk<'_>>,
     relative_paths_escape: bool,
+    scratch: ScratchWrites,
 ) -> Option<DestructionScope> {
     /// True when `scope` escapes the workspace; records an in-workspace hit.
     fn escapes(scope: Option<DestructionScope>, found_in_ws: &mut bool) -> bool {
@@ -935,12 +969,23 @@ fn bash_destruction_scope_at(
         .collect();
     let linkers = may_link.iter().filter(|&&links| links).count();
     let reach = LinkReach::of(command);
+    // Read from the text alone, since a scratch target is checked on disk
+    // even where the scan has no workspace disk to read.
+    let links_by_text: Vec<bool> = segments.iter().map(|s| may_make_a_link(s)).collect();
     let mut cwds: Vec<PathBuf> = disk.map(|d| d.cwds.to_vec()).unwrap_or_default();
     for (i, segment) in segments.iter().enumerate() {
         let here = disk.map(|d| OnDisk {
             root: d.root,
             cwds: &cwds,
         });
+        let linked_first = (0..segments.len())
+            .any(|j| j != i && links_by_text[j] && reach.reaches(j, i))
+            || may_link_itself(segment);
+        let scratch = if linked_first {
+            ScratchWrites::Destroy
+        } else {
+            scratch
+        };
         // After a `cd` out of the workspace, a relative path lands out there.
         // So it does when another segment, or this one's own substitution or
         // wrapper, can lay down a link before this segment runs.
@@ -957,7 +1002,7 @@ fn bash_destruction_scope_at(
         // wrapper's own preamble, as in `bash >/etc/crontab -c 'true'`, and the
         // unwrap discards everything before `-c` along with it.
         if escapes(
-            relocate(segment_destruction_scope(segment, here)),
+            relocate(segment_destruction_scope(segment, here, scratch)),
             &mut found_in_ws,
         ) {
             return Some(DestructionScope::OutOfWorkspace);
@@ -968,7 +1013,7 @@ fn bash_destruction_scope_at(
         let inner = unwrap_shell_command(segment);
         if inner != segment.as_str()
             && escapes(
-                relocate(segment_destruction_scope(&inner, here)),
+                relocate(segment_destruction_scope(&inner, here, scratch)),
                 &mut found_in_ws,
             )
         {
@@ -976,7 +1021,7 @@ fn bash_destruction_scope_at(
         }
         // The scope scan reads a relative overwrite as in-workspace, which the
         // fast path settles Safe. Out of the workspace it lands out there.
-        if escape && (truncates_a_file(segment) || truncates_a_file(&inner)) {
+        if escape && (truncates_a_file(segment, scratch) || truncates_a_file(&inner, scratch)) {
             return Some(DestructionScope::OutOfWorkspace);
         }
         let left = changes_dir_out_of_workspace(segment, root, here, cdpath_set)
@@ -1001,12 +1046,13 @@ fn bash_destruction_scope_at(
             cwds: &cwds,
         });
         for body in substitution_bodies(command) {
-            let scope = bash_destruction_scope_at(
+            let scope = destruction_scope_in(
                 body,
                 depth + 1,
                 root,
                 here,
                 left_workspace || linkers > 0,
+                ScratchWrites::Destroy,
             );
             if escapes(scope, &mut found_in_ws) {
                 return Some(DestructionScope::OutOfWorkspace);
@@ -1034,6 +1080,52 @@ fn may_make_a_link(segment: &str) -> bool {
             matches!(base.as_str(), "cd" | "pushd" | "popd")
                 || DESTRUCTIVE_HEADS.contains(&base.as_str())
         })
+}
+
+/// True when `segment` may lay down a link before its own redirect opens: a
+/// substitution, which expands first, even inside quotes a wrapper unwraps,
+/// a link-making word, as in `find -exec ln … -exec sh -c 'echo > f'`, or a
+/// redirect that opens late ([`a_quoted_redirect_opens_late`]).
+fn may_link_itself(segment: &str) -> bool {
+    segment.contains('`')
+        || ["$(", "<(", ">("].iter().any(|open| segment.contains(open))
+        || segment.split_whitespace().any(|word| {
+            let word = dequoted(word);
+            let base = word.rsplit('/').next().unwrap_or_default();
+            matches!(base, "ln" | "link") || word.contains("symlink")
+        })
+        || a_quoted_redirect_opens_late(segment)
+}
+
+/// True when a redirect in `segment` sits in a quoted script that its head
+/// may run after other commands. Example: `find -exec tar … -exec sh -c`.
+/// A shell wrapper and a `lucidos background-task` run nothing first, so
+/// their script is read as a segment of its own.
+fn a_quoted_redirect_opens_late(segment: &str) -> bool {
+    let inner = unwrap_shell_command(segment);
+    if inner != segment {
+        return may_link_itself(&inner);
+    }
+    if let Some(script) = background_task_script(segment) {
+        return may_link_itself(&script);
+    }
+    REDIRECT_RE
+        .find_iter(segment)
+        .any(|m| quote_open_after(&segment[..m.start()]))
+}
+
+/// The script a `lucidos background-task run … -- <script>` segment queues.
+fn background_task_script(segment: &str) -> Option<Cow<'_, str>> {
+    let toks: Vec<&str> = segment.split_whitespace().collect();
+    let heads = danger_head_candidates(&toks);
+    let [(head, args)] = heads.as_slice() else {
+        return None;
+    };
+    if head != "lucidos" || args.first() != Some(&"background-task") {
+        return None;
+    }
+    let (_, script) = segment.split_once(" -- ")?;
+    Some(split_shell_script_operand(script.trim()).0)
 }
 
 /// True when `segment` runs a command its head does not name that may lay
@@ -1248,12 +1340,16 @@ fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
 
 /// Destruction scope of one shell segment, or `None`. Skips the same benign
 /// prefixes the other scans do, so `sudo rm -rf /etc/x` is seen.
-fn segment_destruction_scope(segment: &str, disk: Option<OnDisk<'_>>) -> Option<DestructionScope> {
+fn segment_destruction_scope(
+    segment: &str,
+    disk: Option<OnDisk<'_>>,
+    scratch: ScratchWrites,
+) -> Option<DestructionScope> {
     // A truncation (`>` or a plain `tee`) onto a path outside the workspace
     // overwrites it, and no checkpoint covers that. An append (`>>`, `tee -a`)
     // is an out-of-workspace EDIT (wanted). An in-workspace truncation reads
     // as Safe, like any in-workspace write. Neither lands here.
-    if truncation_escapes(segment, disk) {
+    if truncation_escapes(segment, disk, scratch) {
         return Some(DestructionScope::OutOfWorkspace);
     }
     let toks: Vec<&str> = segment.split_whitespace().collect();
@@ -1358,15 +1454,17 @@ fn target_directories(head_args: &[&str]) -> Vec<String> {
 }
 
 /// True when the segment truncates a file outside the workspace.
-fn truncation_escapes(segment: &str, disk: Option<OnDisk<'_>>) -> bool {
+fn truncation_escapes(segment: &str, disk: Option<OnDisk<'_>>, scratch: ScratchWrites) -> bool {
     truncated_files(segment)
         .iter()
-        .any(|target| !path_in_workspace(target, disk))
+        .any(|target| !path_in_workspace(target, disk) && !scratch.exempts(target))
 }
 
 /// True when the segment truncates any real file.
-fn truncates_a_file(segment: &str) -> bool {
-    !truncated_files(segment).is_empty()
+fn truncates_a_file(segment: &str, scratch: ScratchWrites) -> bool {
+    truncated_files(segment)
+        .iter()
+        .any(|target| !scratch.exempts(target))
 }
 
 /// The real files a segment truncates: each target of a `>` redirect (not
@@ -3506,6 +3604,24 @@ fn dequoted(token: &str) -> String {
     word
 }
 
+/// True when a quote opened in `text` is still open at its end, read with
+/// the escapes [`dequoted`] honours.
+fn quote_open_after(text: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), _) if c == q => quote = None,
+            (None | Some('"'), '\\') => {
+                chars.next();
+            }
+            _ => {}
+        }
+    }
+    quote.is_some()
+}
+
 /// `token` without the quotes around it.
 fn unquoted(token: &str) -> &str {
     token.trim_matches(|c| c == '"' || c == '\'')
@@ -3544,8 +3660,8 @@ const TMPDIR_SCRATCH_PREFIX: &str = "${TMPDIR:-/tmp}/";
 /// True when [`TMPDIR_SCRATCH_PREFIX`] names the temp dir for `command`.
 ///
 /// Two conditions. The engine's own `TMPDIR`, which a coding agent inherits,
-/// is unset, empty or itself a temp dir. And `command` names `TMPDIR` only
-/// inside the prefix, since any other mention may rebind it (`TMPDIR=~;`).
+/// is unset, empty or itself a temp dir. And `command` cannot rebind it
+/// ([`cannot_rebind_tmpdir`]).
 fn tmpdir_trusted_for(command: &str) -> bool {
     static INHERITED_IS_SCRATCH: LazyLock<bool> =
         LazyLock::new(|| match std::env::var_os("TMPDIR") {
@@ -3555,8 +3671,28 @@ fn tmpdir_trusted_for(command: &str) -> bool {
                     || is_scratch_target(&format!("{}/x", dir.trim_end_matches('/')), false)
             }),
         });
-    *INHERITED_IS_SCRATCH
-        && command.matches("TMPDIR").count() == command.matches(TMPDIR_SCRATCH_PREFIX).count()
+    *INHERITED_IS_SCRATCH && cannot_rebind_tmpdir(command)
+}
+
+/// Words that run code the line does not spell out, which may bind any name.
+const CODE_LOADERS: &[&str] = &[
+    ".", "source", "eval", "alias", "trap", "autoload", "emulate", "enable", "zmodload",
+];
+
+/// True when `command` binds no name it does not spell out, and spells
+/// `TMPDIR` only inside [`TMPDIR_SCRATCH_PREFIX`].
+///
+/// Outside the prefix it expands nothing (no `$`, backtick, escape, brace or
+/// glob) and loads no code ([`CODE_LOADERS`]). So `printf -v TMP''DIR` and
+/// `$a$b -v $c$d` both read as a rebind, the first by its quote-free spelling.
+fn cannot_rebind_tmpdir(command: &str) -> bool {
+    let rest = command.replace(TMPDIR_SCRATCH_PREFIX, " ");
+    let unquoted = rest.replace(['\'', '"'], "");
+    !rest.contains(['$', '`', '\\', '{', '(', '*', '?', '['])
+        && !unquoted.contains("TMPDIR")
+        && !unquoted
+            .split(|c: char| c.is_whitespace() || ";|&<>".contains(c))
+            .any(|word| CODE_LOADERS.contains(&word))
 }
 
 /// True for a *scratch target* (`docs/glossary.md`): a redirect target under
@@ -3567,13 +3703,100 @@ fn tmpdir_trusted_for(command: &str) -> bool {
 /// path cannot leave the dir. That bars `$`, backticks, globs and braces:
 /// zsh writes a redirect to every word `/tmp/{..,..}/x` expands to.
 fn is_scratch_target(target: &str, tmpdir_trusted: bool) -> bool {
+    scratch_parts(target, tmpdir_trusted).is_some()
+}
+
+/// The temp dir a scratch target opens with, as it lies on disk, and the
+/// path below it. [`TMPDIR_SCRATCH_PREFIX`] resolves as the shell would.
+///
+/// A target with an escape or an open quote is a cut-off capture: the shell
+/// writes `"/tmp/a b"`, where [`REDIRECT_RE`] stops at `"/tmp/a`.
+fn scratch_parts(target: &str, tmpdir_trusted: bool) -> Option<(PathBuf, String)> {
+    if target.contains('\\') || quote_open_after(target) {
+        return None;
+    }
     let path = dequoted(target);
-    let rest = SCRATCH_PREFIXES
-        .iter()
-        .chain(tmpdir_trusted.then_some(&TMPDIR_SCRATCH_PREFIX))
-        .find_map(|prefix| path.strip_prefix(prefix))
-        .or_else(|| per_user_temp_rest(&path));
-    rest.is_some_and(|rest| !rest.is_empty() && rest.split('/').all(is_plain_path_segment))
+    let (base, rest) = match path.strip_prefix(TMPDIR_SCRATCH_PREFIX) {
+        Some(rest) if tmpdir_trusted => {
+            let inherited = std::env::var_os("TMPDIR").filter(|dir| !dir.is_empty());
+            (
+                PathBuf::from(inherited.unwrap_or_else(|| "/tmp".into())),
+                rest,
+            )
+        }
+        _ => {
+            let rest = SCRATCH_PREFIXES
+                .iter()
+                .find_map(|prefix| path.strip_prefix(prefix))
+                .or_else(|| per_user_temp_rest(&path))?;
+            (PathBuf::from(&path[..path.len() - rest.len()]), rest)
+        }
+    };
+    (!rest.is_empty() && rest.split('/').all(is_plain_path_segment))
+        .then(|| (base, rest.to_string()))
+}
+
+/// True for a scratch target a truncation cannot turn into somebody else's
+/// file. See [`scratch_target_owned_by`].
+fn private_scratch_target(target: &str, tmpdir_trusted: bool) -> bool {
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    scratch_parts(target, tmpdir_trusted)
+        .is_some_and(|(base, rest)| scratch_target_owned_by(&base, &rest, me))
+}
+
+/// True when `rest` under the temp dir `base` stays `uid`'s own, so no other
+/// user can swap in a link before the redirect opens.
+///
+/// - `base` is `uid`'s private dir, or sticky, so nobody else renames in it.
+/// - Each existing directory below it is a real one private to `uid`.
+/// - The file is a regular one `uid` owns with one link. Or it is absent, in a
+///   private dir, or in a sticky dir whose OS refuses another user's link.
+///
+/// A missing directory makes the redirect fail, unless somebody else can make
+/// it first. Metadata that cannot be read never qualifies.
+fn scratch_target_owned_by(base: &Path, rest: &str, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let private = |meta: &std::fs::Metadata| meta.uid() == uid && meta.mode() & 0o022 == 0;
+    let sticky = |meta: &std::fs::Metadata| meta.mode() & 0o1000 != 0;
+    let names: Vec<&str> = rest.split('/').filter(|name| !name.is_empty()).collect();
+    let Some((file, dirs)) = names.split_last() else {
+        return false;
+    };
+    let Ok(base_meta) = std::fs::metadata(base) else {
+        return false;
+    };
+    let mut parent_private = private(&base_meta);
+    if !base_meta.is_dir() || !(parent_private || sticky(&base_meta)) {
+        return false;
+    }
+    let mut path = base.to_path_buf();
+    for dir in dirs {
+        path.push(dir);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_dir() && private(&meta) => parent_private = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return parent_private,
+            _ => return false,
+        }
+    }
+    match std::fs::symlink_metadata(path.join(file)) {
+        Ok(meta) => meta.file_type().is_file() && meta.uid() == uid && meta.nlink() == 1,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            parent_private || sticky_dirs_refuse_foreign_links()
+        }
+        Err(_) => false,
+    }
+}
+
+/// True when the OS will not follow another user's link in a sticky
+/// world-writable dir: Linux's `fs.protected_symlinks`. macOS has no such
+/// setting, so the answer there is no.
+fn sticky_dirs_refuse_foreign_links() -> bool {
+    static REFUSED: LazyLock<bool> = LazyLock::new(|| {
+        std::fs::read_to_string("/proc/sys/fs/protected_symlinks")
+            .is_ok_and(|setting| setting.trim() == "1")
+    });
+    *REFUSED
 }
 
 /// True for a path segment the shell passes through as written, that is
@@ -5487,6 +5710,162 @@ pub fn grant_command<'c>(command: &'c str, site: CommandSite<'_>) -> Cow<'c, str
         Cow::Borrowed(command)
     } else {
         dropped
+    }
+}
+
+/// `find` primaries that act rather than read: delete, run a program, or write
+/// a file.
+const FIND_ACTING_PRIMARIES: [&str; 9] = [
+    "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls",
+];
+
+/// Whether `command` may write under a directory one of `dirs` names, such as
+/// `.claude/`. Only a write counts, never a mention.
+///
+/// A command that names one of `dirs` counts unless EVERY segment only reads:
+/// a read-only head, a read-only `git` call, or a `find` with no acting
+/// primary. One writing segment anywhere counts, since a read can hand the
+/// path on: `grep -l x .claude/ | xargs rm`. A redirect into one of `dirs`
+/// counts behind any head. A literal heredoc body is text. A substitution
+/// counts, since its body is not read. The check reads through a shell `-c`
+/// layer only when the layer is a bare wrapper ([`bare_shell_script`]).
+pub fn command_may_write_under(command: &str, dirs: &[&str]) -> bool {
+    let mut script = command.to_string();
+    for _ in 0..MAX_SHELL_LAYERS {
+        match bare_shell_script(&script) {
+            Some(inner) => script = inner.into_owned(),
+            None => break,
+        }
+    }
+    let names = |text: &str| dirs.iter().any(|dir| text.contains(dir));
+    if !names(&script) {
+        return false;
+    }
+    let heredocs = blank_literal_heredoc_bodies(&script, |_| false);
+    let blanked = heredocs
+        .as_ref()
+        .map_or(script.as_str(), |h| h.text.as_str());
+    if has_command_substitution(blanked) {
+        return true;
+    }
+    let line = LineFacts::of(&script);
+    command_segments(&quoted_operators_masked(blanked)).any(|segment| {
+        redirect_targets(&segment).any(&names) || !segment_only_reads(&segment, line)
+    })
+}
+
+/// The `-c` script of `command` when the line is nothing but a shell running
+/// it: the shell is the first word, only options sit between it and `-c`, and
+/// no operand follows the script. `None` for any other line, which then keeps
+/// its shell head: a preamble or a positional operand belongs to the outer
+/// layer, and reading only the script would hide it.
+fn bare_shell_script(command: &str) -> Option<Cow<'_, str>> {
+    let toks: Vec<&str> = command.split_whitespace().collect();
+    if !GUARD_SHELLS.contains(&normalized_head(toks.first()?)) {
+        return None;
+    }
+    let flag = toks.iter().skip(1).position(|tok| is_shell_c_flag(tok))? + 1;
+    if !toks[1..flag].iter().all(|tok| tok.starts_with('-')) {
+        return None;
+    }
+    let mut rest = command;
+    for _ in 0..=flag {
+        rest = rest.trim_start();
+        rest = &rest[rest.find(char::is_whitespace).unwrap_or(rest.len())..];
+    }
+    let (script, tail) = split_shell_script_operand(rest.trim());
+    tail.trim().is_empty().then_some(script)
+}
+
+/// `command` with every control or redirect character that the shell reads
+/// as text replaced by `_`: one inside quotes, or escaped by a backslash. So a
+/// quoted `'a\|b'` stays one argument rather than a pipe into a head `b'`.
+///
+/// `command` itself, unmasked, wherever the walk could read quotes
+/// differently from the shell: a quote left open, a heredoc whose body is
+/// still in the text, or a `#` comment, where a quote is text. The plain split
+/// then errs towards more segments, and every real head still starts one.
+fn quoted_operators_masked(command: &str) -> Cow<'_, str> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Quote {
+        Single,
+        Double,
+        /// `$'…'`, where a backslash escapes even the closing quote.
+        AnsiC,
+    }
+    if command.contains("<<") {
+        return Cow::Borrowed(command);
+    }
+    let mut out = String::with_capacity(command.len());
+    let mut quote: Option<Quote> = None;
+    let mut escaped = false;
+    // An unquoted, unescaped `$` just before: the next `'` opens `$'…'`.
+    let mut dollar = false;
+    let mut prev: Option<char> = None;
+    for c in command.chars() {
+        let starts_word = prev.is_none_or(|p| p.is_whitespace() || "|;&()".contains(p));
+        if c == '#' && quote.is_none() && !escaped && starts_word {
+            return Cow::Borrowed(command);
+        }
+        prev = Some(c);
+        let literal = escaped || quote.is_some();
+        out.push(match c {
+            '|' | ';' | '&' | '>' | '<' | '\n' if literal => '_',
+            _ => c,
+        });
+        let was_escaped = std::mem::take(&mut escaped);
+        let after_dollar =
+            std::mem::replace(&mut dollar, c == '$' && quote.is_none() && !was_escaped);
+        match (quote, c) {
+            (Some(Quote::Single), '\'') => quote = None,
+            (Some(Quote::Single), _) => {}
+            (_, '\\') if !was_escaped => escaped = true,
+            (Some(Quote::Double), '"') | (Some(Quote::AnsiC), '\'') if !was_escaped => quote = None,
+            (None, '\'') if !was_escaped => {
+                quote = Some(if after_dollar {
+                    Quote::AnsiC
+                } else {
+                    Quote::Single
+                })
+            }
+            (None, '"') if !was_escaped => quote = Some(Quote::Double),
+            _ => {}
+        }
+    }
+    if quote.is_some() || escaped {
+        Cow::Borrowed(command)
+    } else {
+        Cow::Owned(out)
+    }
+}
+
+/// True when `segment` runs a head that only reads, as
+/// [`command_may_write_under`] defines it. A `(` or `{` word never reads. It
+/// opens a function body or a group, which a later segment may run under a
+/// read-only name.
+fn segment_only_reads(segment: &str, line: LineFacts) -> bool {
+    let toks: Vec<&str> = segment.split_whitespace().collect();
+    if toks
+        .iter()
+        .any(|tok| tok.starts_with(['(', '{']) || tok.ends_with("()"))
+    {
+        return false;
+    }
+    let i = command_head_index(&toks);
+    let Some(&head) = toks.get(i) else {
+        return true;
+    };
+    match head {
+        "cd" => true,
+        "find" => !toks[i + 1..]
+            .iter()
+            .any(|tok| FIND_ACTING_PRIMARIES.contains(&dequoted(tok).as_str())),
+        "git" => head_safety(segment, None, &TrustedHeads::NONE, line).is_none(),
+        _ => {
+            READ_ONLY_HEADS.contains(&head)
+                && !WRITE_CAPABLE_READ_ONLY_HEADS.contains(&head)
+                && head_safety(segment, None, &TrustedHeads::NONE, line).is_none()
+        }
     }
 }
 
@@ -8341,7 +8720,6 @@ subprocess.run('ls\x3b id', shell=True)",
             "echo x | tee /etc/hosts -a",
             "echo x | tee ~/.zshrc >(grep -a x)",
             "echo x | tee '/etc/hosts'",
-            "echo x | tee /tmp/scratch.log",
             "cd ~ && echo x | tee .zshrc",
             // After `--`, a flag-shaped word is a file name.
             "cd ~ && echo x | tee -- -a",
@@ -8663,6 +9041,152 @@ subprocess.run('ls\x3b id', shell=True)",
             ". /dev/stdin <<'E'\nTMPDIR=/Users/me\nE\necho x >> ${TMPDIR:-/tmp}/.zshrc",
         ] {
             assert!(refused(cmd), "{cmd}");
+        }
+    }
+
+    /// A fresh directory under literal `/tmp`, which every unix host has.
+    fn scratch_dir() -> tempfile::TempDir {
+        tempfile::Builder::new().tempdir_in("/tmp").unwrap()
+    }
+
+    /// The logs an unattended run is steered to write are not destruction:
+    /// an absent file, or one this user owns with a single link.
+    #[test]
+    fn a_private_scratch_log_is_not_destruction() {
+        let dir = scratch_dir();
+        let d = dir.path().display();
+        std::fs::write(dir.path().join("old.log"), "x").unwrap();
+        for cmd in [
+            format!("cargo build > \"{d}/b.log\" 2>&1"),
+            format!("cargo build > {d}/old.log"),
+            format!("git log | tee {d}/log.txt"),
+            format!("cd data && ./run.sh > {d}/run.log 2>&1; tail {d}/run.log"),
+            format!(
+                "lucidos background-task run --poll -- './scripts/e2e.sh > \"{d}/rw.log\" 2>&1'"
+            ),
+        ] {
+            assert_eq!(bash_destruction_scope(&cmd), None, "{cmd}");
+            assert_eq!(fb_bash(&cmd).lane, RiskLane::Safe, "{cmd}");
+        }
+        if tmpdir_trusted_for("") {
+            let fresh = tempfile::tempdir().unwrap();
+            let name = fresh.path().file_name().unwrap().to_str().unwrap();
+            let cmd = format!("cargo build > \"${{TMPDIR:-/tmp}}/{name}/b.log\" 2>&1");
+            assert_eq!(bash_destruction_scope(&cmd), None, "{cmd}");
+        }
+    }
+
+    /// A scratch target a link, a shared file or another segment can turn
+    /// into somebody else's file stays out-of-workspace destruction.
+    #[test]
+    fn an_unsafe_scratch_target_stays_out_of_workspace_destruction() {
+        let dir = scratch_dir();
+        let p = dir.path();
+        let d = p.display();
+        std::os::unix::fs::symlink("/Users/me/.zshrc", p.join("link")).unwrap();
+        std::fs::create_dir(p.join("real")).unwrap();
+        std::os::unix::fs::symlink(p.join("real"), p.join("via")).unwrap();
+        std::fs::write(p.join("shared"), "x").unwrap();
+        std::fs::hard_link(p.join("shared"), p.join("shared2")).unwrap();
+        for cmd in [
+            format!("echo x > {d}/link"),
+            format!("echo x > {d}/via/x.log"),
+            format!("echo x > {d}/shared"),
+            format!("echo x > {d}/real"),
+            format!("cat x > {d}/run.log && ln -s ~/.zshrc {d}/a; echo x > {d}/a"),
+            format!("./make-links.sh; echo x > {d}/a"),
+            format!("echo $(ln -s ~/.zshrc {d}/a) > {d}/a"),
+            format!("bash -c 'echo `x` > {d}/a'"),
+            format!("find . -exec ln -s ~/.zshrc {d}/a + -exec sh -c 'echo > {d}/a' +"),
+            format!("x $(echo > {d}/a)"),
+            // The capture stops short of the file the shell writes.
+            format!("cargo build > \"{d}/a b\""),
+            format!("cargo build > {d}/a\\ b"),
+            format!("echo x > \"{d}/a;b\""),
+            format!("git log | tee \"{d}/a b\""),
+            // The quoted script runs after the head's other commands.
+            format!("find . -exec tar xf {{}} -C {d} + -exec sh -c 'echo x > {d}/a ' +"),
+            format!("find . -exec python3 -c \"__import__('os').symlink('/x','{d}/a')\" + -exec sh -c 'echo > {d}/a ' +"),
+            format!("bash -c 'find . -exec tar xf {{}} -C {d} + -exec sh -c \"echo > {d}/a \" +'"),
+            format!(
+                "lucidos background-task run -- 'find . -exec tar xf {{}} -C {d} + -exec sh -c \"echo > {d}/a \" +'"
+            ),
+            "TMPDIR=/Users/me; cargo build > ${TMPDIR:-/tmp}/.zshrc".to_string(),
+            "TMPDIR=~; x $(echo > ${TMPDIR:-/tmp}/.zshrc)".to_string(),
+            "cargo build > ${TMPDIR}/b.log".to_string(),
+        ] {
+            assert_eq!(
+                bash_destruction_scope(&cmd),
+                Some(DestructionScope::OutOfWorkspace),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scratch_target_under_a_foreign_directory_is_not_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir();
+        let mode = |path: &Path, bits: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).unwrap()
+        };
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        mode(&dir.path().join("sub"), 0o700);
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        assert!(scratch_target_owned_by(dir.path(), "sub/x.log", me));
+        assert!(!scratch_target_owned_by(dir.path(), "sub/x.log", me + 1));
+        std::fs::write(dir.path().join("f"), "x").unwrap();
+        assert!(!scratch_target_owned_by(dir.path(), "f", me + 1));
+        // Anybody may write in a shared dir, so a link can land there first.
+        mode(&dir.path().join("sub"), 0o777);
+        assert!(!scratch_target_owned_by(dir.path(), "sub/x.log", me));
+        assert!(!scratch_target_owned_by(dir.path(), "sub/new/x.log", me));
+        // A sticky shared dir keeps an existing file its owner's. An absent
+        // name is safe only where the OS refuses another user's link.
+        mode(&dir.path().join("sub"), 0o1777);
+        assert!(!scratch_target_owned_by(
+            &dir.path().join("sub"),
+            "new/x.log",
+            me
+        ));
+        assert_eq!(
+            scratch_target_owned_by(&dir.path().join("sub"), "x.log", me),
+            sticky_dirs_refuse_foreign_links()
+        );
+        std::fs::write(dir.path().join("sub/mine.log"), "x").unwrap();
+        assert!(scratch_target_owned_by(
+            &dir.path().join("sub"),
+            "mine.log",
+            me
+        ));
+    }
+
+    /// A line can rebind `TMPDIR` without spelling it, through quotes, an
+    /// expansion, a brace, a glob or code it loads.
+    #[test]
+    fn a_line_that_may_rebind_tmpdir_unspelled_is_not_trusted() {
+        for cmd in [
+            "cargo build > \"${TMPDIR:-/tmp}/b.log\" 2>&1",
+            "lucidos background-task run --poll --description \"flaky spec\" -- \
+             './scripts/e2e-browser.sh x.spec.ts > \"${TMPDIR:-/tmp}/rw.log\" 2>&1'",
+        ] {
+            assert!(cannot_rebind_tmpdir(cmd), "{cmd}");
+        }
+        let log = "cargo build > \"${TMPDIR:-/tmp}/.zshrc\"";
+        for rebind in [
+            "TMPDIR=/Users/me",
+            "printf -v TMP''DIR /Users/me",
+            "export TMP\\DIR=/Users/me",
+            "a=pr b=intf c=TMP d=DIR; $a$b -v $c$d /Users/me",
+            "p{rintf,} -v TMP{DIR,} x",
+            "pri?tf -v TMPDI? /Users/me",
+            "source ./rebind.sh",
+            "printf 'TMPD%sR=/x' I | . /dev/stdin",
+            "eval \"$(cat rebind)\"",
+        ] {
+            let cmd = format!("{rebind}; {log}");
+            assert!(!cannot_rebind_tmpdir(&cmd), "{cmd}");
         }
     }
 
@@ -9493,7 +10017,9 @@ subprocess.run('ls\x3b id', shell=True)",
         let outside = d.outside.display();
         for cmd in [
             "rm -rf ~/something".to_string(),
-            format!("echo x > {outside}/keep.txt"),
+            // `outside` sits in the temp dir, where a private file is scratch.
+            "echo x > data/x/keep.txt".to_string(),
+            "echo x > /Users/me/keep.txt".to_string(),
             format!("cp data/sub/a.txt {outside}/b.txt"),
         ] {
             d.assert_escapes(&cmd);

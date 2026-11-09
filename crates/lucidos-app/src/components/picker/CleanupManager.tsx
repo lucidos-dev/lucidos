@@ -15,7 +15,7 @@ import { Disclosure } from '../shared/Disclosure';
 import { LoadableError } from '../shared/LoadableError';
 import { LoadingFade } from '../shared/LoadingFade';
 import { ListSkeletonOf, SkText, useSkeleton } from '../shared/Skeleton';
-import { cleanupTotals, isCleanupSuggested, sortCleanupRows, CLEANUP_NUDGE_BYTES, CLEANUP_NUDGE_INTERVAL_MS } from './cleanupReview';
+import { cleanupTotals, hasCleanupWork, isCleanupSuggested, sortCleanupRows, CLEANUP_NUDGE_BYTES, CLEANUP_NUDGE_INTERVAL_MS } from './cleanupReview';
 
 function ReviewRow({ row, selected = false, disabled = false, onSelect, onReview }: {
   row?: CleanupRow; selected?: boolean; disabled?: boolean;
@@ -90,9 +90,14 @@ export function CleanupManager({ tick, requestedWorkspace, onRequestHandled, onC
     ]);
     reading.current = false;
   }
+  const data = review.value.status === 'loaded' ? review.value.data : null;
+  // A requested deletion opens it, and a failed read must stay reachable.
+  const shown = open.value || review.value.status === 'failed' || trash.value.status === 'failed'
+    || (data !== null && trash.value.status === 'loaded' && hasCleanupWork(data.rows, trash.value.data));
   useEffect(() => { void reload(); }, []);
+  // Hidden, it has no Refresh button, so the gateway poll is how new work appears.
   useEffect(() => {
-    if (review.value.status === 'loaded' && review.value.data.refreshing) void reload();
+    if (!shown || data?.refreshing) void reload();
   }, [tick]);
   useEffect(() => {
     if (!requestedWorkspace) { requested.current = null; return; }
@@ -140,11 +145,10 @@ export function CleanupManager({ tick, requestedWorkspace, onRequestHandled, onC
     });
   }, [review.value, busy.value]);
 
-  const data = review.value.status === 'loaded' ? review.value.data : null;
   const chosen = data?.rows.filter(row => selected.value.includes(row.id)) ?? [];
   const totals = cleanupTotals(chosen);
   const batch = frozen.value;
-  return <section class="ws-cleanup" aria-label="Manage workspaces">
+  return <Disclosure open={shown}><section class="ws-cleanup" aria-label="Manage workspaces">
     <button class="action-btn" aria-expanded={open.value} onClick={() => {
       open.value = !open.value;
       if (open.value) {
@@ -231,5 +235,5 @@ export function CleanupManager({ tick, requestedWorkspace, onRequestHandled, onC
       </Disclosure>
       {results.value.length > 0 && <div role="status"><h3>Cleanup results</h3><ul>{results.value.map(result => <li key={result.id}>{resultNames.current[result.id]}: {result.status}{result.detail ? `: ${result.detail}` : ''}</li>)}</ul></div>}
     </Disclosure>
-  </section>;
+  </section></Disclosure>;
 }

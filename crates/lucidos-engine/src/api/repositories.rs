@@ -109,8 +109,10 @@ pub async fn remove_repository(
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let actor = crate::api::actor::user_actor(&headers, None);
-    match RepositoryStore::unregister(&state.pool, &state.engine.event_bus, id, actor).await {
+    let actor = crate::api::actor::require_user_actor(&headers, &state.pool, None)
+        .await
+        .map_err(|e| (e.status, e.message))?;
+    match RepositoryStore::unregister(&state.pool, &state.engine.event_bus, id, Some(actor)).await {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
         Ok(false) => Err((StatusCode::NOT_FOUND, "Repository not found".to_string())),
         Err(e) => Err((

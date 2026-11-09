@@ -1,4 +1,4 @@
-import type { CleanupRow } from '../../api/client/control';
+import type { CleanupRow, TrashEntry } from '../../api/client/control';
 
 const STALE_MS = 30 * 24 * 60 * 60 * 1000;
 export const CLEANUP_NUDGE_BYTES = 1024 ** 3;
@@ -16,6 +16,12 @@ export function isCleanupSuggested(row: CleanupRow, now = Date.now()): boolean {
   const dates = [row.folder_modified, row.database?.last_event, workspace.last_opened_at]
     .filter((value): value is string => value != null).map(Date.parse);
   return dates.length > 0 && dates.every(Number.isFinite) && Math.max(...dates) <= now - STALE_MS;
+}
+
+/** The review is for harness buildup, orphans and Trash. A picker holding only
+ * registered user or pre-origin workspaces has nothing for it to show. */
+export function hasCleanupWork(rows: CleanupRow[], trash: TrashEntry[]): boolean {
+  return trash.length > 0 || rows.some(row => !row.workspace || ['eval', 'e2e', 'demo'].includes(row.workspace.origin));
 }
 
 export function cleanupTotals(rows: CleanupRow[]): { count: number; knownBytes: number; unknownSizes: number } {

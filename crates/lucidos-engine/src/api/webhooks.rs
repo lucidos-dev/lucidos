@@ -738,6 +738,7 @@ async fn signing_secret(
 }
 
 /// `POST /api/v1/webhooks/:id/deliver`: verify a delivery, then emit its event.
+/// A verified Slack URL check is echoed instead (ADR 0624).
 ///
 /// The body arrives as [`Bytes`] rather than `Json`, which is the whole point.
 /// Verification runs on those exact bytes, before any parse, and the signature
@@ -826,6 +827,18 @@ async fn deliver(
         crate::log!("[Webhook] '{}' refused: {}", hook.name, refusal.reason());
         stamp_refused(&state, &hook, &headers, refusal).await;
         return refused();
+    }
+
+    // Slack saving a Request URL is a handshake, not a delivery: echo it and
+    // emit nothing, so no trigger fires on it.
+    if let Some(challenge) = webhooks::slack_url_verification(&hook, body_str) {
+        stamp_accepted(&state, &hook).await;
+        crate::log!("[Webhook] '{}' answered Slack's URL check", hook.name);
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "challenge": challenge })),
+        )
+            .into_response();
     }
 
     // Everything below runs only for a delivery that authenticated. A public

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 /**
  * A dashboard (ADR 0496). Its fixed square cells take their column count from
- * the dashboard's own width, and there are three size spans. Tiles take their
+ * the dashboard's own width, and there are four size spans. Tiles take their
  * order through CSS `order` over a DOM order that never rearranges.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -61,6 +61,7 @@ import {
   WIDGET_GAP_CSS,
   dashboardColumns,
   dashboardContentWidth,
+  widgetBoxCss,
   widgetCellCss,
 } from '../../../utils/dashboardGeometry';
 import { SIZE_SPANS } from '../DashboardTile';
@@ -146,6 +147,7 @@ describe('dashboard geometry', () => {
       small: { columns: s, rows: s },
       medium: { columns: 2 * s, rows: s },
       large: { columns: 2 * s, rows: 2 * s },
+      xl: { columns: 4 * s, rows: 2 * s },
     });
   });
 
@@ -160,6 +162,8 @@ describe('dashboard geometry', () => {
     expect(extent(SIZE_SPANS.medium.columns)).toBeCloseTo(cells(2));
     expect(extent(SIZE_SPANS.medium.rows)).toBeCloseTo(cells(1));
     expect(extent(SIZE_SPANS.large.rows)).toBeCloseTo(cells(2));
+    expect(extent(SIZE_SPANS.xl.columns)).toBeCloseTo(cells(4));
+    expect(extent(SIZE_SPANS.xl.rows)).toBeCloseTo(cells(2));
     expect(extent(SIZE_SPANS.quarter.columns)).toBeLessThan(edge / 2);
   });
 });
@@ -202,6 +206,21 @@ describe('<Dashboard>', () => {
       ['prs', 'large', '2', 'span 4', 'span 4'],
     ]);
     expect(frameProps.get('inbox')).toMatchObject({ place: 'dashboard', size: 'medium', visible: true });
+  });
+
+  /** Invariant: an XL tile never widens the grid. On a two-column dashboard it
+   *  spans every step, keeps its XL box in a scroller, and the widget still
+   *  hears `xl`. */
+  it('clamps an XL tile to the grid and keeps its true size', () => {
+    setDashboard([tile('board', 'xl', { sizes: ['medium', 'large', 'xl'] })]);
+    act(() => render(<Dashboard dashboard="desktop" />, host));
+    const [xl] = tiles();
+    const steps = DASHBOARD_MIN_COLUMNS * DASHBOARD_STEPS_PER_CELL;
+    expect(SIZE_SPANS.xl.columns).toBeGreaterThan(steps);
+    expect([xl.dataset.size, xl.style.gridColumn, xl.style.gridRow]).toEqual(['xl', `span ${steps}`, `span ${SIZE_SPANS.xl.rows}`]);
+    expect(frameProps.get('board')).toMatchObject({ place: 'dashboard', size: 'xl' });
+    const canvas = xl.querySelector<HTMLElement>(':scope > .widget-box-scroll > .widget-box-canvas')!;
+    expect(canvas.style.getPropertyValue('--widget-box-true-width')).toBe(widgetBoxCss('xl').width);
   });
 
   /** Invariant: reordering never moves an iframe in the DOM. */

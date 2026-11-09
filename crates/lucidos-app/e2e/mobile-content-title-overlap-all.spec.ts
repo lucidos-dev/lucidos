@@ -42,6 +42,7 @@ interface ContentMetrics {
   hasOverflow: boolean;   // the ⋯ overflow trigger is rendered
   bareActions: number;    // context actions rendered as header buttons (bell aside)
   trailingIcons: number;  // everything in the trailing cluster, bell included
+  textCenter: number;
   clusterCenter: number;  // the centred box's own centre
   rowCenter: number;      // the axis it is centred on
 }
@@ -72,6 +73,7 @@ async function measureContent(page: Page): Promise<ContentMetrics | null> {
       titleLeft: t.left,
       titleRight: t.right,
       titleWidth: t.width,
+      textCenter: t.left + t.width / 2,
       clusterCenter: c.left + c.width / 2,
       rowCenter: r.left + r.width / 2,
       navRight: nav.getBoundingClientRect().right,
@@ -95,7 +97,9 @@ async function setScaleAndSettle(page: Page, scale: number): Promise<ContentMetr
         && m.titleLeft >= m.navRight - 0.6;
     }, { timeout: 6_000, message: `content title never settled clear of the clusters at ui-scale ${scale}` })
     .toBe(true);
-  return (await measureContent(page))!;
+  const measured = (await measureContent(page))!;
+  console.log(JSON.stringify({ scale, phoneTitleWidth: measured.titleWidth }));
+  return measured;
 }
 
 /** The two promises that hold for every content view, at every scale. */
@@ -109,14 +113,9 @@ function expectClearAndCentred(m: ContentMetrics, scale: number): void {
     `ui-scale ${scale}: title left ${m.titleLeft.toFixed(1)} paints under nav right ${m.navRight.toFixed(1)}`,
   ).toBeGreaterThanOrEqual(m.navRight - 0.6);
   expect(m.titleWidth, `ui-scale ${scale}: title has zero width (hidden)`).toBeGreaterThan(0);
-  // Centred on the ROW middle with no offset of any kind. The measured layout
-  // this replaced could slide the box, and pinning that it no longer can is
-  // what keeps this pane's chevrons on the same axis as the thread pane's
-  // (asserted directly in mobile-threads-title-alignment-all.spec.ts).
-  expect(
-    Math.abs(m.clusterCenter - m.rowCenter),
-    `ui-scale ${scale}: cluster centre ${m.clusterCenter.toFixed(1)} is off the row centre ${m.rowCenter.toFixed(1)}`,
-  ).toBeLessThan(1.5);
+  expect(Math.abs(m.textCenter - m.rowCenter),
+    `ui-scale ${scale}: content title is off the pane axis`).toBeLessThan(1.5);
+
 }
 
 test.describe('Mobile content header collapses to one icon and never overlaps', () => {
@@ -150,7 +149,7 @@ test.describe('Mobile content header collapses to one icon and never overlaps', 
     await ensureMobileView(page, 'content');
     await expect(page.locator('.mobile-content-header .mobile-content-title')).toBeVisible({ timeout: 10_000 });
 
-    for (const scale of [100, 125, 150]) {
+    for (const scale of [100, 125, 150, 175]) {
       const m = await setScaleAndSettle(page, scale);
       // The ask, and the reason the trailing cluster is predictable at all: the
       // actions are collapsed even at ui-scale 100, where they would all fit.
@@ -173,7 +172,7 @@ test.describe('Mobile content header collapses to one icon and never overlaps', 
     await expect(page.locator('.mobile-content-header .mobile-content-title'))
       .toHaveText('Files', { timeout: 15_000 });
 
-    for (const scale of [100, 125, 150]) {
+    for (const scale of [100, 125, 150, 175]) {
       const m = await setScaleAndSettle(page, scale);
       expect(m.hasOverflow, `ui-scale ${scale}: a lone action needs no overflow trigger`).toBe(false);
       expect(m.bareActions, `ui-scale ${scale}: the one action should ride the row`).toBe(1);
@@ -213,7 +212,7 @@ test.describe('Mobile content header collapses to one icon and never overlaps', 
     await expect(title).toHaveText('Appearance', { timeout: 15_000 });
     await expect(title).toHaveAttribute('data-tooltip', 'Appearance & Behavior');
 
-    for (const scale of [100, 125, 150]) {
+    for (const scale of [100, 125, 150, 175]) {
       const m = await setScaleAndSettle(page, scale);
       // Nothing to collapse, so no trigger for an empty menu.
       expect(m.bareActions, `ui-scale ${scale}: settings should carry no context actions`).toBe(0);

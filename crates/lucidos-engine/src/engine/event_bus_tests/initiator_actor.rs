@@ -66,6 +66,7 @@ async fn initiator_system_trigger() {
             go_to_review: false,
             model: None,
             reasoning_effort: None,
+            continue_key: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),
@@ -109,6 +110,7 @@ async fn initiator_inherited_system_to_cc_child() {
             go_to_review: false,
             model: None,
             reasoning_effort: None,
+            continue_key: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),
@@ -304,6 +306,7 @@ async fn initiator_preserved_on_session_started_upsert() {
             go_to_review: false,
             model: None,
             reasoning_effort: None,
+            continue_key: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),
@@ -482,6 +485,7 @@ fn persisted_system_events_round_trip_through_json() {
             event_id: None,
             tap: crate::scheduler::notifications::Tap::Modal,
             actor: None,
+            audience: None,
         },
         SystemEvent::PreferencesChanged {
             key: crate::core::prefs::TIMEZONE.key().into(),

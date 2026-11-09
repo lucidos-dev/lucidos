@@ -213,11 +213,29 @@ pub struct MintedPairing {
     pub code: Option<String>,
 }
 
+/// What a pairing was minted for: the name the device takes and, for a
+/// device pairing, the operator it joins. `None` operator joins the first.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PairingIntent {
+    pub label: Option<String>,
+    pub operator_id: Option<String>,
+}
+
+#[cfg(test)]
+impl PairingIntent {
+    pub fn labelled(label: &str) -> Self {
+        Self {
+            label: Some(label.to_string()),
+            operator_id: None,
+        }
+    }
+}
+
 /// What one redemption attempt produced.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Redemption {
-    /// Good, carrying the label suggested when it was minted.
-    Redeemed(Option<String>),
+    /// Good, carrying what it was minted for.
+    Redeemed(PairingIntent),
     /// Wrong, expired, or nothing pending.
     Rejected,
     /// A short code from a public channel, refused before any compare.
@@ -233,8 +251,7 @@ struct PendingPairing {
     minted: Instant,
     secret: String,
     code: Option<String>,
-    /// What `lucidos pair --label` asked the device to be called.
-    label: Option<String>,
+    intent: PairingIntent,
 }
 
 /// Pairings minted and not yet redeemed.
@@ -258,7 +275,7 @@ impl PendingPairings {
     }
 
     /// Mint a pairing and remember it until it is redeemed or expires.
-    pub fn mint(&mut self, label: Option<String>) -> std::io::Result<MintedPairing> {
+    pub fn mint(&mut self, intent: PairingIntent) -> std::io::Result<MintedPairing> {
         let now = Instant::now();
         self.drop_expired(now);
         let minted = MintedPairing {
@@ -273,7 +290,7 @@ impl PendingPairings {
             minted: now,
             secret: minted.secret.clone(),
             code: minted.code.clone(),
-            label,
+            intent,
         });
         Ok(minted)
     }
@@ -290,7 +307,7 @@ impl PendingPairings {
         }
         if let Some(secret) = valid_pairing_secret(presented, self.kind) {
             return match self.take(|p| ct_eq(&p.secret, secret)) {
-                Some(label) => Redemption::Redeemed(label),
+                Some(intent) => Redemption::Redeemed(intent),
                 None => Redemption::Rejected,
             };
         }
@@ -305,9 +322,9 @@ impl PendingPairings {
             return Redemption::Throttled;
         }
         match self.take(|p| p.code.as_deref().is_some_and(|c| ct_eq(c, code))) {
-            Some(label) => {
+            Some(intent) => {
                 self.throttle.forgive(source);
-                Redemption::Redeemed(label)
+                Redemption::Redeemed(intent)
             }
             None => {
                 self.throttle.record(source, now);
@@ -316,12 +333,12 @@ impl PendingPairings {
         }
     }
 
-    /// Remove the first pending pairing `matches` accepts, answering its label.
+    /// Remove the first pending pairing `matches` accepts, answering its intent.
     /// Every entry is compared, so timing says nothing about which one matched.
-    fn take(&mut self, matches: impl Fn(&PendingPairing) -> bool) -> Option<Option<String>> {
+    fn take(&mut self, matches: impl Fn(&PendingPairing) -> bool) -> Option<PairingIntent> {
         let hits: Vec<bool> = self.pending.iter().map(matches).collect();
         let index = hits.iter().position(|hit| *hit)?;
-        Some(self.pending.remove(index).label)
+        Some(self.pending.remove(index).intent)
     }
 
     fn drop_expired(&mut self, now: Instant) {
@@ -397,12 +414,24 @@ const PUBLIC_PORT_OFFSET: u16 = 30;
 
 /// The public listener's port, read from this process's environment.
 ///
-/// It binds loopback only and serves the whole gateway. A tunnel or reverse
-/// proxy on this machine points at it, and every request it accepts is public.
+/// It serves the whole gateway, and every request it accepts is public. A
+/// tunnel or reverse proxy points at it.
 pub fn resolved_public_port(gateway_port: u16) -> Option<u16> {
     public_port(
         std::env::var("LUCIDOS_PUBLIC_PORT").ok().as_deref(),
         gateway_port,
+    )
+}
+
+/// The public listener's address, read from this process's environment.
+///
+/// Loopback unless `LUCIDOS_PUBLIC_BIND_ADDR` names an IP, which a container
+/// sets so its Ingress can reach the listener at the pod IP (ADR 0624).
+pub fn resolved_public_bind_addr(port: u16) -> std::net::SocketAddr {
+    crate::net_config::side_bind_addr(
+        "LUCIDOS_PUBLIC_BIND_ADDR",
+        std::env::var("LUCIDOS_PUBLIC_BIND_ADDR").ok().as_deref(),
+        port,
     )
 }
 

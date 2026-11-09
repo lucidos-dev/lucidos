@@ -29,9 +29,8 @@ pub use lucidos_gateway_constants::PAIR_PARAM;
 /// The device pairing secret, or an older gateway's short code, a query string
 /// carries. `None` when it carries neither.
 ///
-/// The reader for what [`pair_url`] writes. Two callers: the manifest, which
-/// stamps the token into `start_url` so a freshly installed home-screen app
-/// pairs itself, and the shell, which points its manifest link here.
+/// Compatibility reader for old manifest requests. Newly emitted links carry
+/// fragments, captured by the document before any resource requests.
 ///
 /// Nothing is percent-decoded. Digits and lowercase base32 encode to
 /// themselves, so a value needing decoding is not a value we wrote.
@@ -79,7 +78,7 @@ pub fn valid_origin(raw: &str) -> Option<&str> {
 /// reserved sigil namespace the picker is served from, and the picker is the
 /// one surface an unpaired device may reach.
 pub fn pair_url(origin: &str, secret: &str) -> String {
-    format!("{origin}/~/?{PAIR_PARAM}={secret}")
+    format!("{origin}/~/#{PAIR_PARAM}={secret}")
 }
 
 /// `data` as an SVG QR code, or `None` when it does not fit in a QR at all.
@@ -246,7 +245,7 @@ mod tests {
     fn the_pair_url_carries_the_code_into_the_picker() {
         assert_eq!(
             pair_url("https://mac.ts.net:5252", "01234567"),
-            "https://mac.ts.net:5252/~/?pair=01234567"
+            "https://mac.ts.net:5252/~/#pair=01234567"
         );
     }
 
@@ -255,14 +254,14 @@ mod tests {
     #[test]
     fn the_query_reader_finds_the_secret_the_pair_url_wrote() {
         let url = pair_url("https://mac.ts.net", SECRET);
-        let query = url.split_once('?').map(|(_, q)| q);
+        let query = url.split_once('#').map(|(_, q)| q);
         assert_eq!(pairing_token_in_query(query), Some(SECRET));
     }
 
     #[test]
     fn the_query_reader_still_takes_an_older_gateways_short_code() {
         let url = pair_url("https://mac.ts.net", "01234567");
-        let query = url.split_once('?').map(|(_, q)| q);
+        let query = url.split_once('#').map(|(_, q)| q);
         assert_eq!(pairing_token_in_query(query), Some("01234567"));
 
         // Among siblings, and in either order.

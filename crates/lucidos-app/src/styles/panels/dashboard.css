@@ -272,7 +272,11 @@
     border: 1px dashed var(--accent);
 }
 
-.dashboard-tile.is-editing > .widget-frame {
+/* The tile no longer clips, so its badge can hang past the corner. The
+   scroller clips the frame to the rounded corner inside the border instead. */
+.dashboard-tile.is-editing > .widget-box-scroll {
+    overflow: hidden;
+    border-radius: calc(var(--radius-surface) - 1px);
     opacity: 0.85;
 }
 

@@ -54,6 +54,15 @@ pub(crate) enum ClaimFor {
     KeepAlive,
 }
 
+impl ClaimFor {
+    /// Whether the claim records the brief handoff a session past its
+    /// *context ceiling* still owes, so the spawn becomes the successor. Only
+    /// a run does: a keep-alive must never wake the session it would end.
+    pub(crate) fn settles_owed_handoff(self) -> bool {
+        self == Self::Run
+    }
+}
+
 /// What the claimed entry shares with the run that claimed it.
 pub(crate) struct ClaimedEntry {
     pub(crate) coding_agent: CodingAgent,
@@ -175,6 +184,7 @@ pub(crate) fn claim_thread_for(
             reasoning_effort_in_force: None,
             question_resume_pending: false,
             quiet_answer_pending: None,
+            in_ceiling_reentry: false,
             tools_in_flight: entry.tools_in_flight.clone(),
             question_flushes: entry.question_flushes.clone(),
             coding_agent,
@@ -319,6 +329,10 @@ impl crate::engine::LucidosEngine {
                 Some(agent) => agent,
                 None if free => {
                     drop(sessions);
+                    // Before the backend: the handoff names the successor's.
+                    if purpose.settles_owed_handoff() {
+                        self.settle_owed_ceiling_handoff(thread_id).await;
+                    }
                     coding_agent = Some(
                         resolve_thread_coding_agent(self.pool(), thread_id, requested_coding_agent)
                             .await?,

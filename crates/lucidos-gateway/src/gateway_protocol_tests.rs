@@ -144,7 +144,10 @@ async fn the_label_on_the_code_wins_over_the_one_the_gateway_offers() {
 #[tokio::test]
 async fn a_device_code_never_pairs_a_gateway() {
     let (state, _dir) = gateway();
-    let device_code = state.mint_pairing(None).unwrap().secret;
+    let device_code = state
+        .mint_pairing(crate::pairing::PairingIntent::default())
+        .unwrap()
+        .secret;
     let (status, _) = call(
         &state,
         "POST",
@@ -210,7 +213,10 @@ async fn gateway_calls_refuse_anything_but_a_current_gateway_credential() {
     let (state, _dir) = gateway();
     pair_a_gateway(&state).await;
     let device = match state.redeem_pairing(
-        &state.mint_pairing(None).unwrap().secret,
+        &state
+            .mint_pairing(crate::pairing::PairingIntent::default())
+            .unwrap()
+            .secret,
         crate::pairing::PairingChannel::Public,
         None,
     ) {
@@ -275,6 +281,63 @@ async fn unpair_on_b_refuses_the_very_next_call() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn an_ended_pairing_takes_its_relayed_people() {
+    let (state, _dir) = gateway();
+    let answer = pair_a_gateway(&state).await;
+    let seen = crate::gateway_event_log::RelayedDevice {
+        device_id: crate::relay::namespaced_device_id(&answer.pairing_id, "d1"),
+        operator_id: crate::relay::namespaced_device_id(&answer.pairing_id, "op"),
+        name: "Sam".into(),
+        via: "laptop".into(),
+        emails: vec![],
+    };
+    state
+        .record(|d| Ok(d.relayed_seen(seen).into_iter().collect()))
+        .unwrap()
+        .unwrap();
+    let (status, _) = call(
+        &state,
+        "DELETE",
+        &pairing_path(),
+        &[(HEADER_GATEWAY_CREDENTIAL, &answer.credential)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(state.directory().relayed.is_empty());
+}
+
+/// The unpair saved, then the forget failed: the retry answers 404 for the
+/// pairing and still forgets its people.
+#[tokio::test]
+async fn a_retried_unpair_still_forgets_the_relayed_people() {
+    let (state, _dir) = gateway();
+    let answer = pair_a_gateway(&state).await;
+    let seen = crate::gateway_event_log::RelayedDevice {
+        device_id: crate::relay::namespaced_device_id(&answer.pairing_id, "d1"),
+        operator_id: crate::relay::namespaced_device_id(&answer.pairing_id, "op"),
+        name: "Sam".into(),
+        via: "laptop".into(),
+        emails: vec![],
+    };
+    state
+        .record(|d| Ok(d.relayed_seen(seen).into_iter().collect()))
+        .unwrap()
+        .unwrap();
+    assert!(state.paired_gateways().unpair(&answer.pairing_id).unwrap());
+    let (status, _) = call(
+        &state,
+        "DELETE",
+        &format!("/~/api/v1/auth/gateways/{}", answer.pairing_id),
+        &[LOCAL],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(state.directory().relayed.is_empty());
 }
 
 #[tokio::test]
@@ -631,6 +694,8 @@ async fn the_qr_carries_the_long_secret_never_the_short_code() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let url = body["pair_url"].as_str().unwrap();
+    assert!(url.contains("/~/#pair="), "{url}");
+    assert!(!url.contains('?'), "{url}");
     assert!(url.ends_with(body["secret"].as_str().unwrap()), "{url}");
     assert!(!url.contains(body["code"].as_str().unwrap()), "{url}");
 }

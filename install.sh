@@ -41,7 +41,7 @@
 # copy the user actually piped in (see the piped branch below). release.sh
 # rewrites this line in the same step that bumps RELEASE; install_test.sh and
 # version_sources_test.sh assert the two match.
-LUCIDOS_DEFAULT_VERSION="0.56.0"
+LUCIDOS_DEFAULT_VERSION="0.57.0"
 # Where a PIPED dash run re-fetches itself from. A mirror that serves this script
 # under its own domain (lucidos.dev) rewrites this line at publish time so the
 # re-fetch pulls THE SAME copy, not whatever github main happens to hold.
@@ -122,6 +122,7 @@ LUCIDOS_LIB_BASE_URL="${LUCIDOS_LIB_BASE_URL:-}"            # base URL for the h
 LUCIDOS_UNINSTALL_URL="${LUCIDOS_UNINSTALL_URL:-}"          # URL for uninstall.sh when piped (curl|sh); empty = derived from LUCIDOS_INSTALL_URL
 LUCIDOS_TLS_CERT="${LUCIDOS_TLS_CERT:-}"                    # opt-in TLS (--tls-cert): cert path; with --tls-key the gateway serves https
 LUCIDOS_TLS_KEY="${LUCIDOS_TLS_KEY:-}"                      # opt-in TLS (--tls-key): private-key path; both-or-neither
+LUCIDOS_NO_TLS="${LUCIDOS_NO_TLS:-}"                        # set to 1 (or --no-tls) to drop the TLS pair a re-run would keep from the service
 LUCIDOS_BIND="${LUCIDOS_BIND:-}"                            # optional (--bind): all | loopback | <IP> — written to the machine-global ~/.lucidos/network.toml
 INSTALL_EXTERNAL_ADDRESS=""                                  # optional (--external-address): origin written to network.toml. Flag only: the gateway reads LUCIDOS_EXTERNAL_ADDRESS itself, as a lock
 
@@ -146,6 +147,7 @@ LUCIDOS_LIBS="stage_runtime.sh headless_tarball.sh install_common.sh"
 OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 VERTEX_PROJECT_ID="${VERTEX_PROJECT_ID:-}"
 VERTEX_REGION="${VERTEX_REGION:-}"
+LUCIDOS_NO_PROVIDER_KEYS="${LUCIDOS_NO_PROVIDER_KEYS:-}"  # set to 1 (or --no-provider-keys) to drop the provider creds a re-run would keep from the service
 
 # ── output helpers ──────────────────────────────────────────────────────────
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -545,9 +547,11 @@ finish_install() {
         return 0
     fi
 
-    apply_bind_config
     manager="$(service_detect_manager)"
     decision="$(service_compose_decision "$LUCIDOS_NO_SERVICE" "$manager")"
+    # Before the machine-global writes, so a refused read-back changes nothing.
+    if [ "$decision" = "service" ]; then keep_service_env "$manager"; fi
+    apply_bind_config
     resolve_instance
     apply_external_address_config
     report_coexisting_app
@@ -885,6 +889,7 @@ tls_enabled() { [ -n "$LUCIDOS_TLS_CERT" ] && [ -n "$LUCIDOS_TLS_KEY" ]; }
 # connection far less legibly.
 validate_tls_config() {
     [ -n "$LUCIDOS_TLS_CERT$LUCIDOS_TLS_KEY" ] || return 0
+    [ -z "$LUCIDOS_NO_TLS" ] || die "--no-tls cannot be combined with --tls-cert or --tls-key."
     tls_enabled || die "--tls-cert and --tls-key must be supplied together (got only one)."
     [ -f "$LUCIDOS_TLS_CERT" ] || die "--tls-cert: file not found: $LUCIDOS_TLS_CERT"
     [ -f "$LUCIDOS_TLS_KEY" ]  || die "--tls-key: file not found: $LUCIDOS_TLS_KEY"
@@ -897,9 +902,7 @@ validate_tls_config() {
 install_url_scheme() { if tls_enabled; then printf 'https'; else printf 'http'; fi; }
 
 # append_tls_env <env-block> — append the TLS pairs when configured (mirrors
-# append_provider_creds; ends with printf so `set -e` is safe). Like the
-# provider creds, TLS is re-baked from this run's flags: re-run WITH the flags
-# when re-registering, or the service reverts to plain http.
+# append_provider_creds; ends with printf so `set -e` is safe).
 append_tls_env() {
     local block="$1"
     if tls_enabled; then
@@ -907,6 +910,48 @@ append_tls_env() {
 $(service_tls_env_pairs "$LUCIDOS_TLS_CERT" "$LUCIDOS_TLS_KEY")"
     fi
     printf '%s' "$block"
+}
+
+# keep_service_env <manager> — before a re-run rewrites the instance's unit,
+# take the TLS pair and provider creds this run did not supply from the unit it
+# replaces. The unit is the one record of them, and the update command in
+# Settings passes only --name and --prefix. A flag or env value still wins.
+# --no-tls drops the pair, and --no-provider-keys drops the creds.
+keep_service_env() {
+    local manager="$1" unit contents names="" name value
+    case "$manager" in
+        launchd)      unit="$(service_launchd_plist_path "$HOME" "$LUCIDOS_INSTANCE")" ;;
+        systemd-user) unit="$(service_systemd_unit_path "$HOME" "$LUCIDOS_INSTANCE" "${XDG_CONFIG_HOME:-}")" ;;
+        *) return 0 ;;
+    esac
+    [ -f "$unit" ] || return 0
+    contents="$(cat "$unit")" || die "Could not read the current service unit at $unit"
+
+    [ -n "$LUCIDOS_NO_TLS$LUCIDOS_TLS_CERT$LUCIDOS_TLS_KEY" ] || names="LUCIDOS_TLS_CERT LUCIDOS_TLS_KEY"
+    [ -n "$LUCIDOS_NO_PROVIDER_KEYS" ] || names="$names OPENAI_API_KEY VERTEX_PROJECT_ID VERTEX_REGION"
+    for name in $names; do
+        [ -z "${!name}" ] || continue
+        value="$(service_unit_env_value "$manager" "$contents" "$name")"
+        # A unit that names the variable but yields no value was edited into a
+        # form the reader cannot parse. Dropping the value would be silent.
+        case "$value:$contents" in
+            :*"$name"*) die "$unit sets $name in a form this installer cannot read.
+       Re-run with the value you want the service to have, or with --no-tls
+       (for the TLS pair) or --no-provider-keys (for provider keys) to drop it." ;;
+        esac
+        printf -v "$name" '%s' "$value"
+    done
+
+    case "$names" in LUCIDOS_TLS_CERT*) ;; *) return 0 ;; esac
+    if tls_enabled; then
+        [ -r "$LUCIDOS_TLS_CERT" ] && [ -r "$LUCIDOS_TLS_KEY" ] \
+            || die "The service serves https with $LUCIDOS_TLS_CERT and $LUCIDOS_TLS_KEY,
+       but one of them is gone or unreadable. Re-run with --tls-cert and --tls-key
+       naming the current files, or with --no-tls to serve plain http."
+        info "Keeping the service's TLS pair ($LUCIDOS_TLS_CERT)."
+    else
+        LUCIDOS_TLS_CERT="" LUCIDOS_TLS_KEY=""
+    fi
 }
 
 # ── macOS Command Line Tools preflight (download / from-tarball paths) ───────
@@ -1608,11 +1653,13 @@ Flags:
                         plain http limits those to localhost. Works with certs from
                         'tailscale cert', mkcert, or a real CA. Remote reachability
                         itself is separate: --bind (or Settings → Access → Network
-                        access; the gateway binds loopback-only by default). Like
-                        provider creds, TLS is baked from THIS run's flags — re-run
-                        with them when re-registering, or the service reverts to http.
+                        access; the gateway binds loopback-only by default). A
+                        re-run without TLS flags keeps the pair the service has.
   --tls-key PATH        the private key for --tls-cert (both-or-neither).
-  --force               re-download / re-extract the runtime even if already installed
+  --no-tls              drop the service's TLS pair and serve plain http again.
+  --no-provider-keys    drop the provider keys baked into the service. Keys this
+                        run supplies are still baked.
+  --force              re-download / re-extract the runtime even if already installed
   --no-launch           install but do not start (or register) the gateway
   --no-service          run in the foreground instead of registering a service
   --uninstall           stop + remove an instance (see Modes); with --all, every instance
@@ -1642,8 +1689,12 @@ Environment variables:
   LUCIDOS_BIND               same as --bind
   LUCIDOS_TLS_CERT           same as --tls-cert
   LUCIDOS_TLS_KEY            same as --tls-key
+  LUCIDOS_NO_TLS=1           same as --no-tls
+  LUCIDOS_NO_PROVIDER_KEYS=1 same as --no-provider-keys
   LUCIDOS_LIB_BASE_URL       base URL for the helper libs when piped (curl|sh)
-  OPENAI_API_KEY             provider: GPT via OpenAI (exported / baked into the service)
+  OPENAI_API_KEY             provider: GPT via OpenAI (exported / baked into the service;
+                             a re-run without it keeps the service's value,
+                             unless --no-provider-keys)
   VERTEX_PROJECT_ID          provider: Claude/Gemini via Vertex AI
   VERTEX_REGION              optional Vertex region
   --dev-only: LUCIDOS_REPO_URL, LUCIDOS_REF, LUCIDOS_HOME (clone dir),
@@ -1678,6 +1729,8 @@ parse_args() {
             --external-address) [ $# -ge 2 ] || die "--external-address requires an argument"; INSTALL_EXTERNAL_ADDRESS="$2"; shift 2 ;;
             --tls-cert)       [ $# -ge 2 ] || die "--tls-cert requires a path argument"; LUCIDOS_TLS_CERT="$2"; shift 2 ;;
             --tls-key)        [ $# -ge 2 ] || die "--tls-key requires a path argument";  LUCIDOS_TLS_KEY="$2"; shift 2 ;;
+            --no-tls)         LUCIDOS_NO_TLS=1; shift ;;
+            --no-provider-keys) LUCIDOS_NO_PROVIDER_KEYS=1; shift ;;
             --force)          LUCIDOS_FORCE=1; shift ;;
             --no-launch)      LUCIDOS_NO_LAUNCH=1; shift ;;
             --no-service)     LUCIDOS_NO_SERVICE=1; shift ;;

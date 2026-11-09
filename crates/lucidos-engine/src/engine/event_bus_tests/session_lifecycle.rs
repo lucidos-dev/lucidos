@@ -1042,6 +1042,7 @@ async fn trigger_continuation_started_keeps_trigger_source_and_flag_false() {
             go_to_review: false,
             model: None,
             reasoning_effort: None,
+            continue_key: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),

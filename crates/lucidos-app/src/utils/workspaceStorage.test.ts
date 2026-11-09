@@ -64,14 +64,15 @@ describe('pure helpers', () => {
     );
   });
 
-  it('isGlobalKey: ONLY the cross-workspace switcher keys stay raw', () => {
+  it('isGlobalKey: only switcher keys and device pairing history stay raw', () => {
     expect(isGlobalKey('lucidos-last-workspace')).toBe(true);
     expect(isGlobalKey('lucidos-last-workspace-count')).toBe(true);
     // Tapping a peer lands in ITS namespace, so a scoped key would forget the
     // unfolded list on every switch.
     expect(isGlobalKey('lucidos-workspace-switcher-expanded')).toBe(true);
     expect(isGlobalKey('lucidos-remote-workspaces')).toBe(true);
-    expect(GLOBAL_KEYS.size).toBe(4);
+    expect(isGlobalKey('lucidos.pairing.spentLaunchCodes')).toBe(true);
+    expect(GLOBAL_KEYS.size).toBe(5);
     // Everything else is now workspace-scoped — including device id + appearance.
     expect(isGlobalKey('lucidos-device-id')).toBe(false);
     expect(isGlobalKey('lucidos-theme')).toBe(false);

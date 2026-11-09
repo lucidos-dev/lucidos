@@ -200,6 +200,9 @@ Implementation: `engine/cc_permission.rs` (`AttendMode`, `resolve_attend_mode`,
 `docs/plans/2026-06-25-trigger-coding-agent-inherited-grant.md`. See also ADR 0005
 (the Codex app-server approval bridge this rides on).
 
+**Amended by ADR 0628.** "Never hangs" now reads "never hangs past its
+*permission wait*". A refused shape parks a card when a device is reachable.
+
 ## Addendum (2026-07-30): in-worktree writes auto-allow; session allows are durable
 
 **Context.** Two defects made the coding-agent permission card fire constantly on
@@ -424,6 +427,10 @@ Implementation: `engine/command_guard.rs` (`FastPathDecline`, `segment_safety`,
 `bash_fast_path`), `engine/cc_permission.rs` (`CommandPayload`,
 `RequestVerdict::Unclassified`, `record_unattended_denial`). Plan:
 `docs/plans/2026-08-24-command-guard-bypass-cluster.md`.
+
+**Amended by ADR 0628.** A refusal now parks a card for its permission wait when
+a push can reach a device, and is denied when nobody answers. With no reachable
+device, or a wait of `deny`, it is still denied at once.
 
 ## Addendum (2026-09-21): the ATTENDED coding-agent lane may reach the judge
 

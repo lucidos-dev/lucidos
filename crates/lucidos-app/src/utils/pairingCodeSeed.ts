@@ -3,7 +3,7 @@
  * anyone type eight digits.
  *
  * Settings -> Access mints a pairing and renders a QR for
- * `<reachable-origin>/~/?pair=<secret>`. The phone's camera opens that, the
+ * `<reachable-origin>/~/#pair=<secret>`. The phone's camera opens that, the
  * picker loads, and `PairingGate` redeems the secret. The link carries the
  * long secret rather than the short code, because the gateway accepts a typed
  * code only on a local channel. An older gateway's link carries the code.
@@ -58,10 +58,11 @@ export function isPairingSecret(value: string): boolean {
  * none".
  * Pure, so every rejection is testable without a DOM.
  */
-export function pairingCodeToAdopt(search: string): string | null {
+export function pairingCodeToAdopt(search: string, hash = ''): string | null {
   let raw: string | null;
   try {
-    raw = new URLSearchParams(search).get(PAIR_PARAM);
+    const fragment = new URLSearchParams(hash.replace(/^#/, ''));
+    raw = (fragment.has(PAIR_PARAM) ? fragment : new URLSearchParams(search)).get(PAIR_PARAM);
   } catch {
     return null;
   }
@@ -88,11 +89,20 @@ export function takePairingCodeFromUrl(): string | null {
     taken = null;
     return taken;
   }
-  taken = pairingCodeToAdopt(window.location.search);
+  const boot = window as Window & { lucidosPairingSeed?: string | null };
   const url = new URL(window.location.href);
-  if (url.searchParams.has(PAIR_PARAM)) {
+  taken = 'lucidosPairingSeed' in boot
+    ? pairingCodeToAdopt('', `#${PAIR_PARAM}=${encodeURIComponent(boot.lucidosPairingSeed ?? '')}`)
+    : pairingCodeToAdopt(url.search, url.hash);
+  delete boot.lucidosPairingSeed;
+  const fragment = new URLSearchParams(url.hash.slice(1));
+  if (url.searchParams.has(PAIR_PARAM) || fragment.has(PAIR_PARAM)) {
     url.searchParams.delete(PAIR_PARAM);
-    window.history.replaceState(null, '', url.toString());
+    if (fragment.has(PAIR_PARAM)) {
+      fragment.delete(PAIR_PARAM);
+      url.hash = fragment.toString();
+    }
+    window.history.replaceState(window.history.state, '', url.toString());
   }
   return taken;
 }
@@ -103,7 +113,7 @@ export function takePairingCodeFromUrl(): string | null {
  * Per storage container, which is the point: a home-screen app and the browser
  * on the same phone hold separate ones, and each spends its own code.
  */
-const SPENT_KEY = 'lucidos.pairing.spentLaunchCodes';
+export const SPENT_KEY = 'lucidos.pairing.spentLaunchCodes';
 
 /** How many to remember. A launch URL carries one, so this is only slack. */
 const SPENT_LIMIT = 8;
@@ -118,6 +128,19 @@ function spentLaunchCodes(): string[] {
     // no record, which reads as "not spent" and costs one redeem attempt.
     return [];
   }
+}
+
+/** Keep a live pairing seed on the picker if its session probe failed open. */
+export function hasUnspentPairingLaunch(): boolean {
+  const boot = window as Window & { lucidosPairingLaunch?: boolean };
+  if (!boot.lucidosPairingLaunch) return false;
+  const code = takePairingCodeFromUrl();
+  return !code || !spentLaunchCodes().includes(code);
+}
+
+/** A verified paired session can navigate without spending its unused seed. */
+export function releasePairingLaunch(): void {
+  (window as Window & { lucidosPairingLaunch?: boolean }).lucidosPairingLaunch = false;
 }
 
 function rememberSpentLaunchCode(code: string): void {

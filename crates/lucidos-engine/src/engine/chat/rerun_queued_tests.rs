@@ -522,6 +522,7 @@ async fn a_trigger_thread_keeps_its_channel_through_the_recovery() {
             go_to_review: false,
             model: None,
             reasoning_effort: None,
+            continue_key: None,
         },
         EventMeta {
             channel: Some(EventChannel::Trigger),

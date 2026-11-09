@@ -50,6 +50,8 @@ vi.mock('./chat-changes', () => ({ addRestartGroup: vi.fn() }));
 vi.mock('./preferences', () => ({ loadPreferences: vi.fn(() => Promise.resolve()) }));
 vi.mock('./client-update', () => ({ syncClientUpdateFromBuild: vi.fn() }));
 vi.mock('./releaseNotices', () => ({ loadReleaseNotices: vi.fn() }));
+vi.mock('./operators', () => ({ loadOperators: vi.fn() }));
+vi.mock('./reader-devices', () => ({ loadReaderDevices: vi.fn(), readIsMine: vi.fn(() => true) }));
 vi.mock('./artifacts', () => ({
   loadArtifacts: vi.fn(),
   openFilePreview: vi.fn(),
@@ -86,6 +88,8 @@ const { loadPreferences } = await import('./preferences');
 const { syncClientUpdateFromBuild } = await import('./client-update');
 const { refreshLlmConfigured } = await import('./entityReferences');
 const { loadReleaseNotices } = await import('./releaseNotices');
+const { loadOperators } = await import('./operators');
+const { loadReaderDevices } = await import('./reader-devices');
 
 describe('handleGlobalEvent — preference events refresh the preferences cache', () => {
   beforeEach(() => {
@@ -216,5 +220,19 @@ describe('handleGlobalEvent: a provider preference re-probes /health', () => {
     }
     handleGlobalEvent('PreferencesChanged', {});
     expect(refreshLlmConfigured).not.toHaveBeenCalled();
+  });
+});
+
+/** Every people list (Settings People, the device picker, pairing) reads the
+ *  operators signal, so a change made on another device re-reads it. */
+describe('handleGlobalEvent: OperatorsChanged re-reads the people', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('reloads the operators and this page\'s reader devices', () => {
+    handleGlobalEvent('OperatorsChanged', {});
+    expect(loadOperators).toHaveBeenCalledTimes(1);
+    expect(loadReaderDevices).toHaveBeenCalledTimes(1);
   });
 });

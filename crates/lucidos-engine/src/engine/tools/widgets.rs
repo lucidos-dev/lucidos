@@ -71,7 +71,8 @@ impl LucidosEngine {
         args: &serde_json::Value,
         caller: Uuid,
     ) -> Result<String, BoxError> {
-        let size = optional_size(args)?.ok_or("size is required (small, medium or large)")?;
+        let size = optional_size(args)?
+            .ok_or_else(|| format!("size is required ({})", WidgetSize::choices()))?;
         let instance = WidgetInstance::from_args(args)?;
         let app_id = instance.app_id.clone();
         let thread_id = target_thread(args, caller)?;
@@ -252,7 +253,7 @@ fn optional_size(args: &serde_json::Value) -> Result<Option<WidgetSize>, BoxErro
         serde_json::Value::Null => Ok(None),
         serde_json::Value::String(raw) => WidgetSize::parse(raw.trim())
             .map(Some)
-            .ok_or_else(|| format!("unknown size '{raw}'. Use small, medium or large.").into()),
+            .ok_or_else(|| format!("unknown size '{raw}'. Use {}.", WidgetSize::choices()).into()),
         other => Err(format!("size must be a string, not {other}").into()),
     }
 }

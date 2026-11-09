@@ -89,6 +89,10 @@ pub enum PrefValue {
     /// the workspace font exists is asked where it is used, which falls back
     /// when it does not (ADR 0308).
     FontFamily,
+    /// A *permission wait*, read by `PermissionWait::parse`.
+    PermissionWait,
+    /// A *context ceiling*, read by `ContextCeiling::parse`.
+    ContextCeiling,
 }
 
 /// Who may write a preference.
@@ -915,6 +919,17 @@ pub const FOLLOW_MAIN_INTERVAL_MINUTES: Pref<Number> = Pref::number(PrefSpec {
     side_effect: PrefSideEffect::None,
 });
 
+pub const DRIVER_TIMEOUT_HOURS: Pref<Number> = Pref::number(PrefSpec {
+    key: "driver_timeout_hours",
+    label: "Escalate a driver's gate after (hours)",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::Number { min: 0.0, max: 720.0 },
+    default: PrefDefault::Value("0"),
+    description: "In a team workspace, how long a gate may wait on its work item's driver before it escalates, in hours. An escalated gate pushes the whole team once, and the driver keeps the work item. 0 never escalates. The team setup sets it, typically to 24.",
+    side_effect: PrefSideEffect::None,
+});
+
 pub const NOTIFICATIONS_FILTER: Pref<Text> = Pref::text(PrefSpec {
     key: "notifications_filter",
     label: "Notifications filter",
@@ -1213,6 +1228,19 @@ pub const CACHE_KEEP_ALIVE_MODE: Pref<Text> = Pref::text(PrefSpec {
     side_effect: PrefSideEffect::None,
 });
 
+pub const CODING_AGENT_CONTEXT_CEILING: Pref<Text> = Pref::text(PrefSpec {
+    key: "coding_agent_context_ceiling",
+    label: "Context ceiling",
+    access: PrefAccess::Human {
+        hint: "a higher ceiling spends more, so only a person sets the workspace context ceiling, in Settings → Coding Agents. An agent may lower its own thread's with `lucidos threads context-ceiling`",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::ContextCeiling,
+    default: PrefDefault::Value("300k"),
+    description: "The context size at which a coding-agent session hands off to a successor session, for every thread that sets none of its own (ADR 0629). 'off' never hands off; a size such as '300k'; or a share of the session's window such as '30%'. No ceiling goes above 75% of the window or below 100k. At the first turn end past it, the session writes its handoff narrative, and the successor starts on the thread's next input.",
+    side_effect: PrefSideEffect::None,
+});
+
 pub const MODEL_CLAUDE_CODE: Pref<Text> = Pref::text(PrefSpec {
     key: "model_claude_code",
     label: "Claude Code default model",
@@ -1493,6 +1521,17 @@ pub const BACKUP_REMINDER_DISMISSED: Pref<Optional> = Pref::optional(PrefSpec {
     side_effect: PrefSideEffect::None,
 });
 
+pub const UNATTENDED_PERMISSION_WAIT: Pref<Text> = Pref::text(PrefSpec {
+    key: "unattended_permission_wait",
+    label: "Unattended permission wait",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::PermissionWait,
+    default: PrefDefault::Value("30"),
+    description: "How long a coding-agent session nobody is watching waits on a permission card the command guard refused to settle. It parks the card only when a device can take a push, and pushes it. 'deny' never parks; a whole number of minutes (1–1440) parks, then denies when nobody answers; 'indefinite' waits like an attended card. A trigger's own permission_wait overrides this for its runs and their sub-threads.",
+    side_effect: PrefSideEffect::None,
+});
+
 // ---- Human-only: real settings the agent must not write ----
 
 pub const COMMAND_GUARD: Pref<Flag> = Pref::flag(PrefSpec {
@@ -1523,14 +1562,14 @@ pub const COMMAND_GUARD_JUDGE: Pref<Flag> = Pref::flag(PrefSpec {
 
 pub const COMMAND_GUARD_CODING_AGENTS: Pref<Flag> = Pref::flag(PrefSpec {
     key: "command_guard_coding_agents",
-    label: "Enabled for coding agents",
+    label: "Answer coding-agent questions",
     access: PrefAccess::Human {
         hint: "managed in Settings → Permissions (Command safety)",
     },
     scope: PrefScope::Global,
     value: PrefValue::Bool,
     default: PrefDefault::Value("true"),
-    description: "Whether the command guard answers the permission cards of coding-agent commands (Codex command_execution, Claude Code Bash). On, a command the guard places as safe or reversible runs without a card. There is no undo for a wrong reversible verdict. Off, a Codex command card is skipped only when the guard places it as safe, and a Claude Code Bash card always asks. Read only while command_guard is on.",
+    description: "Whether the command guard answers the permission cards of coding-agent commands (Codex command_execution, Claude Code Bash). On, a command the guard places as safe or reversible runs without a card. There is no undo for a wrong reversible verdict. Off, the guard runs no Claude Code command unasked. A catastrophic command the guard recognises is refused whatever this says, and a Codex sandbox escape the guard places as safe runs whatever this says. Read only while command_guard is on.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -2073,6 +2112,7 @@ pub const CATALOG: &[&PrefSpec] = &[
     &OPENCODE_FREE_ENABLED.spec,
     &PROXY_TIMEOUT_SECS.spec,
     &FOLLOW_MAIN_INTERVAL_MINUTES.spec,
+    &DRIVER_TIMEOUT_HOURS.spec,
     &NOTIFICATIONS_FILTER.spec,
     &NOTIFICATION_TOASTS.spec,
     &COMPOSER_ENTER_KEY.spec,
@@ -2099,6 +2139,7 @@ pub const CATALOG: &[&PrefSpec] = &[
     &CODING_AGENT_CLAUDE_PERMISSION_MODE.spec,
     &CODING_AGENT_AUTO_COMPACT_TRIAL.spec,
     &CACHE_KEEP_ALIVE_MODE.spec,
+    &CODING_AGENT_CONTEXT_CEILING.spec,
     &MODEL_CLAUDE_CODE.spec,
     &REASONING_CLAUDE_CODE.spec,
     &MODEL_CODEX.spec,
@@ -2125,6 +2166,7 @@ pub const CATALOG: &[&PrefSpec] = &[
     &COMMAND_GUARD.spec,
     &COMMAND_GUARD_JUDGE.spec,
     &COMMAND_GUARD_CODING_AGENTS.spec,
+    &UNATTENDED_PERMISSION_WAIT.spec,
     &MODEL_COMMAND_JUDGE.spec,
     &REASONING_COMMAND_JUDGE.spec,
     &JUDGMENT_COMMAND_GUARD.spec,
@@ -2402,6 +2444,12 @@ pub fn validate(spec: &PrefSpec, value: &str) -> Result<(), String> {
                 ))
             }
         }
+        PrefValue::PermissionWait => crate::core::permission_wait::PermissionWait::parse(value)
+            .map(|_| ())
+            .map_err(|e| format!("'{}': {}", spec.key, e)),
+        PrefValue::ContextCeiling => crate::engine::context_ceiling::ContextCeiling::parse(value)
+            .map(|_| ())
+            .map_err(|e| format!("'{}': {}", spec.key, e)),
     }
 }
 
@@ -2493,6 +2541,11 @@ pub fn allowed_values_hint(spec: &PrefSpec) -> String {
             "{} | ws-<slug> (a workspace font)",
             crate::core::fonts::FONT_PREFERENCE_VALUES.join(" | ")
         ),
+        PrefValue::PermissionWait => format!(
+            "deny | indefinite | whole minutes 1–{}",
+            crate::core::permission_wait::MAX_PERMISSION_WAIT_MINUTES
+        ),
+        PrefValue::ContextCeiling => "off | <N>k | <P>% of the window".to_string(),
     }
 }
 

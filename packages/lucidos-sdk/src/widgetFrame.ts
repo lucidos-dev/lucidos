@@ -31,7 +31,8 @@ export const WIDGET_CHANNEL = 'widget';
 export const WIDGET_CONTENT_SIZE_MESSAGE_TYPE = 'lucidos:ui:size';
 
 /** What a frame marked `menu` posts to open the widget's menu: on a
- *  right-click, and on a finger held still on a dashboard tile. */
+ *  right-click, and on a finger held still on a thread card or a dashboard
+ *  tile. */
 export const WIDGET_MENU_MESSAGE_TYPE = 'lucidos:ui:widget-menu';
 
 /** A {@link WIDGET_MENU_MESSAGE_TYPE} message. `at` is where a pointer pressed,
@@ -63,7 +64,7 @@ export const WIDGET_PLACES = ['inline', 'option', 'dashboard'] as const;
 
 export type WidgetPlace = (typeof WIDGET_PLACES)[number];
 
-/** One of the three sizes a widget takes as a dashboard tile. */
+/** One of the sizes a widget takes as a thread card or a dashboard tile. */
 export type WidgetSize = (typeof WIDGET_SIZES)[number];
 
 /** What the host pushes on {@link WIDGET_CHANNEL}. Every field is optional,
@@ -74,10 +75,15 @@ export interface WidgetPush {
   visible?: boolean;
   /** The host opens a widget menu for this frame, so a right-click goes there. */
   menu?: boolean;
+  /** The host clamped the box below its true width and scrolls it sideways. */
+  pans?: boolean;
 }
 
+/** A content-size report. `size` is the widget size the widget laid out
+ *  for, so the host can tell a report from before a resize from one after. */
 export interface ContentSize {
   height: number;
+  size?: WidgetSize;
 }
 
 function verticalMargins(doc: Document): number {
@@ -129,6 +135,7 @@ let size: WidgetSize | null = null;
 let place: WidgetPlace | null = null;
 let visible = true;
 let menu = false;
+let pans = false;
 // The press that may raise the next `contextmenu`, taken in its capture phase.
 let menuPress = false;
 let selectionAtPress = false;
@@ -144,6 +151,12 @@ let endHold: (() => void) | null = null;
 let heldOpenedMenu = false;
 // The root's own selection styles, kept from a hold until the next press.
 let stylesBeforeHold: Array<[property: string, value: string, priority: string]> | null = null;
+/** A box the host clamped below its true width, which only an XL box can be,
+ *  scrolls sideways (ADR 0633). A sideways drag in it belongs to that scroller. */
+export function inSidewaysBox(): boolean {
+  return pans && inBox(place, size);
+}
+
 const sizeListeners = new Set<(size: WidgetSize | null) => void>();
 const visibilityListeners = new Set<(visible: boolean) => void>();
 
@@ -178,9 +191,10 @@ function postMenuRequest(at?: Point): void {
   postToHost(request);
 }
 
-/** A finger held still on a dashboard tile marked `menu` opens the menu, with a
- *  haptic tick, while it is still down. A finger that lifts early, scrolls the
- *  dashboard or travels past the tolerance cancels the hold.
+/** A finger held still on a thread card or a dashboard tile marked `menu`
+ *  opens the menu while it is still down. A haptic tick marks it. A finger that
+ *  lifts early, scrolls or travels past the tolerance cancels the hold. An
+ *  option frame never holds: it has no widget menu.
  *
  *  The hold is read from the events' own times as well as a timer. A frame
  *  busy through the whole press gets the lift before its timer can run. The
@@ -189,7 +203,7 @@ function postMenuRequest(at?: Point): void {
 function trackPress(down: PointerEvent): void {
   endHold?.();
   releaseNativeLongPress();
-  if (place !== 'dashboard' || !down.isPrimary || down.pointerType === 'mouse' || !menu) return;
+  if ((place !== 'inline' && place !== 'dashboard') || !down.isPrimary || down.pointerType === 'mouse' || !menu) return;
   const end = () => {
     clearTimeout(timer);
     if (endHold === end) endHold = null;
@@ -279,11 +293,12 @@ export function installWidgetFrame(): void {
   let scheduled = false;
   const report = () => {
     scheduled = false;
-    const size: ContentSize = { height: contentHeight(document) };
-    const key = String(size.height);
+    const content: ContentSize = { height: contentHeight(document) };
+    if (size) content.size = size;
+    const key = `${content.height} ${size}`;
     if (key === last) return;
     last = key;
-    postToHost({ type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, ...size });
+    postToHost({ type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, ...content });
   };
   const schedule = () => {
     if (scheduled) return;
@@ -296,6 +311,7 @@ export function installWidgetFrame(): void {
     const nextSize = sizeOf(data);
     const nextVisible = (data as { visible?: unknown } | null)?.visible !== false;
     menu = (data as { menu?: unknown } | null)?.menu === true;
+    pans = (data as { pans?: unknown } | null)?.pans === true;
     // A new place can relay out the widget even at the same size, and the host
     // waits for a report there.
     last = '';
@@ -372,7 +388,7 @@ export function _resetWidgetFrameForTesting(): void {
   size = null;
   place = null;
   visible = true;
-  menu = menuPress = selectionAtPress = menuFromPointer = menuOverSelection = false;
+  menu = pans = menuPress = selectionAtPress = menuFromPointer = menuOverSelection = false;
   primaryDown = heldOpenedMenu = false;
   releaseNativeLongPress();
   holdStillInBox(false);

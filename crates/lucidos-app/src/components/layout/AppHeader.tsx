@@ -305,14 +305,8 @@ export function AppHeader() {
           <div class="content-header-elements" onClick={() => focusPane('content')}>
             <HamburgerButton />
             <ContentRefreshButton />
-            {/* Same arrangement as the thread pane one row over, and as both
-                mobile headers: the chevrons bracket the title rather than
-                sitting in the leading cluster, so history reads as belonging to
-                what is on screen. The title is the group's one shrinking
-                member, and the group is a FIXED SPAN centred on the row, so the
-                chevrons hold their places as the user navigates between
-                destinations with wildly different title lengths AND between
-                views whose trailing action clusters differ in width. */}
+            {/* Equal chevrons bracket the shrinking title on the pane axis.
+                Their span depends on pane geometry, not destination or actions. */}
             <span class="pane-header-content-title">
               <ContentBackButton />
               {showContentTitle && (

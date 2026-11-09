@@ -1,28 +1,16 @@
 /* --- Widgets (ADRs 0402, 0432, 0466) ---
-   A widget is an inline widget in its turn (.inline-widget): a bar over a
-   widget box, the same box a dashboard tile is. No frame scrolls inside the
+   A widget is an inline widget in its turn (.inline-widget): a bare widget
+   box, the same box a dashboard tile is. No frame scrolls inside the
    transcript. */
-
-.widget-panel {
-    margin: 0.25rem 0 0;
-    background: var(--bg-primary);
-    box-shadow: var(--shadow-md);
-}
-
-.widget-panel {
-    border: 1px solid var(--border-color);
-    border-radius: var(--radius-surface);
-    background: var(--bg-secondary);
-    overflow: hidden;
-}
 
 /* --- The widget box: a thread card's and a dashboard tile's (WidgetBox) ---
    The size sets the box and the frame fills it. A report never sizes it, and
    it never scrolls inside: content past it is clipped under a fade. */
 .widget-box {
+    --widget-box-border: 1px;
     position: relative;
     overflow: hidden;
-    border: 1px solid var(--border-color);
+    border: var(--widget-box-border) solid var(--border-color);
     border-radius: var(--radius-surface);
     background: var(--bg-secondary);
     isolation: isolate;
@@ -31,14 +19,38 @@
 /* The frame takes the bottom layer and everything the box draws over it
    stacks above. Tree order alone fails on iOS: a frame whose widget
    composites, such as an animated transform, paints over later siblings. */
-.widget-box > .widget-frame {
+.widget-box > .widget-box-scroll {
     position: absolute;
     inset: 0;
     z-index: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    /* A scrollbar that takes room would cut the bottom off the box. */
+    scrollbar-width: none;
 }
 
-.widget-box > :not(.widget-frame) {
+.widget-box > .widget-box-scroll::-webkit-scrollbar {
+    display: none;
+}
+
+.widget-box > :not(.widget-box-scroll) {
     z-index: 1;
+}
+
+/* The canvas is the frame's room. It fills the box, and an XL box a host
+   clamps keeps its true width inside it, so the scroller pans across it. The
+   box's border is outside the scroller's padding box, so it is taken off. */
+.widget-box-canvas {
+    height: 100%;
+}
+
+.widget-box[data-size="xl"] > .widget-box-scroll > .widget-box-canvas {
+    min-width: calc(var(--widget-box-true-width) - 2 * var(--widget-box-border));
+}
+
+.widget-box-canvas > .widget-frame {
+    height: 100%;
 }
 
 .widget-box .app-ui-iframe {
@@ -73,41 +85,72 @@
     background: none;
 }
 
-/* --- An inline widget: its bar over its widget box ---
-   The card is the box's width (--widget-box-width, set from the size). The
-   bar and the box carry the surface between them, so the box keeps a tile's
-   border and the widget gets a tile's room to the pixel. On a phone the box
-   matches the phone dashboard's, which can be a hair wider than the turn: it
-   then centres on the turn rather than spilling to one side. */
+/* Hides a resize until the widget has laid out for the new size. It comes up
+   at once and fades out. */
+.widget-box-cover {
+    position: absolute;
+    inset: 0;
+    background: var(--bg-secondary);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--duration-normal) ease;
+}
+
+.widget-box-cover.is-covering {
+    opacity: 1;
+    transition: none;
+}
+
+.widget-box.is-transparent .widget-box-cover {
+    background: var(--bg-primary);
+}
+
+/* --- An inline widget: its bare widget box ---
+   The card is the box's width (--widget-box-width, set from the size), with a
+   tile's border and radius and no shadow. It centres in the turn. On a phone
+   the box matches the phone dashboard's, which can be a hair wider than the
+   turn: the negative left margin then centres it rather than spilling it to
+   one side. */
 .inline-widget {
     width: var(--widget-box-width);
     max-width: none;
-    margin: var(--space-sm) 0 var(--space-sm) min(0px, (100% - var(--widget-box-width)) / 2);
-    border: none;
-    background: none;
-    overflow: visible;
+    margin: var(--space-xl) 0 var(--space-xl) calc((100% - var(--widget-box-width)) / 2);
+    /* A hold opens the widget menu, so it selects no text. */
+    -webkit-user-select: none;
+    user-select: none;
 }
 
-.inline-widget > .widget-bar {
-    border: 1px solid var(--border-color);
-    border-bottom: none;
-    border-radius: var(--radius-surface) var(--radius-surface) 0 0;
-    background: var(--bg-secondary);
+/* An XL card is wider than a narrow turn can be. It stops at the turn's
+   width, and its box scrolls the widget sideways at the true XL width. It
+   centres while the turn has room. */
+.inline-widget.inline-widget-xl {
+    max-width: 100%;
+    margin-left: max(0px, (100% - var(--widget-box-width)) / 2);
+}
+
+/* The card is a focus stop for its menu key. The transparent outline is the
+   forced-colors fallback, where box-shadow is stripped. */
+.inline-widget:focus-visible {
+    border-radius: var(--radius-surface);
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
 }
 
 .inline-widget > .widget-box {
     height: var(--widget-box-height);
-    border-radius: 0 0 var(--radius-surface) var(--radius-surface);
 }
 
 .inline-widget.inline-widget-gone {
     width: auto;
     margin: var(--space-sm) 0;
     border: 1px solid var(--border-color);
+    border-radius: var(--radius-surface);
     background: var(--bg-secondary);
     padding: var(--space-sm) var(--space-md);
     color: var(--text-muted);
     font-size: var(--font-size-sm);
+    -webkit-user-select: text;
+    user-select: text;
 }
 
 .inline-widget-gone-reason {
@@ -116,45 +159,7 @@
     overflow-wrap: anywhere;
 }
 
-.widget-bar {
-    display: flex;
-    align-items: center;
-    gap: 0.375rem;
-    min-width: 0;
-    padding: 0.25rem 0.375rem 0.25rem 0.75rem;
-    border-bottom: 1px solid var(--border-color);
-    font-size: var(--font-size-sm);
-    /* A hold on the bar opens the widget menu, so it selects no text. */
-    -webkit-user-select: none;
-    user-select: none;
-}
-
-.widget-bar-icon {
-    --app-icon-size: 1.125rem;
-    flex: none;
-    display: inline-flex;
-    width: var(--app-icon-size);
-    height: var(--app-icon-size);
-}
-
-.widget-bar-name {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-weight: 600;
-    color: var(--text-primary);
-}
-
-.widget-bar-add {
-    flex-shrink: 0;
-    padding: 0.125rem 0.5rem;
-    font-size: var(--font-size-xs);
-    white-space: nowrap;
-}
-
-/* The pill a card's bar and an edited tile draw. In a bar it stays compact, so
-   a small card's bar still holds its icon, the pill and the ⋯. */
+/* The pill a card's widget menu and an edited tile draw. */
 .widget-size-pill {
     display: flex;
     flex-shrink: 0;
@@ -182,24 +187,6 @@
     color: var(--text-on-accent);
 }
 
-.widget-bar-actions {
-    display: flex;
-    align-items: center;
-    gap: 0.125rem;
-    margin-left: auto;
-    flex-shrink: 0;
-}
-
-.widget-bar .icon-btn.header-icon {
-    width: 1.75rem;
-    height: 1.75rem;
-}
-
-.widget-bar .icon-btn.header-icon svg {
-    width: var(--icon-size-md);
-    height: var(--icon-size-md);
-}
-
 /* An option frame is sized to what the widget reports. */
 .widget-frame {
     position: relative;
@@ -219,6 +206,18 @@
    height back without end. */
 .widget-frame-option {
     max-height: 300dvh;
+}
+
+/* The widget menu's first row: the label, and the size pill at the end. It
+   takes a menu item's padding and type, so its label lines up with theirs. */
+.widget-menu-size {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-md);
+    padding: 0.5rem 0.625rem;
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
 }
 
 .widget-menu-label {

@@ -466,6 +466,54 @@ raw = json.loads(os.environ.get("TRIGGER_EVENT_PAYLOAD", "{}"))
 body = raw.get("payload") if isinstance(raw.get("payload"), dict) else raw
 ```
 
+## Continue key
+
+By default every fire starts a new thread. Set `continue_key` on an intent trigger when later fires about the same thing belong in the thread an earlier fire started: comments on one ticket, replies in one chat thread, updates to one pull request. The key ties them to one *work item*.
+
+A key spec is a list of parts. Each part is a **field path** in the syntax a `condition` uses. A part can also list field paths, and the first one with a value wins. Lucidos resolves every part against the fire's stored event payload, so the § "The envelope" rules apply: a webhook's fields sit under `payload.`.
+
+| Spec | Key for one fire |
+|---|---|
+| `["payload.repository.full_name", ["payload.issue.number", "payload.pull_request.number"]]` | `["example-org/example-repo","42"]`, for an issue or a pull request alike |
+| `["channel", "thread_ts"]` | `["C123","1700000000.1234"]`, on a domain event your translation script emits |
+| `["ticket_id"]` | `["T-17"]` |
+
+How a keyed fire lands:
+
+- **The key is the JSON array of the resolved values.** Lucidos compares it and never parses it. A number and the same digits as a string give the same key.
+- **Every part must resolve** to a non-empty string, number or boolean. If any part has no value, the fire has no key and starts a new, unkeyed thread.
+- **A key that matches an open thread continues it.** The fire arrives there as a new message, and the thread's first message still holds the intent. Otherwise a new thread starts and keeps the key.
+- **Keys are shared across triggers.** Two triggers that build the same key reach the same thread. That lets an intake trigger and a follow-up trigger feed one work item. Put a source name in the spec when two sources could collide.
+- **One key maps to at most one open thread**, even when two fires race.
+- **The Archive action releases the key.** The next fire with that key starts a fresh thread, and unarchiving does not take the key back. An unattended run that lands in Archive on its own when it finishes keeps its key, so the next comment still reaches it.
+- **A retry starts its own unkeyed thread**, because the run it retries still holds the key.
+
+**A keyed fire can answer a question.** When the thread waits on a question card, the fire answers it as free text, exactly like a typed answer. The agent judges whether the text really answers the question, and asks again if not. Use the trigger's `condition` to decide who may answer from the source.
+
+Only intent triggers take a key: a script fire starts no thread to continue. `continue_key: null` or `[]` clears a spec. The key is only for input. Replies to the source go out through workspace script triggers on thread events, which read the address from the thread's first delivery.
+
+## Actor
+
+Set `actor` on an intent trigger to say whose action a fire carries: the person who wrote the comment, filed the ticket or sent the message. The value is one **field path** to an email in the fire's event payload. It uses `condition` syntax, so a webhook's fields sit under `payload.` (§ "The envelope").
+
+| `actor` | Payload it reads |
+|---|---|
+| `"payload.sender.email"` | A webhook whose body names the sender's email |
+| `"author_email"` | A domain event your translation script emits |
+
+How a fire uses it:
+
+- **The fire records the email, never a person.** It goes on the fire's origin: on `TriggerStarted`, and on the answer when a keyed fire answers a question. The thread credits the *operator* who holds that email, and moving an email to another operator moves the credit.
+- **An email no operator holds credits nobody.** The thread still runs. It just names the trigger alone.
+- **No email, no credit.** A path that resolves to nothing, or to a value that is not one email, records none. The email is trimmed and lowercased.
+- **It is attribution, never authority.** The fire runs with the workspace's credentials either way. Use the trigger's `condition` to decide whose actions may fire it.
+
+Some sources send user ids rather than emails. Give them a script trigger that looks the id up and emits a domain event with the email. Point the intent trigger's `actor` at that field.
+
+Only intent triggers take an actor: a script fire starts no thread to credit. `actor: null` or `""` clears it.
+
+This `actor` is not the engine-written `actor` on a domain event (§ "Who emitted a domain event: `actor`"). That one records which caller emitted the event. This one names a person inside the event's own payload.
+
 ## Notification discipline
 
 Call `send_notification` only when there is something the user wants to hear about. A morning summary that finds nothing new sends no notification: silent success is the norm.
@@ -763,6 +811,24 @@ The chat command guard fails the *whole* run on an ungranted side-effect, but th
 
 The flow follows child spawns only. A top spawn, by `spawn_thread` with `relation: "top"` or by `lucidos spawn-thread` without `--relation child`, is independent of the trigger: its cards wait for a human. Spawn the coding agent as a child when the run must finish unattended. A spawn into another workspace is always a top spawn, so it always asks.
 
+### Permission wait
+
+Some requests fit none of the rules above: the engine cannot classify the command. If a trigger will announce the card, the engine parks a permission card on the coding-agent thread instead of denying it. That means an enabled, unpaused trigger that fires on the card's permission request, such as "When agent needs me". The engine sends no push of its own. The trigger's notification opens the thread, and the user can answer from any device. The card offers to allow the request once or for this thread, never "Always allow".
+
+The **permission wait** sets how long that card waits before the engine denies it. It has one form everywhere (trigger settings, `trigger.toml`, the HTTP API, the SDK and the CLI):
+
+| Value | Effect |
+|---|---|
+| `"deny"` | Never park a card: deny at once, as when no trigger would announce the card. |
+| whole minutes, 1 to 1440 | Park the card and deny it when nobody answers in time. |
+| `"indefinite"` | Park the card and wait for an answer, like an attended prompt. |
+
+A trigger's `permission_wait` applies to every coding-agent thread in its spawn tree. A trigger without one uses the workspace preference `unattended_permission_wait` (default `30`). The user picks it under *Permission wait* in the trigger's settings. A card that timed out says nobody answered it within its permission wait. With no trigger that announces the card, the request is denied at once, whatever the wait says.
+
+### Context ceiling
+
+A trigger's optional `context_ceiling` is copied onto each thread it fires, as a `ContextCeilingSet` (ADR 0629). Its coding-agent sub-threads inherit it at spawn. The value is `off`, a size such as `200k`, or a window share such as `30%`. A trigger without one leaves its threads on the workspace preference `coding_agent_context_ceiling` (default `300k`). An agent may set a trigger's ceiling no higher than the workspace's; only the user raises one or turns it off.
+
 ## MCP servers the fires use: `mcp_servers`
 
 A running *MCP server* offers its tools only to the threads that enabled it (ADR 0430). A trigger lists the servers its intent needs in `mcp_servers`, for example `["slack"]`. Each fire then enables them in its thread and starts any that are not running, before the first step. So the tools are there from round 1. A listed id that no server has becomes a line in the fire's `[MCP SERVERS]` block, and so does a server that fails to start. The run still goes ahead.
@@ -921,9 +987,11 @@ Never claim "I'll delete it after it runs" without one of the above.
 **The scheduler never reads this file.** `data/triggers/<slug>/trigger.toml` is a
 **derived read-model** of the trigger's definition. It mirrors the durable
 subset of its config (`name`, `slug`, `schedule`, `timezone`, `run`, `on`,
-`app_id`, `go_to_review`, `group_id`, `side_effect_grant`, `mcp_servers`,
-`model`, `reasoning_effort`, `provider`). A trigger on the account trigger model
-omits the last three. The engine maintains it from the trigger events: written on
+`app_id`, `go_to_review`, `group_id`, `side_effect_grant`, `permission_wait`,
+`context_ceiling`, `mcp_servers`, `model`, `reasoning_effort`, `provider`). A
+trigger on the account trigger model omits the last three. One on the workspace
+permission wait omits `permission_wait`, and one on the workspace ceiling omits
+`context_ceiling`. The engine maintains it from the trigger events: written on
 create/update, removed on delete, rebuilt from events on boot (ADR 0019).
 Runtime and identity fields (`id`, `last_run`, `last_run_status`, `paused`) are
 left out. It is **not version-controlled**: the engine adds

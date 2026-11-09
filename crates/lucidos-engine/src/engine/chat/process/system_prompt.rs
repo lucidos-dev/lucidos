@@ -1737,7 +1737,19 @@ mod tests {
     /// the ENGINE HOST line, net of slack freed since the last measure.
     /// Without it, a cloud agent took the user's Mac browser for its own
     /// host. A `linux` (`x86_64`) build measures 1 less.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 133_754;
+    ///
+    /// Raised by 765 to a measured 134,519 for the team workspace (ADR 0623):
+    /// the trigger tool's `continue_key` and `actor` fields, and the
+    /// `team-workspace` routing line. All three descriptions were cut first.
+    ///
+    /// Raised by 243 to a measured 134,762 for the `threads` tool's
+    /// `context_ceiling` action (ADR 0629), the prompt-first path to the
+    /// Settings ceiling. Its summary was cut to one clause first.
+    ///
+    /// Raised by 38 to a measured 134,800 for the `xl` widget size (ADR 0633):
+    /// one more value in each size enum, and the widget rules naming it. That
+    /// rule was cut to one clause first.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 134_800;
 
     /// The gate set the ratchet bills.
     ///
@@ -1905,7 +1917,7 @@ mod tests {
         ),
         (
             "triggers",
-            3_418,
+            3_907,
             "seven actions, each contributing its own summary line and its own \
              `(requires: …)` clause, plus the create schema's union shapes for \
              `cron` and `on`. system-knowhow/triggers.md deliberately does NOT \
@@ -1922,7 +1934,9 @@ mod tests {
              from 3,401 by the eighth, `claude-gateway` (ADR 0508). \
              Raised from 3,250 by `mcp_servers` (ADR 0430): a null-union over a \
              string array, since a trigger's fires may call only the MCP servers \
-             it lists",
+             it lists. Raised from 3,418 by ADR 0623: `continue_key` is a \
+             null-union over an array of strings or string arrays, and `actor` \
+             a null-union string, each with one trimmed sentence",
         ),
         (
             "manage_models",
@@ -2018,7 +2032,7 @@ mod tests {
         ),
         (
             "threads",
-            3_369,
+            3_614,
             "five more actions on a domain whose two existing schemas \
              are almost entirely a spelled-out `status` enum pinned to \
              `ThreadStatus::ALL` by a test, repeated across both because \
@@ -2032,7 +2046,9 @@ mod tests {
              summaries and one `entries` array. Raised from 3,159 for \
              `change_state`, the three-value enum that replaced `has_diff` \
              (ADR 0400). Raised from 3,172 for `cache_keep_alive`, one clause \
-             and a two-value `state` enum (ADR 0554)",
+             and a two-value `state` enum (ADR 0554). Raised from 3,369 for \
+             `context_ceiling`, one cut clause and a `ceiling` string, the \
+             prompt-first path to the Settings ceiling (ADR 0629)",
         ),
         (
             "events",

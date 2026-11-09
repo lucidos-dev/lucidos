@@ -91,6 +91,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // Pairing lives on the same row as push now, so Revoke is found on the
   // Devices page rather than under Access. Still gateway-gated: with none, no
   // row carries a Revoke button and the word would land on nothing.
+  { id: 'devices:people', label: 'People', subview: 'devices', path: 'Settings → Devices', anchor: 'devices:people', keywords: 'people person operator team member teammate email add remove offboard whose device', gatewayOnly: true },
   { id: 'devices:paired', label: 'Paired devices', subview: 'devices', path: 'Settings → Devices', anchor: 'devices:list', keywords: 'paired pairing device revoke unpair sign out cut off network access', gatewayOnly: true },
   { id: 'system', label: 'System', subview: 'system', path: 'Settings' },
   { id: 'appearance', label: 'Appearance & Behavior', subview: 'appearance', path: 'Settings', keywords: 'appearance interface behavior theme font scale links browser' },
@@ -141,6 +142,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // Coding Agents subview
   { id: 'coding-agents:binaries', label: 'Binaries', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:binaries', keywords: 'coding agent claude codex binary path cli override auto-detect' },
   { id: 'coding-agents:permissions', label: 'Permissions', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:permissions', keywords: 'permission mode claude code auto accept edits classifier approve prompt card ask' },
+  { id: 'coding-agents:context-ceiling', label: 'Context ceiling', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:context-ceiling', keywords: 'context ceiling hand off handoff fresh session successor size tokens 300k window' },
   { id: 'models:cache-keep-alive', label: 'Cache keep-alive', subview: 'models', path: 'Settings → Models', anchor: 'models:cache-keep-alive', keywords: 'cache keep-alive keep warm prompt cache reread rewrite ping beat prefill give up reread cap on off cost claude code lucidos agent' },
   // Like Region below: the Cache cards row renders only while the keep-alive
   // is on, so this lands on the section title that carries its switch.
@@ -271,7 +273,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'command-safety', label: 'Command safety', subview: 'permissions', path: 'Settings → Permissions', anchor: 'command-safety', keywords: 'command guard safety bash python shell judge' },
   { id: 'command-safety:guard', label: 'Command guard', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:guard', keywords: 'command guard safety bash python shell' },
   { id: 'command-safety:judge', label: 'LLM judge', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:judge', keywords: 'command guard llm judge' },
-  { id: 'command-safety:coding-agents', label: 'Enabled for coding agents', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:coding-agents', keywords: 'command guard coding agents codex claude code bash permission card auto allow' },
+  { id: 'command-safety:coding-agents', label: 'Answer coding-agent questions', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:coding-agents', keywords: 'command guard enabled for coding agents codex claude code bash permission card questions auto allow' },
   { id: 'command-safety:judge-model', label: 'Judge model', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:judge-model', keywords: 'command guard judge model haiku typesafe jev clef system one judgment backend' },
   { id: 'permissions:lucidos', label: 'Lucidos Agent permissions', subview: 'permissions', path: 'Settings → Permissions', anchor: 'permissions:lucidos', keywords: 'lucidos agent command allowlist bash python always allow auto allow' },
   { id: 'permissions:coding-agent', label: 'Coding agent permissions', subview: 'permissions', path: 'Settings → Permissions', anchor: 'permissions:coding-agent', keywords: 'claude code permissions codex permissions tool permissions allowed tools allowlist always allow' },

@@ -106,12 +106,12 @@ describe('the rail toggle is one control in the window corner', () => {
     ).props;
     // Padding, never a moved `right`, so the centred title holds still.
     expect(docked.has('right')).toBe(false);
-    expect(docked.get('padding-right')).toBe('calc(var(--header-icon-box) + var(--pane-header-gap))');
+    expect(docked.get('padding-right')).toBe('calc(var(--header-padding-x) + var(--header-icon-box) + var(--pane-header-gap))');
   });
 
   it('grows both content reserves by its box and one gap while docked', () => {
     const terms = (value: string | undefined) => {
-      const m = /calc\((\d+) \* var\(--header-icon-box\) \+ (\d+) \* 0\.25rem\)/.exec(value ?? '');
+      const m = /calc\((\d+) \* var\(--header-icon-box\) \+ (\d+) \* 0\.25rem(?: \+ var\(--header-padding-x\))?\)/.exec(value ?? '');
       return m ? [Number(m[1]), Number(m[2])] : null;
     };
     const root = cssRules(shellCss).find(r => r.selector === ':root' && r.props.has('--content-side-reserve'))!.props;
@@ -139,9 +139,8 @@ describe('with the Canvas hidden, the toggle takes a slot in the Conversation ro
     // Padding, as the Canvas row does: the centred brand holds still, and
     // `useHeaderActionCollapse` folds the actions short of it.
     expect(row.has('right')).toBe(false);
-    // The row runs to the header's edge, so it also keeps the padding the
-    // Canvas row stops short by.
-    expect(rule(shellCss, '.app-header .content-header-elements').props.get('right')).toBe('var(--header-padding-x)');
+    // Both rows reach the edge and keep controls inset with padding.
+    expect(rule(shellCss, '.app-header .content-header-elements').props.get('right')).toBe('0');
     expect(row.get('padding-right')).toBe('calc(var(--header-padding-x) + var(--header-icon-box) + var(--pane-header-gap))');
   });
 
@@ -156,7 +155,7 @@ describe('with the Canvas hidden, the toggle takes a slot in the Conversation ro
 
   it('widens the brand\'s trailing reserve to the slot plus the actions at their widest', () => {
     const terms = (value: string | undefined) => {
-      const m = /calc\((.+?) \+ (\d+) \* var\(--header-icon-box\) \+ (?:(\d+) \* )?0\.25rem\)/.exec(value ?? '');
+      const m = /calc\((.+?) \+ (\d+) \* var\(--header-icon-box\) \+ (?:(\d+) \* )?0\.25rem(?: \+ var\(--header-padding-x\))?\)/.exec(value ?? '');
       return m ? { pad: m[1], boxes: Number(m[2]), gaps: Number(m[3] ?? 1) } : null;
     };
     const root = cssRules(shellCss).find(r => r.selector === ':root' && r.props.has('--brand-trail-end'))!.props;

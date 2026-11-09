@@ -1,6 +1,6 @@
 import { test, expect, Page, Locator } from './fixtures';
 import { randomUUID } from 'crypto';
-import { apiRequest, assertHealthy, ensureOnThreadPane, isMobileViewport, navigateToApp, waitForDashboardReady } from './helpers';
+import { apiRequest, assertHealthy, ensureOnThreadPane, isMobileViewport, navigateToApp, openWidgetCardMenu, waitForDashboardReady } from './helpers';
 import { psql } from './db-helpers';
 
 /**
@@ -95,11 +95,15 @@ async function inside(box: Locator, s: Size) {
   };
 }
 
+/** Picks `s` in the card menu's Size row, then closes the menu. */
 async function pickCardSize(page: Page, s: Size): Promise<void> {
-  const option = card(page).locator(`[role="radiogroup"] [role="radio"][aria-label="${s}"]`);
+  const menu = await openWidgetCardMenu(page, card(page));
+  const option = menu.locator(`.widget-menu-size [role="radio"][aria-label="${s}"]`);
   await option.click();
   await expect(option).toHaveAttribute('aria-checked', 'true');
   await expect(cardBox(page)).toHaveAttribute('data-size', s);
+  await page.keyboard.press('Escape');
+  await expect(menu).toHaveCount(0);
 }
 
 async function setTileSize(page: Page, dashboard: 'desktop' | 'phone', appId: string, s: Size): Promise<void> {
@@ -143,6 +147,72 @@ test.describe('One widget box', () => {
     await apiRequest(page).post('/api/v1/widgets/dashboard-remove', { data: { app_id: appId, dashboard } });
     psql(`DELETE FROM events WHERE thread_id = '${threadId}'; DELETE FROM thread_summaries WHERE thread_id = '${threadId}'`);
     for (const path of written) await apiRequest(page).delete(`/api/v1/data/${path}`);
+  });
+
+  /** Invariants: an XL box is four cells wide at its true size in a card and a
+   *  tile alike. A host narrower than that clamps the box and scrolls it
+   *  sideways, never widening the page, and the widget is still told `xl`. */
+  test('an XL widget keeps four cells inside a clamped card and tile, scrolling sideways', async ({ page }) => {
+    await page.goto('/');
+    await writeFile(page, `apps/${appId}/index.html`, OLD_CONTRACT_WIDGET);
+    await writeFile(page, `apps/${appId}/manifest.json`, JSON.stringify({
+      name: 'E2E run plan', description: 'This week of runs', kind: 'widget', reusable: true,
+      sizes: ['medium', 'large', 'xl'],
+    }));
+    const added = await apiRequest(page).post('/api/v1/widgets/dashboard-add', { data: { app_id: appId, dashboard } });
+    expect(added.ok(), `add: ${await added.text()}`).toBeTruthy();
+    seedThreadShowingWidget(threadId, appId);
+
+    await page.addInitScript((tid: string) => {
+      if (window.parent !== window) return;
+      localStorage.setItem('lucidos-focused-thread', tid);
+    }, threadId);
+    await navigateToApp(page);
+    if (isMobileViewport(page)) await ensureOnThreadPane(page);
+    await expect(card(page)).toBeVisible({ timeout: 15_000 });
+
+    const scroller = (box: Locator) => box.locator(':scope > .widget-box-scroll');
+    const canvas = (box: Locator) => scroller(box).locator('.widget-box-canvas');
+    async function xlBox(box: Locator) {
+      const frame = box.frameLocator('iframe[data-role="app-ui-frame"]');
+      await expect(frame.locator('html'), 'told its size').toHaveAttribute('data-widget-size', 'xl', { timeout: 15_000 });
+      const dims = await scroller(box).evaluate((el) => ({
+        boxInnerWidth: el.clientWidth,
+        scrolls: el.scrollWidth > el.clientWidth + 1,
+        boxWidth: (el.parentElement as HTMLElement).getBoundingClientRect().width,
+        viewportWidth: window.innerWidth,
+      }));
+      return {
+        ...dims,
+        canvasWidth: (await size(canvas(box))).width,
+      };
+    }
+
+    const rem = await page.evaluate(() => parseFloat(getComputedStyle(document.documentElement).fontSize));
+
+    await pickCardSize(page, 'large');
+    const large = await size(cardBox(page));
+    await pickCardSize(page, 'xl');
+    await card(page).scrollIntoViewIfNeeded();
+    const inCard = await xlBox(cardBox(page));
+    // Four cells: two large boxes and the gap between them, less the border.
+    const gap = inCard.canvasWidth + 2 - 2 * large.width;
+    expect(Math.abs(gap - 0.75 * rem), 'XL is two larges and a gap').toBeLessThanOrEqual(1.5);
+    expect(inCard.boxWidth, 'the card never outgrows the viewport').toBeLessThanOrEqual(inCard.viewportWidth);
+
+    await showDashboard(page);
+    await setTileSize(page, dashboard, appId, 'xl');
+    const inTile = await xlBox(tile(page, appId));
+    await hideDashboard(page);
+    expect(Math.abs(inTile.canvasWidth - inCard.canvasWidth), 'one true width').toBeLessThanOrEqual(1);
+    expect(inTile.boxWidth, 'the tile never outgrows the viewport').toBeLessThanOrEqual(inTile.viewportWidth);
+
+    for (const [place, seen] of [['card', inCard], ['tile', inTile]] as const) {
+      const clamped = seen.boxInnerWidth < seen.canvasWidth - 1;
+      expect(seen.scrolls, `${place} scrolls exactly when clamped`).toBe(clamped);
+    }
+    // A phone has two columns, so its tile is always clamped.
+    if (isMobileViewport(page)) expect(inTile.scrolls, 'phone tile scrolls').toBe(true);
   });
 
   for (const scale of [100, 175]) {

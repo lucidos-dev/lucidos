@@ -292,6 +292,12 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         "ThreadUnarchived" => EventClass::Metadata,
         // A proposal records what the agent offered; the reply moves things.
         "ThreadTriageProposed" => EventClass::Metadata,
+        // Work item roles mark who steers it, not its work (ADR 0623).
+        "WorkItemDriverTaken"
+        | "WorkItemDriverReleased"
+        | "WorkItemGateEscalated"
+        | "WorkItemWatched"
+        | "WorkItemUnwatched" => EventClass::Metadata,
         // A read decision and a sighting mark the reply, not the thread's
         // work, so none bumps recency (ADR 0409).
         "ThreadReadRequested" | "ThreadReadNotRequested" | "ThreadReplySeen" => {
@@ -334,7 +340,10 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         | "SessionHandedOff"
         | "HandoffCheckpointReached"
         | "SuccessorOfferDeclined"
-        | "SuccessorRequested" => EventClass::Metadata,
+        | "SuccessorRequested"
+        | "ContextCeilingSet"
+        | "ContextCeilingReached"
+        | "SessionHandoffWithdrawn" => EventClass::Metadata,
         // Voice-session lifecycle. Metadata on BOTH halves, which is the
         // asymmetry against the coding-agent pair above, where the end is
         // Terminal. A live microphone is not a turn: the thread's status
@@ -561,6 +570,11 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "ApplyNowEnded",
         "ThreadReplySeen",
         "ThreadTriageProposed",
+        "WorkItemDriverTaken",
+        "WorkItemDriverReleased",
+        "WorkItemGateEscalated",
+        "WorkItemWatched",
+        "WorkItemUnwatched",
         "ThreadStarted",
         "ThreadDiscarded",
         "HomeThreadCreated",
@@ -600,6 +614,9 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "HandoffCheckpointReached",
         "SuccessorOfferDeclined",
         "SuccessorRequested",
+        "ContextCeilingSet",
+        "ContextCeilingReached",
+        "SessionHandoffWithdrawn",
         "UserQuestionAsked",
         "UserQuestionAnswered",
         "CodingAgentPermissionRequest",
@@ -773,6 +790,9 @@ pub fn resolve_transition(
         "ThreadSaved" => to_inbox,
         // Archive all's Undo (ADR 0349).
         "ThreadUnarchived" => to_inbox,
+        // A trigger-fired thread is a Chat thread, and its coding-agent
+        // children inherit the ceiling it holds (ADR 0629).
+        "ContextCeilingSet" => no_change,
         // CC-only events illegal for Chat
         "SessionStarted"
         | "SessionEnded"
@@ -793,6 +813,8 @@ pub fn resolve_transition(
         | "HandoffCheckpointReached"
         | "SuccessorOfferDeclined"
         | "SuccessorRequested"
+        | "ContextCeilingReached"
+        | "SessionHandoffWithdrawn"
         | "ContinuationRequested" => match thread_type {
             ThreadType::CodingAgent => no_change,
             ThreadType::Chat => violation("coding-agent-specific event on Chat thread"),
@@ -926,6 +948,11 @@ pub fn resolve_transition(
         | "ApplyNowEnded"
         | "ThreadReplySeen"
         | "ThreadTriageProposed"
+        | "WorkItemDriverTaken"
+        | "WorkItemDriverReleased"
+        | "WorkItemGateEscalated"
+        | "WorkItemWatched"
+        | "WorkItemUnwatched"
         | "TriggerStarted"
         | "TriggerCompleted"
         | "ChangeReverted"

@@ -25,20 +25,23 @@ export interface ObjectMenu {
   onClick: (e: MouseEvent) => void;
 }
 
+/** The keyboard's menu key, or Shift+F10 where the keyboard has none. An
+ *  object that takes focus opens its menu on it. */
+export function isMenuKey(e: KeyboardEvent): boolean {
+  return e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10');
+}
+
 /** An object with actions (ADR 0285): a right-click or a long press on it
  *  opens its menu. A phone places the menu against the object, since a finger
  *  covers the point. Option+right-click is left to the native menu.
  *
- *  `onTap` is the object's own tap. `anchor` names the part of a large object
- *  a menu with no point opens against, such as a widget's bar. */
-export function useObjectMenu({ onTap = () => {}, anchor = (el) => el }: {
+ *  `onTap` is the object's own tap. */
+export function useObjectMenu({ onTap = () => {} }: {
   onTap?: (e: MouseEvent) => void;
-  anchor?: (el: HTMLElement) => HTMLElement;
 } = {}): ObjectMenu {
   const opener = useRef<OverflowMenuOpener | null>(null);
   const open: OverflowMenuOpener = (el, at) => {
-    const point = viewportIsMobile.value ? undefined : at;
-    opener.current?.(point ? el : anchor(el), point);
+    opener.current?.(el, viewportIsMobile.value ? undefined : at);
   };
   const press = useLongPress(open, onTap);
   return {

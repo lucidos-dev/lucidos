@@ -157,11 +157,43 @@ interface TouchContact {
   screenY: number;
 }
 
+/** What the scroll check reads off the pressed element and its ancestors. */
+export interface ScrollNode {
+  scrollTop: number;
+  scrollLeft: number;
+  parentElement: ScrollNode | null;
+}
+
 /** What the cancel path reads off `touchstart`, `touchmove` and `touchcancel`.
- *  `touches` is every contact still on the glass, on this element or not. */
+ *  `touches` is every contact still on the glass, on this element or not.
+ *  `currentTarget` is the pressed element, read only at `touchstart`. */
 export interface TouchPressLike {
   changedTouches: ArrayLike<TouchContact>;
   touches: ArrayLike<unknown>;
+  currentTarget?: ScrollNode | null;
+}
+
+interface ScrollMark {
+  node: ScrollNode;
+  top: number;
+  left: number;
+}
+
+/** The scroll offsets of every element above `el`, short of the root.
+ *
+ *  The root (`<html>`, the only element with no parent) stands for the
+ *  document, which the iOS keyboard moves under a stationary finger. Only a
+ *  container the finger can drag counts as a scroll. */
+function scrollMarksAbove(el: ScrollNode | null | undefined): ScrollMark[] {
+  const marks: ScrollMark[] = [];
+  for (let node = el?.parentElement ?? null; node?.parentElement; node = node.parentElement) {
+    marks.push({ node, top: node.scrollTop, left: node.scrollLeft });
+  }
+  return marks;
+}
+
+function scrolledSince(marks: ScrollMark[]): boolean {
+  return marks.some(m => m.node.scrollTop !== m.top || m.node.scrollLeft !== m.left);
 }
 
 function contactOf(e: TouchPressLike, identifier: number): TouchContact | null {
@@ -241,6 +273,10 @@ export const CANCELLED_TAP_SETTLE_MS = 400;
  *  now fires it. That is the trade, and the reasoning is in
  *  `docs/plans/2026-08-26-a-tap-that-stays-on-the-button-sends.md`.
  *
+ *  One test survives, because the browser answers it rather than a coordinate:
+ *  did a container above the button scroll while the finger travelled? A
+ *  scroll that began on a menu row would otherwise fire that row on the lift.
+ *
  *  A DESTRUCTIVE face is the exception and asks the gate, so a scroll cannot
  *  fire it. See `opts.destructive`.
  *
@@ -271,11 +307,16 @@ export function touchActivated(action: () => void, opts: TouchActivateOptions = 
     destructive: boolean;
     /** A click already ran the action for this press, ahead of its lift. */
     served: boolean;
+    /** Where the containers above the button stood when the press began. */
+    scrollMarks: ScrollMark[];
   } | null = null;
   /** One press is one activation, of the face it began on. A lift with no
-   *  press behind it may serve only a constructive face. */
+   *  press behind it may serve only a constructive face. A press that scrolled
+   *  a container above the button was a scroll, on any face. Both halves are
+   *  needed: the app scrolls a transcript under a still finger too. */
   function liftMayServe(p: typeof press): boolean {
     if (p?.served) return false;
+    if (p && p.movedPx > TAP_MOVE_THRESHOLD_PX && scrolledSince(p.scrollMarks)) return false;
     return (p?.destructive ?? false) === destructive();
   }
   /** A refused lift still ends its press: the gate forgets it, and the probe
@@ -307,6 +348,7 @@ export function touchActivated(action: () => void, opts: TouchActivateOptions = 
         fingers: e.touches.length,
         destructive: destructive(),
         served: false,
+        scrollMarks: scrollMarksAbove(e.currentTarget),
       } : null;
     },
     onTouchMove(e: TouchPressLike): void {
@@ -348,7 +390,8 @@ export function touchActivated(action: () => void, opts: TouchActivateOptions = 
         if (pageVisible() && enabled() && destructive()) action();
       }, CANCELLED_TAP_SETTLE_MS);
     },
-    onTouchEnd(e: TouchEventLike): void {
+    onTouchEnd(e: TouchEventLike & Partial<TouchPressLike>): void {
+      if (e.changedTouches && e.touches) travel({ changedTouches: e.changedTouches, touches: e.touches });
       const p = press;
       press = null;
       if (!enabled()) return;

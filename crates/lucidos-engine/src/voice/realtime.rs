@@ -10,6 +10,10 @@
 //! **End of turn is semantic.** `semantic_vad` asks the model whether the
 //! caller finished a thought. A silence timer cannot tell a pause from a full
 //! stop, which is the invariant the plan carries.
+//!
+//! **The provider never cuts a reply.** Its VAD hears the talker's own echo
+//! through a phone speaker. So `interrupt_response` is off, and the client's
+//! `barge_in` control is the only cut (ADR 0200).
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -212,8 +216,12 @@ pub fn session_update(opening: &SessionOpening) -> Value {
                         "type": "audio/pcm",
                         "rate": opening.audio.sample_rate_hz,
                     },
-                    // Semantic, never a silence timer. See the module doc.
-                    "turn_detection": { "type": "semantic_vad" },
+                    // Semantic, never a silence timer, and never a cut. See
+                    // the module doc.
+                    "turn_detection": {
+                        "type": "semantic_vad",
+                        "interrupt_response": false,
+                    },
                     "transcription": transcription(opening),
                 },
                 "output": {

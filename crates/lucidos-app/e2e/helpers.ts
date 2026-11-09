@@ -1834,3 +1834,15 @@ export async function rightClickInsideFrame(page: Page, frame: Locator): Promise
   expect(at.x).toBeLessThanOrEqual(m.x + m.width + 2);
   return menu;
 }
+
+/** Opens an inline widget's menu, which is the only way to its actions: the
+ *  card draws no bar. It focuses the card and presses Shift+F10, the keyboard
+ *  path, which works at every width. `rightClickInsideFrame` covers a
+ *  right-click forwarded from the frame. */
+export async function openWidgetCardMenu(page: Page, card: Locator): Promise<Locator> {
+  await card.focus();
+  await page.keyboard.press('Shift+F10');
+  const menu = page.locator('.thread-overflow-menu');
+  await expect(menu).toBeVisible();
+  return menu;
+}

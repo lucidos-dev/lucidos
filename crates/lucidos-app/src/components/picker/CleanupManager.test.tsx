@@ -17,9 +17,11 @@ const row = (origin: 'eval' | 'user'): api.CleanupRow => ({
   running: false, fingerprint: `fingerprint-${origin}`, warning: null,
 });
 async function click(text: string) {
-  const button = [...host.querySelectorAll('button')].find(button => button.textContent === text)!;
-  expect(button).toBeTruthy();
-  await vi.waitFor(() => expect(button.disabled).toBe(false));
+  const button = await vi.waitFor(() => {
+    const found = [...host.querySelectorAll('button')].find(candidate => candidate.textContent === text);
+    expect(found?.disabled).toBe(false);
+    return found!;
+  });
   await act(async () => { button.click(); });
 }
 beforeEach(() => {
@@ -129,6 +131,38 @@ it('keeps a requested deletion pending while an expired review is refreshed', as
   await act(async () => { render(<CleanupManager tick={1} requestedWorkspace="user" onRequestHandled={handled} onChanged={changed} />, host); });
   await vi.waitFor(() => expect(api.freezeCleanup).toHaveBeenCalledWith([{ id: 'user', fingerprint: 'fingerprint-user' }]));
   expect(handled).toHaveBeenCalledOnce();
+});
+
+it('stays hidden when only ordinary workspaces exist and Trash is empty', async () => {
+  const legacy = { ...row('user'), id: 'legacy', workspace: { ...row('user').workspace!, id: 'legacy', origin: 'unknown' as const } };
+  vi.mocked(api.getCleanupReview).mockResolvedValue({ scanned_at: 'today', refreshing: false,
+    rows: [row('user'), legacy], searched_parents: [], registered_databases: [], warnings: [] });
+  await act(async () => { render(<CleanupManager tick={0} requestedWorkspace={null} onRequestHandled={() => {}} onChanged={async () => {}} />, host); });
+  await vi.waitFor(() => expect(api.listTrash).toHaveBeenCalled());
+  await act(async () => {});
+  expect(host.textContent).not.toContain('Manage workspaces');
+});
+
+it('appears on a later gateway poll once cleanup work exists', async () => {
+  const review = (rows: api.CleanupRow[]): api.CleanupReview =>
+    ({ scanned_at: 'today', refreshing: false, rows, searched_parents: [], registered_databases: [], warnings: [] });
+  vi.mocked(api.getCleanupReview).mockResolvedValue(review([row('user')]));
+  const props = { requestedWorkspace: null, onRequestHandled: () => {}, onChanged: async () => {} };
+  await act(async () => { render(<CleanupManager tick={0} {...props} />, host); });
+  await vi.waitFor(() => expect(api.listTrash).toHaveBeenCalled());
+  await act(async () => {});
+  expect(host.textContent).not.toContain('Manage workspaces');
+  vi.mocked(api.getCleanupReview).mockResolvedValue(review([row('user'), row('eval')]));
+  await act(async () => { render(<CleanupManager tick={1} {...props} />, host); });
+  await vi.waitFor(() => expect(host.textContent).toContain('Manage workspaces'));
+});
+
+it('opens for a requested deletion even when nothing else needs cleanup', async () => {
+  vi.mocked(api.getCleanupReview).mockResolvedValue({ scanned_at: 'today', refreshing: false,
+    rows: [row('user')], searched_parents: [], registered_databases: [], warnings: [] });
+  vi.mocked(api.freezeCleanup).mockResolvedValue({ id: 'batch', phrase: 'Delete user workspace', members: [], results: [] });
+  await act(async () => { render(<CleanupManager tick={0} requestedWorkspace="user" onRequestHandled={() => {}} onChanged={async () => {}} />, host); });
+  await vi.waitFor(() => expect(host.textContent).toContain('Delete user workspace'));
 });
 
 it('requires individual review for unknown folders and databases', async () => {

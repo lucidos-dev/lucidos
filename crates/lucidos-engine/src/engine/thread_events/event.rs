@@ -618,6 +618,13 @@ pub enum ThreadEvent {
     /// the same branch, with `message` as its first input. Pending until that
     /// session's `SessionStarted`.
     SessionHandedOff {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<super::HandoffCause>,
+        #[serde(default)]
+        starts: super::SessionStart,
+        /// The ceiling the session crossed, on a `context-ceiling` handoff.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        crossing: Option<crate::engine::context_ceiling::CeilingCrossing>,
         opening: super::HandoffOpening,
         /// The opening itself: the *handoff narrative* or *handoff brief*,
         /// framed for the new session.
@@ -687,6 +694,31 @@ pub enum ThreadEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
     },
+    /// The thread's *context ceiling* was set: on the thread itself, or copied
+    /// from its trigger at creation (ADR 0629). The newest one wins. A thread
+    /// with none inherits its parent's, else the workspace preference. The
+    /// actor rides the meta, and only a person raises a ceiling.
+    ContextCeilingSet {
+        ceiling: crate::engine::context_ceiling::ContextCeiling,
+        source: crate::engine::context_ceiling::CeilingSource,
+    },
+    /// The session grew past its context ceiling, and the engine sent the
+    /// *ceiling re-entry* (ADR 0629). Once per session, at the turn end that
+    /// crossed it.
+    ContextCeilingReached {
+        /// The session's context size at that turn end, in tokens.
+        context_tokens: u64,
+        /// The effective ceiling it crossed, in tokens.
+        ceiling: u64,
+        /// The window the cap read, absent when no capture recorded one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window: Option<u64>,
+    },
+    /// A person chose *Return to the old session* on a pending ceiling
+    /// handoff (ADR 0629). The handoff no longer stands, and the thread's next
+    /// input resumes the old session. A raising `ContextCeilingSet` and a
+    /// `SuccessorOfferDeclined` at the session's size precede it.
+    SessionHandoffWithdrawn,
     /// The coding agent compacted its own context mid-session: Claude Code's
     /// `compact_boundary`. The context counter drops at this step.
     CodingAgentCompacted {
@@ -861,7 +893,9 @@ pub enum ThreadEvent {
         /// emits `Some("engine_restart_interrupt")` when a mid-turn-crashed
         /// session is surfaced to the UI as "interrupted, click to continue"
         /// instead of being auto-spawned. The frontend reads this field to
-        /// render the continue affordance.
+        /// render the continue affordance. An engine turn stamps
+        /// `"cache_keep_alive"` or `"ceiling_reentry"`, so no trigger or event
+        /// wait reads its idle as the agent finishing.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
         /// Absolute filesystem path of the worktree the agent ran in for this
@@ -961,12 +995,17 @@ pub enum ThreadEvent {
     /// FALSE until the child's next turn starts.
     ParentWakeNotRequested,
     /// The user saw the reply a read request pointed at: its end stayed on
-    /// screen for the seen dwell. Clears `read_requested`. Recorded only while
+    /// screen for the seen dwell. Clears `read_requested`, or with `personal`
+    /// adds the actor's device to `reply_seen_devices`. Recorded only while
     /// the thread's summary still reads `seen_version`, so a duplicate or a
     /// sighting older than a newer request records nothing.
     ThreadReplySeen {
         /// The thread's `summary_version` when the client saw the reply.
         seen_version: i64,
+        /// Seen by one person on a team gateway, so the request stays for the
+        /// others (ADR 0623). Absent means seen for everyone.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        personal: bool,
     },
     /// The Lucidos Agent proposed a *thread triage* in this thread (ADR 0349).
     /// `apply_triage` acts only on these entries, and only after the user
@@ -974,6 +1013,27 @@ pub enum ThreadEvent {
     ThreadTriageProposed {
         entries: Vec<super::TriageProposalEntry>,
     },
+    /// Someone became the *driver* of this work item (ADR 0623), on its
+    /// family root. The actor names them: a device, or a trigger fire whose
+    /// actor email an operator holds. Recorded by Take, Take over, and by
+    /// answering a gate. Projects nothing: `engine::work_item` folds it.
+    WorkItemDriverTaken,
+    /// The work item's driver gave the role up, on its family root. The work
+    /// item has no driver until someone takes it.
+    WorkItemDriverReleased,
+    /// A gate waited on its driver past `driver_timeout_hours`, so it now
+    /// reaches the whole team. Recorded once per gate, on the family root.
+    /// The driver keeps the work item.
+    WorkItemGateEscalated {
+        /// The thread the question card is on: the root or a sub-thread.
+        gate_thread_id: uuid::Uuid,
+        tool_use_id: String,
+    },
+    /// The actor started watching this work item: its gate pushes reach them
+    /// beside the driver. Recorded on the family root.
+    WorkItemWatched,
+    /// The actor stopped watching this work item, from any of their devices.
+    WorkItemUnwatched,
     /// A thread was created in `composing` state. Emitted by the first
     /// successful POST /threads (debounced first user input: keystroke,
     /// image attach, or mode toggle on a fresh compose). The thread can
@@ -1063,6 +1123,11 @@ pub enum ThreadEvent {
         /// decided.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
+        /// The *continue key* this fire claimed for a NEW thread. A later fire
+        /// with the same key continues this thread until it is archived.
+        /// `None` on an unkeyed fire, and on a fire that continued a thread.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        continue_key: Option<String>,
     },
     /// Boot reported a restart-cut fire and its durable retry decision.
     TriggerRunInterrupted {

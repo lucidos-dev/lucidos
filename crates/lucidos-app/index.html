@@ -1,6 +1,29 @@
 <!DOCTYPE html>
 <html lang="en" translate="no" data-theme-mode="dark">
 <head>
+    <!-- Capture before resource discovery and navigation scripts. Never send a launch credential in a manifest request. -->
+    <script>
+      (function () {
+        var url = new URL(location.href);
+        var fragment = new URLSearchParams(url.hash.slice(1));
+        var hasFragment = fragment.has('pair');
+        window.lucidosPairingLaunch = hasFragment || url.searchParams.has('pair');
+        if (!window.lucidosPairingLaunch) return;
+        var raw = (hasFragment ? fragment : url.searchParams).get('pair');
+        window.lucidosPairingSeed = raw;
+        url.searchParams.delete('pair');
+        if (hasFragment) {
+          fragment.delete('pair');
+          url.hash = fragment.toString();
+        }
+        history.replaceState(history.state, '', url.href);
+        try {
+          var spent = JSON.parse(localStorage.getItem('lucidos.pairing.spentLaunchCodes') || '[]');
+          if (Array.isArray(spent) && spent.indexOf((raw || '').trim()) !== -1) window.lucidosPairingLaunch = false;
+        } catch (e) { /* unavailable storage still allows the launch to pair */ }
+      })();
+    </script>
+
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-visual">
     <meta name="google" content="notranslate">
@@ -25,7 +48,23 @@
          so switching workspaces stays in the standalone PWA. In the picker
          context (base "/~/") this resolves to /~/manifest.json, which the
          gateway also re-stamps with scope "/" + start_url "/~/". -->
-    <link rel="manifest" href="manifest.json">
+    <link id="lucidos-install-manifest" rel="manifest" href="manifest.json">
+    <script>
+      (function () {
+        var template = document.getElementById('lucidos-pairing-manifest');
+        if (!window.lucidosPairingLaunch || !template) return;
+        var token = (window.lucidosPairingSeed || '').trim();
+        if (!/^(?:[0-9]{8}|ldp_[a-z2-7]{26})$/.test(token)) return;
+        var manifest = JSON.parse(template.textContent);
+        var base = new URL('/~/manifest.json', location.origin);
+        manifest.start_url = new URL('/~/#pair=' + encodeURIComponent(token), base).href;
+        manifest.id = new URL('/~/', base).href;
+        manifest.scope = new URL('/', base).href;
+        (manifest.icons || []).forEach(function (icon) { icon.src = new URL(icon.src, base).href; });
+        var link = document.getElementById('lucidos-install-manifest');
+        link.href = URL.createObjectURL(new Blob([JSON.stringify(manifest)], { type: 'application/manifest+json' }));
+      })();
+    </script>
     <!--
       iOS PWA splash screens. Without exact-resolution apple-touch-startup-image
       tags, iOS shows a white screen with the app title during WKWebView cold
@@ -64,7 +103,7 @@
     <script>
       (function () {
         try {
-          if (navigator.standalone !== true) return;
+          if (window.lucidosPairingLaunch || navigator.standalone !== true) return;
           var bounce = function () {
             if (window.navigation && !window.navigation.canGoForward) return;
             window.lucidosHistoryBounce = true;
@@ -84,9 +123,7 @@
       picker→workspace cross-document reload seam (the persistent cold-start
       jank/flicker). The browser goes straight to /<slug>/, which plays the single
       reveal. Skipped when `?pick` is present (the in-app "Manage workspaces"
-      escape), when `?pair=` is (a scanned pairing QR, which has to stay on the
-      public picker path so the gateway can stamp its code into the manifest),
-      or when no workspace is remembered, so the picker still renders its list.
+      escape), when pairing was captured, or when no workspace is remembered.
       Reads the RAW device-global `lucidos-last-workspace` key (this runs before
       workspaceStorage.install namespacing, matching how the picker writes it).
       `location.replace` so the picker is not left in history. A since-deleted slug
@@ -117,13 +154,9 @@
           if (document.querySelector('meta[name="lucidos-pairing"]')) return;
           var search = new URLSearchParams(location.search);
           if (search.has('pick')) return;
-          // A scanned pairing QR lands on `/~/?pair=<code>`, which is public,
-          // and the gateway stamps that code into the manifest `start_url` an
-          // Add-to-Home-Screen install then launches with. Redirecting carries
-          // the code onto `/<slug>/`, which is gated: the caller is unpaired,
-          // so `enforce` answers with the pairing shell and the install gets a
-          // manifest with no code in it. Pairing belongs on the picker anyway.
-          if (search.has('pair')) return;
+          // Capture erased the credential before resources loaded. Keep this
+          // document for pairing and its install manifest even on invalid input.
+          if (window.lucidosPairingLaunch || search.has('pair') || new URLSearchParams(location.hash.slice(1)).has('pair')) return;
           var slug = localStorage.getItem('lucidos-last-workspace');
           // Preserve the deep link (notification/thread/tap query + any hash) so a
           // push tap that cold-launches into the picker still reaches the workspace

@@ -17,8 +17,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::core::permission_wait::PermissionWait;
 use crate::core::DATA_DIR;
 use crate::engine::command_guard::SideEffectCategory;
+use crate::engine::context_ceiling::ContextCeiling;
 use crate::triggers::config::{TriggerConfig, TriggerRun};
 use crate::triggers::EventSubscription;
 
@@ -57,6 +59,14 @@ pub struct TriggerDefinition {
     pub plugin_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub side_effect_grant: Vec<SideEffectCategory>,
+    /// How long a parked permission card waits on an unattended fire. Omitted
+    /// (None) = the workspace preference. A scalar, so it stays above the tables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_wait: Option<PermissionWait>,
+    /// The context ceiling copied onto each fired thread (ADR 0629). Omitted
+    /// (None) = the workspace preference. A scalar, so it stays above the tables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_ceiling: Option<ContextCeiling>,
     /// The MCP server ids this trigger's fires use (ADR 0430). A scalar array,
     /// so it must stay above the table fields below.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -74,6 +84,13 @@ pub struct TriggerDefinition {
     /// preferred provider, then its first configured route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// The continue key spec (ADR 0623). An array of strings and arrays, so it
+    /// stays above the table fields below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continue_key: Option<crate::triggers::ContinueKeySpec>,
+    /// The actor field (ADR 0623): the payload path of the fire's email.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<crate::triggers::ActorField>,
     // Table / array-of-tables fields LAST (TOML ordering constraint):
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub on: Vec<EventSubscription>,
@@ -93,10 +110,14 @@ impl TriggerDefinition {
             go_to_review: c.go_to_review,
             plugin_id: c.plugin_id.clone(),
             side_effect_grant: c.side_effect_grant.clone(),
+            permission_wait: c.permission_wait,
+            context_ceiling: c.context_ceiling,
             mcp_servers: c.mcp_servers.clone(),
             model: c.model.clone(),
             reasoning_effort: c.reasoning_effort.clone(),
             provider: c.provider.clone(),
+            continue_key: c.continue_key.clone(),
+            actor: c.actor.clone(),
             on: c.on.clone(),
             run: c.run.clone(),
         }
@@ -119,11 +140,15 @@ impl TriggerDefinition {
             "go_to_review": self.go_to_review,
             "group_id": self.group_id,
             "side_effect_grant": self.side_effect_grant,
+            "permission_wait": self.permission_wait,
+            "context_ceiling": self.context_ceiling,
             "mcp_servers": self.mcp_servers,
             "plugin_id": plugin_id,
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
             "provider": self.provider,
+            "continue_key": self.continue_key,
+            crate::triggers::actor::ACTOR_FIELD_KEY: self.actor,
         })
     }
 

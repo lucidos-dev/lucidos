@@ -17,7 +17,7 @@ export const SSE_KEEPALIVE_EVENT = "keepalive";
 export const WIDGET_PARAMS_MAX_BYTES = 2048;
 
 /** `WidgetSize::ALL` in `core/apps.rs`. */
-export const WIDGET_SIZES = ["small", "medium", "large"] as const;
+export const WIDGET_SIZES = ["small", "medium", "large", "xl"] as const;
 
 /** `MAX_IDS` in `api/threads/archive_all.rs`. */
 export const ARCHIVE_ALL_MAX_IDS = 2000;

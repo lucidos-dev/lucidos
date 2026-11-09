@@ -5,7 +5,7 @@
  */
 
 import type { ThreadMeta, ThreadStatus, ThreadState } from '../../store/thread-events';
-import { changeAwaitsApply, effectiveThreadStatus } from '../../store/store';
+import { changeAwaitsApply, effectiveThreadStatus, readRequestedForMe } from '../../store/store';
 
 /** 'changes' = diff glyph (a pending change awaits Apply). 'read-request' = static
  *  dot (its agent asked the user to read the reply, ADR 0409). 'question' =
@@ -71,7 +71,7 @@ export function resolveVisualStatus(
 /** The meta facts `visualStatusFor` reads. */
 type VisualStatusFacts = Pick<
   ThreadMeta,
-  'id' | 'activeChildrenCount' | 'waitingChildrenCount' | 'codingAgentChangeState' | 'liveEventWaitCount' | 'readRequested'
+  'id' | 'activeChildrenCount' | 'waitingChildrenCount' | 'codingAgentChangeState' | 'liveEventWaitCount' | 'readRequested' | 'replySeenDevices'
 >;
 
 /** `resolveVisualStatus` fed from a thread's meta, for a surface holding a
@@ -85,7 +85,7 @@ export function visualStatusFor(status: ThreadStatus, meta: VisualStatusFacts | 
     meta.activeChildrenCount + (meta.waitingChildrenCount ?? 0) > 0,
     changeAwaitsApply(meta),
     meta.liveEventWaitCount > 0,
-    meta.readRequested === true,
+    readRequestedForMe(meta),
   );
 }
 

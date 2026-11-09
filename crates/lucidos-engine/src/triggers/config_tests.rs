@@ -62,6 +62,50 @@ fn apply_update_sets_plugin_id_but_a_user_edit_never_strips_it() {
 }
 
 #[test]
+fn the_actor_field_reads_back_and_an_update_replaces_or_clears_it() {
+    let mut config = TriggerConfig::from_created_payload(&json!({
+        "trigger_id": "t", "name": "T", "schedule": [], "timezone": "UTC",
+        "run": { "type": "intent", "intent": "hi" }, "on": [{ "event_type": "X" }],
+        "actor_field": "payload.sender.email",
+    }))
+    .unwrap();
+    assert_eq!(
+        config.actor,
+        Some(ActorField("payload.sender.email".into()))
+    );
+
+    config.apply_update(&json!({ "name": "Renamed" }));
+    assert!(
+        config.actor.is_some(),
+        "an absent field leaves the actor alone"
+    );
+    config.apply_update(&json!({ "actor_field": "payload.user.email" }));
+    assert_eq!(config.actor, Some(ActorField("payload.user.email".into())));
+    config.apply_update(&json!({ "actor_field": null }));
+    assert_eq!(config.actor, None);
+}
+
+/// The stored row holds the event's own actor under `actor`. A replay must
+/// read the trigger's actor field from its own key, or a device edit would
+/// clear it on the next restart.
+#[test]
+fn the_event_actor_in_a_stored_payload_never_reads_as_the_actor_field() {
+    let device = json!({ "kind": "device", "device_id": "d1" });
+    let mut config = TriggerConfig::from_created_payload(&json!({
+        "trigger_id": "t", "name": "T", "schedule": [], "timezone": "UTC",
+        "run": { "type": "intent", "intent": "hi" }, "on": [{ "event_type": "X" }],
+        "actor_field": "payload.sender.email",
+        "actor": device,
+    }))
+    .unwrap();
+    config.apply_update(&json!({ "name": "Renamed", "actor": device }));
+    assert_eq!(
+        config.actor,
+        Some(ActorField("payload.sender.email".into()))
+    );
+}
+
+#[test]
 fn from_created_event_script() {
     let payload = json!({
         "trigger_id": "oura-import",
@@ -1131,6 +1175,48 @@ fn apply_update_replaces_and_clears_side_effect_grant() {
     assert!(config.side_effect_grant.is_empty());
 }
 
+// --- Permission wait ---
+
+#[test]
+fn permission_wait_reads_each_wire_form_and_survives_a_payload_round_trip() {
+    use crate::core::permission_wait::PermissionWait;
+    assert_eq!(created_with(json!({})).permission_wait, None);
+    for (wire, wait) in [
+        (json!("deny"), PermissionWait::Deny),
+        (json!(45), PermissionWait::Minutes(45)),
+        (json!("indefinite"), PermissionWait::Indefinite),
+    ] {
+        let config = created_with(json!({ "permission_wait": wire }));
+        assert_eq!(config.permission_wait, Some(wait));
+        let again = TriggerConfig::from_created_payload(&config.to_created_payload()).unwrap();
+        assert_eq!(again.permission_wait, Some(wait));
+    }
+}
+
+/// A stored value the parser refuses reads as unset, so one bad row cannot
+/// wedge the in-memory config.
+#[test]
+fn a_refused_permission_wait_reads_as_unset() {
+    for bad in [json!(0), json!(1441), json!("forever"), json!(true)] {
+        assert_eq!(
+            created_with(json!({ "permission_wait": bad })).permission_wait,
+            None
+        );
+    }
+}
+
+#[test]
+fn apply_update_replaces_and_clears_permission_wait() {
+    use crate::core::permission_wait::PermissionWait;
+    let mut config = created_with(json!({ "permission_wait": 10 }));
+    config.apply_update(&json!({ "trigger_id": "t-model", "permission_wait": "indefinite" }));
+    assert_eq!(config.permission_wait, Some(PermissionWait::Indefinite));
+    config.apply_update(&json!({ "trigger_id": "t-model", "name": "renamed" }));
+    assert_eq!(config.permission_wait, Some(PermissionWait::Indefinite));
+    config.apply_update(&json!({ "trigger_id": "t-model", "permission_wait": null }));
+    assert_eq!(config.permission_wait, None);
+}
+
 // --- MCP servers (ADR 0430) ---
 
 #[test]
@@ -1612,4 +1698,32 @@ fn provider_update_validates_against_the_existing_model() {
     let err = resolve_trigger_provider_update(&registry, &unpinned, None, Some(Some("vertex")))
         .unwrap_err();
     assert!(err.contains("needs a model pin"), "{err}");
+}
+
+/// Undo restores a trigger from the payload this writes, by create or by
+/// update, so both readers must land on the same config.
+#[test]
+fn a_created_payload_reads_back_to_the_same_config_by_create_and_by_update() {
+    let config = TriggerConfig::from_created_payload(&json!({
+        "trigger_id": "t", "name": "Inbox", "slug": "inbox", "schedule": ["0 0 8 * * *"],
+        "timezone": "Europe/Oslo", "run": { "type": "intent", "intent": "triage" },
+        "on": [{ "event_type": "MailReceived", "condition": { "eq": ["payload.x", 1] } }],
+        "paused": true, "app_id": "habit-tracker", "go_to_review": true, "group_id": "g1",
+        "side_effect_grant": ["email"], "mcp_servers": ["srv"], "model": "m",
+        "reasoning_effort": "high", "continue_key": ["payload.thread"],
+        "actor_field": "payload.sender.email",
+    }))
+    .unwrap();
+    let payload = config.to_created_payload();
+
+    let created = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(json!(created), json!(config));
+
+    let mut updated = TriggerConfig::from_created_payload(&json!({
+        "trigger_id": "t", "name": "Other", "schedule": [], "timezone": "UTC",
+        "run": { "type": "intent", "intent": "other" }, "on": [{ "event_type": "X" }],
+    }))
+    .unwrap();
+    updated.apply_update(&payload);
+    assert_eq!(json!(updated), json!(config));
 }

@@ -2,6 +2,7 @@ use super::{
     ensure_trigger_toml_gitignored, rebuild_trigger_definitions, remove_trigger_definition,
     write_trigger_definition, TriggerDefinition,
 };
+use crate::core::permission_wait::PermissionWait;
 use crate::engine::command_guard::SideEffectCategory;
 use crate::triggers::config::{TriggerConfig, TriggerRun};
 use crate::triggers::EventSubscription;
@@ -33,10 +34,14 @@ fn config(slug: &str, run: TriggerRun) -> TriggerConfig {
         go_to_review: false,
         group_id: None,
         side_effect_grant: vec![],
+        permission_wait: None,
+        context_ceiling: None,
         mcp_servers: vec![],
         plugin_id: None,
         model: None,
         reasoning_effort: None,
+        continue_key: None,
+        actor: None,
     }
 }
 
@@ -180,6 +185,52 @@ fn to_trigger_payload_carries_the_provider_pin() {
     let payload = TriggerDefinition::from_config(&c).to_trigger_payload("id", "my-plugin");
     let parsed = TriggerConfig::from_created_payload(&payload).expect("payload parses");
     assert_eq!(parsed.provider.as_deref(), Some("anthropic"));
+}
+
+/// `permission_wait` is a scalar, so the ordering rule binds it. Each wire form
+/// survives the file and the payload the scheduler parses.
+#[test]
+fn roundtrips_each_permission_wait() {
+    for wait in [
+        PermissionWait::Deny,
+        PermissionWait::Minutes(15),
+        PermissionWait::Indefinite,
+    ] {
+        let mut c = config(
+            "nightly-fix",
+            TriggerRun::Intent {
+                intent: "Fix the flaky test".to_string(),
+            },
+        );
+        c.permission_wait = Some(wait);
+        c.on = vec![EventSubscription {
+            event_type: "DayEnded".to_string(),
+            condition: None,
+        }];
+
+        let def = TriggerDefinition::from_config(&c);
+        let toml = def
+            .to_toml()
+            .expect("serialize a trigger with a permission wait");
+        let parsed = TriggerDefinition::from_toml(&toml).expect("parse it back");
+        assert_eq!(parsed.permission_wait, Some(wait), "{toml}");
+
+        let payload = def.to_trigger_payload("id", "my-plugin");
+        let created = TriggerConfig::from_created_payload(&payload).expect("payload parses");
+        assert_eq!(created.permission_wait, Some(wait));
+    }
+}
+
+#[test]
+fn a_trigger_on_the_workspace_wait_writes_no_key() {
+    let c = config(
+        "plain",
+        TriggerRun::Intent {
+            intent: "hi".to_string(),
+        },
+    );
+    let toml = TriggerDefinition::from_config(&c).to_toml().unwrap();
+    assert!(!toml.contains("permission_wait"), "{toml}");
 }
 
 #[test]
@@ -348,4 +399,45 @@ fn ensure_gitignored_leaves_an_unreadable_exclude_untouched() {
         original,
         "an unreadable exclude file must not be rewritten"
     );
+}
+
+/// `context_ceiling` is a scalar too. Each form survives the file and the
+/// payload, and a trigger with none writes no key.
+#[test]
+fn roundtrips_each_context_ceiling() {
+    use crate::engine::context_ceiling::ContextCeiling;
+    for ceiling in [
+        ContextCeiling::Off,
+        ContextCeiling::Tokens(200_000),
+        ContextCeiling::WindowShare(30),
+    ] {
+        let mut c = config(
+            "nightly-fix",
+            TriggerRun::Intent {
+                intent: "Fix the flaky test".to_string(),
+            },
+        );
+        c.context_ceiling = Some(ceiling);
+        c.on = vec![EventSubscription {
+            event_type: "DayEnded".to_string(),
+            condition: None,
+        }];
+
+        let def = TriggerDefinition::from_config(&c);
+        let toml = def.to_toml().expect("serialize a trigger with a ceiling");
+        let parsed = TriggerDefinition::from_toml(&toml).expect("parse it back");
+        assert_eq!(parsed.context_ceiling, Some(ceiling), "{toml}");
+
+        let payload = def.to_trigger_payload("id", "my-plugin");
+        let created = TriggerConfig::from_created_payload(&payload).expect("payload parses");
+        assert_eq!(created.context_ceiling, Some(ceiling));
+    }
+    let plain = config(
+        "plain",
+        TriggerRun::Intent {
+            intent: "hi".to_string(),
+        },
+    );
+    let toml = TriggerDefinition::from_config(&plain).to_toml().unwrap();
+    assert!(!toml.contains("context_ceiling"), "{toml}");
 }

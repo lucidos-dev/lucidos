@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   createTapGate, touchActivated, takePressOutcome, notePressOutcome,
-  CANCELLED_TAP_SETTLE_MS,
+  CANCELLED_TAP_SETTLE_MS, type ScrollNode,
 } from './tapGesture';
 import { LONG_PRESS_DELAY_MS } from '../hooks/useLongPress';
 import { TAP_MOVE_THRESHOLD_PX } from '@lucidos/tap-press';
@@ -781,5 +781,78 @@ describe('a press serves only the face it started on, once', () => {
     advance(1_900);
     handlers.onTouchEnd(lift);
     expect(action).toHaveBeenCalledTimes(1);
+  });
+});
+
+/** The phone report: scrolling the Lucidos menu opened the Setup guide confirm
+ *  on the lift. The press began on that row, and the touch path took every
+ *  press. The browser scrolling the menu under a moving finger is what says
+ *  the press was a scroll. */
+describe('a press that scrolled a container above the button serves nothing', () => {
+  function insideScroller() {
+    // The root has no parent, as `<html>` has none. It stands for the document,
+    // which the iOS keyboard moves under a stationary finger.
+    const root: ScrollNode = { scrollTop: 0, scrollLeft: 0, parentElement: null };
+    const scroller: ScrollNode = { scrollTop: 0, scrollLeft: 0, parentElement: root };
+    const row: ScrollNode = { scrollTop: 0, scrollLeft: 0, parentElement: scroller };
+    const { action, handlers, touch } = harness();
+    const press = { ...contact(100, 200, 1), currentTarget: row };
+    const liftAt = (x: number, y: number) => ({ ...contact(x, y, 0), ...touch });
+    return { scroller, root, action, handlers, press, liftAt };
+  }
+
+  it('a lift after the menu scrolled runs nothing, and leaves no click behind', () => {
+    const { scroller, action, handlers, press, liftAt } = insideScroller();
+    handlers.onTouchStart(press);
+    scroller.scrollTop = 140;
+    const lift = liftAt(100, 60);
+    handlers.onTouchEnd(lift);
+    expect(action).not.toHaveBeenCalled();
+    expect(lift.preventDefault).toHaveBeenCalledTimes(1);
+    handlers.onClick();
+    expect(action).not.toHaveBeenCalled();
+  });
+
+  it('a sideways scroll counts too', () => {
+    const { scroller, action, handlers, press, liftAt } = insideScroller();
+    handlers.onTouchStart(press);
+    scroller.scrollLeft = 60;
+    handlers.onTouchEnd(liftAt(40, 200));
+    expect(action).not.toHaveBeenCalled();
+  });
+
+  it('a tap with nothing scrolled still serves', () => {
+    const { action, handlers, press, liftAt } = insideScroller();
+    handlers.onTouchStart(press);
+    handlers.onTouchEnd(liftAt(100, 200));
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  it('the app scrolling the container under a still finger is not a scroll', () => {
+    // Stick-to-bottom moves the transcript while a reply streams. A tap held
+    // still through that must not go dead.
+    const { scroller, action, handlers, press, liftAt } = insideScroller();
+    handlers.onTouchStart(press);
+    scroller.scrollTop = 140;
+    handlers.onTouchEnd(liftAt(100, 200 + TAP_MOVE_THRESHOLD_PX));
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  it('the document scrolling is not a scroll of the menu', () => {
+    // The keyboard shifts the document while a finger is on Send. Reading the
+    // root as a scroller would bring back the dead Send.
+    const { root, action, handlers, press, liftAt } = insideScroller();
+    handlers.onTouchStart(press);
+    root.scrollTop = 300;
+    handlers.onTouchEnd(liftAt(100, 60));
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  it('a cancelled press that scrolled the menu serves nothing', () => {
+    const { scroller, action, handlers, press } = insideScroller();
+    handlers.onTouchStart(press);
+    scroller.scrollTop = 40;
+    handlers.onTouchCancel(contact(100, 160, 0));
+    expect(action).not.toHaveBeenCalled();
   });
 });

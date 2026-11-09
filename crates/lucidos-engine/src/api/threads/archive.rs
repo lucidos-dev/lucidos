@@ -337,6 +337,32 @@ fn plan_cascade(
     })
 }
 
+/// Archiving a work item's root finishes it, so its driver and watchers hear
+/// it (ADR 0623). The archive stands either way, so a failed notice only logs.
+async fn notify_work_item_done(
+    engine: &std::sync::Arc<LucidosEngine>,
+    thread_id: Uuid,
+    actor: Option<&MessageOrigin>,
+) {
+    use crate::engine::work_item::{notify, WorkItemNotice};
+    let snapshot = crate::gateway_operators::current();
+    let notified = match crate::engine::thread_family::family_root(engine.pool(), thread_id).await {
+        Ok(root) if root == thread_id => {
+            let by = actor.and_then(|a| snapshot.operator_of_origin(a));
+            notify(engine, root, WorkItemNotice::Completed { by }, &snapshot).await
+        }
+        Ok(_) => Ok(()),
+        Err(e) => Err(e.into()),
+    };
+    if let Err(e) = notified {
+        log!(
+            "[API] archive_thread: could not tell {}'s people it is done: {}",
+            thread_id,
+            e
+        );
+    }
+}
+
 /// The cascade the Archive button and an agent's archive both run.
 ///
 /// Inside one transaction the recursive CTE locks parent + all descendants
@@ -608,6 +634,10 @@ pub(crate) async fn archive_family(
             }
             Err(e) => return Err(internal_json(e)),
         }
+    }
+
+    if archived.contains(&thread_uuid) {
+        notify_work_item_done(engine, thread_uuid, actor.as_ref()).await;
     }
 
     // A target already stored archived sits in Current only while a count says

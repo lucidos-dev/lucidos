@@ -34,6 +34,7 @@ pub mod models;
 pub mod oauth;
 pub mod oauth_callback;
 pub mod oauth_registry;
+pub mod permission_wait;
 pub mod pinned_apps;
 pub mod plugin_catalog_cache;
 pub mod plugin_marketplaces;
@@ -1507,6 +1508,10 @@ fn drafts_label(args: &serde_json::Value) -> String {
     }
 }
 
+/// The step label of the `threads` tool's `context_ceiling` action and its
+/// flat alias.
+const CONTEXT_CEILING_LABEL: &str = "Setting a context ceiling...";
+
 /// The step label for the per-thread cache keep-alive switch.
 fn keep_alive_switch_label(args: &serde_json::Value) -> String {
     match args["state"].as_str() {
@@ -1904,6 +1909,7 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
         "detach_child_thread" => "Moving a child thread to top level...".to_string(),
         "archive_thread" => "Archiving a thread...".to_string(),
         "switch_cache_keep_alive" => keep_alive_switch_label(args),
+        "set_context_ceiling" => CONTEXT_CEILING_LABEL.to_string(),
         "request_read" => match args[crate::llm::tools::READ_ARG].as_bool() {
             Some(false) => "No read needed".to_string(),
             _ => "Asking you to read this reply...".to_string(),
@@ -2105,6 +2111,7 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             Some("detach_child") => "Moving a child thread to top level...".to_string(),
             Some("archive") => "Archiving a thread...".to_string(),
             Some("cache_keep_alive") => keep_alive_switch_label(args),
+            Some("context_ceiling") => CONTEXT_CEILING_LABEL.to_string(),
             Some("triage") => "Triaging threads...".to_string(),
             Some("apply_triage") => "Applying the approved triage...".to_string(),
             _ => "Listing threads...".to_string(),

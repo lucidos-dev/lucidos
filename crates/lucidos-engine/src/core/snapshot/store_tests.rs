@@ -119,6 +119,23 @@ fn retention_and_floor_respect_protections_and_boundaries() {
 }
 
 #[test]
+fn floor_refusal_reports_the_space_to_free_and_keeps_its_slug() {
+    let gib = 1024 * 1024 * 1024;
+    let refusal = |available, total, estimate| {
+        let error = check_floor(available, total, estimate).unwrap_err();
+        assert_eq!(error.to_string(), "snapshot_disk_floor");
+        error
+            .downcast_ref::<DiskFloorRefused>()
+            .unwrap()
+            .needed_bytes
+    };
+    assert_eq!(refusal(6 * gib - 1, 20 * gib, gib), 1);
+    assert_eq!(refusal(2 * gib, 100 * gib, 3 * gib), 11 * gib);
+    assert_eq!(refusal(0, 20 * gib, 0), 5 * gib);
+    assert_eq!(refusal(u64::MAX, u64::MAX, u64::MAX), u64::MAX);
+}
+
+#[test]
 fn journal_survives_reopen_and_protects_both_handles() {
     use super::super::journal::Phase;
     let root = tempfile::tempdir().unwrap();

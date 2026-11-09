@@ -1518,6 +1518,9 @@ async fn a_child_between_successor_sessions_still_works() {
         &bus,
         child,
         ThreadEvent::SessionHandedOff {
+            cause: None,
+            starts: crate::engine::thread_events::SessionStart::Now,
+            crossing: None,
             opening: crate::engine::thread_events::HandoffOpening::Narrative,
             message: "A fresh session starts here.".into(),
             checkpoint: None,
@@ -4509,6 +4512,9 @@ async fn a_pending_handoff_leaves_the_selection() {
         &bus,
         thread_id,
         ThreadEvent::SessionHandedOff {
+            cause: None,
+            starts: crate::engine::thread_events::SessionStart::Now,
+            crossing: None,
             opening: crate::engine::thread_events::HandoffOpening::Narrative,
             message: "A fresh session starts here.".into(),
             checkpoint: None,
@@ -5944,6 +5950,53 @@ async fn an_expected_wake_counts_for_the_wait_its_turn_covered() {
         None,
         "a wait armed after its turn ended is another wait"
     );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+async fn picked(pool: &sqlx::PgPool, thread: Uuid) -> bool {
+    read_candidates(pool, &[thread])
+        .await
+        .unwrap()
+        .iter()
+        .any(|r| r.thread_id == thread)
+}
+
+/// I3: a session past its context ceiling gets no beat, so nothing resumes it
+/// before its successor starts. A person's raise above its size lifts that.
+#[tokio::test]
+async fn no_beat_past_the_ceiling() {
+    use crate::engine::context_ceiling::{CeilingSource, ContextCeiling};
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    start_cc_session(&bus, thread, "claude-code/past-the-ceiling", None).await;
+    seed_thread_event(&bus, thread, real_idle()).await;
+    assert!(picked(&pool, thread).await);
+
+    seed_thread_event(
+        &bus,
+        thread,
+        ThreadEvent::ContextCeilingReached {
+            context_tokens: 400_000,
+            ceiling: 300_000,
+            window: None,
+        },
+    )
+    .await;
+    assert!(!picked(&pool, thread).await);
+
+    seed_thread_event(
+        &bus,
+        thread,
+        ThreadEvent::ContextCeilingSet {
+            ceiling: ContextCeiling::Tokens(500_000),
+            source: CeilingSource::Thread,
+        },
+    )
+    .await;
+    assert!(picked(&pool, thread).await, "the raise ends the hold");
 
     pool.close().await;
     teardown_test_db(&db_name).await;

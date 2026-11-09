@@ -161,10 +161,10 @@ else
     fail "output: $OUT; left: $(ls "$BUSY")"
 fi
 
-echo "test: with no lsof to ask, the prune waits and says why"
+echo "test: with neither lsof nor perl to ask, the prune waits and says why"
 mkdir -p "$SCRATCH/empty-path"
 OUT="$(unset -f lsof; PATH="$SCRATCH/empty-path" prune_stale_debug_objects "$BUSY")"
-if [ "$OUT" = "Stale debug objects: no lsof to tell whether another cargo is building here; left for the next build." ] &&
+if [ "$OUT" = "Stale debug objects: no lsof or perl to tell whether another cargo is building here; left for the next build." ] &&
     present "$BUSY" app-1111111111111111.0aaa.gen1.rcgu.o; then
     pass "nothing deleted when the lock cannot be read"
 else

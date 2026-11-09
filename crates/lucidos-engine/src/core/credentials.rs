@@ -159,6 +159,18 @@ pub struct CredentialInfo {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Everything a credential holds except its value. `CredentialDeleted`
+/// carries it, so Undo restores the entry with an empty value (ADR 0623).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialMetadata {
+    pub auth_type: AuthType,
+    #[serde(default)]
+    pub base_urls: Vec<String>,
+    pub auth_header: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_var_name: Option<String>,
+}
+
 /// Full credential including the stored secret.
 ///
 /// **The stored value is private.** It may be a *secret reference*, so a
@@ -358,6 +370,10 @@ type CredentialRow = (
     Option<String>,
 );
 
+/// What a delete returns: `service_name`, `auth_type`, `base_urls`,
+/// `auth_header` and `env_var_name`, never the value.
+type DeletedCredentialRow = (String, String, Vec<String>, String, Option<String>);
+
 /// Columns selected for a full credential (with secret), in `CredentialRow` order.
 const CREDENTIAL_COLUMNS: &str =
     "id, service_name, base_urls, auth_type, auth_value, auth_header, created_at, updated_at, env_var_name";
@@ -423,8 +439,8 @@ fn parse_credential_info(row: CredentialRow) -> CredentialInfo {
 
 /// Store for managing API credentials in the database.
 ///
-/// **No caller can skip the event.** [`Self::upsert`], [`Self::update`] and
-/// [`Self::delete`] are the only reachable mutators: the raw row writes
+/// **No caller can skip the event.** [`Self::upsert`], [`Self::restore`],
+/// [`Self::update`] and [`Self::delete`] are the only reachable mutators: the raw row writes
 /// ([`Self::upsert_row`], [`Self::update_row`], [`Self::delete_row`]) are
 /// private to this module, so nothing anywhere in the crate can change a
 /// credential without the paired `Credential{Created,Updated,Deleted}` emit
@@ -558,6 +574,45 @@ impl CredentialStore {
             .emit_or_log(BusEvent::System(event), "[Credentials] upsert")
             .await;
         Ok(id)
+    }
+
+    /// Recreate a deleted credential from its metadata, with an empty value,
+    /// and announce it. `Ok(false)` when a row already holds the name, under
+    /// either unique constraint: a restore never overwrites a live credential.
+    pub async fn restore(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        service_name: &str,
+        metadata: &CredentialMetadata,
+        actor: Option<MessageOrigin>,
+    ) -> Result<bool, sqlx::Error> {
+        let inserted: Option<Uuid> = sqlx::query_scalar(
+            "INSERT INTO credentials (service_name, base_urls, auth_type, auth_value, auth_header, env_var_name) \
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING RETURNING id",
+        )
+        .bind(service_name)
+        .bind(scope_members(&metadata.base_urls))
+        .bind(metadata.auth_type.to_string())
+        .bind(Secret::<CredentialAuthValue>::new(""))
+        .bind(&metadata.auth_header)
+        .bind(metadata.env_var_name.as_deref())
+        .fetch_optional(pool)
+        .await?;
+        if inserted.is_none() {
+            return Ok(false);
+        }
+        crate::core::secret_reference::forget_resolved_values();
+        event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::CredentialCreated {
+                    service_name: service_name.to_string(),
+                    auth_type: metadata.auth_type,
+                    actor,
+                }),
+                "[Credentials] restore",
+            )
+            .await;
+        Ok(true)
     }
 
     /// Get a credential by service name (includes the secret).
@@ -733,9 +788,10 @@ impl CredentialStore {
         Ok(results.into_iter().map(parse_credential).collect())
     }
 
-    /// Delete a credential row, returning the deleted row's `service_name` for
-    /// the announcement. **Private on purpose**, same as [`Self::upsert_row`]:
-    /// [`Self::delete`] is the reachable mutator, and it emits.
+    /// Delete a credential row, returning the deleted row's `service_name` and
+    /// its metadata for the announcement. **Private on purpose**, same as
+    /// [`Self::upsert_row`]: [`Self::delete`] is the reachable mutator, and it
+    /// emits.
     ///
     /// Keyed on `id` rather than `service_name`: since
     /// `20260805134838_drop_credential_name_prefixes_use_auth_type.sql` a name
@@ -743,11 +799,30 @@ impl CredentialStore {
     /// key), so a name-keyed DELETE would be a coin flip over which one goes.
     /// `RETURNING` is what keeps the event able to name the deleted service
     /// without a second round trip.
-    async fn delete_row(pool: &PgPool, id: Uuid) -> Result<Option<String>, sqlx::Error> {
-        sqlx::query_scalar("DELETE FROM credentials WHERE id = $1 RETURNING service_name")
-            .bind(id)
-            .fetch_optional(pool)
-            .await
+    async fn delete_row(
+        pool: &PgPool,
+        id: Uuid,
+    ) -> Result<Option<(String, CredentialMetadata)>, sqlx::Error> {
+        let row: Option<DeletedCredentialRow> = sqlx::query_as(
+            "DELETE FROM credentials WHERE id = $1 \
+             RETURNING service_name, auth_type, base_urls, auth_header, env_var_name",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(row.map(
+            |(service_name, auth_type, base_urls, auth_header, env_var_name)| {
+                (
+                    service_name,
+                    CredentialMetadata {
+                        auth_type: AuthType::parse(&auth_type),
+                        base_urls,
+                        auth_header,
+                        env_var_name,
+                    },
+                )
+            },
+        ))
     }
 
     /// Delete a credential and announce it. The only way to remove one.
@@ -762,18 +837,34 @@ impl CredentialStore {
     ) -> Result<bool, sqlx::Error> {
         let removed = Self::delete_row(pool, id).await?;
         crate::core::secret_reference::forget_resolved_values();
-        if let Some(service_name) = &removed {
-            event_bus
-                .emit_or_log(
-                    BusEvent::System(SystemEvent::CredentialDeleted {
-                        service_name: service_name.clone(),
-                        actor,
-                    }),
-                    "[Credentials] CredentialDeleted",
-                )
-                .await;
-        }
-        Ok(removed.is_some())
+        let Some((service_name, metadata)) = removed else {
+            return Ok(false);
+        };
+        event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::CredentialDeleted {
+                    service_name,
+                    metadata: Some(metadata),
+                    actor,
+                }),
+                "[Credentials] CredentialDeleted",
+            )
+            .await;
+        Ok(true)
+    }
+
+    /// The id of the row holding `service_name` with `auth_type`, which names
+    /// one row even where an `oauth_client` shadows the name.
+    pub async fn id_of(
+        pool: &PgPool,
+        service_name: &str,
+        auth_type: AuthType,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        sqlx::query_scalar("SELECT id FROM credentials WHERE service_name = $1 AND auth_type = $2")
+            .bind(service_name)
+            .bind(auth_type.to_string())
+            .fetch_optional(pool)
+            .await
     }
 
     /// Update an existing credential's editable fields (everything except the

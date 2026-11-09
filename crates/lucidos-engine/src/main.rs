@@ -1017,6 +1017,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         event_id: None,
                         tap: Default::default(),
                         actor: None,
+                        audience: None,
                     },
                 ),
                 "[Proxy] apis.json NotificationCreated",
@@ -1061,6 +1062,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         event_id: None,
                         tap: Default::default(),
                         actor: None,
+                        audience: None,
                     },
                 ),
                 "[Proxy] insecure transport NotificationCreated",
@@ -1125,6 +1127,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         event_id: None,
                         tap: Default::default(),
                         actor: None,
+                        audience: None,
                     },
                 ),
                 "[Proxy] handshake seed NotificationCreated",
@@ -1148,6 +1151,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shared_engine.start_apply_all_driver();
     shared_engine.start_landing_lane_driver();
     lucidos_engine::landing_gateway::enable();
+    lucidos_engine::gateway_operators::enable();
     shared_engine.start_follow_main();
     shared_engine.start_main_check_driver();
     shared_engine.start_standing_apply_resolver();
@@ -1474,6 +1478,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     boot_stages.lap("apply recovery");
 
     lucidos_engine::engine::memory_consumer::spawn(shared_engine.clone());
+    lucidos_engine::engine::config_change::spawn(shared_engine.clone());
     lucidos_engine::engine::change_summary_consumer::spawn(shared_engine.clone());
     lucidos_engine::engine::pending_change_watch::spawn(shared_engine.clone());
     lucidos_engine::engine::summary_tree::spawn(shared_engine.clone());
@@ -1661,6 +1666,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addrs = net_config::bind_socket_addrs(&bind_choice, api_port);
     let addr = addrs[0];
     let bind_label = net_config::bind_scope_label(&bind_choice);
+
+    lucidos_engine::gateway_operators::await_first_answer().await;
 
     // The gateway reaches this engine here, never on the TCP port (ADR 0445).
     // Bound well after the owner lock, so removing a stale socket file can

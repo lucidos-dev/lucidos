@@ -27,6 +27,10 @@ export type SideEffectCategory =
   | 'out_of_workspace_destruction'
   | 'other';
 
+/** How long an unattended fire's parked permission card waits for an answer:
+ *  `'deny'` (never park), whole minutes from 1 to 1440, or `'indefinite'`. */
+export type PermissionWait = 'deny' | number | 'indefinite';
+
 export interface Trigger {
   id: string;
   name: string;
@@ -46,6 +50,9 @@ export interface Trigger {
   /** Side-effect grant — irreversible categories this trigger may perform
    *  unattended. Omitted when empty (= no grant). */
   side_effect_grant?: SideEffectCategory[];
+  /** Permission wait for this trigger's unattended fires. Omitted when the
+   *  trigger uses the workspace preference `unattended_permission_wait`. */
+  permission_wait?: PermissionWait;
   /** MCP server ids this trigger's fires use. Only these servers' tools run
    *  unattended in its threads. Omitted when empty. */
   mcp_servers?: string[];
@@ -60,7 +67,16 @@ export interface Trigger {
   /** The backend the pinned model runs on. Omitted when the model's own
    *  preferred provider decides. */
   provider?: string;
+  /** The continue key spec. Omitted when every fire starts a new thread. */
+  continue_key?: ContinueKeySpec;
+  /** The payload path of the email of the person behind a fire. Omitted when
+   *  fires credit nobody. */
+  actor?: string;
 }
+
+/** Payload paths whose values name one thread. Each part is a path, or a list
+ *  of paths where the first with a value wins. Intent triggers only. */
+export type ContinueKeySpec = (string | string[])[];
 
 export interface CreateTrigger {
   name: string;
@@ -75,6 +91,9 @@ export interface CreateTrigger {
   /** Side-effect grant — irreversible categories this trigger may perform
    *  unattended. Omit / `[]` = none granted (the safe default). */
   side_effect_grant?: SideEffectCategory[];
+  /** Permission wait for this trigger's unattended fires. Omit / null = the
+   *  workspace preference. Any other value outside the wire form is refused. */
+  permission_wait?: PermissionWait | null;
   /** MCP server ids this trigger's fires use. A fire refuses a call to any
    *  other server. Omit / `[]` = none. */
   mcp_servers?: string[];
@@ -90,6 +109,12 @@ export interface CreateTrigger {
    *  model's own preferred provider. A pin to an unconfigured backend refuses
    *  the fire. */
   provider?: string | null;
+  /** A fire whose key matches an open thread continues it. Omit / null / `[]`
+   *  = every fire starts a new thread. */
+  continue_key?: ContinueKeySpec | null;
+  /** The payload path of the email of the person behind a fire, e.g.
+   *  `payload.sender.email`. Intent triggers only. Omit / null = none. */
+  actor?: string | null;
 }
 
 export interface UpdateTrigger {
@@ -106,6 +131,9 @@ export interface UpdateTrigger {
   /** Full replacement for the side-effect grant. Send the complete new set;
    *  pass `[]` to clear all grants. */
   side_effect_grant?: SideEffectCategory[];
+  /** Set the permission wait, or clear it back to the workspace preference
+   *  (null). Absent leaves it unchanged. */
+  permission_wait?: PermissionWait | null;
   /** Full replacement for the MCP server ids; pass `[]` to clear them. */
   mcp_servers?: string[];
   /** Pin the trigger's intent to a chat model (string) or clear it back to the
@@ -117,6 +145,11 @@ export interface UpdateTrigger {
   /** Pin the backend for the pinned model (string), clear it (null), or leave
    *  it unchanged (absent). Changing the model drops a pin it cannot use. */
   provider?: string | null;
+  /** Full replacement for the continue key spec; null or `[]` clears it. */
+  continue_key?: ContinueKeySpec | null;
+  /** Set the actor field path (string), clear it (null), or leave it
+   *  unchanged (absent). */
+  actor?: string | null;
 }
 
 export interface ApiResult {

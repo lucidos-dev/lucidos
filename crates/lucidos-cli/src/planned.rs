@@ -87,10 +87,11 @@ const FLOOR: &str = "Ask the question your flow asks here, with its own options,
     fresh session. A plan's is `Approve` / `Request changes`, where a real fork takes the second \
     slot. If your flow asks no question here, carry on and ask nothing.";
 
-/// The offered card's shape at the checkpoint run named by `flags`. Two
-/// reasons offer a fresh session: the engine's *handoff estimate* says it pays,
-/// or, at any size, a lower rung than this thread's, as the agent picks it
-/// (ADR 0497). A thread with a rung above its own may also raise (ADR 0499).
+/// The offered card's shape at the checkpoint run named by `flags`. Three
+/// reasons offer a fresh session. The session is past its *context ceiling*
+/// (ADR 0629), or the engine's *handoff estimate* says it pays. Or, at any
+/// size, the agent picks a lower rung than this thread's (ADR 0497). A thread
+/// with a rung above its own may also raise (ADR 0499).
 /// The engine decides whether it pays and owns the ladder, so this compares
 /// neither itself. An unreadable reply offers the floor and says so.
 pub(crate) fn card_shape(reading: crate::successor::ContextReading, flags: &str) -> String {
@@ -118,10 +119,27 @@ pub(crate) fn card_shape(reading: crate::successor::ContextReading, flags: &str)
     match reading {
         ContextReading::Read {
             can_hand_off: true,
+            past_ceiling: true,
+            input_tokens,
+            implementer,
+            ladder,
+            ..
+        } => format!(
+            "This session is past its context ceiling: this thread's context is {}, so \
+             recommend a fresh session whatever the handoff estimate says. \
+             {}{IMPLEMENTER_CHOICE} {} {}",
+            size(input_tokens),
+            runs_on(implementer.as_ref(), ladder.as_ref()),
+            paying_options(),
+            fresh_session_handoff(flags)
+        ),
+        ContextReading::Read {
+            can_hand_off: true,
             pays: true,
             input_tokens,
             implementer,
             ladder,
+            ..
         } => format!(
             "The handoff estimate says a fresh session pays here: this thread's context is {}. \
              {}{IMPLEMENTER_CHOICE} {} {}",
@@ -451,6 +469,7 @@ mod tests {
                 input_tokens: Some(240_000),
                 can_hand_off: true,
                 pays,
+                past_ceiling: false,
                 implementer: Some(Implementer {
                     coding_agent: "claude-code".into(),
                     model: Some("m-b".into()),
@@ -576,12 +595,36 @@ mod tests {
         assert!(large_but_not_paying.contains("does not pay"));
     }
 
+    /// ADR 0629: past the context ceiling the card recommends a fresh session
+    /// on this thread's implementer, whatever the estimate says.
+    #[test]
+    fn past_the_ceiling_the_card_recommends_a_fresh_session() {
+        for pays in [true, false] {
+            let mut past = reading(Some(pays), None);
+            if let ContextReading::Read { past_ceiling, .. } = &mut past {
+                *past_ceiling = true;
+            }
+            let shape = card_shape(past, FLAGS);
+            for needle in [
+                "past its context ceiling",
+                "240k tokens",
+                "`Implement in a fresh session: <implementer> (Recommended)`",
+                "lucidos successor start --narrative <file> --at plan-approval --progress 0/4`",
+            ] {
+                assert!(shape.contains(needle), "missing {needle:?}: {shape}");
+            }
+            assert!(!shape.contains("pays here"), "{shape}");
+            assert!(!shape.contains("does not pay"), "{shape}");
+        }
+    }
+
     #[test]
     fn a_thread_that_cannot_hand_off_gets_the_floor() {
         let closed = ContextReading::Read {
             input_tokens: Some(400_000),
             can_hand_off: false,
             pays: true,
+            past_ceiling: true,
             implementer: None,
             ladder: None,
         };

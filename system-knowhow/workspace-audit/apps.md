@@ -207,9 +207,9 @@ Per `system-knowhow/js-sdk.md`:
   sets `sizes` or `transparent`. Read the hit with its `kind`. Owns the rule:
   `system-knowhow/building-an-app.md` § Widgets, the Sizes and Transparent
   paragraphs.
-  - **broken**: `sizes` is empty, names a size other than `small`, `medium`
-    or `large`, or names one twice. The widget loads with all three sizes,
-    so the sizes the author meant are ignored.
+  - **broken**: `sizes` is empty, names a size other than `small`, `medium`,
+    `large` or `xl`, or names one twice. The widget loads with small, medium
+    and large, so the sizes the author meant are ignored.
   - **broken**: `sizes` or `transparent` on an app that is not a widget. The
     loader ignores both.
 

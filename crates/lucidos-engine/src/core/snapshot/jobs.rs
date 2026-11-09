@@ -20,6 +20,10 @@ pub enum Action {
 #[serde(rename_all = "kebab-case")]
 pub enum Failure {
     CaptureFailed,
+    /// Free disk fell short of the floor by `needed_bytes`.
+    DiskFloor {
+        needed_bytes: u64,
+    },
     CheckFailed,
     Interrupted,
 }
@@ -111,7 +115,7 @@ pub(super) fn finish(
             return Err("snapshot_job_result_refused".into());
         }
         State::Failed {
-            reason: Failure::CaptureFailed,
+            reason: Failure::CaptureFailed | Failure::DiskFloor { .. },
         } if job.action != Action::Capture => {
             return Err("snapshot_job_result_refused".into());
         }
@@ -203,6 +207,50 @@ mod tests {
         MessageOrigin::Device {
             device_id: "test-device".into(),
         }
+    }
+
+    #[test]
+    fn failure_decodes_stored_unit_strings_and_the_disk_floor_shape() {
+        for (wire, failure) in [
+            ("\"capture-failed\"", Failure::CaptureFailed),
+            ("\"check-failed\"", Failure::CheckFailed),
+            ("\"interrupted\"", Failure::Interrupted),
+            (
+                r#"{"disk-floor":{"needed_bytes":42}}"#,
+                Failure::DiskFloor { needed_bytes: 42 },
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&failure).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<Failure>(wire).unwrap(), failure);
+        }
+    }
+
+    #[test]
+    fn a_disk_floor_result_is_refused_for_a_check_job() {
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path(), "demo-workspace");
+        let check = session
+            .create_job(Handle::generate(), Action::Check, actor())
+            .unwrap();
+        assert!(session
+            .finish_job(
+                check.id,
+                State::Failed {
+                    reason: Failure::DiskFloor { needed_bytes: 1 }
+                }
+            )
+            .is_err());
+        let capture = session
+            .create_job(Handle::generate(), Action::Capture, actor())
+            .unwrap();
+        assert!(session
+            .finish_job(
+                capture.id,
+                State::Failed {
+                    reason: Failure::DiskFloor { needed_bytes: 1 }
+                }
+            )
+            .is_ok());
     }
 
     #[test]

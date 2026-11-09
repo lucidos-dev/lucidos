@@ -118,10 +118,11 @@ export function Dashboard({ dashboard, hidden = false }: {
     : SKELETON_SIZES;
   // On the dashboard, since its head lines up with the grid too. The cell
   // edge and gap come from `useWidgetCell`, which a thread pane shares.
+  const steps = columns * DASHBOARD_STEPS_PER_CELL;
   const geometry = {
     '--dashboard-columns': String(columns),
     '--dashboard-steps-per-cell': String(DASHBOARD_STEPS_PER_CELL),
-    '--dashboard-steps': String(columns * DASHBOARD_STEPS_PER_CELL),
+    '--dashboard-steps': String(steps),
   };
   const empty = view.status === 'loaded' && all.length === 0;
   const resize = (key: string, size: WidgetSize) => commit(withTile(all, key, { size }));
@@ -142,7 +143,7 @@ export function Dashboard({ dashboard, hidden = false }: {
         skeleton={(
           <SkeletonProvider>
             <div class="dashboard-grid">
-              {skeletonSizes.map((size, i) => <TileSkeleton key={i} size={size} />)}
+              {skeletonSizes.map((size, i) => <TileSkeleton key={i} size={size} steps={steps} />)}
             </div>
           </SkeletonProvider>
         )}
@@ -163,6 +164,7 @@ export function Dashboard({ dashboard, hidden = false }: {
                   key={key}
                   tile={tile}
                   order={place(key)}
+                  steps={steps}
                   dashboardHidden={hidden}
                   onFrameState={report}
                   actions={{ dashboard, onEdit: editing ? undefined : () => setEditing(true) }}

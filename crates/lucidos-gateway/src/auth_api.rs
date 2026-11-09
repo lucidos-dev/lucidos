@@ -45,6 +45,7 @@ pub fn router() -> Router<GatewayState> {
         .route("/pairing-code", post(pairing_code))
         .route("/devices", get(list_devices))
         .route("/devices/:id", axum::routing::delete(revoke_device))
+        .merge(crate::operators_api::routes())
         // These mint, list and revoke credentials, so an app document must not
         // reach them with the user's cookie. Covers only the routes above it.
         .route_layer(middleware::from_fn(crate::control::control_authz))
@@ -369,10 +370,7 @@ pub async fn enforce(State(state): State<GatewayState>, mut req: Request, next: 
     if is_top_level_navigation(req.headers()) {
         // Show the pairing screen here, rather than a bare 401 with no
         // affordance. In place rather than redirected: see `serve_pairing_shell`.
-        // Hand the screen the code the caller arrived with: a `pair` query does
-        // reach a gated path, and `serve_pairing_shell` says how.
-        let pair_code = pairing_qr::pairing_token_in_query(req.uri().query());
-        return crate::server::serve_pairing_shell(&state, pair_code);
+        return crate::server::serve_pairing_shell(&state);
     }
     if is_nested_frame(req.headers()) {
         // A frame renders what it is given, so JSON would paint the reader a
@@ -495,13 +493,16 @@ async fn session(State(state): State<GatewayState>, headers: HeaderMap) -> Json<
 /// `label` names the device that redeems the code, so `lucidos pair --label`
 /// does more than print a name in the terminal. `origin` asks for a QR, and is
 /// the address the new device should open. Only the caller knows which of this
-/// machine's addresses another device can reach.
+/// machine's addresses another device can reach. `operator` names the person
+/// the device joins; without it the device joins the first operator.
 #[derive(Deserialize, Default)]
 struct PairingCodeQuery {
     #[serde(default)]
     label: Option<String>,
     #[serde(default)]
     origin: Option<String>,
+    #[serde(default)]
+    operator: Option<String>,
 }
 
 /// The minted pairing, plus the QR when the caller asked for one.
@@ -549,7 +550,20 @@ async fn pairing_code(
         })?),
         None => None,
     };
-    let minted = state.mint_pairing(label).map_err(ApiError::internal)?;
+    let operator_id = query
+        .operator
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if let Some(id) = &operator_id {
+        if state.directory().operator(id).is_none() {
+            return Err(ApiError::bad_request("no person with that id"));
+        }
+    }
+    let minted = state
+        .mint_pairing(crate::pairing::PairingIntent { label, operator_id })
+        .map_err(ApiError::internal)?;
     let code = minted
         .code
         .ok_or_else(|| ApiError::internal("a device pairing minted no short code"))?;
@@ -639,6 +653,9 @@ async fn pair(
 struct DeviceRow {
     id: String,
     label: String,
+    /// The person holding this device.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operator_id: Option<String>,
     paired_at: String,
     /// Omitted for a device paired before the field existed, so the list can
     /// say nothing rather than guess. It fills in on that device's next
@@ -648,12 +665,15 @@ struct DeviceRow {
 }
 
 async fn list_devices(State(state): State<GatewayState>) -> Result<Json<Vec<DeviceRow>>, ApiError> {
-    let devices = state.paired_devices();
+    let directory = state.directory();
     Ok(Json(
-        devices
+        directory
             .devices
-            .into_iter()
+            .devices
+            .iter()
+            .cloned()
             .map(|d| DeviceRow {
+                operator_id: directory.operator_of_device(&d.id).map(str::to_string),
                 id: d.id,
                 label: d.label,
                 paired_at: d.paired_at,
@@ -958,6 +978,11 @@ mod tests {
     /// rather than "no frontend configured".
     fn state_with_frontend(dir: &std::path::Path) -> GatewayState {
         std::fs::write(
+            dir.join("manifest.json"),
+            r#"{"name":"Lucidos","start_url":"."}"#,
+        )
+        .unwrap();
+        std::fs::write(
             dir.join("index.html"),
             "<html><head></head><body></body></html>",
         )
@@ -1030,12 +1055,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unpaired_navigation_carries_its_code_into_the_manifest_link() {
-        // A scan lands on the public `/~/?pair=`, but the picker's cold-start
-        // fast path redirects a remembered workspace and takes the query along.
-        // The code has to survive that, or the install it feeds pairs nothing.
+    async fn missing_or_invalid_optional_manifest_does_not_block_pairing() {
+        for source in [None, Some("not json"), Some("[]")] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = state_with_frontend(dir.path());
+            let path = dir.path().join("manifest.json");
+            match source {
+                Some(source) => std::fs::write(path, source).unwrap(),
+                None => std::fs::remove_file(path).unwrap(),
+            }
+            let response = get(&state, "/dev/", &[("sec-fetch-mode", "navigate")]).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(body_text(response)
+                .await
+                .contains("id=\"lucidos-pairing-manifest\""));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unpaired_navigation_keeps_credentials_out_of_manifest_requests() {
+        // Legacy incoming queries must never be echoed into a manifest request.
         let body = pairing_shell_for("?pair=01234567").await;
-        assert!(body.contains("manifest.json?pair=01234567"), "{body}");
+        assert!(!body.contains("manifest.json?pair=01234567"), "{body}");
+        assert!(body.contains("id=\"lucidos-pairing-manifest\""));
     }
 
     #[tokio::test]
@@ -1045,9 +1087,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nothing_but_a_minted_shape_reaches_the_stamped_link() {
-        // The query is caller-supplied and lands in an HTML attribute. One
-        // grammar governs it, and it is `valid_pairing_code`.
+    async fn invalid_query_input_is_not_echoed_into_the_shell() {
+        // Caller-supplied queries stay out of the returned HTML template.
         for query in [
             "?pair=abc",
             "?pair=0123456",
@@ -1065,14 +1106,12 @@ mod tests {
         let state = state_with_frontend(dir);
         let credential = "cred-abc";
         state
-            .write_paired_devices_for_test(|paired| {
-                paired.devices.push(auth::PairedDevice {
-                    id: "device-1".into(),
-                    label: "My iPhone".into(),
-                    credential_digest: auth::digest(credential),
-                    paired_at: "2020-01-01T00:00:00Z".into(),
-                    last_seen_at: last_seen_at.map(str::to_string),
-                });
+            .seed_device_for_test(auth::PairedDevice {
+                id: "device-1".into(),
+                label: "My iPhone".into(),
+                credential_digest: auth::digest(credential),
+                paired_at: "2020-01-01T00:00:00Z".into(),
+                last_seen_at: last_seen_at.map(str::to_string),
             })
             .unwrap();
         state
@@ -1808,6 +1847,9 @@ mod tests {
             ("POST", "/~/api/v1/auth/pairing-code"),
             ("GET", "/~/api/v1/auth/devices"),
             ("DELETE", "/~/api/v1/auth/devices/no-such-device"),
+            ("GET", "/~/api/v1/auth/operators"),
+            ("POST", "/~/api/v1/auth/operators"),
+            ("PUT", "/~/api/v1/auth/devices/no-such-device/operator"),
         ] {
             assert_eq!(
                 auth_plane_call(method, path, FROM_AN_APP_DOCUMENT).await,

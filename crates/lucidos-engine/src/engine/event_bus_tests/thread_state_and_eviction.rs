@@ -24,6 +24,7 @@ async fn trigger_started_creates_active_thread_not_composing() {
             go_to_review: false,
             model: None,
             reasoning_effort: None,
+            continue_key: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),
@@ -87,6 +88,7 @@ async fn trigger_started_does_not_resurrect_discarded_thread() {
             go_to_review: false,
             model: None,
             reasoning_effort: None,
+            continue_key: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),

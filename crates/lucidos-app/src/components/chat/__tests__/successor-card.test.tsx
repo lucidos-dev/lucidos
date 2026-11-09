@@ -13,6 +13,7 @@ vi.mock('../../../api/client', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../api/client')>()),
   fetchThreadContext: vi.fn(),
   declineSuccessorOffer: vi.fn(() => Promise.resolve()),
+  withdrawCeilingHandoff: vi.fn(() => Promise.resolve()),
 }));
 vi.mock('../../../store/actions/compose', () => ({
   startFreshDraft: vi.fn(),
@@ -22,7 +23,7 @@ vi.mock('../../../store/actions/successor', () => ({
 }));
 
 import { SuccessorCard, successorFinding } from '../SuccessorCard';
-import { fetchThreadContext, declineSuccessorOffer, type ThreadContext } from '../../../api/client';
+import { fetchThreadContext, declineSuccessorOffer, withdrawCeilingHandoff, type ThreadContext } from '../../../api/client';
 import { startFreshDraft } from '../../../store/actions/compose';
 import { continueInSuccessor } from '../../../store/actions/successor';
 import {
@@ -147,6 +148,8 @@ describe('SuccessorCard', () => {
 
   const type = (threadId: string, text: string) => patchDraft(threadId, { text });
 
+  const onSend = vi.fn();
+
   async function mount(meta: MetaOverrides = {}, { typed = true } = {}): Promise<HTMLElement> {
     threadMap.value = new Map([['t1', idleThread(meta)]]);
     focusedThreadId.value = 't1';
@@ -154,7 +157,7 @@ describe('SuccessorCard', () => {
     const host = document.createElement('div');
     document.body.appendChild(host);
     hosts.push(host);
-    await act(async () => { render(<SuccessorCard />, host); });
+    await act(async () => { render(<SuccessorCard onSend={onSend} />, host); });
     await act(async () => { await Promise.resolve(); });
     return host;
   }
@@ -302,6 +305,92 @@ describe('SuccessorCard', () => {
     expect(fetchThreadContext).toHaveBeenCalledTimes(1);
     await grow({ usage, purpose: 'turn' });
     expect(fetchThreadContext).toHaveBeenCalledTimes(2);
+  });
+
+  describe('past the context ceiling', () => {
+    const ceiling = (handoff: Partial<NonNullable<ThreadContext['ceiling_handoff']>> = {}): ThreadContext => ({
+      ...reading(null),
+      input_tokens: 352_000,
+      ceiling_handoff: {
+        opening: 'narrative',
+        crossing: { context_tokens: 352_000, ceiling: 300_000, window: 1_000_000 },
+        raises_to: 452_000,
+        ...handoff,
+      },
+    });
+    const labels = (host: HTMLElement) =>
+      Array.from(host.querySelectorAll('.successor-card .question-option-label')).map((e) => e.textContent);
+
+    beforeEach(() => {
+      vi.mocked(fetchThreadContext).mockResolvedValue(ceiling());
+    });
+
+    it('says where the last session handed off, and offers the three ceiling choices', async () => {
+      const host = await mount();
+      expect(host.querySelector('.successor-card')?.getAttribute('data-offer')).toBe('ceiling');
+      expect(host.querySelector('.question-text')?.textContent).toBe(
+        "The last session handed off at this thread's 300k context ceiling, holding 352k tokens. "
+        + "Your message goes to the fresh session, which starts from that session's handoff narrative.",
+      );
+      expect(labels(host)).toEqual(['Send to the fresh session', 'Start fresh', 'Return to the old session']);
+      expect(option(host, 'Return to the old session').textContent).toContain("raises this thread's ceiling to 452k");
+      expect(successorCardThreadId.value).toBeNull();
+    });
+
+    it('says the fresh session starts from a brief when the session wrote none', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue(ceiling({ opening: 'brief' }));
+      const host = await mount();
+      expect(host.querySelector('.question-text')?.textContent).toContain('which starts from a brief of that session.');
+    });
+
+    it('waits for the user to write', async () => {
+      const host = await mount({}, { typed: false });
+      expect(host.querySelector('.successor-card')).toBeNull();
+    });
+
+    it('sends the draft as Send does', async () => {
+      const host = await mount();
+      await act(async () => { option(host, 'Send to the fresh session').click(); });
+      expect(onSend).toHaveBeenCalledTimes(1);
+      expect(withdrawCeilingHandoff).not.toHaveBeenCalled();
+    });
+
+    it('starts fresh through the draft action', async () => {
+      const host = await mount();
+      await act(async () => { option(host, 'Start fresh').click(); });
+      expect(startFreshDraft).toHaveBeenCalledWith(threadMap.value.get('t1')!.meta);
+    });
+
+    it('returns to the old session through the engine', async () => {
+      const host = await mount();
+      await act(async () => { option(host, 'Return to the old session').click(); });
+      expect(withdrawCeilingHandoff).toHaveBeenCalledWith('t1');
+      expect(onSend).not.toHaveBeenCalled();
+    });
+
+    it('tells the user when the return is refused', async () => {
+      vi.mocked(withdrawCeilingHandoff).mockRejectedValueOnce(new Error('no ceiling handoff'));
+      const host = await mount();
+      await act(async () => { option(host, 'Return to the old session').click(); });
+      expect(toasts.value.map((t) => t.message).join(' ')).toContain('Could not return to the old session');
+    });
+
+    it('offers no return when no ceiling can rise past the session', async () => {
+      vi.mocked(fetchThreadContext).mockResolvedValue(ceiling({ raises_to: null }));
+      const host = await mount();
+      expect(labels(host)).toEqual(['Send to the fresh session', 'Start fresh']);
+    });
+
+    it('re-reads when a handoff is recorded or withdrawn', async () => {
+      await mount();
+      for (const type of ['SessionHandedOff', 'SessionHandoffWithdrawn']) {
+        const thread = threadMap.value.get('t1')!;
+        const next = idleThread({}, [...thread.events.values(), { type } as StoredEvent]);
+        await act(async () => { threadMap.value = new Map([['t1', next]]); });
+        await act(async () => { await Promise.resolve(); });
+      }
+      expect(fetchThreadContext).toHaveBeenCalledTimes(3);
+    });
   });
 
   it('draws nothing when the context read fails', async () => {

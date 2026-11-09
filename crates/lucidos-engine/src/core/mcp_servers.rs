@@ -626,6 +626,7 @@ impl McpServerStore {
                     BusEvent::System(SystemEvent::McpServerDisabledToolsChanged {
                         server_id: id.to_string(),
                         disabled_tools: wanted.clone(),
+                        previous: Some(current),
                         actor,
                     }),
                     "[MCP] McpServerDisabledToolsChanged",
@@ -677,6 +678,7 @@ impl McpServerStore {
         .bind(id)
         .fetch_optional(pool)
         .await?;
+        let created = prior.is_none();
         let mut dropped = prior.map(pointers_of).transpose()?.unwrap_or_default();
         let server = Self::upsert_row(pool, id, name, command, args, env).await?;
         event_bus
@@ -684,6 +686,7 @@ impl McpServerStore {
                 BusEvent::System(SystemEvent::McpServerRegistered {
                     server_id: server.id.clone(),
                     name: server.name.clone(),
+                    created,
                     actor: actor.clone(),
                 }),
                 "[MCP] McpServerRegistered",

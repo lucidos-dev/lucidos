@@ -21,7 +21,9 @@ impl LucidosEngine {
         // is best-effort — failures (e.g. zero-commit branch, missing
         // worktree on disk) leave the field as `None`.
         let worktree_head_sha = match snapshot.worktree_path {
-            Some(p) if !snapshot.keep_alive => external_edits::git_head_sha(p).await,
+            Some(p) if snapshot.turn != IdleTurn::KeepAlive => {
+                external_edits::git_head_sha(p).await
+            }
             _ => None,
         };
         // Clear any permission card still dangling at this turn boundary. A live
@@ -52,9 +54,7 @@ impl LucidosEngine {
                         requires_restart: snapshot.requires_restart,
                         cc_session_id,
                         coding_agent,
-                        reason: snapshot.keep_alive.then(|| {
-                            crate::engine::thread_events::KEEP_ALIVE_IDLE_REASON.to_string()
-                        }),
+                        reason: snapshot.turn.reason().map(str::to_string),
                         worktree_path: snapshot
                             .worktree_path
                             .map(|p| p.to_string_lossy().into_owned()),
@@ -77,8 +77,38 @@ pub(super) struct CodingAgentIdleSnapshot<'a> {
     pub(super) requires_restart: bool,
     pub(super) bg_bash_pending: bool,
     pub(super) worktree_path: Option<&'a std::path::Path>,
-    /// The turn was a *cache keep-alive*. Its idle carries the keep-alive
-    /// reason and no HEAD, so the next real turn still diffs against the last
-    /// real idle.
-    pub(super) keep_alive: bool,
+    pub(super) turn: IdleTurn,
+}
+
+/// Whose turn an idle ends. An engine turn's idle carries a `reason`, so no
+/// trigger or event wait reads it as the agent finishing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum IdleTurn {
+    Agent,
+    /// A *cache keep-alive*. Its idle also carries no HEAD, so the next real
+    /// turn still diffs against the last real idle.
+    KeepAlive,
+    /// A *ceiling re-entry* (ADR 0629).
+    CeilingReentry,
+}
+
+impl IdleTurn {
+    pub(super) fn of(keep_alive: bool, ceiling_reentry: bool) -> Self {
+        if keep_alive {
+            Self::KeepAlive
+        } else if ceiling_reentry {
+            Self::CeilingReentry
+        } else {
+            Self::Agent
+        }
+    }
+
+    fn reason(self) -> Option<&'static str> {
+        use crate::engine::thread_events::{CEILING_REENTRY_IDLE_REASON, KEEP_ALIVE_IDLE_REASON};
+        match self {
+            Self::Agent => None,
+            Self::KeepAlive => Some(KEEP_ALIVE_IDLE_REASON),
+            Self::CeilingReentry => Some(CEILING_REENTRY_IDLE_REASON),
+        }
+    }
 }

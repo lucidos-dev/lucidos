@@ -57,6 +57,11 @@ export interface AudioDevice {
   note: string | null;
   play(pcm: ArrayBuffer): void;
   stopPlayback(): void;
+  /** True while any chunk of the talker is still due to sound.
+   *
+   *  The talker's turn ends when its words are generated, which can be seconds
+   *  before they finish playing. Its echo lasts as long as the playing does. */
+  isPlaying(): boolean;
   /** What the caller did NOT hear of the talker, measured as it happened.
    *
    *  Read once, as the call comes down. Nothing acts on it: the caller heard
@@ -314,6 +319,7 @@ async function openAudio(
       node.start(placed.startAt);
     },
     stopPlayback,
+    isPlaying: () => queued.size > 0,
     playbackGaps: () => ({ count: playback.gaps, seconds: playback.silentSeconds }),
     async close(): Promise<void> {
       stopPlayback();

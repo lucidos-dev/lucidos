@@ -317,6 +317,9 @@ source "$SCRIPT_DIR/lib/release_build_fingerprint.sh"
 # public-mirror-safe — source it unconditionally like release_staging.sh.
 # shellcheck source=scripts/lib/stage_runtime.sh
 source "$SCRIPT_DIR/lib/stage_runtime.sh"
+# The pin on the bundled Postgres major, shared with build-headless.sh.
+# shellcheck source=scripts/lib/release_pg_major.sh
+source "$SCRIPT_DIR/lib/release_pg_major.sh"
 
 # Asset-attach ordering: upload the artifacts, prove they are on the Release,
 # and only then upload the latest.json that points at them. One `gh release
@@ -2432,6 +2435,8 @@ while [ $# -gt 0 ]; do
         *)                 die "unknown argument: $1" ;;
     esac
 done
+
+release_pg_major_guard "$PG_VERSION" || exit 1
 
 if [ "$DO_CHECK" = "1" ]; then
     check_resource_contract

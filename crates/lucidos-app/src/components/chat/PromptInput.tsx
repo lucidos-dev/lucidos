@@ -1572,7 +1572,7 @@ export function PromptInput() {
         </div>
       </Disclosure>
       <NotReadyStrip key="not-ready" />
-      <SuccessorCard key="successor" />
+      <SuccessorCard key="successor" onSend={() => void submit()} />
       <HandedOffCard key="handed-off" />
       <div key="prompt-box" class="prompt-box">
         <div class="prompt-row">

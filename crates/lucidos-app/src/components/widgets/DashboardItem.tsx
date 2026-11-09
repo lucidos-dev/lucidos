@@ -92,22 +92,3 @@ export function DashboardItem({ tile, noun, run }: { tile: WidgetInstance; noun:
     />
   );
 }
-
-/** "+ Dashboard" on a card's bar: Add to dashboard in one tap. It shows only
- *  once the dashboard is read and does not hold the widget yet. The ⋯ menu
- *  still offers both actions. */
-export function AddToDashboardButton({ tile }: { tile: WidgetInstance }) {
-  const { dashboard, view, held } = useDashboardHolding(tile);
-  if (view.status !== 'loaded' || held) return null;
-  return (
-    <button
-      type="button"
-      class="action-btn action-btn-secondary widget-bar-add"
-      aria-label={`Add ${tile.name} to the ${dashboard} dashboard`}
-      data-tooltip={`A tile on the ${dashboard} dashboard`}
-      onClick={() => void addToDashboard(dashboard, tileRef(tile), tile.name, 'widget')}
-    >
-      + Dashboard
-    </button>
-  );
-}

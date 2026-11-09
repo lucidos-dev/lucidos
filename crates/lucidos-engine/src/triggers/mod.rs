@@ -1,5 +1,7 @@
+pub mod actor;
 pub mod affected;
 pub mod config;
+pub mod continue_key;
 pub mod definition;
 pub mod groups;
 pub mod registry;
@@ -12,12 +14,14 @@ pub mod summary;
 /// *event wait* subscribes with the same shape and the same matcher; the
 /// re-export keeps trigger code reading in trigger terms.
 pub use crate::core::event_subscription::EventSubscription;
+pub use actor::{ActorField, ACTOR_FIELD_KEY};
 pub use config::{
     is_valid_reasoning_effort, is_valid_trigger_slug, mint_unique_trigger_slug,
     normalize_mcp_servers, normalize_route_setting, resolve_trigger_provider_update,
     slugify_trigger_name_with_fallback, validate_script_extension, validate_trigger_provider,
     validate_trigger_reasoning_effort, TriggerConfig, TriggerRun, TriggerRunStatus,
 };
+pub use continue_key::ContinueKeySpec;
 pub use groups::{
     find_group_by_name_ci, replay_trigger_group_events, TriggerGroup, TriggerGroupEventRow,
 };
@@ -104,10 +108,14 @@ mod tests {
             go_to_review: false,
             group_id: None,
             side_effect_grant: vec![],
+            permission_wait: None,
+            context_ceiling: None,
             mcp_servers: vec![],
             plugin_id: None,
             model: None,
             reasoning_effort: None,
+            continue_key: None,
+            actor: None,
         }
     }
 
@@ -317,10 +325,14 @@ mod tests {
             go_to_review: false,
             group_id: None,
             side_effect_grant: vec![],
+            permission_wait: None,
+            context_ceiling: None,
             mcp_servers: vec![],
             plugin_id: None,
             model: None,
             reasoning_effort: None,
+            continue_key: None,
+            actor: None,
         };
         configs.insert("cron-only".into(), cron_trigger);
 

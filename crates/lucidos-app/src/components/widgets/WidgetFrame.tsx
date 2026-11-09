@@ -127,12 +127,16 @@ function watchInViewport(el: HTMLElement, onChange: (inView: boolean) => void): 
  *
  *  `onMenu` opens the widget's menu. Given one, the frame is marked `menu`, so
  *  an unclaimed right-click inside it lands there, at its point in the
- *  viewport. A frame with no menu leaves its right-click alone. */
-export function WidgetFrame({ appId, params, reveal, place, size, visible = true, onHeight, onSize, onFrameState, onMenu }: WidgetFramePlacement & {
+ *  viewport. A frame with no menu leaves its right-click alone.
+ *
+ *  `pans` says the box around the frame scrolls sideways, so the frame leaves
+ *  a sideways drag to it rather than swiping the panes. */
+export function WidgetFrame({ appId, params, reveal, place, size, visible = true, pans = false, onHeight, onSize, onFrameState, onMenu }: WidgetFramePlacement & {
   appId: string;
   params?: WidgetParams;
   reveal: AppReveal;
   visible?: boolean;
+  pans?: boolean;
   onHeight?: (px: number) => void;
   onSize?: (size: ContentSize, fromReport: boolean) => void;
   onFrameState?: (state: FrameState) => void;
@@ -244,11 +248,12 @@ export function WidgetFrame({ appId, params, reveal, place, size, visible = true
     const push: WidgetPush = { place, visible };
     if (size) push.size = size;
     if (hasMenu) push.menu = true;
+    if (pans) push.pans = true;
     return postToAppFrame(el, WIDGET_CHANNEL, push);
   };
   useEffect(() => {
     if (frame.current) mark(frame.current);
-  }, [place, size, visible, hasMenu]);
+  }, [place, size, visible, hasMenu, pans]);
 
   // Evicted by the shared cap: drawn again when it next comes on screen.
   useEffect(() => {

@@ -399,7 +399,13 @@ fn workspace_shape(engine: &LucidosEngine, thread_id: uuid::Uuid) -> SectionFutu
 
         // All three reads together, for the reason `this_thread` gives.
         let (unread, running, waiting) = tokio::join!(
-            NotificationStore::get_filtered(engine.pool(), "unread", SHAPE_ITEMS as i64, None),
+            NotificationStore::get_filtered(
+                engine.pool(),
+                &crate::gateway_operators::Reader::Team,
+                "unread",
+                SHAPE_ITEMS as i64,
+                None
+            ),
             running_thread_names(engine.event_store(), thread_id),
             engine
                 .event_store()

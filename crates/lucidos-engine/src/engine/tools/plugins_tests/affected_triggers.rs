@@ -149,7 +149,7 @@ fn notifications(bus: &MockEventBus) -> Vec<(String, String, Tap)> {
 fn tap_target(tap: &Tap) -> (NavigateTarget, Option<String>) {
     match tap {
         Tap::Navigate { to } => (to.target, to.id.clone()),
-        Tap::Modal | Tap::RestoreSnapshot { .. } => {
+        Tap::Modal | Tap::RestoreSnapshot { .. } | Tap::UndoConfigChange { .. } => {
             panic!("the notification must open a trigger surface")
         }
     }

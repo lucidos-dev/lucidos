@@ -1,4 +1,4 @@
-use super::idle_snapshot::CodingAgentIdleSnapshot;
+use super::idle_snapshot::{CodingAgentIdleSnapshot, IdleTurn};
 use crate::engine::agent_session::io_helpers::{drain_lost_followups, lost_followups_to_orphans};
 use crate::engine::agent_session::lifecycle::{
     auto_resume_after_api_error, classify_session_end_action, conflict_abort_deletes_temp_state,
@@ -1174,9 +1174,14 @@ impl LucidosEngine {
                                             requires_restart,
                                             bg_bash_pending: false,
                                             worktree_path: worktree_path.as_deref(),
-                                            keep_alive: self
-                                                .event_bus
-                                                .in_keep_alive_turn(thread_id),
+                                            turn: IdleTurn::of(
+                                                self.event_bus.in_keep_alive_turn(thread_id),
+                                                self.agent_sessions
+                                                    .lock()
+                                                    .await
+                                                    .get(&thread_id)
+                                                    .is_some_and(|s| s.in_ceiling_reentry),
+                                            ),
                                         },
                                         meta,
                                         coding_agent,

@@ -187,6 +187,7 @@ mod tests {
         let expected = SessionContinuity::Handoff {
             checkpoint: Some("pre-harden".into()),
             progress: None,
+            crossing: None,
             opening: crate::engine::thread_events::HandoffOpening::Brief,
             message: "m".into(),
         };

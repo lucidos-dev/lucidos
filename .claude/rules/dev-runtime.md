@@ -87,6 +87,8 @@ paths:
   - "scripts/lib/engine_build_only_test.sh"
   - "scripts/lib/engine_build_spares_other_builds_test.sh"
   - "scripts/lib/stale_objects*.sh"
+  - "scripts/lib/stale_incremental*.sh"
+  - "scripts/lib/cargo_build_lock.sh"
   - "scripts/lib/preflight_gate_test.sh"
   - "scripts/lib/proc_env*.sh"
   - "scripts/lib/sleep.sh"
@@ -115,9 +117,9 @@ Add new scripts to `paths:` here or in `build-release.md`, so their rule loads.
 
 - `assert_stack_not_worktree_pinned` (`scripts/lib/workspace.sh`) refuses with the corrective command. The gateway refuses a worktree-rooted `LUCIDOS_ENGINE_BIN`, self-reload and spawn-env passthrough.
 - `LUCIDOS_ALLOW_WORKTREE_STACK=1` (set by `scripts/lib/e2e.sh`) covers only a session-scoped direct engine. The gateway ignores it: that daemon is machine-global, and `-b` relaunches it from the invoking checkout.
-- **`./scripts/web-dev.sh -w e2e-test -b` from a worktree is refused.** Don't reach for `LUCIDOS_NO_GATEWAY=1`. The pre-start is redundant: **just run `./scripts/e2e.sh`** (or `e2e-api.sh` / `e2e-browser.sh`). `ensure_workspace_running` in `scripts/lib/e2e.sh` provisions everything.
+- **`./scripts/web-dev.sh -w e2e-test -b` from a worktree is refused.** Don't reach for `LUCIDOS_NO_GATEWAY=1`. The pre-start is redundant: **just run `./scripts/e2e.sh`**. `ensure_workspace_running` in `scripts/lib/e2e.sh` provisions everything.
 
-Daily scripts: `web-dev.sh -w <ws> [-b] [-r]` (dev start), `run.sh -w <ws>` (user start), `tauri-dev.sh`, `stop.sh -w <ws>`, `status.sh`, `new-migration.sh`, `test-engine.sh [--full|--fresh]`, `test-scripts.sh`, `lint-shell.sh`, `with-build-slot.sh -- <cmd>` (ADR 0070), `preflight-reclaim-engines.sh`, `memory-watch.sh --once` (ADR 0264). `main-check.sh <sha>` is the engine's (ADR 0464): never run it by hand. See gate and hardening script headers for usage.
+Daily scripts: `web-dev.sh -w <ws> [-b] [-r]` (dev start), `run.sh -w <ws>` (user start), `tauri-dev.sh`, `stop.sh -w <ws>`, `status.sh`, `new-migration.sh`, `test-engine.sh [--full|--fresh]`, `test-scripts.sh`, `lint-shell.sh`, `with-build-slot.sh -- <cmd>` (ADR 0070), `preflight-reclaim-engines.sh`, `memory-watch.sh --once` (ADR 0264). `main-check.sh <sha>` is the engine's (ADR 0464): never run it by hand.
 
 ### The two evals spend money and run by hand only
 

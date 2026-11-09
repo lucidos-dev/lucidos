@@ -13,6 +13,7 @@ import { toFailed, setLoadingIfFresh } from '../types';
 import type {
   EventSubscription,
   Loadable,
+  PermissionWait,
   SideEffectCategory,
   TriggerInfo,
   TriggerRun,
@@ -184,6 +185,9 @@ interface SubmitTriggerParams {
    *  authorized to perform unattended. Always sent as a complete list (the
    *  engine replaces wholesale); `[]` clears all grants. */
   sideEffectGrant: SideEffectCategory[];
+  /** The *permission wait* for unattended fires; `null` = the workspace
+   *  preference. Same send semantics as `model`. */
+  permissionWait: PermissionWait | null;
   /** The *trigger model* this trigger's intent fires on; `null` = the account
    *  default (Settings → Models → Chat & triggers). Sent on every update so
    *  switching back to Default clears the stored pin. */
@@ -212,7 +216,7 @@ function surfaceWriteWarnings(result: ApiResult): void {
 export async function submitTrigger(params: SubmitTriggerParams): Promise<boolean> {
   const {
     name, run, cronExpressions, triggerId, on, showEvent, goToReview, groupId, sideEffectGrant,
-    model, reasoningEffort, provider,
+    permissionWait, model, reasoningEffort, provider,
   } = params;
   if (!name.trim()) {
     showToast('Trigger name is required', 'error');
@@ -225,13 +229,14 @@ export async function submitTrigger(params: SubmitTriggerParams): Promise<boolea
     return false;
   }
 
-  // Four fields apply only to the intent (LLM) path: a script trigger runs no
+  // These fields apply only to the intent (LLM) path: a script trigger runs no
   // LLM and reads none of them. Gate here, once, so a caller can never persist
   // state left over from an intent → script switch, and so the rule lives in
-  // one place instead of four ternaries in the form.
+  // one place instead of a ternary per field in the form.
   const isIntent = run.type === 'intent';
   const llmGoToReview = isIntent && goToReview;
   const llmGrant = isIntent ? sideEffectGrant : [];
+  const llmWait = isIntent ? permissionWait : null;
   const llmModel = isIntent ? model : null;
   const llmEffort = isIntent ? reasoningEffort : null;
   // A backend pin is meaningless without a model pin, and the engine refuses one.
@@ -250,6 +255,7 @@ export async function submitTrigger(params: SubmitTriggerParams): Promise<boolea
         // Full replacement every save (the form always reflects the complete
         // grant); `[]` clears all grants.
         side_effect_grant: llmGrant,
+        permission_wait: llmWait,
         // Always sent, never omitted: `null` is how "back to Default" reaches
         // the engine, and omitting the field would leave a stale pin in place.
         model: llmModel,
@@ -278,6 +284,7 @@ export async function submitTrigger(params: SubmitTriggerParams): Promise<boolea
         // Only send a grant when non-empty (keeps the create payload clean for
         // the common no-grant trigger).
         side_effect_grant: llmGrant.length > 0 ? llmGrant : undefined,
+        permission_wait: llmWait ?? undefined,
         // Omitted on create when Default: there is no stored pin to clear yet,
         // so a new trigger on the account defaults keeps a clean payload.
         model: llmModel ?? undefined,

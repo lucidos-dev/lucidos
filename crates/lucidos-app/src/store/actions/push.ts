@@ -157,6 +157,27 @@ export async function refreshPushSubscription(registration: ServiceWorkerRegistr
 }
 
 /**
+ * Unregister this scope's service worker, if any. Unregistering removes it from
+ * the scope map at once, so the next load is uncontrolled. The caller registers
+ * again (startup does on every load).
+ */
+export async function unregisterServiceWorker(): Promise<void> {
+  const existing = await navigator.serviceWorker.getRegistration();
+  if (!existing) return;
+  // Notifications shown by this registration are orphaned once it is gone.
+  // Chrome keeps them visible but routes their clicks to the dead
+  // registration, so a click does nothing. Dismiss them now: the unread
+  // state lives in the backend, and the in-app inbox still shows each one.
+  try {
+    const stale = await existing.getNotifications();
+    for (const n of stale) n.close();
+  } catch {
+    /* best-effort orphan cleanup — don't block the recovery on it */
+  }
+  await existing.unregister();
+}
+
+/**
  * Force a fresh service worker by unregistering the existing one and
  * registering again. Used to recover from a "wedged" SW state where Chrome
  * can no longer deliver events to it — the symptom users see is notification
@@ -173,23 +194,7 @@ export async function recoverServiceWorker(): Promise<void> {
   // A dev-server bundle registered none, so there is nothing wedged to recover
   // and registering one here would be the very thing the gate exists to prevent.
   if (isDevServerBundle()) return;
-  const existing = await navigator.serviceWorker.getRegistration();
-  if (existing) {
-    // Notifications shown by this registration would be orphaned once we
-    // unregister: Chrome keeps them visible but routes their click events
-    // to a registration that no longer exists, so the click does nothing
-    // (manifests as a "stuck" notification you can't click, only manually
-    // dismiss in the Chrome notification UI). Dismiss them on-screen now;
-    // the unread state is durable in the backend and the user still sees
-    // every notification in the in-app inbox.
-    try {
-      const stale = await existing.getNotifications();
-      for (const n of stale) n.close();
-    } catch {
-      /* best-effort orphan cleanup — don't block the recovery on it */
-    }
-    await existing.unregister();
-  }
+  await unregisterServiceWorker();
   await navigator.serviceWorker.register(withBase('/sw.js'), { scope: SCOPE_PATH, updateViaCache: 'none' });
   // pushManager.subscribe requires an active worker; calling pre-activation
   // rejects with InvalidStateError. `ready` resolves to the registration that

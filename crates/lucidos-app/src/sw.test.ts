@@ -179,6 +179,16 @@ describe('Service Worker fetch handler', () => {
     expect(event.respondWith).not.toHaveBeenCalled();
   });
 
+  // The page's fetch-path probe is the marked health request. It must reach the
+  // worker's own fetch(), or it cannot tell a wedged worker from a healthy one.
+  it('GET to /api/v1/health?sw-fetch-probe=1: forwards through respondWith', () => {
+    mockFetch.mockResolvedValue(new Response('ok'));
+    const event = makeEvent('https://example.com/api/v1/health?sw-fetch-probe=1');
+    handlers.fetch(event);
+    expect(event.respondWith).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
   // Exempting the probe must not exempt its neighbours: everything else under
   // /api/v1/ keeps the retry, which does earn its keep on an ordinary read
   // inside a 10s budget.

@@ -21,6 +21,7 @@ export * from './client/themes';
 export * from './client/models';
 export * from './client/mcp';
 export * from './client/pluginMarketplaces';
+export * from './client/readerDevices';
 export * from './client/releaseNotices';
 export * from './client/voice';
 export * from './client/webhooks';

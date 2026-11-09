@@ -550,6 +550,50 @@ fn a_constant_time_compare_still_compares() {
     assert!(ct_eq("", ""));
 }
 
+// ── Slack's URL check ────────────────────────────────────────────────────
+
+const SLACK_CHALLENGE: &str = r#"{"token":"t","challenge":"3eZbrw1aB","type":"url_verification"}"#;
+
+#[test]
+fn a_slack_hook_echoes_a_url_check() {
+    let hook = hook_with(None, Some(slack_config()));
+    assert_eq!(
+        slack_url_verification(&hook, SLACK_CHALLENGE).as_deref(),
+        Some("3eZbrw1aB")
+    );
+    let lower = hook_with(
+        None,
+        Some(HmacConfig {
+            signature_header: "x-slack-signature".into(),
+            ..slack_config()
+        }),
+    );
+    assert!(
+        slack_url_verification(&lower, SLACK_CHALLENGE).is_some(),
+        "header names compare case-insensitively"
+    );
+}
+
+#[test]
+fn only_a_url_check_on_a_slack_hook_echoes() {
+    let slack = hook_with(None, Some(slack_config()));
+    for body in [
+        r#"{"type":"event_callback","challenge":"x"}"#,
+        r#"{"type":"url_verification"}"#,
+        r#"{"type":"url_verification","challenge":7}"#,
+        r#"["url_verification"]"#,
+        "type=url_verification&challenge=x",
+    ] {
+        assert_eq!(slack_url_verification(&slack, body), None, "for {body}");
+    }
+    for other in [
+        hook_with(None, Some(github_config())),
+        hook_with(Some("tok"), None),
+    ] {
+        assert_eq!(slack_url_verification(&other, SLACK_CHALLENGE), None);
+    }
+}
+
 // ── The store, against a real database ───────────────────────────────────
 
 #[tokio::test]

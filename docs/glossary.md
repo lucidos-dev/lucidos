@@ -2175,7 +2175,9 @@ The row dimension was added because the turn budget did nothing on the shape tha
 
 **An EDGE, never a count, in both dimensions.** A count slides forward as the live turn grows, so appending a turn would evict the oldest one the reader was shown. Stored per thread in a module Map, so a PARTIAL edge survives a switch-away-and-back: the reader grew it by scrolling, and re-seeding would make them walk back up on every return.
 
-**A render-all does not survive it** (`reseedOnReopen`). A *deep-link anchor* and the scroll-to-top chevron both set the edge to `WHOLE_THREAD`, which is right for the visit that asked. Nothing narrowed it again, so one tap bought every later open of that thread a full render: a reported 13,683-event thread drew 4,069 rows an open against the 37 its window would have drawn. A fresh open now re-seeds, and the *reading position* walks the window back to the turn the reader was on. **Who stored the window decides it, never its value** (`StoredWindowKind`), since a reader who scrolls up to the first turn also holds `WHOLE_THREAD`.
+**A claimed window does not survive it** (`reseedOnReopen`). A *deep-link anchor* claims the turn holding its target, and the scroll-to-top chevron claims `WHOLE_THREAD`. Each is right for the visit that asked. Nothing narrowed a render-all again, so one tap bought every later open of that thread a full render: a reported 13,683-event thread drew 4,069 rows an open against the 37 its window would have drawn. A fresh open now re-seeds, and the *reading position* walks the window back to the turn the reader was on. **Who stored the window decides it, never its value** (`StoredWindowKind`), since a reader who scrolls up to the first turn also holds `WHOLE_THREAD`.
+
+**A deep link draws from its target turn, never the whole thread** (`deepLinkEdge`, ADR 0631). History pages toward the target until its turn is loaded. A link no loaded turn holds draws nothing extra, since every stamp it could land on comes from a turn. A whole render of a long thread got the iOS page killed.
 
 **Growth is scroll-driven and has no control of its own.** Rows first, then turns: scrolling up into the oldest turn uncovers a budget of its head, and only once that turn is whole does the window reach past it. A per-turn "Show earlier steps" expander shipped twice and was removed twice. The second removal happened because the user disliked it from the first message, so a source-scan tripwire fails if one comes back (`components/chat/__tests__/floor-turn-row-clamp.test.ts`).
 
@@ -2185,7 +2187,7 @@ A GESTURE covers the second case a scroll cannot. A container already at `scroll
 
 A turn the *reading position* names must render WHOLE, not merely be present, because the restore measures that turn's own top edge (ADR 0152). A ROW it names needs only that row drawn (`edgeMustReachRow`).
 
-**The stored edge names its turn BY KEY as well as by index** (`storeEdge` / `storedEdge`). A fold of older history grows the list at the front, so a bare index named an older turn for the fold's commit. That render drew every turn the fold brought in, and a restore landed on that page before the re-point shrank it. A render-all is stored with no key, pinned to the first turn. **A reopen reseeds in RENDER**, not in an effect: Preact flushes a component's effects before re-rendering it, so a restore attached against the old window and was moved when it shrank.
+**The stored edge names its turn BY KEY as well as by index** (`storeEdge` / `storedEdge`). A fold of older history grows the list at the front, so a bare index named an older turn for the fold's commit. That render drew every turn the fold brought in, and a restore landed on that page before the re-point shrank it. A render-all is stored with no key, pinned to the first turn. A deep link's claim is stored by key, as `claimed`. **A reopen reseeds in RENDER**, not in an effect: Preact flushes a component's effects before re-rendering it, so a restore attached against the old window and was moved when it shrank.
 
 **A position the loaded pages do not hold is CHASED, within a bound** (ADR 0234, `readingChaseAction`). The walk reads older history in 2000-event pages, at most `MAX_READING_CHASES` of them, until the turn or row is loaded. Past the bound the thread opens at the top of the newest page, since an unbounded chase would spend exactly what paging bought. The record survives, so a client holding the history still lands on it. A position INSIDE the loaded pages is honoured exactly, and that is what the walk is for.
 
@@ -2214,11 +2216,11 @@ The client holds every drawable event of a thread: its first page has loaded, an
 A page holds *drawable history*: `get_thread_events_page` skips auxiliary captures (`AUXILIARY_CAPTURE_SQL`, the SQL twin of `isAuxiliaryCapture`), which the transcript never draws. The unpaged and delta reads keep them. Distinct from the *history hold*, which records where the reader was during a read.
 
 ### History hold
-Where the reader was, recorded while a read of older history is in flight, so the fold can put them back (`historyHoldByThread` in `components/chat/ThreadView.tsx`). A page lands at the FRONT of the transcript. WebKit implements no scroll anchoring, so the container keeps its offset while the content under it slides down. Two readers take one: the scroll-driven backfill, and the whole-history fetch a *deep-link anchor*'s render-all needs.
+Where the reader was, recorded while a read of older history is in flight, so the fold can put them back (`historyHoldByThread` in `components/chat/ThreadView.tsx`). A page lands at the FRONT of the transcript. WebKit implements no scroll anchoring, so the container keeps its offset while the content under it slides down. Two readers take one: the scroll-driven backfill, and the pages a *deep-link anchor* reads toward its target turn.
 
-**It records the reader's TURN as well as the frame**, and `holdTargetTop` prefers the turn. A height delta says only how much taller the transcript got, so the correction has to assume every pixel landed above the reader. A live thread drawing a reply BELOW them breaks that, and it fires no scroll event, so the refresh never sees it. A whole-history fetch runs for seconds, which is long enough for that to be a screenful.
+**It records the reader's TURN as well as the frame**, and `holdTargetTop` prefers the turn. A height delta says only how much taller the transcript got, so the correction has to assume every pixel landed above the reader. A live thread drawing a reply BELOW them breaks that, and it fires no scroll event, so the refresh never sees it. Paging toward an old target runs for seconds, which is long enough for that to be a screenful.
 
-**Distinct from the WINDOW's own re-point** (`anchorKey`, `anchorAfterBackfill`), which a backfill needs and a render-all must not have: the *render window* is already drawing every turn and has to keep them.
+**Distinct from the WINDOW's own re-point** (`anchorKey`, `anchorAfterBackfill`), which a backfill needs and a deep link's pages must not have (`readerOnlyHold`). The *render window* already names the target turn by key, and a re-point would grow it on every page.
 
 **It is advisory.** `requestBackfill` asks the store whether a read is running, rather than reading that off the hold. So a hold nothing consumed cannot refuse pages for the rest of a visit.
 
@@ -2247,7 +2249,13 @@ It draws no initiator panel, because nothing loaded says who started the turn (`
 Transient by construction: the page behind it carries the boundary, and the fold then merges its rows into the real turn. A backfill re-points the window by identity through that merge (`anchorAfterBackfill`). The measurements, and the three fixes weighed against this one, are in ADR 0230.
 
 ### Reading position
-Where a reader had parked in a transcript, remembered across a thread switch, a reload, and the app being backgrounded (`lucidos-scroll-thread-<id>` in localStorage, written and restored by `hooks/useScrollMemory.ts`). Since the transcript stopped scrolling itself to the bottom (see *navigation scroll*, and *standing follow* for the one thing that rides the bottom now, on request and never on open), this is the ONLY thing that decides where a thread opens, and it answers every form of the question: a saved position is restored, and a thread with none opens at the TOP of what is rendered (`resetOnEmpty`, which matters because `.thread-content` is one element reused across threads and would otherwise inherit the previous one's offset). There is a THIRD answer, because the transcript is WINDOWED: an offset recorded against a taller render (a session that scrolled up, a *deep-link anchor*'s render-all) is routinely out of reach of the trailing slice the next open renders, and an offset that cannot be honoured opens the thread at the top as well. Never at the bottom. `Math.min(saved.top, max)` used to say otherwise in both places that gave up (the restore deadline, the dead-link rescue below), and since a clamp can only run when the offset is unreachable, `max` was the whole of it: the live edge, three seconds after the reader arrived and settled. The wait itself is spent parked at the top for the same reason rather than on the borrowed offset the shared container arrived holding, so a restore that never becomes possible has already left the reader somewhere honest instead of on a number the save listener would then persist as theirs. EVERY position is saved, the bottom included, and `0` persists as a real position distinct from no save at all. The save is debounced and committed from the attachment's teardown AND on `onPageHide`, because a background is neither: a frozen page's pending timer never runs if the page is then discarded, so the reader's last act would be lost, and the direction that does damage is a lost DISARM (the stale live edge outliving them, so the next open drags them to a bottom they scrolled away from).
+Where a reader had parked in a transcript (`lucidos-scroll-thread-<id>` in localStorage, written and restored by `hooks/useScrollMemory.ts`). It survives a thread switch, a reload, and the app being backgrounded. The transcript no longer scrolls itself to the bottom (see *navigation scroll*). Only a *standing follow* rides the bottom, on request and never on open. So this is the ONLY thing that decides where a thread opens. A saved position is restored, and a thread with none opens at the TOP of what is rendered (`resetOnEmpty`).
+
+That reset matters because `.thread-content` is one element reused across threads, and would otherwise inherit the previous thread's offset. There is a THIRD answer, because the transcript is WINDOWED. An offset recorded against a taller render is routinely out of reach of the trailing slice the next open renders. A session that scrolled up, a *deep-link anchor*'s claim, and the chevron's render-all all draw one. An offset that cannot be honoured opens the thread at the top as well. Never at the bottom.
+
+`Math.min(saved.top, max)` used to say otherwise in both places that gave up: the restore deadline and the dead-link rescue below. A clamp only runs when the offset is unreachable, so `max` was the whole of it. That was the live edge, three seconds after the reader arrived and settled. The wait itself is spent parked at the top for the same reason, not on the offset the shared container arrived holding. So a restore that never becomes possible has already left the reader somewhere honest. Otherwise the save listener would persist a borrowed number as theirs.
+
+EVERY position is saved, the bottom included, and `0` persists as a real position distinct from no save at all. The save is debounced, and committed from the attachment's teardown AND on `onPageHide`, because a background is neither. A frozen page's pending timer never runs if the page is then discarded, so the reader's last act would be lost. The damaging direction is a lost DISARM. The stale live edge outlives them, so the next open drags them to a bottom they scrolled away from.
 
 **THE TRANSCRIPT RECORDS THE STEP ROW AT THE LINE** (`row:<relTop>:<rowEventId>`), by its tool call's event id, where the turn at the line has one. Otherwise it records the TURN (`anchor:<relTop>:<eventId>`). Both sit behind the `anchorsToContent` opt-in. The row is the finer answer. A coding-agent turn holds hundreds of rows, and the window draws its tail first. A turn anchor measured there landed the reader above their place (ADR 0152).
 
@@ -3543,6 +3551,9 @@ It routes `rustc` to the agents' own sccache daemon (ADR 0343). An OS-sandboxed 
 ### Debug object generation
 The set of `<artifact>.<cgu>.<generation>.rcgu.o` files one build of a binary or test target writes into `target/<profile>/deps`. Under unpacked split-debuginfo, cargo's macOS dev default, the binary reads its debug info from them, so they must outlive the link. Cargo never deletes an older generation. Rustc hardlinks reused codegen units, so generations can share an mtime, and only the binary's `OSO` stabs say which one it links. Every engine build runs `prune_stale_debug_objects`, which keeps the linked generation plus the newest other one (ADR 0408).
 
+### Stale incremental dir
+A `<crate>-<hash>` dir directly inside a cargo `incremental` dir whose mtime is older than 7 days. rustc makes one per crate and build configuration, and cargo never removes the dir of a configuration that stopped being built. `prune_stale_incremental` (`scripts/lib/stale_incremental.sh`) moves each into a trash dir of its own run, `<build>/.stale-incremental.<pid>/`, and deletes that in the background. It runs at most once a day per build dir, and never while another cargo holds the profile's `.cargo-lock`. `scripts/with-build-slot.sh` calls it before every wrapped build (ADR 0635). A temporary measure.
+
 ### Compile mode
 What a Lucidos-source agent build compiles with that changes its fingerprint: today, whether OpenSSL is vendored or linked from the shared prebuilt. `runtime/compile_mode.rs` decides it, and only for a tree carrying `crates/lucidos-engine/Cargo.toml`. The first decision is pinned in `target/.lucidos-compile-mode`, and every later spawn and background task reads the pin. So a worktree never alternates, which would rebuild its whole tree each time.
 
@@ -3659,6 +3670,20 @@ Triggers DO reach the judge now (Phase 5), since the side-effect grant needs the
 ### Scratch target
 A redirect target under the system temp dir, spelled literally: `/tmp/`, `/private/tmp/`, macOS's per-user `/var/folders/<a>/<b>/T/`, or `${TMPDIR:-/tmp}/` when the inherited `TMPDIR` is itself a temp dir and the line never rebinds it. Each segment below the prefix is plain text and none is `..`, so no `$`, backtick, glob or brace (`is_scratch_target` in `engine/command_guard.rs`). The *command guard*'s fast path reads a write to one as an omission, so the *judge* sees it rather than a card. It never settles `Safe`, since a temp path can be a planted link. Any other target outside the workspace is a refusal (ADR 0002, 2026-10-24 addendum).
 
+The judge-off destruction scan does not count a truncating write to a *private* scratch target as destruction outside the workspace (`private_scratch_target`). So an unattended run can write the log the system prompt steers it to. Private is an `lstat` answer:
+
+- the temp dir is private to the engine's user, or sticky;
+- each existing directory below it is a real one private to that user (owned, and no group or other write);
+- the file is a regular file that user owns with one link, or it is absent;
+- an absent file sits in a private directory, or in a sticky one whose OS refuses another user's link (Linux `fs.protected_symlinks`);
+- no segment that can run before or alongside the write may make a link;
+- the segment itself has no substitution, no link-making word, and no quoted redirect that its head runs after other commands (`find -exec … -exec sh -c '…'`);
+- the target is the whole word the shell writes, with no escape or open quote.
+
+For `${TMPDIR:-/tmp}/` the line must also be unable to rebind `TMPDIR` without spelling it: outside the prefix it expands nothing and loads no code (`cannot_rebind_tmpdir`).
+
+The check runs before the command, so two known gaps stay open. An earlier call's background job can link the path after the check. And `${TMPDIR:-/tmp}` is checked against the engine's own `TMPDIR`, which an agent must share.
+
 ### Trusted repo script
 A path-qualified command head (`./scripts/x.sh`) that the attended coding-agent gate hands to the *judge* rather than refusing. It resolves, symlinks followed, to a tracked file of the session's own worktree. Its bytes also match the same path on the default branch, read as `refs/heads/<branch>`. Code: `engine/trusted_repo_scripts.rs`, carried into the classifier as `command_guard::TrustedHeads`.
 
@@ -3749,7 +3774,7 @@ The gateway's second listener, the one that answers webhook deliveries (`crates/
 
 **A separate socket rather than a path, because `tailscale funnel` maps a port.** This is the one surface a user may point at the open internet, and no path allow-list on the main listener could express that. A router with one route cannot answer the control plane, whatever it is sent.
 
-Bound **loopback**, like the main surface. Funnel proxies from this machine, so it reaches loopback, while nothing else on the network can address the socket directly. The gateway's `enforce` middleware is deliberately absent: a webhook sender holds no device credential.
+Bound **loopback** by default, like the main surface. Funnel proxies from this machine, so it reaches loopback, while nothing else on the network can address the socket directly. A container widens it with `LUCIDOS_HOOK_BIND_ADDR` (ADR 0624). The gateway's `enforce` middleware is deliberately absent: a webhook sender holds no device credential.
 
 On its engine hop it presents the *hook socket token*, which is the narrowest credential Lucidos mints (ADR 0155). It strips every inbound `x-lucidos-*` first, so a public sender can neither supply that credential nor reach for the wider one.
 
@@ -4081,7 +4106,9 @@ A surface opened from a header button that hangs just under the header, on the L
 Search Everywhere opened with no button, by a shortcut or from the Lucidos menu, centres on the focused pane group. File search with no button falls back to the Canvas pane. On mobile both centre on the screen. A palette dims nothing.
 
 ### Toast tap
-What a tap anywhere on a toast card does (`toastTap` in `components/shared/toastTap.ts`). A toast with its own `onClick` runs it, whatever its type. An info or success toast with one neutral action runs that action and draws no button for it. A passive toast does nothing on a tap, since a reader may tap it looking for more and must not lose it. A warning or an error keeps its buttons, since a tap to read it must not act. So do two actions, a lone `danger` or `confirm` action, and a `deliberate` one such as Archive all's Undo.
+What a tap anywhere on a toast card does (`toastTap` in `components/shared/toastTap.ts`). A toast with its own `onClick` runs it, whatever its type. An info or success toast with one neutral action runs that action and draws no button for it. A passive toast does nothing on a tap, since a reader may tap it looking for more and must not lose it. A warning or an error keeps its buttons, since a tap to read it must not act. So do two actions, a lone `danger` or `confirm` action, and a `deliberate` one.
+
+A `deliberate` action is a neutral one that changes state, such as Archive all's Undo. It is also one the toast's text gives no hint of, such as Open thread on "Started on Home".
 
 A tap on a button or a link never counts, nor does the mouseup ending a text selection inside the card. A card that acts also carries a visually hidden button for the keyboard and screen readers, labelled with the action or "Open". The card is never `role="button"` itself, since that would hide its X and links from assistive tech. A card that acts draws its X even on a timer, so closing it never means following it (`toastHasClose`).
 
@@ -4890,7 +4917,7 @@ A workspace-wide permission grant: what the two **"Always allow"** buttons on a 
 
 **Two consumers, and that is what makes the click bind now.** Claude Code gets the file as `--allowedTools` at spawn, after `ENGINE_ALLOWED_TOOLS`: the commands the engine's own prompt runs on every turn, such as `lucidos request-read`. Each gets no card even in a workspace that has granted nothing. The file is frozen for that subprocess's life. `cc_permission::persisted_allow_covers` reads it fresh on every prompt, before CC's own gate. Until ADR 0125 only the first consumer existed, so a click took effect one session late and the user was re-asked seconds after granting.
 
-The engine honours a stored pattern **only where `derive_allow_pattern` would have produced it for that same request**, at `Broad` or `Narrow`. `None` at both scopes means Claude Code ignores the pattern. That rules out a bare `Edit` / `Write` / `NotebookEdit` / `ExitPlanMode` line, a `Bash` command touching `.claude/` or `.git/`, and the Codex backend tools. A command additionally takes the per-segment rule of `command_guard::grant_covers_command`. The gate sits below the unattended fast path, so a grant never answers for a trigger-rooted session.
+The engine honours a stored pattern **only where `derive_allow_pattern` would have produced it for that same request**, at `Broad` or `Narrow`. `None` at both scopes means no stored line covers the request: a bare `Edit` / `Write` / `NotebookEdit` / `ExitPlanMode` line, a Codex backend tool, or a risky command. That last is a `Bash` command that may write under `.claude/` or `.git/` (ADR 0634). A command additionally takes the per-segment rule of `command_guard::grant_covers_command`. The gate sits below the unattended fast path, so a grant never answers for a trigger-rooted session.
 See also: *session allow*, `docs/adr/0125-engine-gate-enforces-the-workspace-allowlist.md`.
 
 ### Session allow
@@ -5289,6 +5316,18 @@ The engine's check, just before a turn's response is recorded, that the turn end
 - **Session re-entry**: the engine sends the coding agent back with an instruction, once per requirement key. Used where the requirement is work only the agent can do. An idle sends at most one, since a branch has at most one *proposal hold*.
 
 A turn that did not end normally (canceled, failed, aborted) meets no requirement. Neither does a side question, an auxiliary call, or an engine-run merge resolution session.
+
+### Ceiling re-entry
+The *session re-entry* the *turn-end gate* sends when an ordinary turn ends past the session's *context ceiling* (ADR 0629). It asks for a *handoff narrative* and `lucidos successor start`. It outranks the *proposal hold*'s re-entry, and fires once per session, never in a session's first turn.
+
+- **It is an engine turn.** Like a cache keep-alive turn, its end forces no read or wake decision.
+- **`ContextCeilingReached` opens it.** From that event on, the run's input arm holds every input for the successor. Only the re-entry's own `AgentUserInput` passes.
+- **Its end always records a handoff.** A turn that ends without `SessionHandedOff` gets a brief one, `BriefCause::NoNarrative`, before its idle. A restart owes it at the next spawn that is not a keep-alive claim.
+
+Code: `TurnEndRequirement::CeilingHandoff` in `engine/turn_end/`, the prompt in `agent_session/prompts.rs`.
+
+### Next-input start
+A handoff whose *successor session* starts on the thread's next input rather than at once: `SessionHandedOff.starts` is `on-next-input`. The next input of any kind spawns the successor, and its first message is the opening plus that input (`PendingHandoff::first_message`). Boot never starts one. Only a *ceiling re-entry*'s handoff uses it (ADR 0629).
 
 ### Turn-end requirement
 One rule the *turn-end gate* enforces. Three kinds today. The two decisions run together, then the re-entry. The exception is `wake_settles_first`: a forced read on a turn the user did not open waits for the wake decision (ADR 0446).

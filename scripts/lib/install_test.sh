@@ -40,6 +40,7 @@ PASS=0
 FAIL=0
 fail() { echo "  FAIL: $*"; FAIL=$((FAIL+1)); }
 pass() { echo "  ok:   $*"; PASS=$((PASS+1)); }
+has()  { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 
 VERSION="0.14.0"
 TRIPLE="$(stage_runtime_host_triple)"   # the host triple — the artifact the download path resolves
@@ -918,6 +919,123 @@ else
     fi
 fi
 rm -rf "$CP_DIR"
+
+# ── INTEGRATION: a re-run keeps the unit's TLS and provider env ──────────────
+# The Settings update command passes only --name and --prefix, so such a re-run
+# must keep the unit's TLS pair and provider keys. Fake service managers let both
+# the launchd and the systemd path register on any host; the health wait then
+# fails fast, after the unit is written.
+make_service_fakebin() {   # <uname -s>
+    local dir; dir="$(mktemp -d)"
+    # shellcheck disable=SC2016 # $1 and $0 belong to the generated stubs
+    {
+        printf '#!/bin/sh\n[ "$1" = "-s" ] && { echo %s; exit 0; }\nexec /usr/bin/uname "$@"\n' "$1" > "$dir/uname"
+        printf '#!/bin/sh\nS="$(dirname "$0")/loaded"\ncase "$1" in\n  print) [ -f "$S" ]; exit ;;\n  bootstrap|load) : > "$S" ;;\n  bootout|remove) rm -f "$S" ;;\nesac\nexit 0\n' > "$dir/launchctl"
+        printf '#!/bin/sh\n[ "$2" = "is-active" ] && exit 1\nexit 0\n' > "$dir/systemctl"
+        printf '#!/bin/sh\nexit 0\n' > "$dir/loginctl"
+    }
+    chmod +x "$dir"/*
+    printf '%s' "$dir"
+}
+REL="$(new_release_dir)"; TARBALL="$REL/$STEM.tar.gz"
+# Every character the two unit escapers rewrite, so the read-back must decode.
+KEEP_KEY='sk-keep%2"q\b&<x>'
+for KEEP_OS in Darwin Linux; do
+    echo ""
+    echo "test: a bare re-run keeps the TLS and provider env ($KEEP_OS)"
+    FB="$(make_service_fakebin "$KEEP_OS")"
+    PREFIX="$(mktemp -d)"; FAKEHOME="$(mktemp -d)"
+    CERTS="$(mktemp -d)"; : > "$CERTS/a.crt"; : > "$CERTS/a.key"; : > "$CERTS/b.crt"; : > "$CERTS/b.key"
+    if [ "$KEEP_OS" = Darwin ]; then
+        UNIT="$FAKEHOME/Library/LaunchAgents/com.lucidos.gateway.keep.plist"
+    else
+        UNIT="$FAKEHOME/.config/systemd/user/lucidos-gateway-keep.service"
+    fi
+    keep_install() {   # <OPENAI_API_KEY> <VERTEX_PROJECT_ID> <install.sh args...>
+        local key="$1" project="$2"; shift 2
+        PATH="$FB:$PATH" HOME="$FAKEHOME" XDG_CONFIG_HOME='' LUCIDOS_GATEWAY_DATA='' LUCIDOS_HEALTH_TIMEOUT=1 \
+            OPENAI_API_KEY="$key" VERTEX_PROJECT_ID="$project" VERTEX_REGION='' LUCIDOS_BIND='' \
+            LUCIDOS_TLS_CERT='' LUCIDOS_TLS_KEY='' LUCIDOS_NO_TLS='' LUCIDOS_NO_PROVIDER_KEYS='' \
+            bash "$INSTALL" --from-tarball "$TARBALL" --prefix "$PREFIX" --name keep "$@" 2>&1
+    }
+    keep_install "$KEEP_KEY" proj-1 --port 59261 --tls-cert "$CERTS/a.crt" --tls-key "$CERTS/a.key" >/dev/null
+    first="$(cat "$UNIT" 2>/dev/null)"
+    if has "$first" "LUCIDOS_TLS_CERT" && has "$first" "proj-1"; then
+        pass "the first install baked TLS and provider env"
+    else
+        fail "the first install wrote no TLS or provider env at $UNIT: $first"
+    fi
+
+    out="$(keep_install '' '')"
+    if [ -n "$first" ] && [ "$(cat "$UNIT" 2>/dev/null)" = "$first" ]; then
+        pass "a re-run with only --name and --prefix rewrites the unit unchanged"
+    else
+        fail "the bare re-run changed the unit: $(diff <(printf '%s\n' "$first") "$UNIT")"
+    fi
+    if [ "$(mode_of "$UNIT")" = 600 ]; then pass "the kept provider key stays at mode 600"; else fail "unit mode $(mode_of "$UNIT")"; fi
+    if has "$out" "https://localhost:59261"; then pass "the re-run probes https"; else fail "expected an https probe: $out"; fi
+
+    keep_install sk-new '' --tls-cert "$CERTS/b.crt" --tls-key "$CERTS/b.key" >/dev/null
+    now="$(cat "$UNIT" 2>/dev/null)"
+    if has "$now" "$CERTS/b.crt" && has "$now" "$CERTS/b.key" && ! has "$now" "$CERTS/a.crt"; then
+        pass "explicit TLS flags replace the kept pair"
+    else
+        fail "the new TLS pair did not win: $now"
+    fi
+    if has "$now" "sk-new" && ! has "$now" "sk-keep" && has "$now" "proj-1"; then
+        pass "an explicit key wins, and the unset one is still kept"
+    else
+        fail "provider env after an explicit key: $now"
+    fi
+
+    out="$(keep_install '' '' --no-tls)"
+    now="$(cat "$UNIT" 2>/dev/null)"
+    if ! has "$now" "LUCIDOS_TLS_" && has "$out" "http://localhost:59261"; then
+        pass "--no-tls drops the kept pair"
+    else
+        fail "--no-tls kept TLS: $out"
+    fi
+
+    keep_install '' '' --no-provider-keys >/dev/null
+    now="$(cat "$UNIT" 2>/dev/null)"
+    if ! has "$now" "OPENAI_API_KEY" && ! has "$now" "proj-1" && [ "$(mode_of "$UNIT")" = 644 ]; then
+        pass "--no-provider-keys drops the kept keys"
+    else
+        fail "--no-provider-keys kept a key (mode $(mode_of "$UNIT")): $now"
+    fi
+
+    rm -f "$CERTS/b.crt" "$CERTS/b.key"
+    keep_install '' '' --tls-cert "$CERTS/a.crt" --tls-key "$CERTS/a.key" >/dev/null
+    # A hand edit the reader cannot parse: a trailing comment, or systemd's unquoted form.
+    if [ "$KEEP_OS" = Darwin ]; then
+        sed 's|<key>LUCIDOS_TLS_CERT</key>|& <!-- edited -->|' "$UNIT" > "$UNIT.new"
+    else
+        sed 's|^Environment="\(LUCIDOS_TLS_CERT=.*\)"$|Environment=\1|' "$UNIT" > "$UNIT.new"
+    fi
+    mv "$UNIT.new" "$UNIT"
+    out="$(keep_install '' '')"; rc=$?
+    if [ $rc -ne 0 ] && has "$out" "$UNIT sets LUCIDOS_TLS_CERT"; then
+        pass "a unit edited into an unreadable form fails closed"
+    else
+        fail "expected a refusal for the unreadable unit (rc=$rc): $out"
+    fi
+
+    keep_install '' '' --tls-cert "$CERTS/a.crt" --tls-key "$CERTS/a.key" >/dev/null
+    rm -f "$CERTS/a.crt"
+    out="$(keep_install '' '' --bind all)"; rc=$?
+    if [ $rc -ne 0 ] && has "$out" "$CERTS/a.crt" && has "$out" "--no-tls"; then
+        pass "a kept cert that is gone fails closed and names --no-tls"
+    else
+        fail "expected a refusal for the missing kept cert (rc=$rc): $out"
+    fi
+    if [ ! -e "$FAKEHOME/.lucidos/network.toml" ]; then
+        pass "the refusal comes before the machine-global network.toml write"
+    else
+        fail "the refused re-run still wrote network.toml"
+    fi
+    rm -rf "$FB" "$PREFIX" "$FAKEHOME" "$CERTS"
+done
+rm -rf "$REL"
 
 echo ""
 echo "install: $PASS passed, $FAIL failed"

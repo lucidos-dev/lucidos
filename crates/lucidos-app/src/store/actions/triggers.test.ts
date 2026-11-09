@@ -102,6 +102,7 @@ describe('submitTrigger scroll reset', () => {
       triggerId: 't1',
       goToReview: false,
       sideEffectGrant: [],
+      permissionWait: null,
       model: null,
       reasoningEffort: null,
       provider: null,
@@ -121,6 +122,7 @@ describe('submitTrigger scroll reset', () => {
       cronExpressions: ['0 0 0 * * *'],
       goToReview: false,
       sideEffectGrant: [],
+      permissionWait: null,
       model: null,
       reasoningEffort: null,
       provider: null,
@@ -141,6 +143,7 @@ describe('submitTrigger scroll reset', () => {
       triggerId: 't1',
       goToReview: false,
       sideEffectGrant: [],
+      permissionWait: null,
       model: null,
       reasoningEffort: null,
       provider: null,
@@ -170,6 +173,7 @@ describe('submitTrigger: the trigger model and reasoning effort', () => {
     cronExpressions: ['0 0 8 * * *'],
     goToReview: false,
     sideEffectGrant: [],
+    permissionWait: null,
     provider: null,
   };
 
@@ -227,6 +231,7 @@ describe('submitTrigger: the trigger model and reasoning effort', () => {
       triggerId: 't1',
       goToReview: true,
       sideEffectGrant: ['email'],
+      permissionWait: 'indefinite',
       model: 'gemini-3.8-flash',
       reasoningEffort: 'low',
       provider: 'vertex',
@@ -237,6 +242,16 @@ describe('submitTrigger: the trigger model and reasoning effort', () => {
     expect(body.provider).toBeNull();
     expect(body.go_to_review).toBe(false);
     expect(body.side_effect_grant).toEqual([]);
+    expect(body.permission_wait).toBeNull();
+  });
+
+  it('sends an intent trigger\'s permission wait, and null to clear it', async () => {
+    const edit = { ...base, run: intentRun, triggerId: 't1', model: null, reasoningEffort: null };
+    await submitTrigger({ ...edit, permissionWait: 15 });
+    expect(mockUpdateTrigger.mock.calls[0][1].permission_wait).toBe(15);
+    mockUpdateTrigger.mockClear();
+    await submitTrigger({ ...edit, permissionWait: null });
+    expect(mockUpdateTrigger.mock.calls[0][1].permission_wait).toBeNull();
   });
 });
 
@@ -258,6 +273,7 @@ describe('submitTrigger surfaces the engine warnings', () => {
     cronExpressions: ['0 0 8 * * *'],
     goToReview: false,
     sideEffectGrant: [],
+    permissionWait: null,
     model: null,
     reasoningEffort: null,
     provider: null,
