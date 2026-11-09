@@ -1331,9 +1331,7 @@ mod tests {
             "{failure}"
         );
         assert!(
-            failure
-                .to_string()
-                .contains("Settings → Models → Providers"),
+            failure.to_string().contains(providers_settings!()),
             "{failure}"
         );
         // A local URL needs no credential or network call to exercise hot-swap.

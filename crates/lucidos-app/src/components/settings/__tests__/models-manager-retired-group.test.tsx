@@ -58,7 +58,7 @@ const OPUS_47 = model({ id: 'claude-opus-4-7', label: 'Opus 4.7', successor: 'cl
 const OLD_USER = model({ id: 'my/old-model', label: 'My Old Model', source: 'user', successor: 'claude-opus-5-6' });
 
 const text = (showRetired: boolean, models: ModelInfo[] = [OPUS_5, OPUS_47, OLD_USER]) =>
-  vnodeToText(modelManagerList(models, showRetired, () => {}));
+  vnodeToText(modelManagerList(models, { needs: false, retired: showRetired }, () => {}));
 
 describe('the Retired group', () => {
   it('counts the retired models in its header', () => {
@@ -102,7 +102,7 @@ describe('the vision toggle', () => {
    *  that reads images. A wrong or unverified seed is fixed here. */
   it('shows on every row, pressed only when the model reads images', () => {
     const looker = model({ id: 'claude-opus-5-6', label: 'Opus 5.6', vision: true });
-    const out = vnodeToText(modelManagerList([looker, OPUS_5], false, () => {}));
+    const out = vnodeToText(modelManagerList([looker, OPUS_5], { needs: false, retired: false }, () => {}));
     expect(out).toContain('aria-label="Opus 5.6 reads images" data-tooltip="Reads images"');
     expect(out).toMatch(/pressed="true"[^>]*aria-label="Opus 5.6 reads images"/);
     expect(out).toMatch(/pressed="false"[^>]*aria-label="Opus 5 \(1M\) reads images"/);

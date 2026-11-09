@@ -99,21 +99,27 @@
 /* The controls sit on the sentence's FIRST line, never the middle of a wrapped
    block, where they float beside the second line and read as detached. Each
    control centres in a first row as tall as the bar's tallest control, and
-   the sentence pads its first line into that row. A one-line bar looks the
-   same as a centred one. */
+   the sentence pads its first line into that row, and only above: padding
+   below would add height to every line a wrapped bar carries. A one-line bar
+   looks the same as a centred one. */
 :is(.backup-reminder, .slowness-banner, .ingress-banner, .refusal-banner) {
     --banner-first-row: var(--banner-button-height);
     align-items: flex-start;
     line-height: var(--banner-line-height);
 }
 
-/* The close X is the tallest control on the bars that carry one. */
+/* The close X is the tallest control on the bars that carry one. These bars
+   carry long sentences that wrap on a phone, so they keep the tight line
+   spacing they had, and a wrapped bar does not push the mobile header down. */
 :is(.backup-reminder, .slowness-banner) {
     --banner-first-row: calc(var(--icon-size-sm) + 2 * var(--space-sm));
+    --banner-line-height: 1.2;
 }
 
 :is(.backup-reminder-text, .slowness-banner-text, .ingress-banner-text, .refusal-banner-text) {
-    padding-block: calc((var(--banner-first-row) - 1em * var(--banner-line-height)) / 2);
+    box-sizing: border-box;
+    min-height: var(--banner-first-row);
+    padding-top: calc((var(--banner-first-row) - 1em * var(--banner-line-height)) / 2);
 }
 
 :is(.backup-reminder, .slowness-banner, .ingress-banner, .refusal-banner) > .surface-icon {

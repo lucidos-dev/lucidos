@@ -6,6 +6,7 @@ import { submitNewCredential, deleteCredential } from '../../store/actions/crede
 import type { AuthType } from '../../store/types';
 import { findProviderCredential } from './providerCredential';
 import { ProviderBlock } from './ProviderBlock';
+import { providerAnchor } from '../../store/modelProviders';
 
 const ANTHROPIC_SERVICE = 'anthropic';
 const ANTHROPIC_BASE_URL = 'https://api.anthropic.com';
@@ -15,7 +16,7 @@ const AUTH_KINDS = [
   { value: 'bearer', label: 'OAuth subscription token' },
 ];
 
-/** Configure the direct-Anthropic provider credential (Settings → Models →
+/** Configure the direct-Anthropic provider credential (Settings →
  *  Providers). Stores a credential named `anthropic`; the engine's
  *  AnthropicProvider reads it (preferring it over the ANTHROPIC_API_KEY launch
  *  env var) and picks the header by auth kind (`api_key` → `x-api-key`,
@@ -55,7 +56,7 @@ export function AnthropicProviderSettings() {
     <ProviderBlock
       id="anthropic"
       label="Anthropic (direct)"
-      anchor="models:anthropic"
+      anchor={providerAnchor('anthropic')}
       hasStoredConfig={!!existing}
       explainer={
         <>

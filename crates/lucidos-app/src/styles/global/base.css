@@ -225,9 +225,10 @@ html {
        Shared by every bar so they read as one family, and named so the live
        style remote can retune the wash without reaching into four rules. */
     --banner-tint-strength: 10%;
-    /* Every bar's line-height, stated rather than inherited and named rather
+    /* A bar's line-height, stated rather than inherited and named rather
        than written into a rule, because the offsets that land a leading dot,
-       icon, button or close X on the sentence's FIRST line derive from it. */
+       icon, button or close X on the sentence's FIRST line derive from it.
+       The bars with a close X set a tighter value in `panels/shell.css`. */
     --banner-line-height: 1.4;
     /* Every bar's action button, the Start button included. */
     --banner-button-height: 1.75rem;

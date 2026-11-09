@@ -69,7 +69,7 @@ pub const PROVIDER_PREFERENCE_KEYS: [&str; 10] = [
 ];
 
 /// The per-provider enable switches, resolved from the `provider_enabled_*`
-/// preferences (Settings → Models → Providers).
+/// preferences (Settings → Providers).
 ///
 /// A switch is a VETO over a provider that is otherwise configured. It never
 /// installs one, and it never touches the credential: turning a provider off is
@@ -895,7 +895,7 @@ fn build_openai_provider(
 
 /// Build the OpenRouter provider — an [`OpenAiProvider`] pinned to OpenRouter's
 /// OpenAI-compatible Chat Completions endpoint — from a stored `openrouter`
-/// credential (Settings → Models → Providers) with the `LUCIDOS_OPENROUTER_API_KEY` env
+/// credential (Settings → Providers) with the `LUCIDOS_OPENROUTER_API_KEY` env
 /// var as a fallback. Sends OpenRouter's optional `HTTP-Referer` / `X-Title`
 /// attribution headers. `None` when no key is configured.
 fn build_openrouter_provider(
@@ -921,7 +921,7 @@ fn build_openrouter_provider(
 
 /// Build the xAI provider: an [`OpenAiProvider`] pinned to xAI's
 /// OpenAI-compatible Chat Completions endpoint, serving Grok. The key comes
-/// from a stored `xai` credential (Settings → Models → Providers), with
+/// from a stored `xai` credential (Settings → Providers), with
 /// `LUCIDOS_XAI_API_KEY` as the fallback. `None` when neither is configured.
 ///
 /// Sends no extra headers: `HTTP-Referer` / `X-Title` are OpenRouter's own
@@ -1132,8 +1132,12 @@ fn local_key_in_scope(
                 Some(stored.value)
             } else {
                 crate::log!(
-                    "[Startup] Not sending the stored 'local' key to {}: its scope is {:?}. \
-                     Re-save the key in Settings → Models → Providers to scope it to this URL",
+                    concat!(
+                        "[Startup] Not sending the stored 'local' key to {}: its scope is {:?}. \
+                         Re-save the key in ",
+                        providers_settings!(),
+                        " to scope it to this URL"
+                    ),
                     base,
                     stored.base_urls
                 );
@@ -1932,7 +1936,7 @@ mod tests {
             .err()
             .expect("an empty chain errors")
             .to_string();
-        assert!(msg.contains("Settings → Models → Providers"), "{msg}");
+        assert!(msg.contains(providers_settings!()), "{msg}");
         teardown_test_db(&db).await;
     }
 

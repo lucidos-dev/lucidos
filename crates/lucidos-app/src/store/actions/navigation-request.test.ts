@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { NAVIGATE_TARGETS, SETTINGS_VIEW_TARGETS } from '@lucidos/sdk';
-import { SETTINGS_SUBVIEW_ITEMS, pluginScrollTarget, selectedLines, lineScrollTarget, filePreviewSource, panelOverlay, repositories, findRequest, focusedThreadId } from '../store';
+import { SETTINGS_SUBVIEW_ITEMS, pluginScrollTarget, selectedLines, lineScrollTarget, filePreviewSource, panelOverlay, repositories, findRequest, focusedThreadId, settingsLinkedFragment } from '../store';
 
 // Spy on showToast but keep the rest of the store real — navigation-request.ts
 // reads the nav lists + settingsSubviewLabel at module load to build its
@@ -93,6 +93,31 @@ describe('handleNavigationRequest — settings sub-sections', () => {
     handleNavigationRequest({ target: 'settings', settings_view: 'backup' });
     expect(openSettingsSubview).toHaveBeenCalledWith('backup');
     expect(switchMenuItem).not.toHaveBeenCalled();
+  });
+
+  it('hands a settings fragment to the page it opens', () => {
+    handleNavigationRequest({ target: 'settings', settings_view: 'providers', fragment: 'xai' });
+    expect(openSettingsSubview).toHaveBeenCalledWith('providers');
+    expect(settingsLinkedFragment.value).toBe('xai');
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('names the page alone with no fragment', () => {
+    settingsLinkedFragment.value = null;
+    handleNavigationRequest({ target: 'settings', settings_view: 'providers' });
+    expect(settingsLinkedFragment.value).toBeNull();
+  });
+
+  it('opens the aliased view for a fragment', () => {
+    handleNavigationRequest({ target: 'settings', settings_view: 'mobile-access', fragment: 'addresses' });
+    expect(openSettingsSubview).toHaveBeenCalledWith('access');
+    expect(settingsLinkedFragment.value).toBe('addresses');
+  });
+
+  it('ignores a fragment on an unknown view', () => {
+    settingsLinkedFragment.value = null;
+    handleNavigationRequest({ target: 'settings', settings_view: 'not-a-section', fragment: 'xai' });
+    expect(settingsLinkedFragment.value).toBeNull();
   });
 
   it('lands the Thread Queue subpanel in ONE nav push too', () => {

@@ -9,10 +9,11 @@ import {
 import { useServerBackedField } from '../../hooks/useServerBackedField';
 import { findProviderCredential, providerKeyRescope } from './providerCredential';
 import { ProviderBlock } from './ProviderBlock';
+import { providerAnchor } from '../../store/modelProviders';
 
 const LOCAL_SERVICE = 'local';
 
-/** Configure the local OpenAI-compatible provider (Settings → Models →
+/** Configure the local OpenAI-compatible provider (Settings →
  *  Providers): Ollama / LM Studio / vLLM / llama.cpp. The base URL is stored as
  *  the `local_base_url` preference; an optional API key is stored as a `local`
  *  credential (most local servers ignore it — the engine omits the
@@ -83,7 +84,7 @@ export function LocalProviderSettings() {
     <ProviderBlock
       id="local"
       label="Local (OpenAI-compatible)"
-      anchor="models:local"
+      anchor={providerAnchor('local')}
       // The optional API key, which is the only thing an off state could
       // promise to keep. The base URL is a preference, not a credential.
       hasStoredConfig={!!existing}

@@ -666,6 +666,11 @@ A model the user adds starts off the ladder, and **Settings → Intelligence** t
 
 A model listing several providers is served by whichever the workspace has credentials for: see *preferred provider*. The *rung control* lists *intelligence rungs* from the *intelligence ladder*, not these rows.
 
+Manage models folds two groups below the main list, both closed at first:
+
+- **Needs a provider** holds every current model with no provider set up and switched on. Each row links to its providers' blocks on **Settings → Providers**.
+- **Retired** holds every model with a successor, set up or not. The router reaches its successor, so it never lists under Needs a provider.
+
 ### Vision flag
 Whether a model reads images: the image icon on each row in **Settings → Models**, the `vision` field of `manage_models` and `lucidos models`. It is off unless declared. A chat turn withholds images from a row whose flag is off, and puts a short note in each image's place.
 
@@ -771,12 +776,12 @@ The last three can be edited. An edited one keeps its shipped description, shows
 ### Preferred provider
 The *provider* a *model* was last picked on, remembered per model on its row. So Grok stays on xAI and Opus on Anthropic, neither overwriting the other.
 
-The picker asks for a provider last, after the model and its *reasoning effort*, and only when two of the model's providers are set up. With one set up it never asks, but still names the provider. A pick sticks to the thread or draft it was made in, so a later pick elsewhere never moves a running conversation. A *trigger* can pin its own. Settings → Models → Providers shows and edits which providers serve each model, in the order tried.
+The picker asks for a provider last, after the model and its *reasoning effort*, and only when two of the model's providers are set up. With one set up it never asks, but still names the provider. A pick sticks to the thread or draft it was made in, so a later pick elsewhere never moves a running conversation. A *trigger* can pin its own. Settings → Models → Manage models shows and edits which providers serve each model, in the order tried.
 
 A model with no stored choice runs on its first backend with credentials. If the stored choice is later removed or switched off, the turn is refused rather than quietly moved. The picker badges it "not set up", so one click fixes it.
 
 ### Provider
-The backend that serves a *model*. Each *model registry* entry names its provider, whose credentials are configured once under Settings → Models → Providers.
+The backend that serves a *model*. Each *model registry* entry names its provider, whose credentials are configured once under Settings → Providers.
 
 **Vertex AI** takes no stored credential: it resolves project and token from gcloud. **Anthropic** is direct via `api.anthropic.com`: a Claude subscription OAuth token or an API key. The `ANTHROPIC_API_KEY` launch env var is a fallback below the stored credential. **OpenAI** is direct via `api.openai.com`: an API key, with the `OPENAI_API_KEY` launch env var as a fallback. Below that, a key is auto-detected from the Codex CLI's `${CODEX_HOME:-~/.codex}/auth.json` `apikey` login, as Vertex reads the gcloud ADC file.
 
@@ -791,7 +796,7 @@ OpenAI, OpenRouter, xAI, OpenCode Free and Local all speak the OpenAI Chat Compl
 A model naming several providers stays ONE picker entry, served by whichever has credentials. The first-party Claude models list Vertex and Anthropic, since their ids match on both. A backend that spells a model differently says so per provider: Grok is `grok-4.6` on xAI and `x-ai/grok-4.6` on OpenRouter.
 
 ### Claude gateway
-An organisation's own front door to Anthropic's API: the Messages API behind the organisation's sign-in. Lucidos serves Claude models through it on the `claude-gateway` *provider*. Set up under **Settings → Models → Providers** or with `lucidos claude-gateway sign-in`.
+An organisation's own front door to Anthropic's API: the Messages API behind the organisation's sign-in. Lucidos serves Claude models through it on the `claude-gateway` *provider*. Set up under **Settings → Providers** or with `lucidos claude-gateway sign-in`.
 
 Signing in shows a code to confirm on the gateway's page. Lucidos signs in as itself, apart from Claude Code, and keeps and refreshes the tokens. No API response, event, app or provider proxy hands them on. Like every stored secret, they sit sealed in the workspace database, and `LUCIDOS_DATABASE_URL` cannot read them. The URL field starts on the gateway Claude Code's managed settings name, when that file exists, and nothing signs in until you confirm.
 
@@ -816,7 +821,7 @@ See also: *Claude gateway*.
 ### System One model
 A model that answers typed questions with a probability for every answer, rather than writing text. It cannot hold a conversation, so it never appears in the chat model picker. Six are offered: TypeSafe's **Jev**, Jev through **OpenRouter**, Cloudflare's **Clef** and **Clef-flash**, **OpenAI Decisions**, and a **custom** endpoint. OpenAI Decisions is GPT-6 Luna on OpenAI's Decisions API. A custom endpoint can be a model hosted on the user's own machine.
 
-Each is set up on a row in Settings → Models → Providers. OpenRouter and OpenAI use the key and the switch of their chat provider rows.
+Each is set up on a row in Settings → Providers. OpenRouter and OpenAI use the key and the switch of their chat provider rows.
 
 A System One model is picked in the model control of a decision Lucidos makes: the command guard's Judge model, Query classification, the Read decision and the Wake decision. Picking one sends what that decision judges to its vendor. If a System One call fails, the chat model answers instead. For the Wake decision that holds only for a chat model Lucidos measured for it, or one you picked: otherwise the parent wakes.
 
@@ -825,7 +830,7 @@ Most decisions run on a chat model until you pick, and storing a key moves none 
 ### Builtin provider proxy
 A *provider*'s API exposed through the engine's proxy **without** re-entering the credential in `data/config/apis.json`. Apps reach it with `lucidos.proxy(<name>).fetch(path, init)`, scripts with `lucidos proxy <name>`, and the Lucidos Agent with `proxy_request`. The builtin names are `anthropic`, `claude-gateway`, `local`, `openai`, `openrouter`, `typesafe`, `vertex` and `xai`. `opencode-free` has none (ADR 0104). The `claude-gateway` proxy uses the engine's issuer-bound sign-in and managed model policy (ADR 0614).
 
-When `<name>` matches one and no `apis.json` entry exists, the engine forwards to that provider's API root (every default root includes `/v1`). It injects the credential from Settings → Models → Providers server-side, so the secret never reaches the caller. A same-named `apis.json` entry is consulted first and overrides the builtin. The Lucidos Agent's context lists every builtin and whether it is configured. `request_credential` refuses a key a configured builtin already injects (ADR 0350).
+When `<name>` matches one and no `apis.json` entry exists, the engine forwards to that provider's API root (every default root includes `/v1`). It injects the credential from Settings → Providers server-side, so the secret never reaches the caller. A same-named `apis.json` entry is consulted first and overrides the builtin. The Lucidos Agent's context lists every builtin and whether it is configured. `request_credential` refuses a key a configured builtin already injects (ADR 0350).
 
 `vertex` takes the publisher/model suffix only: the engine owns the `…/projects/<project>/locations/<region>` prefix and mints the access token. So the app never needs the project id or a token. See `system-knowhow/js-sdk.md` § `lucidos.proxy`.
 
@@ -1407,7 +1412,7 @@ It clears once the end of the latest reply has been on screen for a second, the 
 The address that opens a *thread*, written as a markdown link target: `[Plan dinner](thread:myws/<thread_id>)`. Every row the `threads` tool and `lucidos threads` return carries one as `link`, as does a spawn result. Its workspace is always the one that served the row. A *draft* or a *held message* has no address of its own, so its link is its thread's.
 
 ### Settings link
-The address that opens one Settings page, written as a markdown link target: `[Settings → System → Backup](settings:backup)`. The part after `settings:` is the same view id `navigate_ui` takes as `settings_view`. The label is the breadcrumb route, so a surface that shows plain text still reads the route. Engine notifications that name a Settings page link it this way, and the link opens the same page as the notification's tap.
+The address that opens one Settings page, written as a markdown link target: `[Settings → System → Backup](settings:backup)`. The part after `settings:` is the same view id `navigate_ui` takes as `settings_view`. A `#<row>` after it names a row on that page, the same as `navigate_ui`'s `fragment`: `[xAI](settings:providers#xai)` opens Settings → Providers at the xAI block. The label is the breadcrumb route, so a surface that shows plain text still reads the route. Engine notifications that name a Settings page link it this way, and the link opens the same page as the notification's tap.
 
 ### Reader fields
 Four fields on each row that `lucidos threads list`, `lucidos threads search` and the `threads` tool return, saying what each *thread* holds and how to open it. `has_draft` says whether it holds a *draft*. `draft_preview` and `draft_length` give the draft's first 200 characters and its length, only when there is one. `link` is its *thread link*. Other thread reads leave them out.

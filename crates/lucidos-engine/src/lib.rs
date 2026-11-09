@@ -7,6 +7,15 @@
 //! - LLM integration with tool calling
 //! - Python runtime execution
 
+/// The Providers page as copy names it: the one definition for engine strings.
+/// A macro, not a `const`, so `concat!` can take it in `const` strings and
+/// `match` arms. The frontend's twin is `PROVIDERS_SETTINGS_PATH`.
+macro_rules! providers_settings {
+    () => {
+        "Settings → Providers"
+    };
+}
+
 /// Timestamped log with auto-derived module label.
 /// - `log!("message")` → auto module from `module_path!()`
 /// - `log!(@Push, "message")` → explicit label override

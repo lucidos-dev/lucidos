@@ -143,11 +143,12 @@ pub struct NavigateUi {
     pub settings_view: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_id: Option<String>,
-    /// The place INSIDE the app to open, delivered as the app iframe's
-    /// `location.hash`. Only meaningful with `target: App`. The page-side
-    /// router hands it over and never inspects it, since only the app knows
-    /// what its own targets are. An app that ignores the hash still opens,
-    /// exactly as a file opens at the top when its cited line has gone stale.
+    /// The place INSIDE the target to open. With `target: App` it is the app
+    /// iframe's `location.hash`. The page-side router hands it over and never
+    /// inspects it, since only the app knows what its own targets are. An app
+    /// that ignores the hash still opens, exactly as a file opens at the top
+    /// when its cited line has gone stale. With `target: Settings` it names a
+    /// row on the `settings_view` page, and the page toasts one it cannot find.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fragment: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

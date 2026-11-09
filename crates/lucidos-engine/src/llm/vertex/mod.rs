@@ -217,10 +217,11 @@ pub(crate) fn explain_publisher_model_404(
              A region that reaches this model may move Claude off the one it needs.",
         );
     } else {
-        advice.push_str(
-            " Check the region in Settings, Models, Providers, Vertex AI. \
-             That setting overrides the VERTEX_REGION environment variable.",
-        );
+        advice.push_str(concat!(
+            " Check the region in ",
+            providers_settings!(),
+            ", Vertex AI. That setting overrides the VERTEX_REGION environment variable.",
+        ));
     }
 
     Some(format!("{advice} Vertex said: {body}"))
@@ -672,7 +673,7 @@ mod tests {
         assert!(message.contains("`europe-west1`"), "{message}");
         assert!(message.contains("claude-opus-5@default[1m]"), "{message}");
         assert!(
-            message.contains("Settings, Models, Providers, Vertex AI"),
+            message.contains(concat!(providers_settings!(), ", Vertex AI")),
             "{message}"
         );
         assert!(message.contains("VERTEX_REGION"), "{message}");
@@ -696,7 +697,7 @@ mod tests {
 
         assert!(message.contains("`global`"), "{message}");
         assert!(
-            !message.contains("Settings, Models, Providers, Vertex AI"),
+            !message.contains(concat!(providers_settings!(), ", Vertex AI")),
             "a pinned model must not be blamed on the region setting: {message}"
         );
         assert!(

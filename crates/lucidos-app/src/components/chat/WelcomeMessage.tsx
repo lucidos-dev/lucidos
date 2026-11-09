@@ -26,13 +26,13 @@ function WelcomeDisclaimer() {
 /** First-run state when the engine booted with no LLM provider configured
  *  (`llmConfigured === false`). The agent can't answer until a provider exists,
  *  so this replaces the setup-interview entry point with calls to action that
- *  deep-link into Settings → Models → Providers. One dismissal hides both it
+ *  deep-link into Settings → Providers. One dismissal hides both it
  *  and the starter prompts (`welcomePlacement`).
  *
  *  TWO actions, because the first one is unreachable for the very user this
  *  screen exists for. Every credential provider wants a key, and a key wants a
  *  subscription or a card. OpenCode Free wants neither, so it is the only one
- *  such a newcomer can act on. Naming it only under Providers hid it behind a
+ *  such a newcomer can act on. Naming it only on the Providers page hid it behind a
  *  hunt for a key they do not have.
  *
  *  The free action NAVIGATES and nothing more. The tier is opt-in and states its
@@ -56,7 +56,7 @@ export function ProviderSetupWelcome() {
           Set up your AI provider
         </button>
         <p class="welcome-provider-setup-hint">
-          Opens Settings → Models → Providers. Add an OpenAI, Anthropic or
+          Opens Settings → Providers. Add an OpenAI, Anthropic or
           OpenRouter key, or point Lucidos at a local model. It takes effect
           right away, with no restart.
         </p>

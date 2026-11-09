@@ -4565,6 +4565,29 @@ mod tests {
         }
     }
 
+    /// The three commands a bare `Bash` grant still carded, though each only
+    /// reads under `.claude/`: a sed that prints, a loop, a substitution.
+    #[test]
+    fn a_bare_bash_grant_covers_a_read_through_sed_a_loop_or_a_substitution() {
+        let bare_bash = |p: &str| p == CLAUDE_CODE_COMMAND_TOOL;
+        for command in [
+            "rg -n x .claude/rules | sed \"s|a||\"",
+            "R=/repo; rg -n x .claude/rules | sed \"s|$R/||\"",
+            "for f in a .claude/rules/x.md:84; do ln=${f##*:}; line=$(sed -n \"${ln}p\" \"$f\"); done",
+        ] {
+            let input = serde_json::json!({ "command": command });
+            assert!(
+                persisted_allow_covers(
+                    CLAUDE_CODE_COMMAND_TOOL,
+                    &input,
+                    &TrustedHeads::NONE,
+                    bare_bash
+                ),
+                "{command}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_secret_read_escalation_still_cards() {
         let input =

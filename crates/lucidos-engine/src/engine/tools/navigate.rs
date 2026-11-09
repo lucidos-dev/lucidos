@@ -295,7 +295,11 @@ fn describe_target(target: &str, args: &serde_json::Value) -> String {
         "trigger" => format!("trigger {}", arg("id")),
         "url" => arg("url").to_string(),
         "settings" if !arg("settings_view").is_empty() => {
-            format!("Settings → {}", arg("settings_view"))
+            let view = arg("settings_view");
+            match arg("fragment") {
+                "" => format!("Settings → {view}"),
+                row => format!("Settings → {view}, the {row} row"),
+            }
         }
         other => format!("the {other} view"),
     }
@@ -308,6 +312,7 @@ fn page_guide(target: &str, args: &serde_json::Value) -> Option<&'static str> {
         return None;
     }
     match args.get("settings_view").and_then(|v| v.as_str()) {
+        Some("providers") => Some(PROVIDERS_SETTINGS_GUIDE),
         Some("models") => Some(MODELS_SETTINGS_GUIDE),
         Some("backup") => Some(BACKUP_SETTINGS_GUIDE),
         Some("environment-variables") => Some(ENV_VARS_SETTINGS_GUIDE),
@@ -315,10 +320,19 @@ fn page_guide(target: &str, args: &serde_json::Value) -> Option<&'static str> {
     }
 }
 
+const PROVIDERS_SETTINGS_GUIDE: &str = "Settings → Providers shows:\n\
+     - One block per model provider (Vertex AI, Anthropic, OpenAI, OpenRouter, xAI, \
+       OpenCode Free, local, Claude gateway): its key or sign-in and its switch\n\
+     - A System One section: TypeSafe, Cloudflare Workers AI and custom providers\n\
+     Pass fragment with a provider's id ('xai', 'openai', 'vertex', 'anthropic') to \
+     land on its block. A model needs one of its providers set up here before it \
+     can be chosen.";
+
 const MODELS_SETTINGS_GUIDE: &str = "Settings → Models shows:\n\
      - The active Chat & triggers model (the model picker) and reasoning effort\n\
      - Image generation and background-task models (title, image description, memory)\n\
-     - Providers (Anthropic, OpenAI, OpenRouter, xAI, local) and the model registry\n\
+     - A link to Settings → Providers, and the model registry (models no provider \
+       serves sit in a closed 'Needs a provider' group)\n\
      Tell the user they can change the active model from the picker here. To switch \
      it for them instead, use set_preference(key='chat_model'); to add a model to the \
      picker, use manage_models.";

@@ -926,7 +926,7 @@ const data = await res.json();
 
 ### Built-in model-provider proxies (no `apis.json` entry needed)
 
-The engine already holds credentials and routing for every model provider in the model registry (Settings → Models), plus TypeSafe. It exposes them as **built-in provider proxies** under the SAME route. So an app can call an LLM / image / judgment provider with no `apis.json` entry. When `<name>` matches one and has no `apis.json` entry, the engine forwards to that provider's API root and injects its credential server-side:
+The engine already holds credentials and routing for every model provider in the model registry (set up in Settings → Providers), plus TypeSafe. It exposes them as **built-in provider proxies** under the SAME route. So an app can call an LLM / image / judgment provider with no `apis.json` entry. When `<name>` matches one and has no `apis.json` entry, the engine forwards to that provider's API root and injects its credential server-side:
 
 | `proxy(name)` | Base URL | Injected server-side | You send |
 |---|---|---|---|
@@ -945,7 +945,7 @@ The engine already holds credentials and routing for every model provider in the
 - **Not configured → 404.** With no credential/config and no `apis.json` entry, the call returns 404 naming what to set.
 - **Every default base already includes `/v1`.** Send `/models`, never `/v1/models`, which doubles the segment and answers 404. A `local` base you configure yourself may lack it.
 - **`opencode-free` has no proxy.** The keyless free tier serves chat only, and an app must not build on an anonymous endpoint that can vanish without notice (ADR 0104).
-- **`claude-gateway` shares the engine's sign-in.** Configure and sign in under Settings → Models → Providers.
+- **`claude-gateway` shares the engine's sign-in.** Configure and sign in under Settings → Providers.
   Send `/messages` with the normal Anthropic body: `model`, `max_tokens`, and `messages`; `stream: true` is supported.
   Choose a model served to your account. The engine resolves listed snapshots and enforces managed model policy.
   A model id ending in `[1m]` goes upstream without the suffix, plus the 1M-context `anthropic-beta`.
@@ -1723,7 +1723,7 @@ type NavigateTarget =
 // are absent because nothing has asked to link them: `webhooks` and
 // `communication-surfaces`.
 type SettingsViewTarget =
-  | 'models' | 'intelligence' | 'permissions' | 'mcp' | 'coding-agents' | 'accounts' | 'locale' | 'marketplaces'
+  | 'providers' | 'models' | 'intelligence' | 'permissions' | 'mcp' | 'coding-agents' | 'accounts' | 'locale' | 'marketplaces'
   | 'access' | 'devices' | 'system' | 'appearance' | 'keyboard-shortcuts'
   | 'system-overview' | 'release-notices' | 'whats-new'
   | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables' | 'debugging';
@@ -1732,8 +1732,9 @@ interface NavigateUi {
   target: NavigateTarget;
   settings_view?: SettingsViewTarget;
   app_id?: string;
-  /** The place INSIDE the app, delivered as the app iframe's `location.hash`.
-   *  Only used with `target: 'app'`. See § Navigation targets. */
+  /** The place INSIDE the target. With `target: 'app'` it is the app iframe's
+   *  `location.hash`. With `target: 'settings'` it names a row on the page,
+   *  such as `'xai'` on `'providers'`. See § Navigation targets. */
   fragment?: string;
   file_path?: string;
   /** 1-based line to open `file_path` at, and the inclusive last line of the
@@ -2255,7 +2256,7 @@ show(await lucidos.ui.focusedThread());
 |--------|--------|-------------|
 | `thread` | `id` | Focus a specific thread |
 | `app` | `id` (or `app_id`), `fragment` (optional) | Open an app UI, optionally at a place inside it. See the fragment param below. |
-| `settings` | `settings_view` (optional) | Open Settings, optionally a sub-section: `models`, `intelligence`, `permissions`, `mcp`, `coding-agents`, `accounts`, `locale`, `marketplaces`, `access`, `devices`, `appearance`, `keyboard-shortcuts`, or a System page (`system` is the list of them; `system-overview`, `release-notices`, `whats-new`, `backup`, `memory`, `disk-usage`, `environment-variables`, `thread-queue`, `debugging` are the pages themselves). Omit `settings_view` for the Settings home list. |
+| `settings` | `settings_view` (optional), `fragment` (optional) | Open Settings, optionally a sub-section: `providers`, `models`, `intelligence`, `permissions`, `mcp`, `coding-agents`, `accounts`, `locale`, `marketplaces`, `access`, `devices`, `appearance`, `keyboard-shortcuts`, or a System page (`system` is the list of them; `system-overview`, `release-notices`, `whats-new`, `backup`, `memory`, `disk-usage`, `environment-variables`, `thread-queue`, `debugging` are the pages themselves). Omit `settings_view` for the Settings home list. A `fragment` scrolls to a row on that page: `settings_view: 'providers'` with `fragment: 'xai'` lands on the xAI block. An unknown row still opens the page, then shows a toast. |
 | `new-chat` | `prompt`, `coding_agent`, `folder` (all optional) | Open a fresh chat thread, optionally prefilling the compose textarea and preselecting the coding agent and folder. Prefer `lucidos.ui.startThread()`, the typed wrapper around this target. |
 | `plugins` | `id` (optional) | Open the Plugins panel's Installed tab. With `id` (a plugin id), scroll to and pulse-highlight that plugin's row. The plugin-update notification uses this, so a tap on one update lands on its plugin. |
 | `app-store` | (none) | Open the Plugins panel's Store (marketplace) tab. |
@@ -2278,8 +2279,8 @@ await lucidos.ui.navigate('app', {
 });
 ```
 
-- Only used with `target: 'app'`. On any other target it is ignored.
-- Lucidos never inspects it: only the app knows what its own targets are.
+- Used with `target: 'app'` and `target: 'settings'`. On any other target it is ignored. On `settings` it names a row on the page, and Lucidos checks it.
+- For an app, Lucidos never inspects it: only the app knows what its own targets are.
 - An app that ignores the hash still opens, at whatever it shows by default.
 - **Absent is not empty.** Omitting it leaves an already-open app where the
   reader put it; `''` would move them to the app's default view.

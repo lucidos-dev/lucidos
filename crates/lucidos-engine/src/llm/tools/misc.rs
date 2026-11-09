@@ -51,6 +51,7 @@ const NAVIGATE_TARGETS: &[&str] = &[
 /// Two are still absent, because every value costs the always-loaded budget and
 /// nothing has asked to link these: `webhooks` and `communication-surfaces`.
 pub(crate) const NAVIGABLE_SETTINGS_VIEWS: &[&str] = &[
+    "providers",
     "models",
     "intelligence",
     "permissions",
@@ -107,7 +108,7 @@ pub(super) fn get_navigate_ui_tool() -> ToolDefinition {
                 },
                 "fragment": {
                     "type": "string",
-                    "description": "A place inside the app; 'app' only. Arrives as its location.hash, so the app routes to that item. Pass it whenever you name one."
+                    "description": "Inside the target. 'app': arrives as location.hash, which it routes on. 'settings': a row, e.g. 'xai'. Pass it whenever you name one."
                 },
                 "file_path": {
                     "type": "string",

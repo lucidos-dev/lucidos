@@ -12,13 +12,12 @@
 # notary queue, and on a day when that queue was wedged, each one deepened the
 # very backlog we were stuck in.
 #
-# A release re-fold onto new main is CORRECT and must stay the default (see the
-# release-process knowhow: never ship a stale candidate). What was wrong is that
-# a re-fold unconditionally implied "rebuild + resubmit". This library lets the
-# re-fold ask a sharper question: does the new tree actually produce different
-# BYTES? When it doesn't, the already-built (and possibly already-in-flight or
-# already-notarized) DMG is still exactly right, and the release commit can move
-# forward without touching Apple.
+# A release now ships its cut, so main moving after Phase A no longer forces a
+# re-fold. A deliberate re-cut still happens, and it must not imply "rebuild +
+# resubmit". This library lets the re-cut ask a sharper question: does the new
+# tree actually produce different BYTES? When it doesn't, the already-built
+# (and possibly already-in-flight or already-notarized) DMG is still exactly
+# right, and the release commit can move forward without touching Apple.
 #
 # WHAT IS FINGERPRINTED
 # ------------------------------------------------------------------------------

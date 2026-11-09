@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -3934,13 +3935,27 @@ fn segment_separators(command: &str) -> Vec<String> {
 static SEGMENT_SEP: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"&&|\|\||;|\||&|\n").unwrap());
 
-/// `command` with the fd-duplications and the noclobber overrides taken out,
-/// ready to split. See [`command_segments`].
+/// The byte range of each [`command_segments`] segment in `command`.
+fn segment_ranges(command: &str) -> Vec<Range<usize>> {
+    let cleaned = segmentable(command);
+    let mut start = 0;
+    let mut ranges = Vec::new();
+    for sep in SEGMENT_SEP.find_iter(&cleaned) {
+        ranges.push(start..sep.start());
+        start = sep.end();
+    }
+    ranges.push(start..cleaned.len());
+    ranges
+}
+
+/// `command` with the fd-duplications and the noclobber overrides blanked,
+/// ready to split. See [`command_segments`]. Keeps the byte length, so a
+/// [`segment_ranges`] range also slices `command`.
 fn segmentable(command: &str) -> String {
     static FD_DUP: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"\d*>&\d+").unwrap());
     FD_DUP
-        .replace_all(command, " ")
+        .replace_all(command, |m: &regex::Captures| " ".repeat(m[0].len()))
         .replace(">|", "> ")
         .replace(">!", "> ")
 }
@@ -4829,8 +4844,27 @@ const MAX_SUBSTITUTION_DEPTH: usize = 8;
 /// An opener with no closer yields the rest of the string. An unparseable
 /// substitution is scanned rather than waved through.
 fn substitution_bodies(s: &str) -> Vec<&str> {
+    substitution_spans(s)
+        .into_iter()
+        .map(|span| &s[span.body])
+        .collect()
+}
+
+/// One outermost substitution in a command, as [`substitution_spans`] finds it.
+struct SubstitutionSpan {
+    /// From the opener through the closer.
+    whole: Range<usize>,
+    body: Range<usize>,
+    /// `$(...)` or backticks, whose output the shell splices into words.
+    /// `<(...)` and `>(...)` stand for a path instead.
+    splices: bool,
+}
+
+/// Every outermost substitution in `s`, read as [`substitution_bodies`]
+/// describes. A nested one sits inside its parent's body.
+fn substitution_spans(s: &str) -> Vec<SubstitutionSpan> {
     let b = s.as_bytes();
-    let mut bodies = Vec::new();
+    let mut spans = Vec::new();
     let mut quotes = QuoteState::default();
     let mut i = 0;
     while i < b.len() {
@@ -4838,23 +4872,32 @@ fn substitution_bodies(s: &str) -> Vec<&str> {
             i = next;
             continue;
         }
-        match b[i] {
+        let (body, splices) = match b[i] {
             b'`' => {
                 let start = i + 1;
-                let end = s[start..].find('`').map_or(s.len(), |o| start + o);
-                bodies.push(&s[start..end]);
-                i = (end + 1).min(s.len());
+                (
+                    start..s[start..].find('`').map_or(s.len(), |o| start + o),
+                    true,
+                )
             }
             b'$' | b'<' | b'>' if b.get(i + 1) == Some(&b'(') => {
                 let start = i + 2;
-                let end = matching_close_paren(s, start);
-                bodies.push(&s[start..end]);
-                i = (end + 1).min(s.len());
+                (start..matching_close_paren(s, start), b[i] == b'$')
             }
-            _ => i += char_len_at(s, i),
-        }
+            _ => {
+                i += char_len_at(s, i);
+                continue;
+            }
+        };
+        let end = (body.end + 1).min(s.len());
+        spans.push(SubstitutionSpan {
+            whole: i..end,
+            body,
+            splices,
+        });
+        i = end;
     }
-    bodies
+    spans
 }
 
 /// Byte offset of the `)` closing a substitution whose body starts at `start`,
@@ -5722,13 +5765,18 @@ const FIND_ACTING_PRIMARIES: [&str; 9] = [
 /// Whether `command` may write under a directory one of `dirs` names, such as
 /// `.claude/`. Only a write counts, never a mention.
 ///
-/// A command that names one of `dirs` counts unless EVERY segment only reads:
-/// a read-only head, a read-only `git` call, or a `find` with no acting
-/// primary. One writing segment anywhere counts, since a read can hand the
-/// path on: `grep -l x .claude/ | xargs rm`. A redirect into one of `dirs`
-/// counts behind any head. A literal heredoc body is text. A substitution
-/// counts, since its body is not read. The check reads through a shell `-c`
-/// layer only when the layer is a bare wrapper ([`bare_shell_script`]).
+/// A command that names one of `dirs` counts unless EVERY segment only reads
+/// ([`segment_only_reads`]). Reads include a read-only head or `git` call, a
+/// bare `git add` or `git commit`, and a printing `sed` or `sort`. So do a
+/// `find` with no acting primary, a loop or `if` keyword, and a comment.
+/// One writing segment anywhere counts, since a read can hand the path on:
+/// `grep -l x .claude/ | xargs rm`. ADR 0634 sets the rule, and ADR 0638
+/// widens what reads.
+///
+/// A redirect into one of `dirs` counts behind any head. A literal heredoc
+/// body is text. A substitution body must only read too
+/// ([`script_only_reads`]). The check reads through a shell `-c` layer only
+/// when the layer is a bare wrapper ([`bare_shell_script`]).
 pub fn command_may_write_under(command: &str, dirs: &[&str]) -> bool {
     let mut script = command.to_string();
     for _ in 0..MAX_SHELL_LAYERS {
@@ -5745,13 +5793,73 @@ pub fn command_may_write_under(command: &str, dirs: &[&str]) -> bool {
     let blanked = heredocs
         .as_ref()
         .map_or(script.as_str(), |h| h.text.as_str());
-    if has_command_substitution(blanked) {
-        return true;
+    !script_only_reads(blanked, LineFacts::of(&script), 0, &names)
+}
+
+/// The word that stands in for a `$(...)` or backtick's output while
+/// [`script_only_reads`] checks the text around it.
+const SPLICED_OUTPUT: &str = "$__substituted__";
+
+/// The path that stands in for a `<(...)` or `>(...)`.
+const PROCESS_SUBSTITUTION_PATH: &str = "/dev/fd/63";
+
+/// True when every segment of `script` only reads ([`segment_only_reads`]) and
+/// no redirect writes into a path `names` matches.
+///
+/// Each substitution body must pass the same check first, `depth` levels deep
+/// at most. Its output then becomes [`SPLICED_OUTPUT`] or
+/// [`PROCESS_SUBSTITUTION_PATH`]. A line holding `<<` with any substitution
+/// counts as a write: an unquoted heredoc body expands one that no walk sees.
+/// So does a backtick body that ends at an escaped backtick, which nests
+/// another substitution, and a `>&word` redirect, which writes `word`.
+fn script_only_reads(
+    script: &str,
+    line: LineFacts,
+    depth: usize,
+    names: &dyn Fn(&str) -> bool,
+) -> bool {
+    if has_command_substitution(script)
+        && (script.contains("<<") || depth >= MAX_SUBSTITUTION_DEPTH)
+    {
+        return false;
     }
-    let line = LineFacts::of(&script);
-    command_segments(&quoted_operators_masked(blanked)).any(|segment| {
-        redirect_targets(&segment).any(&names) || !segment_only_reads(&segment, line)
+    let mut text = String::with_capacity(script.len());
+    let mut copied = 0;
+    for span in substitution_spans(script) {
+        let nests_backtick = script.as_bytes()[span.whole.start] == b'`'
+            && script[span.body.clone()].ends_with('\\');
+        if nests_backtick || !script_only_reads(&script[span.body], line, depth + 1, names) {
+            return false;
+        }
+        text.push_str(&script[copied..span.whole.start]);
+        text.push_str(if span.splices {
+            SPLICED_OUTPUT
+        } else {
+            PROCESS_SUBSTITUTION_PATH
+        });
+        copied = span.whole.end;
+    }
+    text.push_str(&script[copied..]);
+    let masked = quoted_operators_masked(&text);
+    let raw = comments_blanked(&text, &masked);
+    segment_ranges(&masked).into_iter().all(|range| {
+        let segment = segmentable(&masked[range.clone()]);
+        !segment.contains(">&")
+            && !redirect_targets(&segment).any(names)
+            && segment_only_reads(&segment, &raw[range], line)
     })
+}
+
+/// `text` with the comments that [`quoted_operators_masked`] blanked in
+/// `masked` blanked too, and its quotes kept. Masking turns only a comment
+/// into blanks, and a comment's multibyte character into one blank per byte.
+fn comments_blanked<'a>(text: &'a str, masked: &str) -> Cow<'a, str> {
+    let bytes = text
+        .bytes()
+        .zip(masked.bytes())
+        .map(|(t, m)| if m == b' ' { m } else { t })
+        .collect();
+    String::from_utf8(bytes).map_or(Cow::Borrowed(text), Cow::Owned)
 }
 
 /// The `-c` script of `command` when the line is nothing but a shell running
@@ -5777,14 +5885,18 @@ fn bare_shell_script(command: &str) -> Option<Cow<'_, str>> {
     tail.trim().is_empty().then_some(script)
 }
 
-/// `command` with every control or redirect character that the shell reads
-/// as text replaced by `_`: one inside quotes, or escaped by a backslash. So a
-/// quoted `'a\|b'` stays one argument rather than a pipe into a head `b'`.
+/// `command` with every control, redirect or group character that the shell
+/// reads as text replaced by `_`: one inside quotes, or escaped by a
+/// backslash. So a quoted `'a\|b'` stays one argument rather than a pipe into
+/// a head `b'`, and a quoted `"(a)"` opens no group. A `#` comment becomes
+/// blanks up to its line end, so its words open no segment and redirect
+/// nothing. A `#` counts only at the start of a word the shell splits.
 ///
 /// `command` itself, unmasked, wherever the walk could read quotes
-/// differently from the shell: a quote left open, a heredoc whose body is
-/// still in the text, or a `#` comment, where a quote is text. The plain split
-/// then errs towards more segments, and every real head still starts one.
+/// differently from the shell: a quote left open, or a heredoc whose body is
+/// still in the text. The plain split then errs towards more segments, every
+/// real head still starts one, and a `#` word heads a segment that never
+/// reads.
 fn quoted_operators_masked(command: &str) -> Cow<'_, str> {
     #[derive(Clone, Copy, PartialEq)]
     enum Quote {
@@ -5801,16 +5913,24 @@ fn quoted_operators_masked(command: &str) -> Cow<'_, str> {
     let mut escaped = false;
     // An unquoted, unescaped `$` just before: the next `'` opens `$'…'`.
     let mut dollar = false;
-    let mut prev: Option<char> = None;
+    let mut comment = false;
+    // The last character split words: an unquoted, unescaped blank or operator.
+    let mut word_break = true;
     for c in command.chars() {
-        let starts_word = prev.is_none_or(|p| p.is_whitespace() || "|;&()".contains(p));
-        if c == '#' && quote.is_none() && !escaped && starts_word {
-            return Cow::Borrowed(command);
+        if comment && c != '\n' {
+            out.extend(std::iter::repeat_n(' ', c.len_utf8()));
+            continue;
         }
-        prev = Some(c);
+        comment = false;
         let literal = escaped || quote.is_some();
+        if c == '#' && !literal && word_break {
+            comment = true;
+            out.push(' ');
+            continue;
+        }
+        word_break = !literal && (c.is_whitespace() || "|;&()".contains(c));
         out.push(match c {
-            '|' | ';' | '&' | '>' | '<' | '\n' if literal => '_',
+            '|' | ';' | '&' | '>' | '<' | '\n' | '(' | ')' | '{' | '}' if literal => '_',
             _ => c,
         });
         let was_escaped = std::mem::take(&mut escaped);
@@ -5839,32 +5959,564 @@ fn quoted_operators_masked(command: &str) -> Cow<'_, str> {
     }
 }
 
+/// Shell words that may open a segment ahead of the command it runs.
+const LEADING_KEYWORDS: [&str; 8] = ["do", "then", "else", "elif", "if", "while", "until", "!"];
+
+/// True when `toks` is nothing but redirects and their targets.
+fn only_redirects(toks: &[&str]) -> bool {
+    let mut rest = toks.iter();
+    while let Some(tok) = rest.next() {
+        match redirect_token_needs_target(tok) {
+            Some(true) if rest.next().is_none() => return false,
+            Some(_) => {}
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Heads with no option that writes or runs, so a spliced word after one can
+/// only be an operand it reads.
+const SPLICE_READING_HEADS: [&str; 12] = [
+    "cd", "echo", "cat", "readlink", "realpath", "basename", "dirname", "ls", "wc", "head", "tail",
+    "grep",
+];
+
+/// `git` subcommands the protected-path walk reads beyond
+/// [`GIT_READ_ONLY_SUBCOMMANDS`]. `add` and `commit` write only git's own
+/// index, objects and refs, which they do unasked when no protected path is
+/// named.
+const GIT_WALK_READING_SUBCOMMANDS: [&str; 5] = [
+    "add",
+    "commit",
+    "merge-base",
+    "check-ignore",
+    "for-each-ref",
+];
+
 /// True when `segment` runs a head that only reads, as
-/// [`command_may_write_under`] defines it. A `(` or `{` word never reads. It
-/// opens a function body or a group, which a later segment may run under a
-/// read-only name.
-fn segment_only_reads(segment: &str, line: LineFacts) -> bool {
+/// [`command_may_write_under`] defines it. An unquoted `(` or `{` word never
+/// reads. It opens a function body or a group, which a later segment may run
+/// under a read-only name.
+///
+/// [`SPLICED_OUTPUT`] reads as the value of an assignment before the head, or
+/// as an operand of a [`SPLICE_READING_HEADS`] head. Anywhere else it may
+/// become a flag, and as a redirect target it may name any path. A variable
+/// that [`steers_later_heads`] never reads when assigned, by a preamble, a
+/// `for` loop or `printf -v`. A `$'…'` word never reads either: it can spell
+/// any option or script, and the walk does not decode it.
+///
+/// A [`LEADING_KEYWORDS`] word reads only if the rest of the segment does.
+/// `for NAME in WORDS` reads, as do `done`, `fi` and `esac` with only
+/// redirects after them. `case` never reads.
+///
+/// `raw` is `segment` with its quotes kept and only comments blanked
+/// ([`comments_blanked`]), for a head whose quoted arguments decide: a `sed`
+/// script or a `sort` option.
+fn segment_only_reads(segment: &str, raw: &str, line: LineFacts) -> bool {
     let toks: Vec<&str> = segment.split_whitespace().collect();
-    if toks
-        .iter()
-        .any(|tok| tok.starts_with(['(', '{']) || tok.ends_with("()"))
+    if raw.contains("$'")
+        || toks
+            .iter()
+            .any(|tok| tok.starts_with(['(', '{']) || tok.ends_with("()"))
     {
         return false;
     }
+    if let Some(&keyword) = toks.first().filter(|tok| LEADING_KEYWORDS.contains(tok)) {
+        let rest = segment.len() - segment.trim_start().len() + keyword.len();
+        return segment_only_reads(&segment[rest..], &raw[rest..], line);
+    }
+    let spliced = |tok: &str| tok.contains(SPLICED_OUTPUT);
+    let splice_redirected = redirect_targets(segment).any(spliced);
+    if let ["for", name, "in", ..] = toks[..] {
+        return is_env_var_name(name) && !steers_later_heads(name) && !splice_redirected;
+    }
     let i = command_head_index(&toks);
+    let spliced_in_preamble = toks[..i]
+        .iter()
+        .any(|tok| spliced(tok) && !is_assignment_word(tok));
+    let splice_reads = toks
+        .get(i)
+        .is_some_and(|head| SPLICE_READING_HEADS.contains(head))
+        && !splice_redirected;
+    let steering_assignment = toks[..i].iter().any(|tok| {
+        tok.split_once('=')
+            .is_some_and(|(name, _)| steers_later_heads(name.strip_suffix('+').unwrap_or(name)))
+    });
+    if spliced_in_preamble
+        || (toks[i..].iter().any(|tok| spliced(tok)) && !splice_reads)
+        || steering_assignment
+    {
+        return false;
+    }
     let Some(&head) = toks.get(i) else {
         return true;
     };
     match head {
         "cd" => true,
+        "done" | "fi" | "esac" => only_redirects(&toks[i + 1..]),
+        "printf" if toks[i + 1..].iter().any(|tok| tok.starts_with("-v")) => false,
+        "sed" => sed_only_reads(raw),
+        "sort" => sort_only_reads(raw),
         "find" => !toks[i + 1..]
             .iter()
             .any(|tok| FIND_ACTING_PRIMARIES.contains(&dequoted(tok).as_str())),
-        "git" => head_safety(segment, None, &TrustedHeads::NONE, line).is_none(),
+        "git" => {
+            git_walk_reads(&toks[..i], &toks[i + 1..])
+                || head_safety(segment, None, &TrustedHeads::NONE, line).is_none()
+        }
         _ => {
             READ_ONLY_HEADS.contains(&head)
                 && !WRITE_CAPABLE_READ_ONLY_HEADS.contains(&head)
                 && head_safety(segment, None, &TrustedHeads::NONE, line).is_none()
+        }
+    }
+}
+
+/// True when assigning the variable `name` can change what a later head runs
+/// or where it writes. That is a [`CODE_INJECTING_ENV_NAMES`] entry, or
+/// `TMPDIR`, where `sort` and others write temporary files.
+fn steers_later_heads(name: &str) -> bool {
+    is_code_injecting_env_name(name) || name == "TMPDIR"
+}
+
+/// True when a `git` call runs a [`GIT_WALK_READING_SUBCOMMANDS`] entry right
+/// after `git`. A global option or a `GIT_` variable before it can point git
+/// at another index, directory or hook, so either counts as a write.
+fn git_walk_reads(preamble: &[&str], args: &[&str]) -> bool {
+    !preamble.iter().any(|tok| tok.contains("GIT_"))
+        && args
+            .first()
+            .is_some_and(|sub| GIT_WALK_READING_SUBCOMMANDS.contains(&dequoted(sub).as_str()))
+}
+
+/// `sort` long options that only shape how it reads and orders, with no value.
+const SORT_READING_LONG_OPTIONS: [&str; 19] = [
+    "ignore-leading-blanks",
+    "dictionary-order",
+    "ignore-case",
+    "general-numeric-sort",
+    "ignore-nonprinting",
+    "month-sort",
+    "human-numeric-sort",
+    "numeric-sort",
+    "random-sort",
+    "reverse",
+    "version-sort",
+    "check",
+    "merge",
+    "stable",
+    "unique",
+    "zero-terminated",
+    "debug",
+    "help",
+    "version",
+];
+
+/// `sort` long options that take a value and only read: a key, a separator, a
+/// size, or a file it reads.
+const SORT_READING_VALUE_OPTIONS: [&str; 8] = [
+    "key",
+    "field-separator",
+    "buffer-size",
+    "parallel",
+    "sort",
+    "random-source",
+    "files0-from",
+    "batch-size",
+];
+
+/// True when the `sort` call in `segment` uses only reading options. `-o`,
+/// `-T` and `--compress-program` write or run. Any unknown option counts as a
+/// write, an abbreviated long option included.
+fn sort_only_reads(segment: &str) -> bool {
+    let argv = shell_argv(segment);
+    let texts: Vec<&str> = argv.iter().map(|w| w.text.as_str()).collect();
+    let head = command_head_index(&texts);
+    if texts.get(head) != Some(&"sort") {
+        return false;
+    }
+    let mut words = texts[head + 1..].iter();
+    while let Some(&text) = words.next() {
+        if text == "--" {
+            return true;
+        }
+        if text == "-" || !text.starts_with('-') {
+            continue;
+        }
+        if let Some(long) = text.strip_prefix("--") {
+            let reads = match long.split_once('=') {
+                Some((name, _)) => name == "check" || SORT_READING_VALUE_OPTIONS.contains(&name),
+                None => {
+                    SORT_READING_LONG_OPTIONS.contains(&long)
+                        || (SORT_READING_VALUE_OPTIONS.contains(&long) && words.next().is_some())
+                }
+            };
+            if !reads {
+                return false;
+            }
+            continue;
+        }
+        for (at, flag) in text.char_indices().skip(1) {
+            match flag {
+                'b' | 'd' | 'f' | 'g' | 'h' | 'i' | 'M' | 'n' | 'R' | 'r' | 'V' | 'c' | 'C'
+                | 'm' | 's' | 'u' | 'z' => {}
+                'k' | 't' | 'S' => {
+                    if at + 1 == text.len() && words.next().is_none() {
+                        return false;
+                    }
+                    break;
+                }
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
+/// `sed` options that only shape how it reads and prints. GNU accepts an
+/// abbreviated long option, which reads as unknown here, so as a write.
+const SED_READING_LONG_OPTIONS: [&str; 13] = [
+    "--quiet",
+    "--silent",
+    "--regexp-extended",
+    "--separate",
+    "--unbuffered",
+    "--null-data",
+    "--zero-terminated",
+    "--posix",
+    "--debug",
+    "--follow-symlinks",
+    "--binary",
+    "--help",
+    "--version",
+];
+
+/// True when the `sed` call in `segment` only prints. It must have no
+/// in-place flag (`-i`, `-I`, `--in-place`), no script file (`-f`), and no
+/// script command that writes or runs ([`sed_script_only_reads`]). A short
+/// `-l` counts as a write: GNU gives it a value and BSD does not, so the two
+/// disagree on which word is the script.
+///
+/// An option anywhere counts, since GNU sed reads options after operands too.
+/// An unknown option counts as a write. A file operand only reads, even one
+/// that expands: a variable's value is the miss ADR 0634 accepts.
+fn sed_only_reads(segment: &str) -> bool {
+    let argv = shell_argv(segment);
+    let texts: Vec<&str> = argv.iter().map(|w| w.text.as_str()).collect();
+    let head = command_head_index(&texts);
+    if texts.get(head) != Some(&"sed") {
+        return false;
+    }
+    let mut scripts = Vec::new();
+    let mut first_operand = None;
+    let mut options_done = false;
+    let mut words = argv[head + 1..].iter();
+    while let Some(word) = words.next() {
+        let text = word.text.as_str();
+        if options_done || text == "-" || !text.starts_with('-') {
+            match redirect_token_needs_target(text) {
+                Some(needs_target) if !options_done => {
+                    if needs_target {
+                        words.next();
+                    }
+                }
+                _ => {
+                    first_operand.get_or_insert(word);
+                }
+            }
+            continue;
+        }
+        if text == "--" {
+            options_done = true;
+        } else if let Some(long) = text.strip_prefix("--") {
+            let (name, value) = long
+                .split_once('=')
+                .map_or((long, None), |(n, v)| (n, Some(v)));
+            match (name, value) {
+                ("expression", Some(_)) => {
+                    scripts.push(expansions_marked(word)["--expression=".len()..].to_string())
+                }
+                ("expression", None) => match words.next() {
+                    Some(script) => scripts.push(expansions_marked(script)),
+                    None => return false,
+                },
+                ("line-length", Some(_)) => {}
+                ("line-length", None) => {
+                    words.next();
+                }
+                (_, None) if SED_READING_LONG_OPTIONS.contains(&text) => {}
+                _ => return false,
+            }
+        } else {
+            for (at, flag) in text.char_indices().skip(1) {
+                match flag {
+                    'n' | 'E' | 'r' | 's' | 'u' | 'z' | 'b' => continue,
+                    'e' => {
+                        let script = if at + 1 < text.len() {
+                            Some(expansions_marked(word)[at + 1..].to_string())
+                        } else {
+                            words.next().map(expansions_marked)
+                        };
+                        match script {
+                            Some(script) => scripts.push(script),
+                            None => return false,
+                        }
+                        break;
+                    }
+                    _ => return false,
+                }
+            }
+        }
+    }
+    if scripts.is_empty() {
+        scripts.extend(first_operand.map(expansions_marked));
+    }
+    sed_script_only_reads(&scripts.join("\n"))
+}
+
+/// Stands in for a shell expansion inside a `sed` script.
+const SED_EXPANSION: char = '\u{1}';
+
+/// `word` with each shell expansion replaced by [`SED_EXPANSION`]. In a word
+/// that expands, every `$` that starts a name, `{`, digit or special
+/// parameter counts, even one the shell left literal: that error only cards.
+/// Keeps the byte offset of every character before the first `$`.
+fn expansions_marked(word: &ShellWord) -> String {
+    if !word.expands {
+        return word.text.clone();
+    }
+    let mut out = String::with_capacity(word.text.len());
+    let mut chars = word.text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('{') => {
+                let mut depth = 0;
+                for inner in chars.by_ref() {
+                    depth += match inner {
+                        '{' => 1,
+                        '}' => -1,
+                        _ => 0,
+                    };
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+            Some(next) if next.is_ascii_digit() || "@*#?!$-".contains(next) => {
+                chars.next();
+            }
+            Some(next) if next.is_ascii_alphabetic() || next == '_' => {
+                while chars
+                    .peek()
+                    .is_some_and(|n| n.is_ascii_alphanumeric() || *n == '_')
+                {
+                    chars.next();
+                }
+            }
+            _ => {
+                out.push('$');
+                continue;
+            }
+        }
+        out.push(SED_EXPANSION);
+    }
+    out
+}
+
+/// True when the `sed` script `script` has no command that writes a file or
+/// runs one: no `w`, `W` or `e` command, and no `w` or `e` flag on `s`.
+///
+/// Scans addresses, `s` and `y` with any delimiter, `a`/`i`/`c` text, `r`/`R`
+/// file names, labels, comments and blocks. An unknown command letter counts
+/// as a write, and so does a [`SED_EXPANSION`] where a command belongs. Only a
+/// separator may follow a command, as GNU sed requires. So a scan that lost
+/// its place stops at a write rather than reading on.
+fn sed_script_only_reads(script: &str) -> bool {
+    let s: Vec<char> = script.chars().collect();
+    let at = |i: usize| s.get(i).copied();
+    let skip_blanks = |mut i: usize| {
+        while at(i).is_some_and(|c| c == ' ' || c == '\t') {
+            i += 1;
+        }
+        i
+    };
+    let mut i = 0;
+    loop {
+        while at(i).is_some_and(|c| c.is_whitespace() || c == ';') {
+            i += 1;
+        }
+        let Some(after_first) = sed_address_end(&s, i) else {
+            return false;
+        };
+        let addressed = after_first > i;
+        i = skip_blanks(after_first);
+        if addressed && at(i) == Some(',') {
+            i = skip_blanks(i + 1);
+            if matches!(at(i), Some('+' | '~')) {
+                i += 1;
+            }
+            match sed_address_end(&s, i) {
+                Some(end) if end > i => i = skip_blanks(end),
+                _ => return false,
+            }
+        }
+        while at(i) == Some('!') {
+            i = skip_blanks(i + 1);
+        }
+        let Some(command) = at(i) else {
+            return !addressed;
+        };
+        i += 1;
+        match command {
+            '{' => continue,
+            '}' | '=' | 'd' | 'D' | 'g' | 'G' | 'h' | 'H' | 'n' | 'N' | 'p' | 'P' | 'x' | 'z'
+            | 'F' => {}
+            'l' | 'L' | 'q' | 'Q' => {
+                i = skip_blanks(i);
+                while at(i).is_some_and(|c| c.is_ascii_digit()) {
+                    i += 1;
+                }
+            }
+            '#' | 'a' | 'i' | 'c' | 'r' | 'R' => {
+                while let Some(c) = at(i) {
+                    match c {
+                        '\n' => break,
+                        '\\' if matches!(command, 'a' | 'i' | 'c') => i += 2,
+                        _ => i += 1,
+                    }
+                }
+            }
+            ':' | 'b' | 't' | 'T' | 'v' => {
+                while at(i).is_some_and(|c| c != '\n' && c != ';') {
+                    i += 1;
+                }
+            }
+            's' | 'y' => {
+                let Some(delimiter) = at(i).filter(|&d| !matches!(d, '\n' | '\\' | SED_EXPANSION))
+                else {
+                    return false;
+                };
+                i += 1;
+                for _ in 0..2 {
+                    match sed_delimited_end(&s, i, delimiter) {
+                        Some(end) => i = end,
+                        None => return false,
+                    }
+                }
+                while command == 's'
+                    && at(i).is_some_and(|c| "gpiImM".contains(c) || c.is_ascii_digit())
+                {
+                    i += 1;
+                }
+            }
+            _ => return false,
+        }
+        i = skip_blanks(i);
+        if at(i).is_some_and(|c| !matches!(c, '\n' | ';' | '}' | '#')) {
+            return false;
+        }
+    }
+}
+
+/// The index just past the `sed` address starting at `i`, or `i` itself when
+/// none starts there. `None` for a regex address left open. A
+/// [`SED_EXPANSION`] reads as an opaque address piece, so a command must
+/// still follow it.
+fn sed_address_end(s: &[char], mut i: usize) -> Option<usize> {
+    let digits = |mut i: usize| {
+        while s.get(i).is_some_and(|c| c.is_ascii_digit()) {
+            i += 1;
+        }
+        i
+    };
+    match s.get(i) {
+        Some(c) if c.is_ascii_digit() => {
+            i = digits(i);
+            if s.get(i) == Some(&'~') {
+                i = digits(i + 1);
+            }
+            Some(i)
+        }
+        Some('$') => Some(i + 1),
+        Some(&SED_EXPANSION) => {
+            while s.get(i) == Some(&SED_EXPANSION) {
+                i += 1;
+            }
+            Some(i)
+        }
+        Some(&open @ ('/' | '\\')) => {
+            let (delimiter, start) = if open == '/' {
+                ('/', i + 1)
+            } else {
+                (*s.get(i + 1)?, i + 2)
+            };
+            i = sed_delimited_end(s, start, delimiter)?;
+            while s.get(i).is_some_and(|c| matches!(c, 'I' | 'M')) {
+                i += 1;
+            }
+            Some(i)
+        }
+        _ => Some(i),
+    }
+}
+
+/// The index just past the unescaped `delimiter` that closes the run starting
+/// at `i`, or `None` when the run never closes.
+///
+/// Also `None` when that delimiter sits inside a bracket expression. BSD sed
+/// reads it there as text and GNU sed may not, so the two split the script
+/// differently.
+fn sed_delimited_end(s: &[char], mut i: usize, delimiter: char) -> Option<usize> {
+    loop {
+        match s.get(i)? {
+            '\\' => i += 2,
+            &c if c == delimiter => return Some(i + 1),
+            '[' => {
+                if let Some(close) = sed_bracket_end(s, i) {
+                    let mut j = i + 1;
+                    while j < close {
+                        match s[j] {
+                            '\\' => j += 2,
+                            c if c == delimiter => return None,
+                            _ => j += 1,
+                        }
+                    }
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+}
+
+/// The index of the `]` that closes the POSIX bracket expression opening at
+/// `open`, or `None` when it never closes. A `]` right after `[` or `[^` is
+/// text, and so is one inside `[:class:]`, `[=e=]` or `[.c.]`.
+fn sed_bracket_end(s: &[char], open: usize) -> Option<usize> {
+    let mut i = open + 1;
+    if s.get(i) == Some(&'^') {
+        i += 1;
+    }
+    if s.get(i) == Some(&']') {
+        i += 1;
+    }
+    loop {
+        match *s.get(i)? {
+            ']' => return Some(i),
+            '[' if matches!(s.get(i + 1), Some(':' | '=' | '.')) => {
+                let kind = s[i + 1];
+                i += 2;
+                while !(*s.get(i)? == kind && s.get(i + 1) == Some(&']')) {
+                    i += 1;
+                }
+                i += 2;
+            }
+            _ => i += 1,
         }
     }
 }

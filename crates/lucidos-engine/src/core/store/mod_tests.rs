@@ -970,6 +970,34 @@ async fn thread_events_page_has_no_more_when_only_auxiliary_captures_remain() {
     teardown_test_db(&db).await;
 }
 
+/// A failed model call draws nothing either. Home once held 91,000 of them in
+/// front of its last exchange. It opened on an empty page and walked back
+/// hundreds of pages before it drew anything.
+#[tokio::test]
+async fn thread_events_page_skips_failed_model_calls() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let thread = Uuid::new_v4();
+
+    insert_message(&pool, thread, 1).await;
+    insert_message(&pool, thread, 2).await;
+    let failure = json!({ "model": "m", "failure": "other", "purpose": "summary_compaction" });
+    for seq in 3..=5 {
+        insert_typed_thread_event(&pool, thread, seq, "ModelCallFailed", failure.clone()).await;
+    }
+
+    let page = store
+        .get_thread_events_page(thread, None, 1)
+        .await
+        .expect("page");
+    let seqs: Vec<i64> = page.events.iter().map(|e| e.sequence).collect();
+    assert_eq!(seqs, vec![2], "the newest drawable row, not a failure");
+    assert!(page.has_more, "the message at 1 remains");
+    assert_eq!(page.max_sequence, Some(5));
+
+    teardown_test_db(&db).await;
+}
+
 /// A thread of only auxiliary captures serves an empty page that still carries
 /// the watermark. Without it the client's next delta would refetch every row.
 #[tokio::test]

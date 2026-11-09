@@ -436,7 +436,11 @@ pub async fn build_image_provider(
                 // › Codex CLI), so naming only the env var sends the user to
                 // fix the wrong thing when they configured it in Settings.
                 crate::log!(
-                    "[Image] {} selected but no OpenAI key is configured (Settings → Models → Providers or OPENAI_API_KEY)",
+                    concat!(
+                        "[Image] {} selected but no OpenAI key is configured (",
+                        providers_settings!(),
+                        " or OPENAI_API_KEY)"
+                    ),
                     model
                 );
                 None

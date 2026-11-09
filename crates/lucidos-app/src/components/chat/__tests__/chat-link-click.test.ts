@@ -30,7 +30,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
-import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, extractWorkspaceDiskDataPath, extractTriggerIdFromHref, extractSettingsViewFromHref, extractRepoFileTargetFromHref, hasUrlScheme, browserHandlesHref, type RepoFileHrefTarget } from '../../../utils/linkifyPaths';
+import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, extractWorkspaceDiskDataPath, extractTriggerIdFromHref, extractSettingsTargetFromHref, extractRepoFileTargetFromHref, hasUrlScheme, browserHandlesHref, type RepoFileHrefTarget } from '../../../utils/linkifyPaths';
 import { renderMarkdown } from '../../../utils/renderMarkdown';
 import type { App } from '../../../store/types';
 
@@ -104,7 +104,7 @@ type Callbacks = {
   openAppById: (id: string, fragment?: string) => void;
   openTrigger: (id: string) => void;
   openRepoFile: (target: RepoFileHrefTarget) => void;
-  navigate: (req: { target: string; settings_view?: string }) => void;
+  navigate: (req: { target: string; settings_view?: string; fragment?: string }) => void;
   osOpen: (target: string) => void;
   toast: (message: string) => void;
 };
@@ -134,7 +134,13 @@ function runHandleLinkClick(e: ReturnType<typeof mkEvent>, apps: App[], cb: Call
   if (nav) {
     e.preventDefault();
     const target = (nav as any).dataset.navTarget;
-    if (target) cb.navigate({ target, settings_view: (nav as any).dataset.settingsView });
+    if (target) {
+      cb.navigate({
+        target,
+        settings_view: (nav as any).dataset.settingsView,
+        fragment: (nav as any).dataset.settingsFragment,
+      });
+    }
     return;
   }
   // Defense-in-depth fallback
@@ -161,10 +167,10 @@ function runHandleLinkClick(e: ReturnType<typeof mkEvent>, apps: App[], cb: Call
       cb.openRepoFile(repoFile);
       return;
     }
-    const settingsView = extractSettingsViewFromHref(href);
-    if (settingsView) {
+    const settings = extractSettingsTargetFromHref(href);
+    if (settings) {
       e.preventDefault();
-      cb.navigate({ target: 'settings', settings_view: settingsView });
+      cb.navigate({ target: 'settings', settings_view: settings.view, fragment: settings.fragment ?? undefined });
       return;
     }
     const navName = extractNavTargetFromHref(href);
@@ -481,6 +487,17 @@ describe('chat link click — the bug-report scenario', () => {
     expect(e.defaultPrevented).toBe(true);
   });
 
+  it('PRIMARY: a rewritten settings row link carries its fragment to the router', () => {
+    const a = mkAnchor('#', 'nav-link', { navTarget: 'settings', settingsView: 'providers', settingsFragment: 'xai' });
+    runHandleLinkClick(mkEvent(a), APPS, cb);
+    expect(cb.navigate).toHaveBeenCalledWith({ target: 'settings', settings_view: 'providers', fragment: 'xai' });
+  });
+
+  it('FALLBACK: plain <a href="settings:<view>#<row>"> click names the row', () => {
+    runHandleLinkClick(mkEvent(mkAnchor('settings:providers#xai')), APPS, cb);
+    expect(cb.navigate).toHaveBeenCalledWith({ target: 'settings', settings_view: 'providers', fragment: 'xai' });
+  });
+
   it('FALLBACK: plain <a href="settings:<view>"> click → that Settings page, never the guard', () => {
     const e = mkEvent(mkAnchor('settings:backup'));
     runHandleLinkClick(e, APPS, cb);
@@ -499,11 +516,12 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it('the real router claims settings: before the panel names', () => {
-    const settingsIdx = routerSource.indexOf('extractSettingsViewFromHref(rawHref)');
+    const settingsIdx = routerSource.indexOf('extractSettingsTargetFromHref(rawHref)');
     const navIdx = routerSource.indexOf('extractNavTargetFromHref(rawHref)');
     expect(settingsIdx).toBeGreaterThan(0);
     expect(navIdx).toBeGreaterThan(settingsIdx);
     expect(routerSource).toMatch(/settings_view: navTarget\.dataset\.settingsView/);
+    expect(routerSource).toMatch(/fragment: navTarget\.dataset\.settingsFragment/);
   });
 
   it('PRIMARY: pre-rewritten <a class="nav-link"> click → handleNavigationRequest', () => {

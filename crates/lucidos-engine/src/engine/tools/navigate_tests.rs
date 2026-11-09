@@ -530,6 +530,8 @@ async fn no_result_claims_the_target_opened() {
     for args in [
         open_changelog(),
         json!({"target": "files"}),
+        json!({"target": "settings", "settings_view": "providers"}),
+        json!({"target": "settings", "settings_view": "providers", "fragment": "xai"}),
         json!({"target": "settings", "settings_view": "models"}),
         json!({"target": "settings", "settings_view": "backup"}),
         json!({"target": "settings", "settings_view": "environment-variables"}),
@@ -542,6 +544,29 @@ async fn no_result_claims_the_target_opened() {
         assert!(!out.contains("Navigated"), "{args}: {out}");
         assert!(out.contains("My iPhone"), "{args}: {out}");
     }
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// The fragment is part of the destination, so the sent line names it. Two
+/// requests to one page then read differently.
+#[tokio::test]
+async fn a_settings_fragment_is_named_in_the_sent_line() {
+    let (bus, _rx, pool, db) = setup().await;
+    let thread_id = Uuid::new_v4();
+    let args = json!({"target": "settings", "settings_view": "providers", "fragment": "xai"});
+    let out = navigate(&bus, &pool, &args, thread_id, Some(PHONE))
+        .await
+        .expect("navigate succeeds");
+    assert!(out.contains("Settings → providers, the xai row"), "{out}");
+    assert!(out.contains("Settings → Providers shows:"), "{out}");
+
+    let page = json!({"target": "settings", "settings_view": "providers"});
+    let out = navigate(&bus, &pool, &page, thread_id, Some(PHONE))
+        .await
+        .expect("navigate succeeds");
+    assert!(out.contains("Settings → providers "), "{out}");
+    assert!(!out.contains("row"), "{out}");
     pool.close().await;
     teardown_test_db(&db).await;
 }

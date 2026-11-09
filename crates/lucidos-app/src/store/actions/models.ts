@@ -2,7 +2,7 @@ import {
   chatLadder, chatModels, configuredProviders, showToast, showConfirm,
 } from '../store';
 import { failedIfFresh, toFailed, setLoadingIfFresh } from '../types';
-import { MODELS, REASONING_LEVELS, providerLabel } from '../models';
+import { MODELS, PROVIDERS, REASONING_LEVELS, providerLabel } from '../models';
 import {
   clampToOffered, lucidosTiers, tierOptions,
   type ModelChoice, type ProviderChoice, type TierChoice,
@@ -68,6 +68,44 @@ export function modelRow(modelId: string): ModelInfo | undefined {
  *  and nothing else from the Claude family. */
 export function hasConfiguredRoute(model: ModelInfo): boolean {
   return model.routes.some((r) => isProviderConfigured(r.provider));
+}
+
+/** The registry split into the three groups Manage models draws. */
+export interface RegistryGroups {
+  current: ModelInfo[];
+  needsProvider: ModelInfo[];
+  retired: ModelInfo[];
+}
+
+/** A total partition: Retired wins, then a model no configured provider serves
+ *  goes under Needs a provider. Setting up a provider to reach a retired model
+ *  is advice we never give, since routing reaches its successor anyway. */
+export function groupRegistryModels(
+  models: readonly ModelInfo[],
+  isConfigured: (provider: string) => boolean,
+): RegistryGroups {
+  const groups: RegistryGroups = { current: [], needsProvider: [], retired: [] };
+  for (const m of models) {
+    if (m.successor !== null) groups.retired.push(m);
+    else if (m.routes.some((r) => isConfigured(r.provider))) groups.current.push(m);
+    else groups.needsProvider.push(m);
+  }
+  return groups;
+}
+
+/** How many of the model providers are set up, or `null` while the engine has
+ *  not said. A stray value outside `PROVIDERS` does not count. */
+export function providerSetupCount(configured: readonly string[] | null): number | null {
+  if (configured === null) return null;
+  return PROVIDERS.filter((p) => configured.includes(p.value)).length;
+}
+
+/** The providers the Add Model form offers: the ones set up. `null` means
+ *  "don't filter", as everywhere else. */
+export function addModelProviderOptions(
+  configured: readonly string[] | null,
+): typeof PROVIDERS {
+  return configured === null ? PROVIDERS : PROVIDERS.filter((p) => configured.includes(p.value));
 }
 
 /** Whether `modelId` reads images, by its registry row's *vision flag*. A

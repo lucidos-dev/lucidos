@@ -250,7 +250,7 @@ for the architecture.
 - **Node.js** (for Vite frontend dev server)
 - **An LLM provider** (Anthropic, OpenAI, OpenRouter, xAI, Vertex AI, or a local
   OpenAI-compatible endpoint such as Ollama / LM Studio / vLLM). Configure it in
-  **Settings → Models → Providers**, or via the environment variables below.
+  **Settings → Providers**, or via the environment variables below.
   The same screen also offers **OpenCode Free**, a keyless tier that needs no
   account and no key. It is off by default, and the toggle explains the terms.
 

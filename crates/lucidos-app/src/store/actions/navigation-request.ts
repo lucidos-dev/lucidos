@@ -18,7 +18,7 @@ import { revealDashboard } from './dashboardNav';
 import { fileFindScope, requestFind } from './find-request';
 import { focusPromptNow } from '../../components/chat/promptFocus';
 import { isMobile } from '../../utils/viewport';
-import { showToast, dismissToast, repositories, focusedThreadId, panelOverlay, pluginScrollTarget, setPluginsInstalledOnly, parseRepoPath, normalizeLineRange, selectedLines, lineScrollTarget, filePreviewSource, SETTINGS_SUBVIEW_ITEMS, settingsSubviewLabel, aliasRetiredSettingsSubview } from '../store';
+import { showToast, dismissToast, repositories, focusedThreadId, panelOverlay, pluginScrollTarget, setPluginsInstalledOnly, parseRepoPath, normalizeLineRange, selectedLines, lineScrollTarget, filePreviewSource, SETTINGS_SUBVIEW_ITEMS, settingsSubviewLabel, aliasRetiredSettingsSubview, settingsLinkedFragment } from '../store';
 import type { SettingsNavKey } from '../store';
 import type { MenuItem } from '../types';
 
@@ -137,9 +137,10 @@ export function handleNavigationRequest(nav: {
   target: string;
   settings_view?: string;
   app_id?: string;
-  /** The place INSIDE the app, delivered as its iframe's `location.hash`. Only
-   *  meaningful with an `app` target. Absent is not empty: no fragment leaves
-   *  an already-open app where the reader put it. */
+  /** The place INSIDE the target. An `app` receives it as its iframe's
+   *  `location.hash`, and absent is not empty: no fragment leaves an
+   *  already-open app where the reader put it. A `settings` view scrolls to
+   *  the row `<settings_view>:<fragment>`. Other targets ignore it. */
   fragment?: string;
   file_path?: string;
   line?: number;
@@ -226,6 +227,8 @@ export function handleNavigationRequest(nav: {
         // (the Backup notification's "Open settings") walked onto a page the
         // user never visited.
         openSettingsSubview(view as SettingsNavKey);
+        // SettingsView scrolls to the row, and toasts when the page has none.
+        if (nav.fragment) settingsLinkedFragment.value = nav.fragment;
       } else {
         switchMenuItem('settings');
         showToast(`Unknown settings section: "${nav.settings_view}"`, 'error');

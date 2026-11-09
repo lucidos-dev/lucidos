@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 /**
- * The Cloudflare Workers AI and custom System One rows on Settings → Models →
+ * The Cloudflare Workers AI and custom System One rows on Settings →
  * Providers.
  *
  * Both wear the same frame as the TypeSafe row, which its own suite pins. What

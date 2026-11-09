@@ -133,11 +133,14 @@ pub(super) fn format_search_result(answer: &str, sources: &[(String, String)]) -
 /// three that work and where to add one, so the failure is actionable wherever
 /// it surfaces — mirrors the `EMBEDDER_UNAVAILABLE` convention in
 /// `memory::embedder_slot`.
-pub const NO_SEARCH_BACKEND: &str = "web_search has no configured backend. It runs on whichever \
+pub const NO_SEARCH_BACKEND: &str = concat!(
+    "web_search has no configured backend. It runs on whichever \
      LLM provider you have set up — Vertex AI (Gemini Google Search grounding), Anthropic (the \
-     web_search server tool), or OpenAI (Responses web search). Add one under Settings → Models → \
-     Providers. OpenRouter and local OpenAI-compatible endpoints expose no web search tool, so \
-     configuring one of the three above is required even if you chat on another provider.";
+     web_search server tool), or OpenAI (Responses web search). Add one under ",
+    providers_settings!(),
+    ". OpenRouter and local OpenAI-compatible endpoints expose no web search tool, so \
+     configuring one of the three above is required even if you chat on another provider."
+);
 
 /// The configured backends in preference order, tried until one answers.
 ///
@@ -379,12 +382,7 @@ mod tests {
             .err()
             .expect("an empty chain must error");
         let msg = err.to_string();
-        for needle in [
-            "Vertex AI",
-            "Anthropic",
-            "OpenAI",
-            "Settings → Models → Providers",
-        ] {
+        for needle in ["Vertex AI", "Anthropic", "OpenAI", providers_settings!()] {
             assert!(msg.contains(needle), "missing {needle:?} in: {msg}");
         }
     }

@@ -32,9 +32,10 @@ import {
   extractWorkspaceDiskDataPath,
   extractTriggerIdFromHref,
   extractRepoFileTargetFromHref,
-  extractSettingsViewFromHref,
+  extractSettingsTargetFromHref,
   hasUrlScheme,
   type RepoFileHrefTarget,
+  type SettingsHrefTarget,
 } from '../../utils/linkifyPaths';
 import { openFilePreview, openUrl, openLocalFileOnConfirm } from '../../store/actions/artifacts';
 import { openAppById } from '../../store/actions/apps';
@@ -95,8 +96,8 @@ export type PreviewLinkAction =
    *  none. An artifact citing one item inside a shared app carries it. */
   | { kind: 'app'; appId: string; fragment?: string }
   | { kind: 'trigger'; triggerId: string }
-  /** `settingsView` is the Settings page a `settings:<view>` link named. */
-  | { kind: 'nav'; target: string; settingsView?: string }
+  /** `settings` is the Settings page, and row, a `settings:<view>` link named. */
+  | { kind: 'nav'; target: string; settings?: SettingsHrefTarget }
   | { kind: 'local-file'; target: string }
   | { kind: 'file'; path: string }
   | ({ kind: 'repo-file' } & RepoFileHrefTarget)
@@ -230,8 +231,8 @@ export function classifyPreviewLink(
   // to the browser and the link dead-ends. Same shape as the `repo:` arm.
   const triggerId = extractTriggerIdFromHref(href);
   if (triggerId) return { kind: 'trigger', triggerId };
-  const settingsView = extractSettingsViewFromHref(href);
-  if (settingsView) return { kind: 'nav', target: 'settings', settingsView };
+  const settings = extractSettingsTargetFromHref(href);
+  if (settings) return { kind: 'nav', target: 'settings', settings };
   const navTarget = extractNavTargetFromHref(href);
   if (navTarget) return { kind: 'nav', target: navTarget };
   // A bare leading `/` is skipped for a repo preview: there it names a
@@ -314,7 +315,11 @@ export function runPreviewLinkAction(action: PreviewNavigation, artifactPath: st
       );
       return;
     case 'nav':
-      handleNavigationRequest({ target: action.target, settings_view: action.settingsView });
+      handleNavigationRequest({
+        target: action.target,
+        settings_view: action.settings?.view,
+        fragment: action.settings?.fragment ?? undefined,
+      });
       return;
     case 'local-file':
       void openLocalFileOnConfirm(action.target, artifactPath);

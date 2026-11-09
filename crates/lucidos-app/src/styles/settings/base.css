@@ -259,7 +259,7 @@
    dropdown (short control, short label), and wrong for a text field, which wants
    the whole row to show what was typed. Squeezed into the leftover half of a
    phone-width pane, the field truncates a pasted key or URL while the label wraps
-   into a two-line stack beside it ("API key (optional)" under Providers).
+   into a two-line stack beside it ("API key (optional)" on the Providers page).
 
    Matched on the FIELD rather than a per-callsite modifier class, so every
    provider form and the add-model form get it and a new field can't forget to opt
@@ -539,6 +539,26 @@
     color: var(--text-muted);
     border-style: dashed;
     text-transform: none;
+}
+
+/* A provider chip that opens that provider's block on Settings → Providers, on
+   a model no configured provider serves. A button wearing the badge look. */
+.model-provider-setup {
+    background: none;
+    font-family: inherit;
+    cursor: pointer;
+    color: var(--text-primary);
+}
+
+@media (hover: hover) {
+    .model-provider-setup:hover {
+        border-color: var(--text-secondary);
+    }
+}
+
+.model-provider-setup:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
 }
 
 /* ── Settings → Access → Pair a device ──────────────────────────────────────

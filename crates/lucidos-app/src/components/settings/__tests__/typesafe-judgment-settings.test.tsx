@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 /**
- * The TypeSafe (Jev) row on Settings → Models → Providers.
+ * The TypeSafe (Jev) row on Settings → Providers.
  *
  * It wears the same frame as every other provider row, so the things worth
  * pinning are the ones its own state function decides: what the switch reads
@@ -41,8 +41,8 @@ function typeSafeCred(): CredentialInfo {
 describe('TypeSafeJudgmentSettings', () => {
   let host: HTMLElement;
 
-  const header = () => host.querySelector('[data-search-anchor="models:typesafe"]');
-  const usageRow = () => host.querySelector('[data-search-anchor="models:typesafe-usage"]');
+  const header = () => host.querySelector('[data-search-anchor="providers:typesafe"]');
+  const usageRow = () => host.querySelector('[data-search-anchor="providers:typesafe-usage"]');
   const usage = () => usageRow()?.querySelector('.list-row-details')?.textContent ?? '';
   const secretInput = () => host.querySelector<HTMLInputElement>('input[type="password"]');
   const removeButton = () =>

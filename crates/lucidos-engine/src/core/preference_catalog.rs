@@ -1797,7 +1797,7 @@ pub const PROVIDER_ENABLED_VERTEX: Pref<Flag> = Pref::flag(PrefSpec {
     key: "provider_enabled_vertex",
     label: "Vertex provider",
     access: PrefAccess::Human {
-        hint: "whether the Vertex provider is switched on: the user decides in Settings → Models → Providers, and you must not switch off a provider that may be serving this turn",
+        hint: concat!("whether the Vertex provider is switched on: the user decides in ", providers_settings!(), ", and you must not switch off a provider that may be serving this turn"),
     },
     scope: PrefScope::Global,
     value: PrefValue::Bool,
@@ -1810,7 +1810,7 @@ pub const PROVIDER_ENABLED_ANTHROPIC: Pref<Flag> = Pref::flag(PrefSpec {
     key: "provider_enabled_anthropic",
     label: "Anthropic provider",
     access: PrefAccess::Human {
-        hint: "whether the direct Anthropic provider is switched on: managed in Settings → Models → Providers, never via set_preference",
+        hint: concat!("whether the direct Anthropic provider is switched on: managed in ", providers_settings!(), ", never via set_preference"),
     },
     scope: PrefScope::Global,
     value: PrefValue::Bool,
@@ -1823,7 +1823,7 @@ pub const PROVIDER_ENABLED_OPENAI: Pref<Flag> = Pref::flag(PrefSpec {
     key: "provider_enabled_openai",
     label: "OpenAI provider",
     access: PrefAccess::Human {
-        hint: "whether the direct OpenAI provider is switched on: managed in Settings → Models → Providers, never via set_preference",
+        hint: concat!("whether the direct OpenAI provider is switched on: managed in ", providers_settings!(), ", never via set_preference"),
     },
     scope: PrefScope::Global,
     value: PrefValue::Bool,
@@ -1836,7 +1836,7 @@ pub const PROVIDER_ENABLED_OPENROUTER: Pref<Flag> = Pref::flag(PrefSpec {
     key: "provider_enabled_openrouter",
     label: "OpenRouter provider",
     access: PrefAccess::Human {
-        hint: "whether the OpenRouter provider is switched on: managed in Settings → Models → Providers, never via set_preference",
+        hint: concat!("whether the OpenRouter provider is switched on: managed in ", providers_settings!(), ", never via set_preference"),
     },
     scope: PrefScope::Global,
     value: PrefValue::Bool,
@@ -1849,7 +1849,7 @@ pub const PROVIDER_ENABLED_XAI: Pref<Flag> = Pref::flag(PrefSpec {
     key: "provider_enabled_xai",
     label: "xAI provider",
     access: PrefAccess::Human {
-        hint: "whether the xAI provider is switched on: managed in Settings → Models → Providers, never via set_preference",
+        hint: concat!("whether the xAI provider is switched on: managed in ", providers_settings!(), ", never via set_preference"),
     },
     scope: PrefScope::Global,
     value: PrefValue::Bool,
@@ -1862,7 +1862,7 @@ pub const PROVIDER_ENABLED_LOCAL: Pref<Flag> = Pref::flag(PrefSpec {
     key: "provider_enabled_local",
     label: "local provider",
     access: PrefAccess::Human {
-        hint: "whether the local OpenAI-compatible provider is switched on: managed in Settings → Models → Providers, never via set_preference",
+        hint: concat!("whether the local OpenAI-compatible provider is switched on: managed in ", providers_settings!(), ", never via set_preference"),
     },
     scope: PrefScope::Global,
     value: PrefValue::Bool,
@@ -1875,7 +1875,7 @@ pub const PROVIDER_ENABLED_CLAUDE_GATEWAY: Pref<Flag> = Pref::flag(PrefSpec {
     key: "provider_enabled_claude_gateway",
     label: "Claude gateway provider",
     access: PrefAccess::Human {
-        hint: "whether the Claude gateway provider is switched on: managed in Settings → Models → Providers, never via set_preference",
+        hint: concat!("whether the Claude gateway provider is switched on: managed in ", providers_settings!(), ", never via set_preference"),
     },
     scope: PrefScope::Global,
     value: PrefValue::Bool,
@@ -1888,7 +1888,7 @@ pub const PROVIDER_ENABLED_TYPESAFE: Pref<Flag> = Pref::flag(PrefSpec {
     key: "provider_enabled_typesafe",
     label: "TypeSafe provider",
     access: PrefAccess::Human {
-        hint: "whether TypeSafe (Jev) is switched on at all: the master switch above the judgment_* keys, managed in Settings → Models → Providers. Never via set_preference: switching it off moves the command guard's backend, which you must not do",
+        hint: concat!("whether TypeSafe (Jev) is switched on at all: the master switch above the judgment_* keys, managed in ", providers_settings!(), ". Never via set_preference: switching it off moves the command guard's backend, which you must not do"),
     },
     scope: PrefScope::Global,
     value: PrefValue::Bool,
@@ -1901,7 +1901,7 @@ pub const PROVIDER_ENABLED_CLOUDFLARE_WORKERS_AI: Pref<Flag> = Pref::flag(PrefSp
     key: "provider_enabled_cloudflare_workers_ai",
     label: "Cloudflare Workers AI provider",
     access: PrefAccess::Human {
-        hint: "whether Cloudflare Workers AI (Clef and Clef-flash) is switched on at all: the master switch above the judgment_* keys, managed in Settings → Models → Providers. Never via set_preference: switching it off moves the command guard's backend, which you must not do",
+        hint: concat!("whether Cloudflare Workers AI (Clef and Clef-flash) is switched on at all: the master switch above the judgment_* keys, managed in ", providers_settings!(), ". Never via set_preference: switching it off moves the command guard's backend, which you must not do"),
     },
     scope: PrefScope::Global,
     value: PrefValue::Bool,
@@ -1914,7 +1914,7 @@ pub const PROVIDER_ENABLED_SYSTEM_ONE_CUSTOM: Pref<Flag> = Pref::flag(PrefSpec {
     key: "provider_enabled_system_one_custom",
     label: "custom System One provider",
     access: PrefAccess::Human {
-        hint: "whether the custom System One endpoint is switched on at all: the master switch above the judgment_* keys, managed in Settings → Models → Providers. Never via set_preference: switching it off moves the command guard's backend, which you must not do",
+        hint: concat!("whether the custom System One endpoint is switched on at all: the master switch above the judgment_* keys, managed in ", providers_settings!(), ". Never via set_preference: switching it off moves the command guard's backend, which you must not do"),
     },
     scope: PrefScope::Global,
     value: PrefValue::Bool,
@@ -1927,7 +1927,7 @@ pub const LOCAL_BASE_URL: Pref<Text> = Pref::text(PrefSpec {
     key: "local_base_url",
     label: "Local model URL",
     access: PrefAccess::Human {
-        hint: "the local provider's base URL, which receives every prompt and answers with the tool calls you run: the user sets it in Settings → Models → Providers, never via set_preference",
+        hint: concat!("the local provider's base URL, which receives every prompt and answers with the tool calls you run: the user sets it in ", providers_settings!(), ", never via set_preference"),
     },
     scope: PrefScope::Global,
     value: PrefValue::Text,
@@ -1940,7 +1940,7 @@ pub const CLAUDE_GATEWAY_URL: Pref<Optional> = Pref::optional(PrefSpec {
     key: "claude_gateway_url",
     label: "Claude gateway URL",
     access: PrefAccess::Human {
-        hint: "the Claude gateway's origin, which receives every prompt sent to a Claude model routed there, with the user's sign-in: the user sets it in Settings → Models → Providers, never via set_preference",
+        hint: concat!("the Claude gateway's origin, which receives every prompt sent to a Claude model routed there, with the user's sign-in: the user sets it in ", providers_settings!(), ", never via set_preference"),
     },
     scope: PrefScope::Global,
     value: PrefValue::Text,
@@ -1953,7 +1953,7 @@ pub const SYSTEM_ONE_CUSTOM_URL: Pref<Optional> = Pref::optional(PrefSpec {
     key: "system_one_custom_url",
     label: "Custom System One URL",
     access: PrefAccess::Human {
-        hint: "the custom System One endpoint's URL, which receives every state a judgment site sends it and can answer the command guard: the user sets it in Settings → Models → Providers, never via set_preference",
+        hint: concat!("the custom System One endpoint's URL, which receives every state a judgment site sends it and can answer the command guard: the user sets it in ", providers_settings!(), ", never via set_preference"),
     },
     scope: PrefScope::Global,
     value: PrefValue::Text,
@@ -1966,7 +1966,11 @@ pub const SYSTEM_ONE_CUSTOM_MODEL: Pref<Optional> = Pref::optional(PrefSpec {
     key: "system_one_custom_model",
     label: "Custom System One model",
     access: PrefAccess::Human {
-        hint: "the model the custom System One endpoint is asked for: set beside its URL in Settings → Models → Providers, never via set_preference",
+        hint: concat!(
+            "the model the custom System One endpoint is asked for: set beside its URL in ",
+            providers_settings!(),
+            ", never via set_preference"
+        ),
     },
     scope: PrefScope::Global,
     value: PrefValue::Text,
@@ -1979,7 +1983,7 @@ pub const SYSTEM_ONE_OPENROUTER_MODEL: Pref<Optional> = Pref::optional(PrefSpec 
     key: "system_one_openrouter_model",
     label: "OpenRouter System One model",
     access: PrefAccess::Human {
-        hint: "which System One model OpenRouter's System One row asks, and so which vendor sees what a judgment judges: set on the OpenRouter row in Settings → Models → Providers, never via set_preference",
+        hint: concat!("which System One model OpenRouter's System One row asks, and so which vendor sees what a judgment judges: set on the OpenRouter row in ", providers_settings!(), ", never via set_preference"),
     },
     scope: PrefScope::Global,
     value: PrefValue::Text,
@@ -2720,7 +2724,7 @@ mod tests {
     fn the_local_model_host_is_not_agent_settable() {
         assert!(lookup(LOCAL_BASE_URL.key()).is_none());
         let hint = internal_hint(LOCAL_BASE_URL.key()).expect("internal");
-        assert!(hint.contains("Settings → Models → Providers"), "{hint}");
+        assert!(hint.contains(providers_settings!()), "{hint}");
     }
 
     /// The per-turn tool-call cap is the backstop over the agent's own loop, so

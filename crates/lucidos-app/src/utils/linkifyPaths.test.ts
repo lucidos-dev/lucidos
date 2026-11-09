@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractWorkspaceDiskDataPath, extractBareAppRef, extractTriggerIdFromHref, extractSettingsViewFromHref, extractRepoFileTargetFromHref, hrefLineRef, labelLineRef, browserHandlesHref, _resetLinkifyCacheForTesting, PROSE_DATA_PATH_PREFIXES } from './linkifyPaths';
+import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractWorkspaceDiskDataPath, extractBareAppRef, extractTriggerIdFromHref, extractSettingsTargetFromHref, extractRepoFileTargetFromHref, hrefLineRef, labelLineRef, browserHandlesHref, _resetLinkifyCacheForTesting, PROSE_DATA_PATH_PREFIXES } from './linkifyPaths';
 import { DATA_PATH_PREFIXES } from './dataPathPrefixes';
 
 describe('DATA_PATH_PREFIXES', () => {
@@ -235,13 +235,20 @@ describe('extractTriggerIdFromHref', () => {
 
 // An engine notification links the Settings page its tap opens, such as
 // `[Settings → System → Backup](settings:backup)`.
-describe('extractSettingsViewFromHref', () => {
+describe('extractSettingsTargetFromHref', () => {
   it.each([
     ['settings:backup', 'backup'],
     ['settings:disk-usage', 'disk-usage'],
     ['settings:accounts/', 'accounts'],
   ])('extracts %s -> %s', (href, expected) => {
-    expect(extractSettingsViewFromHref(href)).toBe(expected);
+    expect(extractSettingsTargetFromHref(href)).toEqual({ view: expected, fragment: null });
+  });
+
+  it.each([
+    ['settings:providers#xai', 'providers', 'xai'],
+    ['settings:providers/#vertex-region', 'providers', 'vertex-region'],
+  ])('extracts the row of %s', (href, view, fragment) => {
+    expect(extractSettingsTargetFromHref(href)).toEqual({ view, fragment });
   });
 
   it.each([
@@ -252,11 +259,20 @@ describe('extractSettingsViewFromHref', () => {
     ['settings:', null],
     ['settings:backup/key', null],
     ['settings:backup?x=1', null],
+    ['settings:providers#', null],
+    ['settings:providers#a/b', null],
+    ['settings:providers#a#b', null],
     ['settingsx:backup', null],
     ['app:settings', null],
     ['https://example.com/settings:backup', null],
   ])('returns null for %s', (href, expected) => {
-    expect(extractSettingsViewFromHref(href)).toBe(expected);
+    expect(extractSettingsTargetFromHref(href)).toBe(expected);
+  });
+
+  it('rewrites a row link to a nav-link carrying the view and the fragment', () => {
+    const html = linkifyPaths('<a href="settings:providers#xai">xAI</a>', [], []);
+    expect(html).toContain('data-settings-view="providers"');
+    expect(html).toContain('data-settings-fragment="xai"');
   });
 
   it('rewrites to a nav-link carrying the view', () => {
@@ -265,6 +281,7 @@ describe('extractSettingsViewFromHref', () => {
     expect(html).toContain('data-nav-target="settings"');
     expect(html).toContain('data-settings-view="backup"');
     expect(html).not.toContain('settings:backup');
+    expect(html).not.toContain('data-settings-fragment');
   });
 });
 

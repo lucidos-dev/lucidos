@@ -3,7 +3,7 @@ import { LoadableToggle } from '../shared/LoadableToggle';
 import { Explainer } from '../shared/Explainer';
 import { Disclosure } from '../shared/Disclosure';
 
-/** The markup every provider on Settings → Models → Providers wears: a header
+/** The markup every provider on Settings → Providers wears: a header
  *  row that is always there, and config rows that are there only while the
  *  provider is on.
  *

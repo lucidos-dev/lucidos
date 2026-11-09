@@ -51,7 +51,7 @@ vi.mock('../../api/client', () => ({
   listDevices: vi.fn().mockResolvedValue({ devices: [] }),
 }));
 
-const { switchMenuItem, openSettingsSubview, setActiveMenu, landOnAccountsWithOverlay, openBackupSettings, openWebhookSettings, openCaptureContextSetting, openCacheCardsSetting, openCacheKeepAliveSetting, openIntelligenceLadder } = await import('./menu');
+const { switchMenuItem, openSettingsSubview, setActiveMenu, landOnAccountsWithOverlay, openBackupSettings, openWebhookSettings, openCaptureContextSetting, openCacheCardsSetting, openCacheKeepAliveSetting, openIntelligenceLadder, openProviderSettings, openProviderBlock, openFreeProviderSettings } = await import('./menu');
 
 const fakeApp: App = {
   id: 'trip-planner',
@@ -404,6 +404,38 @@ describe('Coding Agents row deep links', () => {
     expect(settingsScrollTarget.value).toBe('models:cache-keep-alive');
     expect(revealContentPane).toHaveBeenCalledTimes(1);
     expect(pushNavState).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Providers page deep links', () => {
+  beforeEach(() => {
+    activeMenuItem.value = 'files';
+    settingsSubview.value = 'main';
+    settingsScrollTarget.value = null;
+    panelOverlay.value = null;
+    pushNavState.mockClear();
+    revealContentPane.mockClear();
+  });
+
+  it('opens the Providers page for first-run onboarding', () => {
+    openProviderSettings();
+    expect(activeMenuItem.value).toBe('settings');
+    expect(settingsSubview.value).toBe('providers');
+    expect(revealContentPane).toHaveBeenCalledTimes(1);
+    expect(pushNavState).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens one provider block, scrolled to', () => {
+    openProviderBlock('xai');
+    expect(settingsSubview.value).toBe('providers');
+    expect(settingsScrollTarget.value).toBe('providers:xai');
+    expect(revealContentPane).toHaveBeenCalledTimes(1);
+  });
+
+  it('lands the keyless shortcut on the OpenCode Free switch', () => {
+    openFreeProviderSettings();
+    expect(settingsSubview.value).toBe('providers');
+    expect(settingsScrollTarget.value).toBe('providers:opencode-free');
   });
 });
 

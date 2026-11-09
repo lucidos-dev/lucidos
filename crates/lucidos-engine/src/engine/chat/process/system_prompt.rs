@@ -1749,7 +1749,12 @@ mod tests {
     /// Raised by 38 to a measured 134,800 for the `xl` widget size (ADR 0633):
     /// one more value in each size enum, and the widget rules naming it. That
     /// rule was cut to one clause first.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 134_800;
+    ///
+    /// Raised by 17 to a measured 134,817 for `providers`, a `settings_view`
+    /// of its own, and `fragment` naming a settings row. A link to a provider's
+    /// block is written while the agent writes the call. The `fragment`
+    /// description was cut to the original's length first.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 134_817;
 
     /// The gate set the ratchet bills.
     ///
@@ -1950,8 +1955,8 @@ mod tests {
         ),
         (
             "navigate_ui",
-            2_822,
-            "the two frozen enums the SDK is generated from (18 targets, 22 \
+            2_839,
+            "the two frozen enums the SDK is generated from (18 targets, 23 \
              settings views) are about 460 chars before a word of prose; the settings \
              gloss is routing information available on no other surface, and \
              it names only the views whose own value does not (`mcp` is not \
@@ -1970,7 +1975,10 @@ mod tests {
              from 2,607 by `intelligence` (ADR 0525): the ladders left Models \
              and Coding Agents for a page of their own. Raised from 2,621 by \
              `coding_agent` and `folder`: a new chat preselects its \
-             destination, and the model chooses both while writing the call",
+             destination, and the model chooses both while writing the call. \
+             Raised from 2,822 by `providers` and the settings use of \
+             `fragment`: a link to one provider's block is chosen while \
+             writing the call",
         ),
         (
             "request_credential",

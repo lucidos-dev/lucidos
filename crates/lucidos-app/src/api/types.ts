@@ -482,6 +482,10 @@ export interface BackfillProgress {
   next_cap_usd: number | null;
   /** The backfill spent its cap and waits for the user. Live work goes on. */
   held: boolean;
+  /** The compactor's model is not answering and the compactor has backed off.
+   *  Absent while it answers. Holds until a probe call succeeds or the user
+   *  picks another model. */
+  failing_model?: string | null;
   /** The order of the frame that announced this count. A snapshot carries the
    *  last frame's order, so a frame no newer than it was already counted. */
   seq: number;

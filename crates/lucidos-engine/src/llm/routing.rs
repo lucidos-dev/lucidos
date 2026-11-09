@@ -332,13 +332,13 @@ impl RoutingProvider {
 fn unconfigured_message(kind: ProviderKind) -> &'static str {
     match kind {
         ProviderKind::Vertex => "Vertex AI model requested but no Google Cloud project is configured (set VERTEX_PROJECT_ID or run `gcloud auth application-default login`)",
-        ProviderKind::Anthropic => "Anthropic model requested but no Anthropic credential is configured (Settings → Models → Providers) and ANTHROPIC_API_KEY is not set",
-        ProviderKind::OpenAi => "OpenAI model requested but no OpenAI credential is configured (Settings → Models → Providers) and OPENAI_API_KEY is not set",
-        ProviderKind::OpenRouter => "OpenRouter model requested but no OpenRouter credential is configured (Settings → Models → Providers) and LUCIDOS_OPENROUTER_API_KEY is not set",
-        ProviderKind::XAi => "xAI model requested but no xAI credential is configured (Settings → Models → Providers) and LUCIDOS_XAI_API_KEY is not set",
-        ProviderKind::OpenCodeFree => "Free model requested but the keyless OpenCode Free tier is turned off (Settings → Models → Providers)",
-        ProviderKind::Local => "Local model requested but the local OpenAI-compatible provider is not configured (Settings → Models → Providers)",
-        ProviderKind::ClaudeGateway => "Claude gateway model requested but Lucidos is not signed in to a Claude gateway (Settings → Models → Providers)",
+        ProviderKind::Anthropic => concat!("Anthropic model requested but no Anthropic credential is configured (", providers_settings!(), ") and ANTHROPIC_API_KEY is not set"),
+        ProviderKind::OpenAi => concat!("OpenAI model requested but no OpenAI credential is configured (", providers_settings!(), ") and OPENAI_API_KEY is not set"),
+        ProviderKind::OpenRouter => concat!("OpenRouter model requested but no OpenRouter credential is configured (", providers_settings!(), ") and LUCIDOS_OPENROUTER_API_KEY is not set"),
+        ProviderKind::XAi => concat!("xAI model requested but no xAI credential is configured (", providers_settings!(), ") and LUCIDOS_XAI_API_KEY is not set"),
+        ProviderKind::OpenCodeFree => concat!("Free model requested but the keyless OpenCode Free tier is turned off (", providers_settings!(), ")"),
+        ProviderKind::Local => concat!("Local model requested but the local OpenAI-compatible provider is not configured (", providers_settings!(), ")"),
+        ProviderKind::ClaudeGateway => concat!("Claude gateway model requested but Lucidos is not signed in to a Claude gateway (", providers_settings!(), ")"),
     }
 }
 
@@ -589,7 +589,7 @@ mod tests {
         };
         let err = err.to_string();
         assert!(err.contains("OpenCode Free"), "{err}");
-        assert!(err.contains("Settings → Models → Providers"), "{err}");
+        assert!(err.contains(providers_settings!()), "{err}");
     }
 
     struct NoTokens;

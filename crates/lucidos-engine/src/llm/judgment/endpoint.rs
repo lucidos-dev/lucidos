@@ -211,10 +211,10 @@ impl SystemOneEndpoint {
                     .first()
                     .map(String::as_str)
                     .unwrap_or("");
-                let url = workers_ai_url(base, model).ok_or(
-                    "the Cloudflare Workers AI credential names no account. Save it again in \
-                     Settings → Models → Providers",
-                )?;
+                let url = workers_ai_url(base, model).ok_or(concat!(
+                    "the Cloudflare Workers AI credential names no account. Save it again in ",
+                    providers_settings!(),
+                ))?;
                 (url, model.to_string(), Some(token))
             }
             Self::Custom => {

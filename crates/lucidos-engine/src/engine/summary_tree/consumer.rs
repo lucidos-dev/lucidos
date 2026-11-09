@@ -7,7 +7,8 @@
 //! deleted thread, so a node a drain wrote during the delete is swept.
 //!
 //! A raised backfill cap re-seeds the compactor, and a cap reached tells the
-//! user with a notification.
+//! user with a notification. A change of the compactor's model wakes the
+//! nodes waiting on a failing one.
 
 use std::sync::Arc;
 
@@ -22,6 +23,7 @@ use super::module::{tree_chosen, MemoryModule};
 use super::spend::StartEstimate;
 use super::store;
 use super::SummaryScope;
+use crate::engine::aux_purpose::SUMMARY_COMPACTION_PREFS;
 use crate::engine::event_bus::{BusEvent, EmittedEvent, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 use crate::engine::{ContextPurpose, LucidosEngine};
@@ -55,6 +57,11 @@ fn start(engine: &Arc<LucidosEngine>, starter: Option<MessageOrigin>) -> Arc<Com
     engine.summary_tree().set(compactor.clone());
     compactor.start();
     compactor
+}
+
+/// Whether `key` picks the compactor's model or its reasoning effort.
+fn is_compactor_model_pref(key: &str) -> bool {
+    key == SUMMARY_COMPACTION_PREFS.model.key() || key == SUMMARY_COMPACTION_PREFS.reasoning.key()
 }
 
 /// Whether an event switches the module, and to which.
@@ -134,6 +141,11 @@ async fn listen(
             ) => compactor.mark_dirty(SummaryScope::Workspace, true),
             BusEvent::System(SystemEvent::ThreadsDeleted { thread_ids, .. }) => {
                 compactor.forget_threads(thread_ids)
+            }
+            BusEvent::System(SystemEvent::PreferencesChanged { key, .. })
+                if is_compactor_model_pref(key) =>
+            {
+                compactor.model_changed().await
             }
             BusEvent::System(SystemEvent::TreeBackfillCapRaised { .. }) => {
                 compactor.cap_raised().await
@@ -222,6 +234,35 @@ async fn notify_cap_reached(engine: &LucidosEngine, spent_usd: f64, cap_usd: f64
     }
 }
 
+/// Tell the user the compactor's model has not answered for a long while,
+/// and where to pick another.
+async fn notify_model_down(engine: &LucidosEngine, model: &str) {
+    let page = SettingsPage::MEMORY;
+    let message = format!(
+        "{model} has not answered for several minutes, so new summaries wait. Pick another \
+         model for Tree memory under {}.",
+        page.link()
+    );
+    if let Err(e) = engine
+        .create_notification(
+            "Tree memory can't reach its model",
+            &message,
+            None,
+            None,
+            None,
+            page.tap(),
+            None,
+        )
+        .await
+    {
+        log!(
+            "[SummaryTree] Could not notify that {} is not answering: {}",
+            model,
+            e
+        );
+    }
+}
+
 struct EngineDeps(Arc<LucidosEngine>);
 
 #[async_trait::async_trait]
@@ -263,6 +304,10 @@ impl CompactorDeps for EngineDeps {
             calls: estimate.calls,
             cost,
         })
+    }
+
+    async fn notify_model_down(&self, model: &str) {
+        notify_model_down(&self.0, model).await
     }
 
     fn read_artifact(&self, path: &str, commit: &str) -> Option<String> {

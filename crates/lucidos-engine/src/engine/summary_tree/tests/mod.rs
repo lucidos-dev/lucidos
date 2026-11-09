@@ -4,6 +4,7 @@
 
 mod browse_tests;
 mod compaction_view_tests;
+mod compactor_breaker_tests;
 mod compactor_tests;
 mod fold_tests;
 mod log_tests;
@@ -95,13 +96,14 @@ pub(super) async fn age_events(pool: &PgPool) {
 /// was asked, so two builds of one log write the same text.
 ///
 /// A step containing `POISON` always fails. One containing `OVERSHOOT` gets a
-/// line over the limit first, to drive the size loop. After `fail_after`
-/// calls, every call fails, which is how a test stops the compactor mid-build.
+/// line over the limit first, to drive the size loop. The calls in `failing`
+/// fail, which is how a test stops the compactor mid-build.
 /// With `refuse_flex`, a Flex call fails as OpenAI's capacity refusal does.
 /// A call that asked for a tier is answered as served on it.
 pub(super) struct EchoProvider {
     pub(super) calls: AtomicUsize,
-    pub(super) fail_after: Option<usize>,
+    /// The calls, by index, that fail.
+    pub(super) failing: Option<std::ops::Range<usize>>,
     pub(super) refuse_flex: bool,
     /// The model and effort each call named.
     pub(super) selections: std::sync::Mutex<Vec<(Option<String>, Option<String>)>>,
@@ -115,7 +117,7 @@ impl EchoProvider {
     pub(super) fn new() -> Self {
         Self {
             calls: AtomicUsize::new(0),
-            fail_after: None,
+            failing: None,
             refuse_flex: false,
             selections: std::sync::Mutex::default(),
             tiers: std::sync::Mutex::default(),
@@ -123,9 +125,11 @@ impl EchoProvider {
         }
     }
 
-    pub(super) fn failing_after(calls: usize) -> Self {
+    /// Fails the calls at these indexes and answers the rest. A run of fewer
+    /// than the breaker's trip count stops a build part way without opening a breaker.
+    pub(super) fn failing_calls(calls: std::ops::Range<usize>) -> Self {
         Self {
-            fail_after: Some(calls),
+            failing: Some(calls),
             ..Self::new()
         }
     }
@@ -152,7 +156,11 @@ impl LlmProvider for EchoProvider {
         if self.refuse_flex && selection.service_tier == Some(ServiceTier::Flex) {
             return Err("429 Resource Unavailable: no Flex capacity".into());
         }
-        if self.fail_after.is_some_and(|limit| n >= limit) {
+        if self
+            .failing
+            .as_ref()
+            .is_some_and(|calls| calls.contains(&n))
+        {
             return Err("the model is down".into());
         }
         let request = messages[0].content.as_text();
@@ -227,6 +235,8 @@ pub(super) struct TestDeps {
 
 #[async_trait::async_trait]
 impl CompactorDeps for TestDeps {
+    async fn notify_model_down(&self, _model: &str) {}
+
     async fn model(&self) -> Result<CompactionModel, String> {
         let provider = self.provider.clone().ok_or("no background model")?;
         Ok(CompactionModel {

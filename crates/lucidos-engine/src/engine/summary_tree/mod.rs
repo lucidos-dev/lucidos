@@ -21,6 +21,7 @@
 //! down to its event ([`recall`]). The compactor runs for exactly those
 //! workspaces ([`consumer`]).
 
+mod breaker;
 mod compaction_view;
 mod compactor;
 pub(crate) mod compactor_models;

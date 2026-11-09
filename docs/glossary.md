@@ -2213,7 +2213,7 @@ What a history read awaits between fetching its events and folding them into the
 ### Whole history loaded
 The client holds every drawable event of a thread: its first page has loaded, and the server reports nothing older (`wholeHistoryLoaded` in `components/chat/threadSkeletonGate.ts`). Every terminal transcript verdict needs it: "No messages", "could not be displayed", and the working shimmer. Until then the thread is loading, and the skeleton shows. A loaded page alone is not enough, because a page can draw nothing while older pages hold the messages.
 
-A page holds *drawable history*: `get_thread_events_page` skips auxiliary captures (`AUXILIARY_CAPTURE_SQL`, the SQL twin of `isAuxiliaryCapture`), which the transcript never draws. The unpaged and delta reads keep them. Distinct from the *history hold*, which records where the reader was during a read.
+A page holds *drawable history*: `get_thread_events_page` skips auxiliary captures (`AUXILIARY_CAPTURE_SQL`, the SQL twin of `isAuxiliaryCapture`) and failed model calls (`ModelCallFailed`, in `NON_EXCHANGE_METADATA_EVENTS`). The transcript draws neither. The unpaged and delta reads keep them. Distinct from the *history hold*, which records where the reader was during a read.
 
 ### History hold
 Where the reader was, recorded while a read of older history is in flight, so the fold can put them back (`historyHoldByThread` in `components/chat/ThreadView.tsx`). A page lands at the FRONT of the transcript. WebKit implements no scroll anchoring, so the container keeps its offset while the content under it slides down. Two readers take one: the scroll-driven backfill, and the pages a *deep-link anchor* reads toward its target turn.
@@ -4428,7 +4428,7 @@ Replaces the single `provider` and `context_window` columns. Those could not exp
 The Rust enum (`crates/lucidos-engine/src/llm/model_registry.rs`) naming which backend serves a model: `Vertex` | `Anthropic` | `OpenAi` | `OpenRouter` | `XAi` | `OpenCodeFree` | `Local` | `ClaudeGateway`. `ProviderKind::ALL` is the one list of them, in the order `/health` reports. So a new variant cannot reach the router while missing from what the picker filters against. Parsed from a *route*'s `provider` (`ProviderKind::parse`, unknown → `Vertex`), and from every choice strictly (`ProviderKind::from_name`, unknown → none). `RoutingProvider::backend` is the single place that maps one onto a provider instance. What it holds, what it reports configured, and what it routes cannot disagree.
 
 ### provider switch
-The per-provider on/off control on Settings → Models → Providers, and the thing that folds a provider's config rows away when it is off. Backed by the `provider_enabled_<id>` preference for the seven credential-, sign-in- and environment-configured providers (`vertex`, `anthropic`, `openai`, `openrouter`, `xai`, `local`, `claude-gateway`), resolved into `ProviderSwitches` by `llm/provider_build.rs`. Absent means **on**, so a workspace that never opened the page builds the provider set it always did.
+The per-provider on/off control on Settings → Providers, and the thing that folds a provider's config rows away when it is off. Backed by the `provider_enabled_<id>` preference for the seven credential-, sign-in- and environment-configured providers (`vertex`, `anthropic`, `openai`, `openrouter`, `xai`, `local`, `claude-gateway`), resolved into `ProviderSwitches` by `llm/provider_build.rs`. Absent means **on**, so a workspace that never opened the page builds the provider set it always did.
 
 A switch is a **veto**, never an installer: off drops the provider before the router is assembled, taking its web-search backend with it, and on adds nothing that is not otherwise configured. It leaves the stored credential alone, which is the whole point of having it beside Remove: it parks a key rather than spending it. It hot-swaps, being in `PROVIDER_PREFERENCE_KEYS`, and the frontend re-probes `/health` on the same keys so the model picker tracks it. The seven keys are human-only in the *preference catalog*: the provider a `set_preference` would switch off may be the one answering that turn.
 
@@ -4696,6 +4696,11 @@ The *front door* of a *release candidate*: `https://rc.lucidos.dev` (its own Clo
 ### Publish route
 Any path a piped run would curl back **from its own origin** and execute, which is the whole test for whether something belongs on a *front door*. Six today: `/install.sh` (the dash re-exec re-fetches itself), `/uninstall.sh` (`install.sh --uninstall` execs it, and a direct pipe runs it), and the four `/scripts/lib/*.sh` helpers the two scripts source (`stage_runtime.sh`, `headless_tarball.sh`, `install_common.sh`, `service.sh`). A missing publish route is not a 404: Cloudflare Pages answers an unknown path with the landing page at status **200**, so `curl -fsSL` succeeds and the shell runs HTML. The set is **enforced in two places that can drift** (the site publisher discovers routes separately for production and for the *RC front door*), which is exactly how `/uninstall.sh` reached production on 2026-07-30 and not the RC, surfacing only on the next morning's `rc/0.18.0` push as three red payload legs. `install-smoke.yml`'s **`front-door-parity`** job is the repo-side guard: daily, it derives each origin's route set from that origin's OWN served scripts (`scripts/lib/front_door_parity.sh`) and fails when production serves a route the candidate does not, naming it. The reverse direction is a warning, since an in-flight candidate legitimately leads production until publish. The structural fix, one discovery path parameterised by destination, is workspace-side.
 
+### Release cut
+The commit on `main`'s line that a Mode 1 release is built from: the *release commit*'s only parent. Phase A takes `main`'s tip, or the commit `release.sh --cut <ref>` names (main or an ancestor, via `release_cut_resolve`). A release **ships its cut**: Phase B publishes the validated *release candidate* whatever `main` did since. Later commits ship in the next release, and the final summary names them as "not in v<version>".
+
+Pass `--prep-preflight`'s `head_commit` as `--cut`, so the changelog draft and the build name one commit. Not `--base`, which is Mode 2 and skips the *release landing*. See ADR 0639.
+
 ### Release candidate (rc)
 The stripped *published release commit* while it is still on the gate branch, i.e. the object a release is gated on and (after *promotion*) the exact commit that becomes the mirror's `main`. Phase A (`release.sh --verify-build`) builds it with `release_tree_build`, scans it, commits it with `release_tree_commit`, and force-pushes it to `refs/heads/rc/<version>` on the `lucidos` remote (which fires `install-smoke.yml`'s clean-machine source install); the staged DMG + updater `.sig` then go onto the `rc-<version>` **draft release** at that branch, and Phase A dispatches `dmg-verify` at it with `-f dmg_tag=rc-<version>`. A draft so the gate artifact is never listed on the public releases page (as a prerelease it sat above the current GA for the whole Phase A to Phase B window), and an explicit dispatch because a draft fires no `release` event at all: see ADR 0036. Its SHA is recorded as `RC_COMMIT` in the verify-build state and pinned locally at `refs/release-candidates/<version>`. Deterministic: identity + dates are inherited from the internal release commit, and the parent is fixed, so re-deriving it yields the same object. Its parent is the mirror's `main` at the moment Phase A built it, recorded alongside as `RC_PARENT`, which is what makes the published history linear (ADR 0039); because the parent is part of the object's identity, rebuilding onto a moved mirror deliberately yields a DIFFERENT object and re-fires the gate. Never a raw branch push of the internal tree: that shipped `docs/plans/` and the release scripts to the public mirror on 2026-07-28 (ADR 0024).
 
@@ -4713,7 +4718,7 @@ The only tree Lucidos ever publishes. It is `HEAD` (or the release commit) minus
 Phase B's publish step: pushing the **already-validated** *release candidate* commit object onto the mirror's `main` (under `--force-with-lease` against the parent it was built on) and tagging it `v<version>` **by SHA**, as opposed to rebuilding an equivalent tree at publish time, which would ship an object CI never saw. Gated by `release_promote_preflight`, which refuses when no `RC_COMMIT` was recorded, when `rc/<version>` is absent from the mirror, when it **moved** (someone re-pushed ⇒ stale gate result), when no `RC_PARENT` was recorded, when the mirror's `main` **moved** off that parent (a release landed since), when the staging manifest's `source_commit` ≠ the worktree HEAD, or when a staged artifact's sha256 drifted. It also refuses the wrong argument count, since the parent pair was appended to an older signature and a five-argument caller would skip that half in silence. Driven by `release-to-lucidos.sh --promote-rc <sha>`; `release.sh --push-rc <version>` re-arms the gate without a rebuild. See ADR 0024. The source-side half that follows it is the *release landing*.
 
 ### Release commit
-The **main-line** commit of a release: the one bumping `RELEASE`, `CHANGELOG.md` and `install.sh`, created on `release/<version>` in the Phase A worktree off `main`. Distinct from the *release candidate*, which is the stripped commit built **from** it: same release, two objects, and the *release tag* names a different one on each remote. `RELEASE` is the load-bearing file: the site publisher reads the version from the local checkout's copy, so a release whose commit never reaches `main` leaves the site advertising the previous version (the v0.17.0 incident).
+The **main-line** commit of a release: the one bumping `RELEASE`, `CHANGELOG.md` and `install.sh`, created on `release/<version>` in the Phase A worktree with the *release cut* as its only parent. Distinct from the *release candidate*, which is the stripped commit built **from** it: same release, two objects, and the *release tag* names a different one on each remote. `RELEASE` is the load-bearing file. The site publisher reads the version from the local checkout's copy. A release whose commit never reaches `main` leaves the site advertising the previous version (the v0.17.0 incident).
 
 ### Engine preflight
 `lucidos-engine preflight`: boots the freshly built engine on a throwaway `pg_dump | pg_restore` copy of the workspace database, then drops the copy. It runs the embedded migrator and the secret-store boot check. The dev build runs it before `publish_all_launch_binaries`, so a binary that cannot boot on the workspace's data is never published. It never writes the source database or a key: a scratch key store keeps mint and park in memory. Distinct from the *Release preflight* and from `preflight.sh`, the launch-time tool check. Code: `crates/lucidos-engine/src/preflight.rs`.
@@ -5837,6 +5842,23 @@ resumes the backfill, and the workspace row's `backfilled_at` is the ready flag.
 runs exactly while the *memory module* is `tree`: one compactor per engine,
 paused and resumed as the preference changes. A pause clears the ready flag,
 so a workspace switched back reads Classic until the compactor catches up.
+
+Each `(lane, model)` pair has a *compactor breaker* (`summary_tree/breaker.rs`).
+Three failed model calls in a row open it. While it is open, nodes wait before they
+take a lane permit, and one probe call tests the model after each wait. The wait
+starts at 10 seconds, doubles per failed probe, and caps at 5 minutes. A success
+closes it. A Flex capacity refusal is neutral: it has its own fallback to the
+standard tier.
+
+The probe always asks for the standard tier, and only the probe's
+own failure lengthens the wait. A node that queued for a lane permit while the
+breaker opened waits again. The probe resolves the model again, so a moved
+default model releases the waiting nodes.
+
+While a breaker is open, `BackfillProgress.failing_model` names the
+model and the Memory row offers to pick another. A one-time notification follows
+when the wait first reaches its cap. Picking another compactor model gets a fresh
+breaker at once.
 
 ### Compaction view
 The context a *compactor* call reads (`engine/summary_tree/compaction_view.rs`,

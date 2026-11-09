@@ -12,8 +12,9 @@ import { useServerBackedField } from '../../hooks/useServerBackedField';
 import { LoadableError } from '../shared/LoadableError';
 import { ProviderBlock } from './ProviderBlock';
 import { claudeGatewayView, initialGatewayUrl, type ClaudeGatewayView } from './claudeGatewayView';
+import { providerAnchor } from '../../store/modelProviders';
 
-/** Configure the Claude gateway provider (Settings → Models → Providers): the
+/** Configure the Claude gateway provider (Settings → Providers): the
  *  Anthropic API behind an organisation's own sign-in. Lucidos signs in as
  *  itself with a device code, and the engine keeps and refreshes the tokens.
  *
@@ -37,7 +38,7 @@ export function ClaudeGatewaySettings() {
     <ProviderBlock
       id="claude-gateway"
       label="Claude gateway"
-      anchor="models:claude-gateway"
+      anchor={providerAnchor('claude-gateway')}
       hasStoredConfig={!!account}
       explainer={
         <>

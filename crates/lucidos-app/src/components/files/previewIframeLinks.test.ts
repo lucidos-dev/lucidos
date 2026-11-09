@@ -210,7 +210,15 @@ describe('classifyPreviewLink', () => {
     expect(classifyPreviewLink('settings:backup', ctx())).toEqual({
       kind: 'nav',
       target: 'settings',
-      settingsView: 'backup',
+      settings: { view: 'backup', fragment: null },
+    });
+  });
+
+  it('carries the row a settings link names', () => {
+    expect(classifyPreviewLink('settings:providers#xai', ctx())).toEqual({
+      kind: 'nav',
+      target: 'settings',
+      settings: { view: 'providers', fragment: 'xai' },
     });
   });
 
@@ -427,7 +435,7 @@ describe('classifyPreviewLink with a repo-flavored context', () => {
       kind: 'trigger', triggerId: '3f9b21c4-0a7e',
     });
     expect(classifyPreviewLink('settings:backup', repoCtx())).toEqual({
-      kind: 'nav', target: 'settings', settingsView: 'backup',
+      kind: 'nav', target: 'settings', settings: { view: 'backup', fragment: null },
     });
     expect(classifyPreviewLink('repo:repo-2:file:src/main.rs', repoCtx())).toEqual({
       kind: 'repo-file', locator: parseRepoPath('repo:repo-2:file:src/main.rs'),

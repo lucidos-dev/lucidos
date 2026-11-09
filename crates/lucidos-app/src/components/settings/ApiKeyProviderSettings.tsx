@@ -11,6 +11,7 @@ import {
   systemOneConsumers,
   type SystemOneProviderId,
 } from './judgmentBackend';
+import { providerAnchor } from '../../store/modelProviders';
 
 /** Shared block for a provider that authenticates with a single API key stored
  *  as an `api_key` credential (OpenAI, OpenRouter, xAI). The secret is
@@ -58,7 +59,7 @@ export function ApiKeyProviderSettings({ service, baseUrl, label, placeholder, n
     <ProviderBlock
       id={service}
       label={label}
-      anchor={`models:${service}`}
+      anchor={providerAnchor(service)}
       explainer={note}
       hasStoredConfig={!!existing}
       /* `.list-row-details` is `display: flex`, so this span is a block box
@@ -98,7 +99,7 @@ export function ApiKeyProviderSettings({ service, baseUrl, label, placeholder, n
       {children}
       {systemOne && (
         <SystemOneUsageRow
-          anchor={`models:${systemOne}-usage`}
+          anchor={providerAnchor(systemOne, 'usage')}
           inUseBy={systemOneConsumers(
             systemOne,
             preferences.value,

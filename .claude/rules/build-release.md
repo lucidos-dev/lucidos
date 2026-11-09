@@ -190,11 +190,11 @@ fails `/harden` when any other tracked script pushes. Route the push through
 ### The source side: main gets the bump, and the tag names it (ADR 0029)
 
 - **The mirror's `v<version>` names the stripped commit, pushed by SHA.** The local
-  and `origin` tags name the release commit on `main`.
-- **`scripts/lib/release_main_sync.sh` lands the bump on `main`** through
-  `settle_and_announce_release`: fast-forward, merge when `main` moved, or
-  hard-fail after `merge --abort`. The tag names the release commit, never a
-  cherry-pick.
+  and `origin` tags name the release commit.
+- **`release_main_sync.sh` lands the bump** (`settle_and_announce_release`):
+  fast-forward, else merge, else hard-fail after `merge --abort`.
+- **A release ships its cut (ADR 0639).** A moved `main` never forces a
+  re-fold. `--cut` never sets `BASE_REF_OVERRIDE`.
 - **`LucidosReleased` fires only after the landing, tag and `origin` push.**
 - **Skips reprint at the end in a `STILL OWED` block.** `origin` is never forced.
 - **`PREV_TAG` is a semver sort, never `git describe`.**

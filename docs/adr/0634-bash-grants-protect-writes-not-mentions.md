@@ -1,6 +1,7 @@
 # 0634: A Bash grant covers a command that only mentions .claude/ or .git/; only a write there asks
 
-- **Status**: Accepted
+- **Status**: Accepted. Widened by ADR 0638, which reads a printing `sed`, a
+  read-only substitution, and loop keywords.
 - **Date**: 2026-11-09
 
 ## Context

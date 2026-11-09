@@ -7,11 +7,14 @@ use async_trait::async_trait;
 /// as a `ThreadEvent::ResponseFailed` (see `engine/agentic_loop/run.rs`), so the
 /// wording is user-facing. Must never be mistaken for real or mock output.
 ///
-/// No "restart" instruction: configuring a provider in Settings → Models →
+/// No "restart" instruction: configuring a provider in Settings →
 /// Providers now takes effect at runtime (the config subscriber hot-swaps the
 /// active provider, see `spawn_provider_config_subscriber`).
-pub const NO_PROVIDER_MESSAGE: &str =
-    "No LLM provider configured. Add one in Settings → Models → Providers.";
+pub const NO_PROVIDER_MESSAGE: &str = concat!(
+    "No LLM provider configured. Add one in ",
+    providers_settings!(),
+    "."
+);
 
 /// Sentinel LLM provider for the "booted before any provider is configured"
 /// state.
@@ -98,7 +101,7 @@ mod tests {
             "error must name the problem: {msg}"
         );
         assert!(
-            msg.contains("Settings → Models → Providers"),
+            msg.contains(providers_settings!()),
             "error must point to the fix: {msg}"
         );
         // Must NEVER be the mock pangram — that is the entire bug this fixes.

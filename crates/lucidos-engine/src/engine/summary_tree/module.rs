@@ -86,7 +86,7 @@ pub async fn tree_ready(pool: &PgPool) -> bool {
 
 /// How far the backfill has got, in scopes: each in-scope thread plus the
 /// workspace. A scope counts as done once its drain completes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct BackfillProgress {
     pub done: usize,
     /// Zero until the compactor has seeded.
@@ -106,6 +106,11 @@ pub struct BackfillProgress {
     /// An owed scope's last drain failed for another reason. It goes back
     /// after [`super::RETRY`], and this holds until it completes.
     pub retrying: bool,
+    /// The model whose breaker is open: its calls keep failing, so nodes wait
+    /// before the next one. Cleared when the model answers or the user picks
+    /// another.
+    #[serde(default)]
+    pub failing_model: Option<String>,
     /// The ready flag is set, so turns read the trees while the older
     /// threads still fill in.
     pub ready: bool,
@@ -124,7 +129,7 @@ pub struct BackfillProgress {
 }
 
 /// What `GET /api/v1/memory/tree-backfill` serves.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum TreeBackfill {
     /// The workspace is on Classic. `started` says a backfill has written

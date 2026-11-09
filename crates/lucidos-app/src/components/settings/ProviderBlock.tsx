@@ -21,7 +21,7 @@ import {
  *  both. A fuse, not an animation, so it does not ride `--duration-scale`. */
 const OVERRIDE_HOLD_MS = 8000;
 
-/** One provider on Settings → Models → Providers: a header row that is always
+/** One provider on Settings → Providers: a header row that is always
  *  there, and config rows that are there only while the provider is on.
  *
  *  The page was one flat stack of every provider's fields at once, about twenty

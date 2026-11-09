@@ -244,7 +244,7 @@ export function closeInlineFormIfActive(form: InlineForm): void {
 // `system` is the System submenu, the list of the sub-pages below it. Overview
 // is one of those sub-pages and holds `system-overview`, so it is reached as a
 // row like every sibling.
-export type SettingsSubview = 'main' | 'system' | 'system-overview' | 'models' | 'intelligence' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'coding-agents' | 'locale' | 'marketplaces' | 'disk-usage' | 'prompt-footprint' | 'permissions' | 'mcp' | 'keyboard-shortcuts' | 'access' | 'webhooks' | 'environment-variables' | 'thread-queue' | 'whats-new' | 'release-notices' | 'debugging' | 'communication-surfaces';
+export type SettingsSubview = 'main' | 'system' | 'system-overview' | 'providers' | 'models' | 'intelligence' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'coding-agents' | 'locale' | 'marketplaces' | 'disk-usage' | 'prompt-footprint' | 'permissions' | 'mcp' | 'keyboard-shortcuts' | 'access' | 'webhooks' | 'environment-variables' | 'thread-queue' | 'whats-new' | 'release-notices' | 'debugging' | 'communication-surfaces';
 export type SettingsNavKey = Exclude<SettingsSubview, 'main'>;
 export interface SettingsNavItem {
   key: SettingsNavKey;
@@ -275,6 +275,11 @@ export interface SettingsHomeNavItem extends SettingsNavItem {
 export const settingsSubview = signal<SettingsSubview>('main');
 /** Anchor to scroll/highlight after navigating from Search Everywhere. SettingsView clears it after applying. */
 export const settingsScrollTarget = signal<string | null>(null);
+/** The row a `settings:<view>#<name>` link named, as `<name>`. SettingsView
+ *  resolves it through the search index. A link can name a row that does not
+ *  exist, so SettingsView toasts when it never renders. A `settingsScrollTarget`
+ *  names an anchor the index covers and stays silent. */
+export const settingsLinkedFragment = signal<string | null>(null);
 
 /** The rows of the System submenu, in the order they are listed there. */
 export const SETTINGS_SYSTEM_SUBPANEL_ITEMS: SettingsNavItem[] = [
@@ -317,6 +322,8 @@ export const SETTINGS_SYSTEM_SUBPANEL_ITEMS: SettingsNavItem[] = [
 //
 // Groups are contiguous and rendered as headings. They add no tap depth.
 export const SETTINGS_NAV_ITEMS: SettingsHomeNavItem[] = [
+  // First, in setup order: a provider is what makes a model reachable.
+  { key: 'providers', label: 'Providers', group: 'Assistant' },
   { key: 'models', label: 'Models', group: 'Assistant' },
   // Beside Models: which model and effort each agent may pick, and what
   // the picks cost. Models is the catalogue they are drawn from.
@@ -422,6 +429,31 @@ export function migrateSettingsSubview(raw: unknown): SettingsSubview {
  *  told, and a typo should not silently land on the Settings home. */
 export function aliasRetiredSettingsSubview(raw: string): string {
   return RETIRED_SETTINGS_SUBVIEWS.get(raw) ?? raw;
+}
+
+/** Where a retired search id or scroll anchor now lives. The provider blocks
+ *  left Models for their own Providers page, and their anchors took the page's
+ *  name with them (`providerAnchor`).
+ *
+ *  A `Map` for the same reason as `RETIRED_SETTINGS_SUBVIEWS`: persisted Search
+ *  recents are an untrusted key source. */
+const RETIRED_SETTINGS_ANCHORS = new Map<string, string>([
+  ['models:providers', 'providers'],
+  ['models:vertex-ai', 'providers:vertex'],
+  ['models:region', 'providers:vertex-region'],
+  ...[
+    'anthropic', 'openai', 'openrouter', 'xai', 'opencode-free', 'local', 'claude-gateway',
+    'typesafe', 'cloudflare-workers-ai', 'system-one-custom',
+  ].flatMap((id): [string, string][] => [
+    [`models:${id}`, `providers:${id}`],
+    [`models:${id}-usage`, `providers:${id}-usage`],
+  ]),
+]);
+
+/** Map a retired search id or anchor onto its current one, leaving anything
+ *  else untouched. */
+export function aliasRetiredSettingsAnchor(raw: string): string {
+  return RETIRED_SETTINGS_ANCHORS.get(raw) ?? raw;
 }
 
 // --- Active menu item ---

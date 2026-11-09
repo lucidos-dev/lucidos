@@ -165,6 +165,7 @@ const DATA_APP_ID_ATTR = /\sdata-app-id\s*=\s*(?:"[^"]*"|'[^']*')/i;
 const DATA_APP_FRAGMENT_ATTR = /\sdata-app-fragment\s*=\s*(?:"[^"]*"|'[^']*')/i;
 const DATA_NAV_TARGET_ATTR = /\sdata-nav-target\s*=\s*(?:"[^"]*"|'[^']*')/i;
 const DATA_SETTINGS_VIEW_ATTR = /\sdata-settings-view\s*=\s*(?:"[^"]*"|'[^']*')/i;
+const DATA_SETTINGS_FRAGMENT_ATTR = /\sdata-settings-fragment\s*=\s*(?:"[^"]*"|'[^']*')/i;
 const DATA_TRIGGER_ID_ATTR = /\sdata-trigger-id\s*=\s*(?:"[^"]*"|'[^']*')/i;
 
 /** UI panels reachable from a markdown link like `[Notifications](notifications)`.
@@ -219,16 +220,26 @@ export function extractNavTargetFromHref(href: string): string | null {
   return NAV_TARGETS.has(candidate) ? candidate : null;
 }
 
+/** A Settings page, plus the row on it a link named. */
+export interface SettingsHrefTarget {
+  /** A `navigate_ui` `settings_view` id. */
+  view: string;
+  /** The row's name without its `#`, or null when the link names the page only.
+   *  The row's anchor is `<view>:<fragment>`. */
+  fragment: string | null;
+}
+
 /** Extract the Settings page a `settings:<view>` href names, such as
  *  `[Settings → System → Backup](settings:backup)` in an engine notification.
- *  `<view>` is a `navigate_ui` `settings_view` id.
+ *  A fragment names a row on the page: `settings:providers#xai`.
  *
  *  Only the SHAPE is checked here. `handleNavigationRequest` validates the view
- *  and toasts one it cannot render, so a stale id is named, never swallowed.
+ *  and toasts one it cannot render, and SettingsView toasts a row it cannot
+ *  find, so a stale name is reported, never swallowed.
  *  Bare `settings` (the Settings home) stays with `extractNavTargetFromHref`. */
-export function extractSettingsViewFromHref(href: string): string | null {
-  const m = /^settings:([a-z0-9-]+)\/?$/i.exec(href);
-  return m ? m[1] : null;
+export function extractSettingsTargetFromHref(href: string): SettingsHrefTarget | null {
+  const m = /^settings:([a-z0-9-]+)\/?(?:#([a-z0-9-]+))?$/i.exec(href);
+  return m ? { view: m[1], fragment: m[2] ?? null } : null;
 }
 
 /** Does this href carry a URL scheme (`https:`, `mailto:`, `app:`, `file:`)?
@@ -508,25 +519,28 @@ function isWorkspaceAbsoluteRoute(href: string): boolean {
  *  panels. Returns a replacement opening tag with
  *  `class="nav-link" data-nav-target="<target>"` so the chat click handler
  *  routes through `handleNavigationRequest({ target })`. A `settings:<view>`
- *  href also carries `data-settings-view="<view>"`. Returns null when the
- *  href is neither, and the caller falls through to the next rewriter. */
+ *  href also carries `data-settings-view="<view>"`, and `data-settings-fragment`
+ *  when it names a row. Returns null when the href is neither, and the caller
+ *  falls through to the next rewriter. */
 function rewriteNavAnchor(tag: string): string | null {
   const m = tag.match(HREF_ATTR);
   if (!m) return null;
   const href = m[1] ?? m[2];
   if (!href) return null;
-  const settingsView = extractSettingsViewFromHref(href);
-  const target = settingsView ? 'settings' : extractNavTargetFromHref(href);
+  const settings = extractSettingsTargetFromHref(href);
+  const target = settings ? 'settings' : extractNavTargetFromHref(href);
   if (!target) return null;
-  const viewAttr = settingsView ? ` data-settings-view="${escapeAttr(settingsView)}"` : '';
+  const viewAttr = settings ? ` data-settings-view="${escapeAttr(settings.view)}"` : '';
+  const fragmentAttr = settings?.fragment ? ` data-settings-fragment="${escapeAttr(settings.fragment)}"` : '';
   const stripped = tag
     .replace(HREF_ATTR, '')
     .replace(CLASS_ATTR, '')
     .replace(DATA_NAV_TARGET_ATTR, '')
-    .replace(DATA_SETTINGS_VIEW_ATTR, '');
+    .replace(DATA_SETTINGS_VIEW_ATTR, '')
+    .replace(DATA_SETTINGS_FRAGMENT_ATTR, '');
   return stripped.replace(
     /^<a/i,
-    `<a href="#" class="nav-link" data-nav-target="${escapeAttr(target)}"${viewAttr}`,
+    `<a href="#" class="nav-link" data-nav-target="${escapeAttr(target)}"${viewAttr}${fragmentAttr}`,
   );
 }
 

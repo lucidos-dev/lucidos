@@ -29,7 +29,7 @@ through the engine proxy. That is what follows. The same call is right for a
 `run_python` or `run_bash` script and for a script-type trigger.
 
 The `judge` tool is off whenever TypeSafe is switched off under Settings →
-Models → Providers, and the proxy route sits outside that switch. A script
+Providers, and the proxy route sits outside that switch. A script
 cannot read the switch, since the preference is human-only. So treat a
 switched-off provider as a no and do not route around it.
 
@@ -41,7 +41,7 @@ credential, exactly as it does for `openai` and `anthropic`. See § "Built-in
 model-provider proxies" in `system-knowhow/js-sdk.md`.
 
 The one requirement is a stored `typesafe` credential, added under Settings →
-Models → Providers, or a `TYPESAFE_API_KEY` in the engine's environment. Check
+Providers, or a `TYPESAFE_API_KEY` in the engine's environment. Check
 with `lucidos credentials list`. With neither, the call returns a 404 naming
 what to set.
 

@@ -14,7 +14,7 @@ const TYPESAFE_BASE_URL = 'https://api.typesafe.ai/v1';
 
 const SERVICE = SYSTEM_ONE_PROVIDERS.typesafe.credentialService;
 
-/** TypeSafe (Jev), on Settings → Models → Providers. */
+/** TypeSafe (Jev), on Settings → Providers. */
 export function TypeSafeJudgmentSettings() {
   const existing = findProviderCredential(credentials.value, SERVICE);
   const [secret, setSecret] = useState('');

@@ -5,8 +5,8 @@
  * and on the compose view only when it does not. It shows nowhere while
  * threads load or once dismissed, and the dismissal lives in the DB-backed
  * welcome_suggestions_dismissed preference. Content stays provider-aware: when
- * no LLM provider is configured the welcome guides the user to Settings → Models
- * → Providers instead of offering the setup interview, which would chat into a
+ * no LLM provider is configured the welcome guides the user to Settings →
+ * Providers instead of offering the setup interview, which would chat into a
  * "no provider" error. These tests invoke the components directly and walk the
  * returned VNode tree (the repo idiom — no DOM render library), and unit-test
  * the pure gating predicate.
@@ -324,13 +324,13 @@ describe('ProviderSetupWelcome — onboarding content', () => {
     vi.mocked(openFreeProviderSettings).mockClear();
   });
 
-  it('shows the setup CTA pointing at Settings → Models → Providers, and nothing that needs a model', () => {
+  it('shows the setup CTA pointing at Settings → Providers, and nothing that needs a model', () => {
     const tree = ProviderSetupWelcome() as AnyVNode;
     const btns = findByClass(tree, 'welcome-provider-setup-btn');
     expect(btns.length).toBe(1);
     expect(textOf(btns[0])).toContain('Set up your AI provider');
     // The fix must steer to provider setup, not offer agent-assuming actions.
-    expect(textOf(tree)).toContain('Settings → Models → Providers');
+    expect(textOf(tree)).toContain('Settings → Providers');
     expect(containsComponent(tree, SetupInterviewWelcome)).toBe(false);
   });
 

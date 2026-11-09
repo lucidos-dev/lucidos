@@ -7,6 +7,7 @@ import {
   continueTreeBackfill,
   treeBackfill,
 } from '../../store/actions/treeBackfill';
+import { displayModelName } from '../../store/thread-events/exchange';
 import { formatBackfillSpend, usd } from './treeBackfillFormat';
 
 const RETRYING = 'A summary failed, retrying.';
@@ -35,7 +36,9 @@ export function TreeBackfillStatus({ onPickModel, onSwitchToClassic }: {
   const counted = filling ?? progress;
   const percent = filling ? backfillPercent(filling) : ready ? 100 : progress ? backfillPercent(progress) : 0;
   const held = counted?.held && counted.cap_usd !== null ? { cap: counted.cap_usd, next: counted.next_cap_usd } : null;
-  const working = counted !== null && counted.total > 0 && !counted.waiting_for_model && !held;
+  // A finished backfill still names a failing model: live summaries wait on it.
+  const failingModel = (counted ?? (state?.state === 'ready' ? state.filling : null))?.failing_model ?? null;
+  const working = counted !== null && counted.total > 0 && !counted.waiting_for_model && !held && !failingModel;
   const spend = counted ? formatBackfillSpend(counted) : null;
 
   let label: ComponentChildren = null;
@@ -64,6 +67,13 @@ export function TreeBackfillStatus({ onPickModel, onSwitchToClassic }: {
           </>
         )}
         <button type="button" class="accent-link" onClick={onSwitchToClassic}>Switch to Classic</button>
+      </>
+    );
+  } else if (failingModel) {
+    label = (
+      <>
+        {ready ? 'Ready. ' : ''}{displayModelName(failingModel)} is not answering, retrying:{' '}
+        <button type="button" class="accent-link" onClick={onPickModel}>pick another model</button>
       </>
     );
   } else if (filling?.waiting_for_model) {

@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.57.0 — 2026-11-09
+## v0.57.1 — 2026-11-09
 
 ### Added
 
@@ -19,6 +19,8 @@
 - The workspace cleanup panel shows only when there is something to clean: harness workspaces, orphan databases, stray folders or items in Trash.
 - Pairing links carry their secret in the URL fragment, so it never reaches a server log.
 - A Bash grant covers a command that only reads from `.claude/` or `.git/`. Writes there still ask.
+- The protected-path check reads a print-only `sed`, command substitutions, loops, `sort`, comments and `git add` precisely, so a coding agent asks for permission far less often. Writes that slipped past it before now ask.
+- Providers have their own Settings page. Manage models groups the models no provider can serve and links to Providers. A settings link lands on its row.
 - An unattended coding agent that hits a refused command parks one permission card when one of your devices can answer it. Trigger surfaces show the permission wait.
 - A coding agent that runs `cd` with an output redirect is told to rewrite the command.
 - An inline widget draws as a bare, centred box, and its menu opens from the keyboard.
@@ -34,6 +36,7 @@
 - A coding agent writing to its own scratch log is no longer blocked as out-of-workspace destruction.
 - An unattended deny card no longer blames a trigger or a person who is not there.
 - A banner's warning sign, close button and actions line up with its first line of text.
+- A thread opens on its exchanges, not on failed model calls, so a thread with many failed calls loads fast.
 - A voice call no longer cuts its own reply off when the phone speaker's echo reaches the microphone.
 - The video player keeps its place, releases and resumes media off screen, and redraws after a scroll on iPhone.
 - Content headers keep their title room, and the Canvas overflow button snaps to its slot on resize.

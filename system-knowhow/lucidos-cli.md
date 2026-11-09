@@ -2331,7 +2331,7 @@ lucidos proxy anthropic /messages -X POST \
   -d '{"model":"<model-id>","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
 ```
 
-- **Not configured answers 404**, and the message names what to set (Settings → Models → Providers, or an env var).
+- **Not configured answers 404**, and the message names what to set (Settings → Providers, or an env var).
 - **An `apis.json` entry with the same name wins**, so you can still point `openai` at a gateway.
 - **`vertex` takes only the suffix**, `/publishers/<publisher>/models/<model>:<method>`. The engine owns the project and region prefix, and any other path answers 400.
 - **`opencode-free` has no proxy.** The keyless free tier serves chat only, so nothing may build on it (ADR 0104).
@@ -2498,7 +2498,7 @@ person enters it. This command reads and moves the scope only.
 ### `lucidos claude-gateway status [--json]` / `sign-in [--url <U>]` / `sign-out`
 
 Sign Lucidos in to a *Claude gateway*: the Anthropic Messages API that an
-organisation runs behind its own sign-in. Settings → Models → Providers does the
+organisation runs behind its own sign-in. Settings → Providers does the
 same through the same routes, so a sign-in started here shows there too.
 
 ```bash

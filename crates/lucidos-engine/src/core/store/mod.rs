@@ -517,9 +517,10 @@ impl EventStore {
     /// a page is prepended to what the client holds rather than reversed there.
     ///
     /// **A page holds drawable history.** It skips auxiliary captures
-    /// ([`AUXILIARY_CAPTURE_SQL`]), in its rows and in `has_more`. The
-    /// transcript drops them, so a page of them draws nothing, and the home
-    /// thread records hundreds. The unpaged and delta reads keep them.
+    /// ([`AUXILIARY_CAPTURE_SQL`]) and failed model calls, in its rows and in
+    /// `has_more`. The transcript drops both, so a page of them draws nothing.
+    /// The home thread records thousands, since background calls bill it. The
+    /// unpaged and delta reads keep them.
     ///
     /// **The cursor is the pair, never the sequence alone.** Rows are ordered by
     /// `(created, sequence)` because a sequence is allocated globally and can
@@ -552,6 +553,7 @@ impl EventStore {
                  WHERE thread_id = $1
                    AND ($2::timestamptz IS NULL OR (created, sequence) < ($2, $3))
                    AND NOT {AUXILIARY_CAPTURE_SQL}
+                   AND event_type <> 'ModelCallFailed'
                  ORDER BY created DESC, sequence DESC
                  LIMIT $4
                ),

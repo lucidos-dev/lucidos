@@ -105,6 +105,37 @@ describe('the Tree backfill row', () => {
     expect(toClassic).toHaveBeenCalledOnce();
   });
 
+  it('names a model that is not answering, and offers another', async () => {
+    unmount = await mount(host, { ...LAST_TREE, retrying: true, failing_model: 'claude-haiku-4-5@20251001' });
+    expect(labels(host)).toEqual(['Haiku 4.5 is not answering, retrying: pick another model']);
+    expect(buttonNamed(host, 'pick another model')).toBeTruthy();
+    expect(host.querySelector('[data-role="tree-backfill"]')?.hasAttribute('data-working')).toBe(false);
+  });
+
+  it('names a model that is not answering while older threads fill in', async () => {
+    const { h, render } = await import('preact');
+    const { TreeBackfillStatus } = await import('../TreeBackfillStatus');
+    treeBackfill.value = {
+      status: 'loaded',
+      data: { state: 'ready', filling: { ...LAST_TREE, ready: true, failing_model: 'some-model' } },
+    };
+    render(h(TreeBackfillStatus, { onPickModel: () => {}, onSwitchToClassic: () => {} }), host);
+    unmount = () => render(null, host);
+    expect(labels(host)).toEqual(['Ready. some-model is not answering, retrying: pick another model']);
+  });
+
+  it('names a model that is not answering after the backfill finished', async () => {
+    const { h, render } = await import('preact');
+    const { TreeBackfillStatus } = await import('../TreeBackfillStatus');
+    treeBackfill.value = {
+      status: 'loaded',
+      data: { state: 'ready', filling: { ...LAST_TREE, done: 15, ready: true, failing_model: 'some-model' } },
+    };
+    render(h(TreeBackfillStatus, { onPickModel: () => {}, onSwitchToClassic: () => {} }), host);
+    unmount = () => render(null, host);
+    expect(labels(host)).toEqual(['Ready. some-model is not answering, retrying: pick another model']);
+  });
+
   it('puts a missing model before a retry, and stops looking busy', async () => {
     unmount = await mount(host, { ...LAST_TREE, retrying: true, waiting_for_model: true });
     expect(labels(host)).toEqual(['Waiting for a background model. Pick one']);

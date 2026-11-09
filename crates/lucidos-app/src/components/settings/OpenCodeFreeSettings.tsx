@@ -4,8 +4,9 @@ import {
   setOpenCodeFreeEnabled,
 } from '../../store/actions/preferences';
 import { Explainer } from '../shared/Explainer';
+import { providerAnchor } from '../../store/modelProviders';
 
-/** Turn the keyless OpenCode Free tier on or off (Settings → Models →
+/** Turn the keyless OpenCode Free tier on or off (Settings →
  *  Providers). There is no key field: the relay serves these models
  *  anonymously, and the engine sends no Authorization header at all. Stored as
  *  the `opencode_free_enabled` preference, which the engine's provider
@@ -24,7 +25,7 @@ export function OpenCodeFreeSettings() {
 
   return (
     <>
-      <div class="settings-row" data-search-anchor="models:opencode-free">
+      <div class="settings-row" data-search-anchor={providerAnchor('opencode-free')}>
         <span class="settings-row-label">
           OpenCode Free (keyless)
           <Explainer title="OpenCode Free (keyless)">

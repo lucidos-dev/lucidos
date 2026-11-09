@@ -25,6 +25,7 @@ import { loadApps } from './apps';
 import { loadInstalledPlugins } from './plugins';
 import { loadPluginCatalog } from './plugin-marketplaces';
 import { pushNavState } from './navigation';
+import { providerAnchor } from '../modelProviders';
 
 /** Set the active menu item, without pushing nav state or loading data.
  *  `overlay` defaults to `null` — clears any open sub-panel (app UI, file
@@ -107,14 +108,20 @@ export function landOnAccountsWithOverlay(overlay: PanelOverlay): void {
   revealContentPane();
 }
 
-/** Deep-link to Settings → Models → Providers in a single render and scroll to
- *  the Providers section. Used by the first-run provider onboarding (when no LLM
- *  provider is configured) so the "Set up your AI provider" button lands the
- *  user exactly where they add one. `settingsScrollTarget` drives the
- *  scroll-and-highlight effect in `SettingsView`. */
+/** Open Settings → Providers. The first-run onboarding uses it, when no LLM
+ *  provider is configured, so "Set up your AI provider" lands where the user
+ *  adds one. */
 export function openProviderSettings(): void {
-  settingsScrollTarget.value = 'models:providers';
-  openSettingsSubview('models');
+  openSettingsSubview('providers');
+}
+
+/** Open Settings → Providers scrolled to one provider's block. Manage models
+ *  links each unservable model to the providers that would serve it.
+ *  `settingsScrollTarget` drives the scroll-and-highlight effect in
+ *  `SettingsView`. */
+export function openProviderBlock(provider: string): void {
+  settingsScrollTarget.value = providerAnchor(provider);
+  openSettingsSubview('providers');
 }
 
 /** Deep-link to Settings → Permissions → Command safety → Answer coding-agent questions, the
@@ -124,16 +131,15 @@ export function openCommandGuardCodingAgentsSettings(): void {
   openSettingsSubview('permissions');
 }
 
-/** Deep-link to the OpenCode Free switch, one row inside the same Providers
- *  section. It is where the onboarding surface sends a user with no key, whose
- *  one actionable option is the keyless tier.
+/** Deep-link to the OpenCode Free switch on the Providers page. It is where
+ *  the onboarding surface sends a user with no key, whose one actionable option
+ *  is the keyless tier.
  *
  *  It navigates and nothing else. The tier is opt-in and states its terms at
  *  the switch (ADR 0104). So the decision stays on the row the user lands on,
  *  never on the button that sent them there. */
 export function openFreeProviderSettings(): void {
-  settingsScrollTarget.value = 'models:opencode-free';
-  openSettingsSubview('models');
+  openProviderBlock('opencode-free');
 }
 
 /** Deep-link to the Capture context per step switch in Settings → System →

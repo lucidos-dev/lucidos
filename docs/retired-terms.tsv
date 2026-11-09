@@ -17,3 +17,4 @@
 widgets\(action="(?:un)?pin"\)	widgets(action="add_to_dashboard"), or widgets(action="size") for a card	docs/adr/0621-widgets-one-box-no-pin.md
 \bthread\s+widgets\b	the thread's inline widgets, drawn from its replies	docs/adr/0621-widgets-one-box-no-pin.md
 \bpush\s+audience\b	notification audience	docs/adr/0623-team-workspace-factory.md
+\b(?-i:Models)(?:\s+(?:→|->|>)\s+Providers\b|,\s+Providers\b|\s+\(Providers\))	Settings → Providers (Providers is its own Settings page)	docs/adr/0637-providers-settings-page.md

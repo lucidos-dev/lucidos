@@ -132,7 +132,7 @@ network-facing surface; packaged engines bind loopback-only behind it.
 Every launch mode boots before a provider is configured (ADR 0613). First run
 installs `UnconfiguredProvider`, which returns a clear "No LLM provider
 configured" error on chat and reports `llm_configured: false` on `/health`.
-The user adds a provider in **Settings → Models → Providers**, and the active
+The user adds a provider in **Settings → Providers**, and the active
 provider updates live. `LUCIDOS_BOOT_WITHOUT_PROVIDER` is an ignored legacy
 launcher setting.
 

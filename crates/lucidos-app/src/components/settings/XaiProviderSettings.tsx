@@ -1,6 +1,6 @@
 import { ApiKeyProviderSettings } from './ApiKeyProviderSettings';
 
-/** Configure the xAI provider credential (Settings → Models → Providers).
+/** Configure the xAI provider credential (Settings → Providers).
  *  Stores a credential named `xai`. The engine builds an OpenAI-compatible
  *  provider pointed at api.x.ai and sends it as the bearer key, preferring it
  *  over the LUCIDOS_XAI_API_KEY launch env var. xAI authenticates with a

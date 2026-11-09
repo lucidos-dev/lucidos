@@ -354,7 +354,7 @@ and `preferences(action="set")` refuses every one with a hint naming the right s
     safety). The second is the Query classification row in Settings → Models
     (Background tasks).
   - A System One row appears only once its provider is set up in Settings →
-    Models (Providers), and each sits under that provider's switch below.
+    Providers, and each sits under that provider's switch below.
   - `openrouter` and `openai` reuse the OpenRouter and OpenAI chat providers'
     keys, and sit under `provider_enabled_openrouter` and
     `provider_enabled_openai`. `openai` asks OpenAI's Decisions API on
@@ -472,7 +472,7 @@ and `preferences(action="set")` refuses every one with a hint naming the right s
   `provider_enabled_openai`, `provider_enabled_openrouter`,
   `provider_enabled_xai`, `provider_enabled_local`,
   `provider_enabled_claude_gateway`: the per-provider switches on
-  Settings → Models → Providers. Absent means **on**; only an explicit `false`
+  Settings → Providers. Absent means **on**; only an explicit `false`
   switches a provider off. Off drops it from the model picker and from web
   search, with no restart, and leaves the stored key untouched for later. Never
   via `preferences(action="set")`: the provider you switch off may be answering this turn.
@@ -480,15 +480,15 @@ and `preferences(action="set")` refuses every one with a hint naming the right s
   free tier on cannot leave the workspace unable to answer. An app may not set
   it: sending chat to an anonymous relay is the user's informed opt-in.
 - `local_base_url`: the base URL of the `local` OpenAI-compatible provider,
-  `http://localhost:11434/v1` by default. The user sets it in Settings → Models
-  → Providers. Neither you (`preferences(action="set")`) nor an app may set it: that host
+  `http://localhost:11434/v1` by default. The user sets it in Settings →
+  Providers. Neither you (`preferences(action="set")`) nor an app may set it: that host
   reads every prompt and writes the replies you run as tool calls. The host must
   be loopback, a private or tailnet address, or a `.local` or `.home.arpa` name.
   Any other host is refused on save, and one stored earlier is ignored, so the
   local provider drops out. The saved `local` key goes only where its credential
   scope covers this URL.
 - `claude_gateway_url`: the origin of the Claude gateway Lucidos signs in to,
-  unset by default. The user sets it in Settings → Models → Providers, never
+  unset by default. The user sets it in Settings → Providers, never
   you: that host receives every prompt sent to a Claude model routed there,
   with the user's sign-in. It must be an `https` origin with no path, and a
   write that is not one is refused. A URL that stops naming the signed-in
@@ -507,10 +507,10 @@ and `preferences(action="set")` refuses every one with a hint naming the right s
   your decision.
 - `system_one_custom_url`, `system_one_custom_model`: where the custom System
   One endpoint lives and which model it is asked for, set on its row in Settings
-  → Models → Providers. That host receives every state a judgment sends it and
+  → Providers. That host receives every state a judgment sends it and
   can answer the command guard, so you never set either.
 - `system_one_openrouter_model`: the System One model the `openrouter` System One
-  row asks, set on the OpenRouter row in Settings → Models → Providers. Unset
+  row asks, set on the OpenRouter row in Settings → Providers. Unset
   asks Jev. It picks which vendor sees what a judgment judges, so you never set
   it.
 

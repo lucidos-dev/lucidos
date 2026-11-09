@@ -1213,7 +1213,7 @@ fn provider_config_read(
 ///
 /// Each way, re-resolve `select_provider` against current DB state via
 /// [`crate::llm::build_active_provider`] and swap the shared provider handle in
-/// place. A first-run user who configures a provider in Settings → Models →
+/// place. A first-run user who configures a provider in Settings →
 /// Providers then gets a working chat with NO restart. Removing the last one
 /// swaps back to the unconfigured sentinel. Mirrors `spawn_models_registry_subscriber`.
 ///

@@ -1,4 +1,4 @@
-import { enginePackaged, releaseCheck, type SettingsSubview } from '../../store/store';
+import { enginePackaged, releaseCheck, aliasRetiredSettingsAnchor, type SettingsSubview } from '../../store/store';
 import type { SearchResultItem } from '../../api/client';
 import { SHORTCUT_DEFS, bindingSearchText, shortcutSearchAnchor } from '../../utils/shortcuts';
 import { displayBinding, bindingFor } from '../../store/actions/keybindings';
@@ -14,7 +14,8 @@ import {
   currentStyleOverrides,
   VOICE_RESIDENT_SECTIONS,
 } from '../../store/actions/preferences';
-import { SYSTEM_ONE_PROVIDERS, SYSTEM_ONE_PROVIDER_LOCATION } from '../settings/judgmentBackend';
+import { SYSTEM_ONE_PROVIDERS } from '../settings/judgmentBackend';
+import { PROVIDERS_SETTINGS_PATH, providerAnchor } from '../../store/modelProviders';
 import { rankByTitle } from './titleMatch';
 import { voiceReachable } from '../../voice/socketUrl';
 
@@ -77,6 +78,7 @@ const hasStyleOverrides = () => Object.keys(currentStyleOverrides()).length > 0;
 
 const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // Top-level subviews (one per SETTINGS_NAV_ITEMS entry)
+  { id: 'providers', label: 'Providers', subview: 'providers', path: 'Settings', keywords: 'providers vertex anthropic openai openrouter xai grok opencode free keyless local gcloud gcp google api key direct credential gpt claude system one typesafe cloudflare' },
   { id: 'models', label: 'Models', subview: 'models', path: 'Settings' },
   { id: 'intelligence', label: 'Intelligence', subview: 'intelligence', path: 'Settings', keywords: 'intelligence ladder rung model effort default picker cost time band price prices lucidos agent claude code codex' },
   { id: 'permissions', label: 'Permissions', subview: 'permissions', path: 'Settings', keywords: 'permissions security command guard safety allowlist claude code lucidos agent bash python tools' },
@@ -175,12 +177,6 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'models:chat', label: 'Chat & triggers', subview: 'models', path: 'Settings → Models', anchor: 'models:chat' },
   { id: 'models:image-generation', label: 'Image generation', subview: 'models', path: 'Settings → Models', anchor: 'models:image-generation' },
   { id: 'models:background-tasks', label: 'Background tasks', subview: 'models', path: 'Settings → Models', anchor: 'models:background-tasks' },
-  { id: 'models:vertex-ai', label: 'Vertex AI', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:vertex-ai', keywords: 'vertex gcloud gcp google adc region' },
-  { id: 'models:providers', label: 'Providers', subview: 'models', path: 'Settings → Models', anchor: 'models:providers', keywords: 'providers vertex anthropic openai openrouter xai grok opencode free keyless local gcloud gcp google api key direct credential gpt claude' },
-  // Its own row, not just a keyword on the section above. It is the one
-  // provider a user with no key can turn on. So "free" lands on the switch,
-  // rather than on the top of a page they then have to scan.
-  { id: 'models:opencode-free', label: 'OpenCode Free (keyless)', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:opencode-free', keywords: 'opencode free keyless no key no account zen relay anonymous trial try' },
   { id: 'models:chat-model', label: 'Chat model', subview: 'models', path: 'Settings → Models → Chat & triggers', anchor: 'models:chat-model', keywords: 'model reasoning effort thinking tier opus sonnet haiku gpt' },
   { id: 'models:trigger-model', label: 'Trigger model', subview: 'models', path: 'Settings → Models → Chat & triggers', anchor: 'models:trigger-model', keywords: 'trigger model reasoning effort thinking tier opus sonnet haiku gpt scheduled default' },
   { id: 'models:response-style', label: 'Response style', subview: 'models', path: 'Settings → Models', anchor: 'models:response-style', keywords: 'response style brevity verbose verbosity concise minimal short shorter terse length yapping waffle rambling output style tone instruction custom learning teach explain why outcome autopilot' },
@@ -194,15 +190,10 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'models:read-decision', label: 'Read decision', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:read-decision', keywords: 'read decision review worth reading typesafe jev openai decisions openrouter system one judgment' },
   { id: 'models:wake-decision', label: 'Wake decision', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:wake-decision', keywords: 'wake decision sub-thread child parent filed report typesafe jev openai decisions openrouter system one judgment' },
   { id: 'models:expected-wake-decision', label: 'Expected wake', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:expected-wake-decision', keywords: 'expected wake decision cache keep-alive waiting estimate when the thread wakes typesafe jev openai decisions openrouter system one judgment' },
-  // Lands on the Vertex header, not on the Region row itself. That row sits
-  // inside the provider's block, which renders only while Vertex is switched
-  // on. An anchor pointing at it scrolls to nothing whenever it is off. The
-  // header is always there, and carries the switch that brings the row back.
-  { id: 'models:region', label: 'Region', subview: 'models', path: 'Settings → Models → Providers → Vertex AI', anchor: 'models:vertex-ai' },
   { id: 'models:voice', label: 'Voice', subview: 'models', path: 'Settings → Models', anchor: 'models:voice', keywords: 'voice call talk speak speech audio microphone realtime talker transcriber experimental' },
   { id: 'models:voice-enabled', label: 'Voice (experimental)', subview: 'models', path: 'Settings → Models → Voice', anchor: 'models:voice-enabled', keywords: 'voice call enable turn on off home thread', when: voiceReachable },
-  // The rows below render only while voice is on. So, like Region above, they
-  // land on the switch row. A relayed workspace draws no switch, so there only
+  // The rows below render only while voice is on. So they land on the
+  // switch row. A relayed workspace draws no switch, so there only
   // the Voice heading above is found.
   { id: 'models:voice-talker', label: 'Talker model', subview: 'models', path: 'Settings → Models → Voice', anchor: 'models:voice-enabled', keywords: 'talker speech to speech realtime voice model', when: voiceReachable },
   { id: 'models:voice-transcriber', label: 'Transcriber model', subview: 'models', path: 'Settings → Models → Voice', anchor: 'models:voice-enabled', keywords: 'transcriber transcription speech to text whisper voice model', when: voiceReachable },
@@ -214,18 +205,30 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'models:summary-compaction', label: 'Summary compaction', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:summary-compaction', keywords: 'summary compaction compactor tree memory', when: () => currentMemoryModule() === 'tree' },
   { id: 'models:response-style-picker', label: 'Style', subview: 'models', path: 'Settings → Models → Response style', anchor: 'models:response-style-picker', keywords: 'response style pick choose preset library' },
   { id: 'models:manage', label: 'Manage models', subview: 'models', path: 'Settings → Models', anchor: 'models:manage', keywords: 'manage models registry add custom model context window remove' },
-  { id: 'models:anthropic', label: 'Anthropic (direct)', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:anthropic', keywords: 'anthropic claude api key direct' },
-  { id: 'models:openai', label: 'OpenAI (direct)', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:openai', keywords: 'openai gpt api key direct' },
-  { id: 'models:openrouter', label: 'OpenRouter', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:openrouter', keywords: 'openrouter router api key' },
-  { id: 'models:xai', label: 'xAI', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:xai', keywords: 'xai grok api key' },
-  { id: 'models:local', label: 'Local (OpenAI-compatible)', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:local', keywords: 'local ollama lm studio llama vllm openai compatible base url self-hosted' },
-  { id: 'models:claude-gateway', label: 'Claude gateway', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:claude-gateway', keywords: 'claude gateway organisation organization company sign in device code anthropic' },
+
+  // Providers subview
+  { id: providerAnchor('vertex'), label: 'Vertex AI', subview: 'providers', path: PROVIDERS_SETTINGS_PATH, anchor: providerAnchor('vertex'), keywords: 'vertex gcloud gcp google adc region' },
+  // Its own row, not just a keyword on the page entry. It is the one provider a
+  // user with no key can turn on. So "free" lands on the switch, rather than on
+  // the top of a page they then have to scan.
+  { id: providerAnchor('opencode-free'), label: 'OpenCode Free (keyless)', subview: 'providers', path: PROVIDERS_SETTINGS_PATH, anchor: providerAnchor('opencode-free'), keywords: 'opencode free keyless no key no account zen relay anonymous trial try' },
+  // Lands on the Vertex header, not on the Region row itself. That row sits
+  // inside the provider's block, which renders only while Vertex is switched
+  // on. An anchor pointing at it scrolls to nothing whenever it is off. The
+  // header is always there, and carries the switch that brings the row back.
+  { id: providerAnchor('vertex', 'region'), label: 'Region', subview: 'providers', path: `${PROVIDERS_SETTINGS_PATH} → Vertex AI`, anchor: providerAnchor('vertex') },
+  { id: providerAnchor('anthropic'), label: 'Anthropic (direct)', subview: 'providers', path: PROVIDERS_SETTINGS_PATH, anchor: providerAnchor('anthropic'), keywords: 'anthropic claude api key direct' },
+  { id: providerAnchor('openai'), label: 'OpenAI (direct)', subview: 'providers', path: PROVIDERS_SETTINGS_PATH, anchor: providerAnchor('openai'), keywords: 'openai gpt api key direct' },
+  { id: providerAnchor('openrouter'), label: 'OpenRouter', subview: 'providers', path: PROVIDERS_SETTINGS_PATH, anchor: providerAnchor('openrouter'), keywords: 'openrouter router api key' },
+  { id: providerAnchor('xai'), label: 'xAI', subview: 'providers', path: PROVIDERS_SETTINGS_PATH, anchor: providerAnchor('xai'), keywords: 'xai grok api key' },
+  { id: providerAnchor('local'), label: 'Local (OpenAI-compatible)', subview: 'providers', path: PROVIDERS_SETTINGS_PATH, anchor: providerAnchor('local'), keywords: 'local ollama lm studio llama vllm openai compatible base url self-hosted' },
+  { id: providerAnchor('claude-gateway'), label: 'Claude gateway', subview: 'providers', path: PROVIDERS_SETTINGS_PATH, anchor: providerAnchor('claude-gateway'), keywords: 'claude gateway organisation organization company sign in device code anthropic' },
   // A provider's "In use by" row sits in its folded body, so it lands on the
   // provider's header, which always renders. A chat provider's header has its
   // own entry above.
   ...Object.values(SYSTEM_ONE_PROVIDERS).flatMap((p): SettingsSearchEntry[] => [
-    ...(p.chatProvider ? [] : [{ id: p.anchor, label: p.label, subview: 'models', path: `Settings → ${SYSTEM_ONE_PROVIDER_LOCATION}`, anchor: p.anchor, keywords: 'system one judgment provider api key' } satisfies SettingsSearchEntry]),
-    { id: `${p.anchor}-usage`, label: `${p.label}: in use by`, subview: 'models', path: `Settings → ${SYSTEM_ONE_PROVIDER_LOCATION} → ${p.label}`, anchor: p.anchor, keywords: 'in use by sites command guard query classification read decision judgment system one' },
+    ...(p.chatProvider ? [] : [{ id: p.anchor, label: p.label, subview: 'providers', path: PROVIDERS_SETTINGS_PATH, anchor: p.anchor, keywords: 'system one judgment provider api key' } satisfies SettingsSearchEntry]),
+    { id: providerAnchor(p.id, 'usage'), label: `${p.label}: in use by`, subview: 'providers', path: `${PROVIDERS_SETTINGS_PATH} → ${p.label}`, anchor: p.anchor, keywords: 'in use by sites command guard query classification read decision judgment system one' },
   ]),
 
   // Appearance & Behavior subview (Links absorbed the retired Links and
@@ -337,8 +340,20 @@ export function getSettingsSearchResults(query: string, limit: number): SearchRe
   }));
 }
 
+/** Resolves a retired id too: Search recents are persisted verbatim. */
 export function findSettingsEntry(id: string): SettingsSearchEntry | undefined {
-  return allSettingsEntries().find(e => e.id === id);
+  const current = aliasRetiredSettingsAnchor(id);
+  return allSettingsEntries().find(e => e.id === current);
+}
+
+/** The anchor a `settings:<view>#<fragment>` link lands on. The fragment is a
+ *  row's search id after its colon, so a page whose anchors carry another
+ *  prefix still resolves. A row inside a fold lands on the ancestor its entry
+ *  names. A fragment the index lacks stays `<view>:<fragment>`. */
+export function settingsLinkAnchor(view: string, fragment: string): string {
+  const entry = allSettingsEntries().find(e =>
+    e.subview === view && e.anchor !== undefined && e.id.slice(e.id.indexOf(':') + 1) === fragment);
+  return entry?.anchor ?? `${view}:${fragment}`;
 }
 
 /** Whether some entry lands on `anchor`, or takes it as its id and lands on an

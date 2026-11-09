@@ -29,7 +29,7 @@ export function customEndpointUrlValid(url: string): boolean {
 }
 
 /**
- * A custom System One endpoint on Settings → Models → Providers, such as an
+ * A custom System One endpoint on Settings → Providers, such as an
  * open model served on this machine.
  *
  * The URL and the model are preferences, and the key is an optional

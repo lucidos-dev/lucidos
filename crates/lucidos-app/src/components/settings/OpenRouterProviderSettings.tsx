@@ -5,7 +5,7 @@ import { useServerBackedField } from '../../hooks/useServerBackedField';
 import { ApiKeyProviderSettings } from './ApiKeyProviderSettings';
 import { OPENROUTER_JEV_MODEL } from '@lucidos/engine-constants';
 
-/** Configure the OpenRouter provider credential (Settings → Models →
+/** Configure the OpenRouter provider credential (Settings →
  *  Providers). Stores a credential named `openrouter`; the engine builds an
  *  OpenAI-compatible provider pointed at openrouter.ai and sends it as the
  *  bearer key (preferring it over the LUCIDOS_OPENROUTER_API_KEY launch env

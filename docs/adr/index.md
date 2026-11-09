@@ -641,3 +641,7 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0633: XL widget size: a fourth size, opt-in, 4 by 2 cells, scrolling sideways where the host is narrower](0633-xl-widget-size.md)
 - [0634: A Bash grant covers a command that only mentions .claude/ or .git/; only a write there asks](0634-bash-grants-protect-writes-not-mentions.md)
 - [0635: The build wrapper prunes stale cargo incremental crate dirs once a day; cargo has no target-dir gc, and the worktree worker was rejected as owner](0635-prune-stale-cargo-incremental-dirs.md)
+- [0637: Providers is a Settings page of its own, a settings link takes a fragment and navigate_ui reuses its fragment argument for it, and Manage models folds unservable models into Needs a provider with Retired winning](0637-providers-settings-page.md)
+- [0638: The protected-path write check reads a printing sed, a read-only substitution, and loop keywords; ADR 0634's whole-command rule stands](0638-protected-path-check-reads-sed-substitutions-loops.md)
+- [0639: A release ships its cut: Phase B publishes the validated rc whatever main did since; --cut pins the commit](0639-release-ships-its-cut.md)
+- [0640: The compactor's circuit breaker lives per lane, not in the model call service](0640-compactor-breaker-per-lane.md)

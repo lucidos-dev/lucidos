@@ -3,6 +3,8 @@
 - **Status**: Accepted
 - **Date**: 2026-09-23
 - **Amends**: [0029](0029-a-release-tag-names-the-main-line-commit.md)
+- **Amended by**: [0639](0639-release-ships-its-cut.md). A moved main is now the
+  normal case, not a race: a release ships its cut and never re-folds to chase main.
 
 ## Context
 

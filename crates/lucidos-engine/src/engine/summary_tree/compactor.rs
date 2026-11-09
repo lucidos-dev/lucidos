@@ -20,6 +20,12 @@
 //! **A failure never wedges the queue.** A failed node puts its scope back
 //! after [`RETRY`] and frees the worker for another scope. Only the first
 //! failure of each node is logged.
+//!
+//! **A dead model does not get a call per scope.** Each model on a route has a
+//! breaker ([`super::breaker`]). Once it opens, a node waits for it, and a
+//! node that queued for a lane permit meanwhile waits again. A waiting node
+//! keeps its drain, so its worker takes no further scope. A new model
+//! preference releases the waiting nodes at once.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,6 +37,9 @@ use sqlx::PgPool;
 use tokio::sync::{Notify, Semaphore};
 use uuid::Uuid;
 
+#[cfg(test)]
+use super::breaker::Waits;
+use super::breaker::{Admission, Breakers, Transition, MAX_WAIT, TRIP_AFTER};
 use super::compaction_view::{self, CompactionView};
 use super::compactor_models::Tokens;
 use super::limit::{Lanes, MAX_LIMIT};
@@ -65,6 +74,10 @@ pub(crate) trait CompactorDeps: Send + Sync {
     /// What a backfill from here would cost on the compactor's model and
     /// tier, as the Start dialog shows it.
     async fn backfill_estimate(&self) -> Result<StartEstimate, String>;
+
+    /// Tell the user `model` has not answered for a long while, so new
+    /// summaries wait and they can pick another.
+    async fn notify_model_down(&self, model: &str);
 }
 
 pub(crate) struct CompactionModel {
@@ -83,6 +96,13 @@ pub(crate) struct CompactionModel {
     pub(crate) flex: bool,
 }
 
+impl CompactionModel {
+    /// Whether both name one breaker.
+    fn same_route(&self, other: &Self) -> bool {
+        self.lane == other.lane && self.model == other.model
+    }
+}
+
 /// Flex refusals in a row, for capacity, after which a node asks for the
 /// standard tier.
 const FLEX_TRIES: u32 = 2;
@@ -98,7 +118,8 @@ pub(crate) enum Drained {
     /// The compactor stopped mid-drain: it paused, or the backfill reached its
     /// cap. Resume, or the raise's re-seed, queues the scope again.
     Paused,
-    /// A node failed; the scope goes back after [`RETRY`].
+    /// A node failed; the scope goes back after [`RETRY`]. While its model's
+    /// breaker is open, a node waits for the breaker before it calls.
     Failed,
     /// No model is configured, so nothing that needs one can be built.
     ModelUnavailable,
@@ -107,6 +128,8 @@ pub(crate) enum Drained {
 enum NodeError {
     ModelUnavailable(String),
     Failed(String),
+    /// The compactor paused while the node waited on a breaker.
+    Paused,
 }
 
 impl From<BoxError> for NodeError {
@@ -194,6 +217,12 @@ pub(crate) struct Compactor {
     bus: EventBus,
     deps: Arc<dyn CompactorDeps>,
     lanes: Lanes,
+    breakers: Breakers,
+    /// The model whose breaker is open, as the progress count names it.
+    failing_model: Mutex<Option<String>>,
+    /// Woken by a change of the compactor's model or a pause, so a node
+    /// parked on a breaker looks again.
+    wake_parked: Notify,
     reads: Semaphore,
     queue: Mutex<Queue>,
     wake: Notify,
@@ -241,11 +270,34 @@ pub(crate) struct Compactor {
 
 impl Compactor {
     pub(crate) fn new(pool: PgPool, bus: EventBus, deps: Arc<dyn CompactorDeps>) -> Arc<Self> {
+        Self::with_breakers(pool, bus, deps, Breakers::default())
+    }
+
+    /// A compactor whose breakers wait `waits`, not the real ones.
+    #[cfg(test)]
+    pub(crate) fn with_breaker_waits(
+        pool: PgPool,
+        bus: EventBus,
+        deps: Arc<dyn CompactorDeps>,
+        waits: Waits,
+    ) -> Arc<Self> {
+        Self::with_breakers(pool, bus, deps, Breakers::with_waits(waits))
+    }
+
+    fn with_breakers(
+        pool: PgPool,
+        bus: EventBus,
+        deps: Arc<dyn CompactorDeps>,
+        breakers: Breakers,
+    ) -> Arc<Self> {
         Arc::new(Self {
             pool,
             bus,
             deps,
             lanes: Lanes::default(),
+            breakers,
+            failing_model: Mutex::default(),
+            wake_parked: Notify::new(),
             reads: Semaphore::new(READS),
             queue: Mutex::default(),
             wake: Notify::new(),
@@ -305,6 +357,7 @@ impl Compactor {
             nodes_total,
             waiting_for_model: self.waiting_for_model.load(Ordering::SeqCst),
             retrying: !backfill.failing.is_empty(),
+            failing_model: self.failing_model.lock().unwrap().clone(),
             ready: backfill.ready,
             spent_usd: episode.and_then(Episode::priced_spend),
             cap_usd: episode.and_then(|e| e.cap_usd),
@@ -392,10 +445,76 @@ impl Compactor {
         }
     }
 
+    /// The compactor's model preference changed. Nodes waiting on a breaker
+    /// look at the model again, so one on a working model goes on at once.
+    pub(crate) async fn model_changed(&self) {
+        self.set_failing_model(None).await;
+        self.wake_parked.notify_waiters();
+    }
+
+    /// Name the model whose breaker is open, or `None`, and announce a change.
+    async fn set_failing_model(&self, model: Option<&str>) {
+        let changed = {
+            let mut failing = self.failing_model.lock().unwrap();
+            let changed = failing.as_deref() != model;
+            *failing = model.map(str::to_string);
+            changed
+        };
+        if changed {
+            self.announce_progress().await;
+        }
+    }
+
+    /// Log and announce what a call's verdict did to its model's breaker.
+    /// A call that outlived a model change or a pause logs, but announces
+    /// nothing: a paused compactor belongs to a workspace on Classic memory.
+    async fn breaker_moved(&self, called: &CompactionModel, transition: Transition) {
+        let model = called.model.as_str();
+        let current = || async {
+            !self.is_paused() && self.deps.model().await.is_ok_and(|m| m.same_route(called))
+        };
+        match transition {
+            Transition::Unchanged => {}
+            Transition::Opened { wait } => {
+                log!(
+                    "[SummaryTree] {} failed {} calls in a row; its next call waits {:?}",
+                    model,
+                    TRIP_AFTER,
+                    wait
+                );
+                if current().await {
+                    self.set_failing_model(Some(model)).await;
+                }
+            }
+            Transition::Backoff { wait, notice } => {
+                log!(
+                    "[SummaryTree] {} still fails; its next call waits {:?}",
+                    model,
+                    wait
+                );
+                if notice && current().await {
+                    log!(
+                        "[SummaryTree] {} has failed for over {:?} between calls; telling the user",
+                        model,
+                        MAX_WAIT
+                    );
+                    self.deps.notify_model_down(model).await;
+                }
+            }
+            Transition::Closed => {
+                log!("[SummaryTree] {} answers again", model);
+                if self.failing_model.lock().unwrap().as_deref() == Some(model) {
+                    self.set_failing_model(None).await;
+                }
+            }
+        }
+    }
+
     /// Stop taking work. Progress is durable, so [`Self::resume`] picks up
     /// where this left off (I8).
     pub(crate) fn pause(&self) {
         self.paused.store(true, Ordering::SeqCst);
+        self.wake_parked.notify_waiters();
     }
 
     /// Take work again, re-reading what changed while paused.
@@ -1285,6 +1404,7 @@ impl Compactor {
                     self.report_once(scope, addr, &e);
                     failed = true;
                 }
+                Err(NodeError::Paused) => {}
             }
         }
 
@@ -1352,6 +1472,38 @@ impl Compactor {
         Ok(node)
     }
 
+    /// The model one call uses, and leave from its breaker to call it. A
+    /// breaker that is open holds the call back, until a probe closes it,
+    /// the model preference changes, or the compactor pauses.
+    async fn admit(&self) -> Result<(CompactionModel, Admission), NodeError> {
+        loop {
+            let woken = self.wake_parked.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            if self.is_paused() {
+                return Err(NodeError::Paused);
+            }
+            let model = self.model().await?;
+            let breaker = self.breakers.breaker(&model.lane, &model.model);
+            self.set_failing_model(breaker.is_open().then_some(model.model.as_str()))
+                .await;
+            tokio::select! {
+                admission = breaker.admit() => {
+                    // The unset preference's default follows the configured
+                    // providers, and no preference change announces that.
+                    if !admission.is_probe() || self.model().await?.same_route(&model) {
+                        return Ok((model, admission));
+                    }
+                }
+                () = &mut woken => {}
+            }
+        }
+    }
+
+    async fn model(&self) -> Result<CompactionModel, NodeError> {
+        self.deps.model().await.map_err(NodeError::ModelUnavailable)
+    }
+
     /// One model-written line for `node`, under the purpose's whole-node
     /// deadline, in the lane of the route it takes. Backfill work asks for
     /// Flex where the route offers it, until [`FLEX_TRIES`] refusals in a row.
@@ -1363,15 +1515,22 @@ impl Compactor {
         capture_thread: Option<Uuid>,
         urgent: bool,
     ) -> Result<(String, String), NodeError> {
-        let model = self
-            .deps
-            .model()
-            .await
-            .map_err(NodeError::ModelUnavailable)?;
-        let tier = (!urgent && model.flex && self.flex_refused(node) < FLEX_TRIES)
+        let (model, admission, permit) = loop {
+            let (model, admission) = self.admit().await?;
+            self.ensure_episode().await;
+            let permit = self.lanes.lane(&model.lane).acquire(urgent).await;
+            // The breaker may have opened while the call queued for the lane.
+            if admission.still_admitted() {
+                break (model, admission, permit);
+            }
+        };
+        // The probe asks for the standard tier: a Flex refusal would hand the
+        // probe on at once and leave the outage with no back-off.
+        let tier = (!urgent
+            && !admission.is_probe()
+            && model.flex
+            && self.flex_refused(node) < FLEX_TRIES)
             .then_some(ServiceTier::Flex);
-        self.ensure_episode().await;
-        let permit = self.lanes.lane(&model.lane).acquire(urgent).await;
         let capture = AuxCapture::for_thread_or_home(
             &self.bus,
             capture_thread,
@@ -1382,6 +1541,19 @@ impl Compactor {
         let fitted = fit_line(&model, tier, request, &capture, &mut spent).await;
         self.record_spend(&model.model, spent.served_tier, spent.tokens)
             .await;
+        // A Flex refusal has its own fallback, the standard tier after
+        // [`FLEX_TRIES`], so it says nothing about whether the model is up.
+        let flex_refused = tier.is_some()
+            && matches!(&fitted, Err(LineError::CallFailed(e)) if crate::llm::is_capacity_error(e));
+        let transition = match &fitted {
+            _ if flex_refused => {
+                drop(admission);
+                Transition::Unchanged
+            }
+            Err(LineError::CallFailed(_)) => admission.failed(),
+            _ => admission.succeeded(),
+        };
+        self.breaker_moved(&model, transition).await;
         match fitted {
             Ok(line) => {
                 permit.succeeded();
@@ -1389,7 +1561,7 @@ impl Compactor {
                 self.set_waiting_for_model(false).await;
                 Ok((line, model.model))
             }
-            Err(NodeError::Failed(e)) => {
+            Err(LineError::CallFailed(e)) => {
                 if crate::llm::is_capacity_error(&e) {
                     permit.congested();
                     if tier.is_some() {
@@ -1398,7 +1570,9 @@ impl Compactor {
                 }
                 Err(NodeError::Failed(e))
             }
-            Err(e) => Err(e),
+            Err(LineError::Empty) => {
+                Err(NodeError::Failed("the model returned an empty line".into()))
+            }
         }
     }
 
@@ -1462,6 +1636,13 @@ fn enqueue(q: &mut Queue, scope: SummaryScope, urgent: bool) {
     }
 }
 
+/// Why [`fit_line`] gave no line. The breaker counts only a failed call: an
+/// empty line means the provider answered.
+enum LineError {
+    CallFailed(String),
+    Empty,
+}
+
 /// Ask for a line until it fits, in one conversation (OptChat §4). After
 /// [`TRIES`] answers the shortest wins, a few bytes over at worst: the size is
 /// a target nothing downstream relies on.
@@ -1475,7 +1656,7 @@ async fn fit_line(
     request: MessageContent,
     capture: &AuxCapture,
     spent: &mut Spent,
-) -> Result<String, NodeError> {
+) -> Result<String, LineError> {
     let mut messages = vec![Message {
         role: "user".to_string(),
         content: request,
@@ -1496,9 +1677,9 @@ async fn fit_line(
         );
         let response = call.await.map_err(|e| {
             if e.is::<tokio::time::error::Elapsed>() {
-                NodeError::Failed(format!("timed out after {:?}", model.deadline))
+                LineError::CallFailed(format!("timed out after {:?}", model.deadline))
             } else {
-                NodeError::from(e)
+                LineError::CallFailed(e.to_string())
             }
         })?;
         let usage = response.usage.unwrap_or_default();
@@ -1509,7 +1690,7 @@ async fn fit_line(
         spent.served_tier = usage.service_tier;
         let line = response.content.unwrap_or_default().trim().to_string();
         if line.is_empty() {
-            return Err(NodeError::Failed("the model returned an empty line".into()));
+            return Err(LineError::Empty);
         }
         tries.push(line.clone());
         if line.len() <= NODE_BYTES || tries.len() >= TRIES {

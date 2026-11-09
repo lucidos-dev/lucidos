@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { enginePackaged, preferences } from '../../store/store';
-import { getSettingsSearchResults, findSettingsEntry } from './searchIndex';
+import { getSettingsSearchResults, findSettingsEntry, settingsLinkAnchor } from './searchIndex';
 
 // Only `isIOS` is steered. Everything else stays real, so jsdom answers as the
 // desktop browser it is.
@@ -328,5 +328,19 @@ describe('settings search: ranked before the cut', () => {
     const ids = getSettingsSearchResults('theme', 50).map((r) => r.id);
     expect(ids[0]).toBe('appearance:theme');
     expect(ids.indexOf('appearance:theme')).toBeLessThan(ids.indexOf('appearance'));
+  });
+});
+
+describe('settingsLinkAnchor', () => {
+  it('resolves a fragment on a page whose anchors carry another prefix', () => {
+    expect(settingsLinkAnchor('permissions', 'guard')).toBe('command-safety:guard');
+  });
+
+  it('lands a row inside a fold on the ancestor its entry names', () => {
+    expect(settingsLinkAnchor('providers', 'vertex-region')).toBe('providers:vertex');
+  });
+
+  it('keeps <view>:<fragment> for a fragment the index lacks', () => {
+    expect(settingsLinkAnchor('providers', 'no-such-row')).toBe('providers:no-such-row');
   });
 });

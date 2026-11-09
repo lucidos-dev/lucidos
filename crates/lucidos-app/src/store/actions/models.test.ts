@@ -19,10 +19,13 @@ import {
   LUCIDOS_TIER_VOCABULARY,
   buildRoutes,
   routeDrafts,
+  groupRegistryModels,
+  providerSetupCount,
+  addModelProviderOptions,
 } from './models';
 import { EFFORT_LADDER, modelRows } from '../modelSelection';
 import { formatContextWindow } from '../../utils/formatTokens';
-import { DEFAULT_CHAT_MODEL, MODELS } from '../models';
+import { DEFAULT_CHAT_MODEL, MODELS, PROVIDERS } from '../models';
 import { displayModelName } from '../thread-events/exchange';
 import type { ModelInfo } from '../../api/types';
 
@@ -525,5 +528,61 @@ describe('the route editor', () => {
     expect(doubled).toEqual({ ok: false, error: 'Vertex appears twice' });
     const badWindow = buildRoutes('m', [{ provider: 'xai', id: '', contextWindow: 'big' }]);
     expect(badWindow.ok).toBe(false);
+  });
+});
+
+describe('groupRegistryModels', () => {
+  const only = (...configured: string[]) => (p: string) => configured.includes(p);
+  const servable = dualRouted('a', 'A', ['vertex', 'openai']);
+  const unservable = dualRouted('b', 'B', ['xai']);
+  const retiredServable = { ...dualRouted('c', 'C', ['vertex']), successor: 'a' };
+  const retiredUnservable = { ...dualRouted('d', 'D', ['xai']), successor: 'a' };
+  const all = [servable, unservable, retiredServable, retiredUnservable];
+
+  it('puts each row in exactly one group, Retired winning', () => {
+    const groups = groupRegistryModels(all, only('vertex'));
+    expect(groups.current).toEqual([servable]);
+    expect(groups.needsProvider).toEqual([unservable]);
+    expect(groups.retired).toEqual([retiredServable, retiredUnservable]);
+  });
+
+  it('is a partition: the union is the input, with no duplicates', () => {
+    const groups = groupRegistryModels(all, only('openai'));
+    const ids = [...groups.current, ...groups.needsProvider, ...groups.retired].map((m) => m.id);
+    expect([...ids].sort()).toEqual(all.map((m) => m.id).sort());
+  });
+
+  it('lists no model under Needs a provider when everything counts as configured', () => {
+    expect(groupRegistryModels(all, () => true).needsProvider).toEqual([]);
+  });
+});
+
+describe('providerSetupCount', () => {
+  it('is null while the engine has not said', () => {
+    expect(providerSetupCount(null)).toBeNull();
+  });
+
+  it('counts the model providers that are set up', () => {
+    expect(providerSetupCount([])).toBe(0);
+    expect(providerSetupCount(['vertex', 'xai'])).toBe(2);
+    expect(providerSetupCount(PROVIDERS.map((p) => p.value))).toBe(PROVIDERS.length);
+  });
+
+  it('ignores a value outside the model providers', () => {
+    expect(providerSetupCount(['typesafe', 'vertex'])).toBe(1);
+  });
+});
+
+describe('addModelProviderOptions', () => {
+  it('offers every provider when the engine has not said', () => {
+    expect(addModelProviderOptions(null)).toEqual(PROVIDERS);
+  });
+
+  it('offers only the providers that are set up, in registry order', () => {
+    expect(addModelProviderOptions(['xai', 'vertex']).map((p) => p.value)).toEqual(['vertex', 'xai']);
+  });
+
+  it('offers none when none is set up', () => {
+    expect(addModelProviderOptions([])).toEqual([]);
   });
 });

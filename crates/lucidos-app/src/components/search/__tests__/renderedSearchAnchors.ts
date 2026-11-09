@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve, join, relative } from 'node:path';
 import { VOICE_RESIDENT_SECTIONS } from '../../../store/actions/preferences';
+import { providerAnchor } from '../../../store/modelProviders';
 import { SYSTEM_ONE_PROVIDERS } from '../../settings/judgmentBackend';
 import { LADDER_SURFACES, ladderAnchor } from '../../settings/intelligenceLadder';
 import { SHORTCUT_DEFS, shortcutSearchAnchor } from '../../../utils/shortcuts';
@@ -43,11 +44,11 @@ const DYNAMIC_ANCHORS: Record<string, DynamicAnchor> = {
   'settings/JudgmentModelRow.tsx props.anchor': { kind: 'forwarded' },
   'settings/ProviderBlock.tsx props.anchor': { kind: 'forwarded' },
   'settings/ProviderBlockFrame.tsx props.anchor': { kind: 'forwarded' },
-  'settings/ApiKeyProviderSettings.tsx `models:${service}`': {
+  'settings/ApiKeyProviderSettings.tsx providerAnchor(service)': {
     kind: 'expands',
     anchors: () => componentSources()
       .filter(({ src }) => src.includes('<ApiKeyProviderSettings'))
-      .flatMap(({ src }) => [...src.matchAll(/\bservice="([^"]+)"/g)].map((m) => `models:${m[1]}`)),
+      .flatMap(({ src }) => [...src.matchAll(/\bservice="([^"]+)"/g)].map((m) => providerAnchor(m[1]))),
   },
   'settings/SystemOneProviderFrame.tsx spec.anchor': { kind: 'expands', anchors: systemOneFrameAnchors },
   'settings/SystemOneProviderFrame.tsx props.anchor': { kind: 'forwarded' },
@@ -55,7 +56,7 @@ const DYNAMIC_ANCHORS: Record<string, DynamicAnchor> = {
     kind: 'expands',
     anchors: () => systemOneFrameAnchors().map((a) => `${a}-usage`),
   },
-  'settings/ApiKeyProviderSettings.tsx `models:${systemOne}-usage`': {
+  "settings/ApiKeyProviderSettings.tsx providerAnchor(systemOne, 'usage')": {
     kind: 'expands',
     anchors: () => Object.values(SYSTEM_ONE_PROVIDERS)
       .filter((p) => p.chatProvider)
@@ -107,6 +108,15 @@ function componentSources(): Array<{ path: string; src: string }> {
   return (sources = found);
 }
 
+/** A `providerAnchor('vertex')` call with literal arguments: as readable as a
+ *  literal anchor, so it needs no `DYNAMIC_ANCHORS` row. */
+const LITERAL_PROVIDER_ANCHOR = /^providerAnchor\('([^']+)'(?:, '([^']+)')?\)$/;
+
+function literalProviderAnchor(expression: string): string | null {
+  const m = LITERAL_PROVIDER_ANCHOR.exec(expression);
+  return m ? providerAnchor(m[1], m[2]) : null;
+}
+
 /** `data-search-anchor={…}` anywhere, plus an `anchor={…}` prop in Settings,
  *  where the row components that render the attribute take it. */
 function dynamicExpressions(): string[] {
@@ -115,7 +125,9 @@ function dynamicExpressions(): string[] {
     const patterns = [/data-search-anchor=\{(`[^`]*`|[^}]*)\}/g];
     if (path.startsWith('settings/')) patterns.push(/\banchor=\{(`[^`]*`|[^}]*)\}/g);
     for (const re of patterns) {
-      for (const m of src.matchAll(re)) keys.push(`${path} ${m[1].trim()}`);
+      for (const m of src.matchAll(re)) {
+        if (!literalProviderAnchor(m[1].trim())) keys.push(`${path} ${m[1].trim()}`);
+      }
     }
   }
   return [...new Set(keys)];
@@ -129,6 +141,10 @@ export function renderedSearchAnchors(): Set<string> {
     // turns into the attribute for its caller. A `${…}` value is a selector
     // inside a template string, not markup.
     for (const m of src.matchAll(/\b[\w-]*[Aa]nchor="([^"$]+)"/g)) anchors.add(m[1]);
+    for (const m of src.matchAll(/\b[\w-]*[Aa]nchor=\{([^}]*)\}/g)) {
+      const anchor = literalProviderAnchor(m[1].trim());
+      if (anchor) anchors.add(anchor);
+    }
   }
   for (const row of Object.values(DYNAMIC_ANCHORS)) {
     if (row.kind === 'expands') row.anchors().forEach((a) => anchors.add(a));

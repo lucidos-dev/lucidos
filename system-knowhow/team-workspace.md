@@ -40,7 +40,7 @@ Emails are how a comment or a message is credited to a person. Matching is exact
 Every credential the workspace holds is the team's, not a teammate's:
 
 - **Bot accounts** for each source, each limited to what the factory touches. The source templates below set them up.
-- **Model keys**: a team account for each model provider, in **Settings → Models → Providers**. Never a teammate's personal subscription: it leaves with them.
+- **Model keys**: a team account for each model provider, in **Settings → Providers**. Never a teammate's personal subscription: it leaves with them.
 - **Coding agents**: log Claude Code or Codex in on the host with the team account, and `gh` with the bot.
 
 Each credential records who saved it. Nothing enforces this rule, so state it to the team.

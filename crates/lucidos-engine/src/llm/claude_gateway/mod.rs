@@ -34,7 +34,7 @@ use std::sync::Arc;
 use crate::llm::ANTHROPIC_API_BASE_URL;
 
 /// Where the user signs in to the Claude gateway, as every error names it.
-pub(crate) const SIGN_IN_LOCATION: &str = "Settings → Models → Providers";
+pub(crate) const SIGN_IN_LOCATION: &str = providers_settings!();
 
 /// The error for a gateway `401`, which names the way to recover.
 pub(crate) fn unauthorized(error_body: &str) -> String {

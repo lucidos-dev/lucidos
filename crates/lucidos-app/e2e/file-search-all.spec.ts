@@ -115,12 +115,16 @@ test.describe('File search', () => {
     await openFilesPanel(page);
     await openFileSearch(page);
 
-    // Modal should be near the top (below safe area + padding), not centered
-    const modalTop = await page.evaluate(() => {
+    // Modal should sit just below the header, not centered. The mobile header
+    // carries any banner, so an absolute bound on the modal would fail whenever
+    // a banner wraps onto another line.
+    const modalOffset = await page.evaluate(() => {
       const modal = document.querySelector('.file-search-modal');
-      return modal ? modal.getBoundingClientRect().top : -1;
+      const header = document.querySelector('.app-header');
+      if (!modal) return -1;
+      return modal.getBoundingClientRect().top - (header?.getBoundingClientRect().bottom ?? 0);
     });
-    expect(modalTop).toBeGreaterThan(0);
-    expect(modalTop).toBeLessThan(150);
+    expect(modalOffset).toBeGreaterThan(0);
+    expect(modalOffset).toBeLessThan(60);
   });
 });

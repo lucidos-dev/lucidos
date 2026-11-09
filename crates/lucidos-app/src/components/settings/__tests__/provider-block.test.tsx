@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 /**
- * The provider block on Settings → Models → Providers.
+ * The provider block on Settings → Providers.
  *
  * Three things the page depends on and the pure state machine cannot show. The
  * header row survives every state, since a deep link has to land on it. The
@@ -25,7 +25,7 @@ function block(hasStoredConfig = false) {
     <ProviderBlock
       id="openai"
       label="OpenAI (direct)"
-      anchor="models:openai"
+      anchor="providers:openai"
       explainer={<p>What this provider is.</p>}
       hasStoredConfig={hasStoredConfig}
     >
@@ -39,7 +39,7 @@ function block(hasStoredConfig = false) {
 describe('ProviderBlock', () => {
   let host: HTMLElement;
 
-  const header = () => host.querySelector('[data-search-anchor="models:openai"]');
+  const header = () => host.querySelector('[data-search-anchor="providers:openai"]');
   const configRow = () => host.querySelector('[data-role="secret-row"]');
   const toggle = () => {
     const el = host.querySelector<HTMLInputElement>('.toggle-switch input');

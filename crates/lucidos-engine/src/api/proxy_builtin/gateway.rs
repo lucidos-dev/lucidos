@@ -23,7 +23,7 @@ async fn resolve_for(
             unconfigured_msg(
                 "claude-gateway",
                 "a gateway URL",
-                "set the Claude gateway URL in Settings → Models → Providers",
+                concat!("set the Claude gateway URL in ", providers_settings!()),
             )
         })?;
     let origin = GatewayOrigin::parse(&url).map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
@@ -41,7 +41,10 @@ async fn resolve_for(
         return Err(unconfigured_msg(
             "claude-gateway",
             "a matching sign-in",
-            "sign in to the configured gateway in Settings → Models → Providers",
+            concat!(
+                "sign in to the configured gateway in ",
+                providers_settings!()
+            ),
         ));
     }
     Ok((

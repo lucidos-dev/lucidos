@@ -18,7 +18,7 @@ import {
 } from './judgmentBackend';
 
 /**
- * One System One provider on Settings → Models → Providers: TypeSafe,
+ * One System One provider on Settings → Providers: TypeSafe,
  * Cloudflare Workers AI, or a custom endpoint.
  *
  * **Not a `ProviderBlock`.** That component pairs a `provider_enabled_*`

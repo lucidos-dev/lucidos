@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
-import { currentModel, preferences, showToast, showConfirm, oauthAccounts, credentials, settingsSubview, settingsScrollTarget, repositories, knownOAuthProviders, oauthConnectPrefill } from '../../store/store';
+import { aliasRetiredSettingsAnchor, currentModel, preferences, showToast, showConfirm, oauthAccounts, credentials, settingsSubview, settingsScrollTarget, settingsLinkedFragment, settingsSubviewLabel, repositories, knownOAuthProviders, oauthConnectPrefill } from '../../store/store';
 import { devices, getDeviceId, updateDeviceName, removeDevice } from '../../store/actions/devices';
-import { setImageModel, setThemeMode, setFontFamily, setChatModelSelection, setTriggerModelSelection, currentTriggerModel, accountChatEffort, currentThemeMode, currentFontFamily, currentUiScale, currentImageModel,  currentMemoryModule, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentCommandGuardCodingAgents, setCommandGuardCodingAgents, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_MAX, currentStyleOverrides, clearStyleOverrides, setMotion, setThemeEffects, type ExternalLinkTarget, type ThemeMode, type FontPreference } from '../../store/actions/preferences';
+import { setImageModel, setThemeMode, setFontFamily, setChatModelSelection, setTriggerModelSelection, currentTriggerModel, accountChatEffort, currentThemeMode, currentFontFamily, currentUiScale, currentImageModel,  currentMemoryModule, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentCommandGuardCodingAgents, setCommandGuardCodingAgents, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_MAX, currentStyleOverrides, clearStyleOverrides, setMotion, setThemeEffects, type ExternalLinkTarget, type ThemeMode, type FontPreference } from '../../store/actions/preferences';
 import { DEFAULT_THEME_MODE, THEME_EFFECTS_PREFS, THEME_MODES, MOTION_PREFS, type ThemeEffectsPref, type MotionPref } from '@lucidos/appearance';
 import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
 import { openScaleModal } from '../shared/scaleModalState';
@@ -24,6 +24,7 @@ import {
   reauthorizationHint,
 } from '../credentials/providerConsoleHint';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
+import { settingsLinkAnchor } from '../search/searchIndex';
 import { setDevicePushEnabled } from '../../store/actions/push';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
@@ -39,18 +40,8 @@ import { TitleStyleRow } from './TitleStyleRow';
 import { useBackgroundModels } from './useBackgroundModels';
 import { ResponseStylesSection } from './ResponseStylesSection';
 import { ModelsManager } from './ModelsManager';
+import { ProvidersPage } from './ProvidersPage';
 import { VoiceSection } from './VoiceSection';
-import { AnthropicProviderSettings } from './AnthropicProviderSettings';
-import { OpenAiProviderSettings } from './OpenAiProviderSettings';
-import { OpenRouterProviderSettings } from './OpenRouterProviderSettings';
-import { XaiProviderSettings } from './XaiProviderSettings';
-import { OpenCodeFreeSettings } from './OpenCodeFreeSettings';
-import { ProviderBlock } from './ProviderBlock';
-import { LocalProviderSettings } from './LocalProviderSettings';
-import { ClaudeGatewaySettings } from './ClaudeGatewaySettings';
-import { TypeSafeJudgmentSettings } from './TypeSafeJudgmentSettings';
-import { CloudflareWorkersAiSettings } from './CloudflareWorkersAiSettings';
-import { CustomSystemOneSettings } from './CustomSystemOneSettings';
 import { JudgmentModelRow } from './JudgmentModelRow';
 import { Dropdown } from '../shared/Dropdown';
 import { fontOptions } from './fontOptions';
@@ -453,67 +444,6 @@ function AddRepositoryForm() {
   );
 }
 
-const VERTEX_REGIONS = [
-  { value: 'global', label: 'global' },
-  { value: 'eu', label: 'eu (multi-region)' },
-  { value: 'europe-west1', label: 'europe-west1 (Belgium)' },
-  { value: 'europe-west4', label: 'europe-west4 (Netherlands)' },
-  { value: 'europe-west9', label: 'europe-west9 (Paris)' },
-  { value: 'europe-north1', label: 'europe-north1 (Finland)' },
-  { value: 'us-central1', label: 'us-central1 (Iowa)' },
-  { value: 'us-east1', label: 'us-east1 (S. Carolina)' },
-  { value: 'us-east4', label: 'us-east4 (N. Virginia)' },
-  { value: 'us-east5', label: 'us-east5 (Columbus)' },
-  { value: 'us-west1', label: 'us-west1 (Oregon)' },
-  { value: 'us-west4', label: 'us-west4 (Las Vegas)' },
-  { value: 'asia-southeast1', label: 'asia-southeast1 (Singapore)' },
-  { value: 'asia-northeast1', label: 'asia-northeast1 (Tokyo)' },
-  { value: 'asia-east1', label: 'asia-east1 (Taiwan)' },
-];
-
-/** The Vertex provider block inside the "Providers" section. Unlike the other
- *  providers it has no credential to enter — it authenticates via ambient GCP
- *  Application Default Credentials (`gcloud auth application-default login`), so
- *  its only knob is the region. Renders just the rows (the enclosing "Providers"
- *  `settings-section` is owned by `SettingsView`), matching the other provider
- *  components. */
-function VertexProviderSettings() {
-  return (
-    <ProviderBlock
-      id="vertex"
-      label="Vertex AI"
-      anchor="models:vertex-ai"
-      // No credential to keep: Vertex is configured on the machine, by gcloud.
-      // So its off state promises nothing about a stored key.
-      hasStoredConfig={false}
-      explainer={
-        <>
-          <p>
-            Serves the Claude models (Opus / Sonnet / Haiku) on the{' '}
-            <strong>vertex</strong> provider via Google Cloud.
-          </p>
-          <p>
-            No key to enter: it uses your <strong>gcloud</strong> Application Default
-            Credentials (<code>gcloud auth application-default login</code>). The region
-            below is the only setting.
-          </p>
-        </>
-      }
-    >
-      <div class="settings-row" data-search-anchor="models:region">
-        <span class="settings-row-label">Region</span>
-        <Dropdown
-          options={VERTEX_REGIONS}
-          value={currentVertexRegion()}
-          freeText
-          placeholder={`e.g. ${PREFERENCE_CATALOG.vertex_region.fallback}`}
-          onChange={setVertexRegion}
-        />
-      </div>
-    </ProviderBlock>
-  );
-}
-
 /** Hand the connection to the agent, which reads the same *OAuth provider
  *  registry* and can walk the user through the provider's app console: the one
  *  step this page cannot do for them, since the Client ID only exists once an
@@ -529,6 +459,37 @@ function askLucidosToConnectAccount(): void {
       'Help me connect an account: register the app with the provider, '
       + 'enter the client ID, and sign in.',
   });
+}
+
+/** How long a landing waits for its row. Some rows render only once their
+ *  page's data loads, or its delay gate passes. */
+export const SETTINGS_ANCHOR_WAIT_MS = 5000;
+
+/** Land on `anchor` once it renders, or report the miss after
+ *  `SETTINGS_ANCHOR_WAIT_MS`. Returns the cancel. */
+function landWhenRendered(anchor: string, land: (el: HTMLElement) => void, missed: () => void): () => void {
+  const find = () => document.querySelector<HTMLElement>(`[data-search-anchor="${anchor}"]`);
+  const present = find();
+  if (present) {
+    land(present);
+    return () => {};
+  }
+  const observer = new MutationObserver(() => {
+    const el = find();
+    if (!el) return;
+    stop();
+    land(el);
+  });
+  const timer = setTimeout(() => {
+    stop();
+    missed();
+  }, SETTINGS_ANCHOR_WAIT_MS);
+  function stop() {
+    observer.disconnect();
+    clearTimeout(timer);
+  }
+  observer.observe(document.body, { childList: true, subtree: true });
+  return stop;
 }
 
 export function SettingsView() {
@@ -571,12 +532,21 @@ export function SettingsView() {
     }
   }, [repositories.value.status]);
 
-  // Subscribe to both signals so this fires after the requested subview has rendered.
+  // A landing outlives the effect run that clears its signals, so it is
+  // cancelled here, when the page changes or the view unmounts.
+  const anchorWatch = useRef<(() => void) | null>(null);
+  useEffect(() => () => anchorWatch.current?.(), [settingsSubview.value]);
+
+  // Subscribe to every signal so this fires after the requested subview has rendered.
   useEffect(() => {
-    const target = settingsScrollTarget.value;
-    if (!target || settingsSubview.value === 'main') return;
-    const el = document.querySelector<HTMLElement>(`[data-search-anchor="${target}"]`);
-    if (el) {
+    const view = settingsSubview.value;
+    const fragment = settingsLinkedFragment.value;
+    const target = settingsScrollTarget.value ?? (fragment && settingsLinkAnchor(view, fragment));
+    if (!target || view === 'main') return;
+    settingsLinkedFragment.value = null;
+    settingsScrollTarget.value = null;
+    anchorWatch.current?.();
+    anchorWatch.current = landWhenRendered(aliasRetiredSettingsAnchor(target), (el) => {
       el.scrollIntoView({ block: 'center', behavior: scrollBehavior() });
       // The anchor can sit on a settings row, a row LABEL span, or a section
       // title. Land the focus marker on the enclosing .settings-row when there is
@@ -594,9 +564,10 @@ export function SettingsView() {
       // not the panel's first control. No-op for a section-title anchor with no
       // focusable child; desktop-only (see focusFirstFocusableWithin).
       focusFirstFocusableWithin(markEl);
-    }
-    settingsScrollTarget.value = null;
-  }, [settingsScrollTarget.value, settingsSubview.value]);
+    }, () => {
+      if (fragment) showToast(`No "${fragment}" on ${settingsSubviewLabel(view) ?? view} settings`, 'error');
+    });
+  }, [settingsScrollTarget.value, settingsLinkedFragment.value, settingsSubview.value]);
 
   // The *OAuth provider registry* backs both the quick buttons and the Connect
   // form's autofill, so it is fetched once when Accounts is first shown rather
@@ -1411,20 +1382,6 @@ export function SettingsView() {
         </div>
         <CacheKeepAliveSection />
         <VoiceSection />
-        <div class="settings-section">
-          <div class="settings-section-title" data-search-anchor="models:providers">Providers</div>
-          <VertexProviderSettings />
-          <AnthropicProviderSettings />
-          <OpenAiProviderSettings />
-          <OpenRouterProviderSettings />
-          <XaiProviderSettings />
-          <OpenCodeFreeSettings />
-          <LocalProviderSettings />
-          <ClaudeGatewaySettings />
-          <TypeSafeJudgmentSettings />
-          <CloudflareWorkersAiSettings />
-          <CustomSystemOneSettings />
-        </div>
         <ModelsManager />
       </>
     );
@@ -1790,6 +1747,7 @@ export function SettingsView() {
       case 'release-notices': return <SystemPage panel="release-notices" />;
       case 'whats-new': return <SystemPage panel="whats-new" />;
       case 'thread-queue': return <SystemPage panel="thread-queue" />;
+      case 'providers': return <ProvidersPage />;
       case 'models': return modelsSection();
       case 'intelligence': return <IntelligencePage />;
       case 'appearance': return appearanceSection();

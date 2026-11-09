@@ -15,7 +15,7 @@
 //! model while unset.
 //!
 //! **Two switches, and both must say yes.** Each System One provider has a
-//! master switch on Settings → Models → Providers. Under it sits one preference
+//! master switch on Settings → Providers. Under it sits one preference
 //! per site. Absent means on for the master and `chat` for a site.
 //!
 //! **The `judge` tool has one switch, not two, and that is deliberate.** A
@@ -301,10 +301,16 @@ pub async fn jev_for_agent(
         .await
         .unwrap_or(true)
     {
-        return Err("TypeSafe is switched off in Settings → Models → Providers");
+        return Err(concat!(
+            "TypeSafe is switched off in ",
+            providers_settings!()
+        ));
     }
     if typesafe_api_key(pool).await.is_none() {
-        return Err("no TypeSafe API key is stored in Settings → Models → Providers");
+        return Err(concat!(
+            "no TypeSafe API key is stored in ",
+            providers_settings!()
+        ));
     }
     SystemOneEndpoint::Jev
         .provider(pool, timeout)

@@ -339,7 +339,7 @@ describe('judgmentSelectionCaveat', () => {
   it('names the switched-off provider of the picked row', () => {
     const caveat = judgmentSelectionCaveat(endpoint('clef-flash'), true);
     expect(caveat).toContain('Cloudflare Workers AI');
-    expect(caveat).toContain('Models → Providers');
+    expect(caveat).toContain('Settings → Providers');
   });
 
   it('is silent in every other combination', () => {

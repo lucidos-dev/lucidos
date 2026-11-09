@@ -169,11 +169,12 @@ impl LucidosEngine {
             // Vertex), so naming only the env vars sends a user who configured
             // the provider in Settings to fix the wrong thing. This one reaches
             // the user in chat rather than the log, which is why it matters most.
-            .ok_or(
-                "No image provider configured. Add an OpenAI key under Settings, Models, \
-                 Providers (or set OPENAI_API_KEY), or configure Google Cloud (set \
+            .ok_or(concat!(
+                "No image provider configured. Add an OpenAI key under ",
+                providers_settings!(),
+                " (or set OPENAI_API_KEY), or configure Google Cloud (set \
                  VERTEX_PROJECT_ID or run `gcloud auth application-default login`).",
-            )?;
+            ))?;
 
         let prompt = args
             .get("prompt")

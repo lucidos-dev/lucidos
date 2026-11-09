@@ -137,8 +137,11 @@ impl Endpoint {
             // There is no refresh path for a direct credential: surface a
             // clear, actionable message rather than a generic auth error.
             Self::Direct(_) => format!(
-                "Anthropic API 401 — check the Anthropic credential in Settings → Models → Providers \
-                 (OAuth subscription tokens are short-lived and may need re-pasting): {}",
+                concat!(
+                    "Anthropic API 401 — check the Anthropic credential in ",
+                    providers_settings!(),
+                    " (OAuth subscription tokens are short-lived and may need re-pasting): {}"
+                ),
                 error_body
             ),
             Self::ClaudeGateway { .. } => crate::llm::claude_gateway::unauthorized(error_body),

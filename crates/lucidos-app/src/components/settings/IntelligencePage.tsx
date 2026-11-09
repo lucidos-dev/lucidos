@@ -9,7 +9,6 @@ import type {
 } from '../../api/types';
 import { useLoadableFetch } from '../../hooks/useLoadableFetch';
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
-import { openSettingsSubview } from '../../store/actions/menu';
 import { setChatModelSelection } from '../../store/actions/preferences';
 import { loadTriggers, navigateToTrigger } from '../../store/actions/triggers';
 import { CHAT_LADDER_PREF, LADDER_PREFS, LONG_PROMPT_SHARE_PREF } from '../../store/intelligenceLadderPrefs';
@@ -17,6 +16,7 @@ import { intelligenceLadderVersion, showConfirm, showToast, triggers } from '../
 import { errorDetail } from '../../utils/errorDetail';
 import { Disclosure } from '../shared/Disclosure';
 import { Explainer } from '../shared/Explainer';
+import { SettingsPageLinkRow } from './SettingsPageLinkRow';
 import { ChevronDownIcon, ChevronUpIcon, GripIcon, StarIcon } from '../shared/icons';
 import { LoadableError } from '../shared/LoadableError';
 import { LoadingFade } from '../shared/LoadingFade';
@@ -142,12 +142,9 @@ export function IntelligencePage() {
 /** A row on another settings page that leads here. */
 export function IntelligenceLinkRow({ children }: { children: ComponentChildren }) {
   return (
-    <div class="settings-row">
-      <span class="settings-row-label">{children}</span>
-      <button class="action-btn" onClick={() => openSettingsSubview('intelligence')}>
-        Open Intelligence
-      </button>
-    </div>
+    <SettingsPageLinkRow view="intelligence" button="Open Intelligence">
+      {children}
+    </SettingsPageLinkRow>
   );
 }
 

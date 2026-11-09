@@ -17,7 +17,7 @@ import {
   extractRepoFileTargetFromHref,
   hasUrlScheme,
   browserHandlesHref,
-  extractSettingsViewFromHref,
+  extractSettingsTargetFromHref,
   hrefLineRef,
   labelLineRef,
   type LineRef,
@@ -109,7 +109,13 @@ export function handleMarkdownLinkClick(e: MouseEvent, apps: App[], source?: str
   if (navTarget) {
     e.preventDefault();
     const target = navTarget.dataset.navTarget;
-    if (target) handleNavigationRequest({ target, settings_view: navTarget.dataset.settingsView });
+    if (target) {
+      handleNavigationRequest({
+        target,
+        settings_view: navTarget.dataset.settingsView,
+        fragment: navTarget.dataset.settingsFragment,
+      });
+    }
     return;
   }
 
@@ -156,10 +162,14 @@ export function handleMarkdownLinkClick(e: MouseEvent, apps: App[], source?: str
     }
     // A Settings page, such as the one a backup notification names. The
     // router validates the view and toasts one it cannot render.
-    const settingsView = extractSettingsViewFromHref(rawHref);
-    if (settingsView) {
+    const settings = extractSettingsTargetFromHref(rawHref);
+    if (settings) {
       e.preventDefault();
-      handleNavigationRequest({ target: 'settings', settings_view: settingsView });
+      handleNavigationRequest({
+        target: 'settings',
+        settings_view: settings.view,
+        fragment: settings.fragment ?? undefined,
+      });
       return;
     }
     const navName = extractNavTargetFromHref(rawHref);

@@ -360,10 +360,11 @@ pub(crate) fn render_builtin_proxies_block(
     for (name, reason) in PROVIDERS_WITHOUT_PROXY {
         block.push_str(&format!("  - {name}: no proxy, {reason}\n"));
     }
-    block.push_str(
-        "Never request_credential for a configured one. An unconfigured one is set up in \
-         Settings > Models > Providers.\n[END BUILTIN PROVIDER PROXIES]",
-    );
+    block.push_str(concat!(
+        "Never request_credential for a configured one. An unconfigured one is set up in ",
+        providers_settings!(),
+        ".\n[END BUILTIN PROVIDER PROXIES]",
+    ));
     block
 }
 
@@ -422,7 +423,11 @@ async fn resolve_openai(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusCod
         return Err(unconfigured_msg(
             "openai",
             "an OpenAI API key",
-            "add an 'openai' credential in Settings → Models → Providers, set OPENAI_API_KEY",
+            concat!(
+                "add an 'openai' credential in ",
+                providers_settings!(),
+                ", set OPENAI_API_KEY"
+            ),
         ));
     };
     let layer = StaticHeaderLayer::bearer(
@@ -440,7 +445,11 @@ async fn resolve_openrouter(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (Statu
         return Err(unconfigured_msg(
             "openrouter",
             "an OpenRouter API key",
-            "add an 'openrouter' credential in Settings → Models → Providers, set LUCIDOS_OPENROUTER_API_KEY",
+            concat!(
+                "add an 'openrouter' credential in ",
+                providers_settings!(),
+                ", set LUCIDOS_OPENROUTER_API_KEY"
+            ),
         ));
     };
     let layer = StaticHeaderLayer::bearer(
@@ -458,7 +467,11 @@ async fn resolve_xai(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusCode, 
         return Err(unconfigured_msg(
             "xai",
             "an xAI API key",
-            "add an 'xai' credential in Settings → Models → Providers, set LUCIDOS_XAI_API_KEY",
+            concat!(
+                "add an 'xai' credential in ",
+                providers_settings!(),
+                ", set LUCIDOS_XAI_API_KEY"
+            ),
         ));
     };
     let layer = StaticHeaderLayer::bearer("xai".to_string(), key, pinned("xai", XAI_BASE_URL));
@@ -479,7 +492,11 @@ async fn resolve_typesafe(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusC
         return Err(unconfigured_msg(
             TYPESAFE_CREDENTIAL_SERVICE,
             "a TypeSafe API key",
-            "add a 'typesafe' credential in Settings → Models → Providers, set TYPESAFE_API_KEY",
+            concat!(
+                "add a 'typesafe' credential in ",
+                providers_settings!(),
+                ", set TYPESAFE_API_KEY"
+            ),
         ));
     };
     let layer = StaticHeaderLayer::bearer(
@@ -508,7 +525,11 @@ fn anthropic_target(auth: Option<AnthropicAuth>) -> Result<BuiltinTarget, (Statu
         return Err(unconfigured_msg(
             "anthropic",
             "an Anthropic API key or OAuth token",
-            "add an 'anthropic' credential in Settings → Models → Providers, set ANTHROPIC_API_KEY",
+            concat!(
+                "add an 'anthropic' credential in ",
+                providers_settings!(),
+                ", set ANTHROPIC_API_KEY"
+            ),
         ));
     };
     // API keys go on `x-api-key`; OAuth subscription tokens on
@@ -622,7 +643,11 @@ async fn resolve_local(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusCode
             "local",
             "a local OpenAI-compatible backend",
             &format!(
-                "set {} in Settings → Models → Providers or LUCIDOS_LOCAL_BASE_URL",
+                concat!(
+                    "set {} in ",
+                    providers_settings!(),
+                    " or LUCIDOS_LOCAL_BASE_URL"
+                ),
                 prefs::LOCAL_BASE_URL.key()
             ),
         ));

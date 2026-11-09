@@ -13,7 +13,7 @@ import {
 const SERVICE = SYSTEM_ONE_PROVIDERS['cloudflare-workers-ai'].credentialService;
 
 /**
- * Cloudflare Workers AI, for Clef and Clef-flash, on Settings → Models →
+ * Cloudflare Workers AI, for Clef and Clef-flash, on Settings →
  * Providers.
  *
  * One credential holds both halves: the token is the secret, and the account

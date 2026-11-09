@@ -47,6 +47,7 @@ const SETTINGS: Record<SettingsSubview, Coverage> = {
   'release-notices': { registers: ['settings/ReleaseNoticesPage.tsx'] },
   'whats-new': { registers: ['settings/WhatsNewPage.tsx'] },
   'thread-queue': { registers: ['thread-queue/ThreadQueueView.tsx'] },
+  providers: { registers: ['settings/ProvidersPage.tsx'] },
   models: { sectionTable: true },
   intelligence: { registers: ['settings/IntelligencePage.tsx'] },
   appearance: { sectionTable: true },

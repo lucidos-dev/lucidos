@@ -34,7 +34,7 @@ use crate::test_support::{aux_captures, setup_test_db, teardown_test_db};
 const MARKER: &str = "zebraquilt";
 const SHORT_USER_TEXT: &str = "remember the zebraquilt blue door";
 
-struct Fixture {
+pub(super) struct Fixture {
     chat: Uuid,
     coding: Uuid,
     quiet_trigger: Uuid,
@@ -47,7 +47,7 @@ struct Fixture {
 /// The home thread comes first, as boot makes it. An artifact leaf's call
 /// records there, so a build would otherwise create it midway and change the
 /// tree count.
-async fn seed_workspace(pool: &PgPool, bus: &EventBus) -> Fixture {
+pub(super) async fn seed_workspace(pool: &PgPool, bus: &EventBus) -> Fixture {
     let home = crate::engine::home_thread::ensure_home_thread(bus, pool)
         .await
         .expect("create the home thread");
@@ -112,7 +112,7 @@ async fn seed_workspace(pool: &PgPool, bus: &EventBus) -> Fixture {
 }
 
 /// Seed and drain until the queue is empty.
-async fn run_to_rest(compactor: &Arc<Compactor>) -> Vec<(SummaryScope, Drained)> {
+pub(super) async fn run_to_rest(compactor: &Arc<Compactor>) -> Vec<(SummaryScope, Drained)> {
     compactor.seed().await.expect("seed");
     drain_to_rest(compactor).await
 }
@@ -122,7 +122,7 @@ const MAX_DRAIN_ROUNDS: usize = 1_000;
 
 /// Drain until the queue is empty. A scope that requeues itself every round
 /// fails the test here, rather than spinning until something kills the run.
-async fn drain_to_rest(compactor: &Arc<Compactor>) -> Vec<(SummaryScope, Drained)> {
+pub(super) async fn drain_to_rest(compactor: &Arc<Compactor>) -> Vec<(SummaryScope, Drained)> {
     let mut outcomes = Vec::new();
     for _ in 0..MAX_DRAIN_ROUNDS {
         let round = compactor.drain_queue().await;
@@ -136,6 +136,15 @@ async fn drain_to_rest(compactor: &Arc<Compactor>) -> Vec<(SummaryScope, Drained
 
 fn compactor(pool: &PgPool, bus: &EventBus, deps: Arc<dyn CompactorDeps>) -> Arc<Compactor> {
     Compactor::new(pool.clone(), bus.clone(), deps)
+}
+
+pub(super) fn compactor_with_waits(
+    pool: &PgPool,
+    bus: &EventBus,
+    deps: Arc<dyn CompactorDeps>,
+    waits: crate::engine::summary_tree::breaker::Waits,
+) -> Arc<Compactor> {
+    Compactor::with_breaker_waits(pool.clone(), bus.clone(), deps, waits)
 }
 
 type Snapshot = BTreeSet<(String, i64, i64, Option<Uuid>, String)>;
@@ -189,7 +198,7 @@ async fn assert_complete(pool: &PgPool, scope: SummaryScope, len: u64) {
     );
 }
 
-async fn assert_every_scope_complete(pool: &PgPool, fixture: &Fixture) {
+pub(super) async fn assert_every_scope_complete(pool: &PgPool, fixture: &Fixture) {
     for id in [fixture.chat, fixture.coding, fixture.home] {
         let len = thread_len(pool, id).await;
         assert_complete(pool, SummaryScope::Thread(id), len).await;
@@ -669,7 +678,7 @@ async fn a_restart_mid_build_resumes_without_duplicates_or_gaps() {
     let (bus, _rx) = EventBus::new(pool.clone());
     let fixture = seed_workspace(&pool, &bus).await;
 
-    let first = compactor(&pool, &bus, deps(EchoProvider::failing_after(2)));
+    let first = compactor(&pool, &bus, deps(EchoProvider::failing_calls(2..4)));
     first.seed().await.unwrap();
     let outcomes = first.drain_queue().await;
     assert!(outcomes.iter().any(|(_, o)| *o == Drained::Failed));
@@ -877,7 +886,7 @@ async fn a_paused_compactor_builds_nothing_until_it_resumes() {
 // ── The backfill count Settings shows ─────────────────────────────────
 
 /// The backfill frames the bus carried, oldest first.
-fn backfill_frames(
+pub(super) fn backfill_frames(
     rx: &mut tokio::sync::broadcast::Receiver<crate::engine::event_bus::EmittedEvent>,
 ) -> Vec<SystemEvent> {
     use tokio::sync::broadcast::error::TryRecvError;
@@ -900,11 +909,11 @@ fn backfill_frames(
     }
 }
 
-fn progress_of(frames: &[SystemEvent]) -> Vec<BackfillProgress> {
+pub(super) fn progress_of(frames: &[SystemEvent]) -> Vec<BackfillProgress> {
     frames
         .iter()
         .filter_map(|f| match f {
-            SystemEvent::TreeBackfillProgressed { progress } => Some(*progress),
+            SystemEvent::TreeBackfillProgressed { progress } => Some(progress.clone()),
             _ => None,
         })
         .collect()
@@ -1016,7 +1025,7 @@ async fn the_count_says_when_a_failed_node_retries() {
     let (bus, _rx) = EventBus::new(pool.clone());
     seed_workspace(&pool, &bus).await;
     let mut rx = bus.subscribe();
-    let c = compactor(&pool, &bus, deps(EchoProvider::failing_after(2)));
+    let c = compactor(&pool, &bus, deps(EchoProvider::failing_calls(2..4)));
 
     c.seed().await.unwrap();
     let outcomes = c.drain_queue().await;
@@ -1086,6 +1095,8 @@ struct SwitchableDeps(std::sync::Mutex<Option<Arc<EchoProvider>>>);
 
 #[async_trait::async_trait]
 impl CompactorDeps for SwitchableDeps {
+    async fn notify_model_down(&self, _model: &str) {}
+
     async fn model(&self) -> Result<CompactionModel, String> {
         let provider = self
             .0
@@ -1211,6 +1222,7 @@ fn the_progress_frame_carries_the_rest_shape() {
         nodes_total: 6,
         waiting_for_model: true,
         retrying: false,
+        failing_model: Some(COMPACTOR_MODEL.to_string()),
         ready: false,
         spent_usd: Some(1.25),
         cap_usd: Some(3.0),
@@ -1218,10 +1230,26 @@ fn the_progress_frame_carries_the_rest_shape() {
         held: false,
         seq: 7,
     };
-    let rest = serde_json::to_value(TreeBackfill::Running { progress }).unwrap();
+    let rest = serde_json::to_value(TreeBackfill::Running {
+        progress: progress.clone(),
+    })
+    .unwrap();
     let frame = serde_json::to_value(SystemEvent::TreeBackfillProgressed { progress }).unwrap();
     assert_eq!(rest["state"], "running");
     assert_eq!(rest["progress"], frame["data"]["progress"]);
+}
+
+/// A frame persisted before `failing_model` existed still parses.
+#[test]
+fn a_frame_from_before_the_failing_model_still_parses() {
+    let old = json!({
+        "done": 1, "total": 2, "done_milli": 1_000, "nodes_done": 0, "nodes_total": 0,
+        "waiting_for_model": false, "retrying": true, "ready": false, "spent_usd": null,
+        "cap_usd": null, "next_cap_usd": null, "held": false, "seq": 3
+    });
+    let progress: BackfillProgress = serde_json::from_value(old).unwrap();
+    assert_eq!(progress.failing_model, None);
+    assert!(progress.retrying);
 }
 
 /// The estimate reads the same trees the compactor builds: the two in-scope
@@ -1275,6 +1303,8 @@ struct ProviderDeps(Arc<dyn LlmProvider>);
 
 #[async_trait::async_trait]
 impl CompactorDeps for ProviderDeps {
+    async fn notify_model_down(&self, _model: &str) {}
+
     async fn model(&self) -> Result<CompactionModel, String> {
         Ok(CompactionModel {
             provider: self.0.clone(),
@@ -2111,6 +2141,8 @@ struct PricedDeps {
 
 #[async_trait::async_trait]
 impl CompactorDeps for PricedDeps {
+    async fn notify_model_down(&self, _model: &str) {}
+
     async fn model(&self) -> Result<CompactionModel, String> {
         Ok(CompactionModel {
             provider: self.provider.clone(),
@@ -2463,6 +2495,8 @@ struct LateEstimateDeps {
 
 #[async_trait::async_trait]
 impl CompactorDeps for LateEstimateDeps {
+    async fn notify_model_down(&self, _model: &str) {}
+
     async fn model(&self) -> Result<CompactionModel, String> {
         self.priced.model().await
     }

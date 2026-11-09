@@ -27,6 +27,7 @@ export const NO_BACKFILL_PROGRESS: BackfillProgress = {
   cap_usd: null,
   next_cap_usd: null,
   held: false,
+  failing_model: null,
   seq: 0,
 };
 

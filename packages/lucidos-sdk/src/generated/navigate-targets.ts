@@ -28,6 +28,7 @@ export const NAVIGATE_TARGETS = [
 export type NavigateTarget = (typeof NAVIGATE_TARGETS)[number];
 
 export const SETTINGS_VIEW_TARGETS = [
+  'providers',
   'models',
   'intelligence',
   'permissions',

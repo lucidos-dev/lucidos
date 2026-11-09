@@ -233,7 +233,7 @@ describe('JudgmentModelRow', () => {
     };
     mount();
     expect(triggerLabel()).toBe('TypeSafe (Jev)');
-    expect(detail()).toContain('Models → Providers');
+    expect(detail()).toContain('Settings → Providers');
   });
 
   /** Still reachable, because the stored pick is Jev and there has to be a way

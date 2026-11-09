@@ -14,6 +14,7 @@ import {
 } from '../../store/actions/preferences';
 import type { ModelSelectionPatch } from '../../hooks/useModelSelection';
 import type { ModelChoice } from '../../store/modelSelection';
+import { PROVIDERS_SETTINGS_PATH, providerAnchor } from '../../store/modelProviders';
 import { findProviderCredential } from './providerCredential';
 import {
   CLOUDFLARE_ACCOUNTS_PREFIX,
@@ -54,10 +55,7 @@ export const CHAT = 'chat';
  *  the page cannot see whether it is set. */
 export { TYPESAFE_API_KEY_ENV } from '@lucidos/engine-constants';
 
-/** Where every System One provider's own row is. */
-export const SYSTEM_ONE_PROVIDER_LOCATION = 'Models → Providers';
-
-/** One System One provider: a row on Settings → Models → Providers with its
+/** One System One provider: a row on Settings → Providers with its
  *  own key and master switch. OpenRouter and OpenAI are chat providers too,
  *  and their rows are the chat provider rows. */
 export type SystemOneProviderId =
@@ -84,14 +82,14 @@ function chatProviderRow(
   label: string,
   switchKey: string,
 ): SystemOneProviderSpec {
-  return { id, label, anchor: `models:${id}`, credentialService: id, switchKey, chatProvider: id };
+  return { id, label, anchor: providerAnchor(id), credentialService: id, switchKey, chatProvider: id };
 }
 
 export const SYSTEM_ONE_PROVIDERS: Record<SystemOneProviderId, SystemOneProviderSpec> = {
   typesafe: {
     id: 'typesafe',
     label: 'TypeSafe (Jev)',
-    anchor: 'models:typesafe',
+    anchor: providerAnchor('typesafe'),
     credentialService: TYPESAFE_CREDENTIAL_SERVICE,
     switchKey: PROVIDER_ENABLED_TYPESAFE_KEY,
   },
@@ -100,14 +98,14 @@ export const SYSTEM_ONE_PROVIDERS: Record<SystemOneProviderId, SystemOneProvider
   'cloudflare-workers-ai': {
     id: 'cloudflare-workers-ai',
     label: 'Cloudflare Workers AI (Clef)',
-    anchor: 'models:cloudflare-workers-ai',
+    anchor: providerAnchor('cloudflare-workers-ai'),
     credentialService: CLOUDFLARE_WORKERS_AI_CREDENTIAL_SERVICE,
     switchKey: PROVIDER_ENABLED_CLOUDFLARE_WORKERS_AI_KEY,
   },
   'system-one-custom': {
     id: 'system-one-custom',
     label: 'Custom System One endpoint',
-    anchor: 'models:system-one-custom',
+    anchor: providerAnchor('system-one-custom'),
     credentialService: SYSTEM_ONE_CUSTOM_CREDENTIAL_SERVICE,
     switchKey: PROVIDER_ENABLED_SYSTEM_ONE_CUSTOM_KEY,
   },
@@ -450,7 +448,7 @@ export function judgmentSelectionCaveat(
 ): string | null {
   if (!picked || !switchedOff) return null;
   return `${SYSTEM_ONE_PROVIDERS[picked.provider].label} is switched off in `
-    + `${SYSTEM_ONE_PROVIDER_LOCATION}, so this runs on its chat model`;
+    + `${PROVIDERS_SETTINGS_PATH}, so this runs on its chat model`;
 }
 
 /**
