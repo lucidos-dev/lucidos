@@ -72,17 +72,25 @@
     background: var(--bg-primary);
 }
 
-/* Marks a clipped box. A tap or a scroll here reaches the widget. */
+/* Marks the edge a box clips: the bottom, or the right for content that spills
+   sideways. Both edges share one reach. A tap or a scroll here reaches the
+   widget. */
 .widget-box-fade {
+    --widget-box-fade-reach: 3.5rem;
     position: absolute;
-    inset: auto 0 0;
-    height: 3.5rem;
-    background: linear-gradient(to bottom, transparent, var(--bg-secondary));
     pointer-events: none;
 }
 
-.widget-box.is-transparent .widget-box-fade {
-    background: none;
+.widget-box-fade[data-edge="bottom"] {
+    inset: auto 0 0;
+    height: var(--widget-box-fade-reach);
+    background: linear-gradient(to bottom, transparent, var(--bg-secondary));
+}
+
+.widget-box-fade[data-edge="right"] {
+    inset: 0 0 0 auto;
+    width: var(--widget-box-fade-reach);
+    background: linear-gradient(to right, transparent, var(--bg-secondary));
 }
 
 /* Hides a resize until the widget has laid out for the new size. It comes up
@@ -103,6 +111,23 @@
 
 .widget-box.is-transparent .widget-box-cover {
     background: var(--bg-primary);
+}
+
+/* A widget fit check's boxes. They sit in the viewport, unseen, because a
+   browser may stop rendering a frame scrolled off it. Each surface starts at
+   the corner, so a wide box never pushes the other surface away. */
+.widget-fit-probe {
+    position: fixed;
+    top: 0;
+    left: 0;
+    opacity: 0;
+    pointer-events: none;
+}
+
+.widget-fit-surface {
+    position: absolute;
+    top: 0;
+    left: 0;
 }
 
 /* --- An inline widget: its bare widget box ---

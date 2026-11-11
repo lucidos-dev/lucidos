@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Mirror a gate question into the chat thread its work item came from.
+"""Mirror a gate question into the chat thread its root thread came from.
 
 Copy to data/triggers/chat-questions/scripts/run.py. Fires on
-UserQuestionAsked. A thread whose work item no chat message started is
+UserQuestionAsked. A thread whose root thread no chat message started is
 skipped. See system-knowhow/team-workspace/chat-tool.md.
 """
 import json

@@ -243,6 +243,7 @@ fn the_deliberate_omissions_stay_denied() {
         ("/devices", "GET"),
         ("/devices/register", "POST"),
         ("/devices/hand-over", "POST"),
+        ("/devices/caller", "GET"),
         ("/device-presence", "POST"),
         ("/push/subscribe", "POST"),
         // Changing the platform.
@@ -263,9 +264,11 @@ fn the_deliberate_omissions_stay_denied() {
         ("/repositories/:id/file", "GET"),
         ("/workspaces", "GET"),
         ("/webhooks", "GET"),
-        // A sibling app's source, and a capture the host did not ask for.
+        // A sibling app's source, and a capture or fit report the host did
+        // not ask for.
         ("/app/:app_id/source", "GET"),
         ("/app-capture", "POST"),
+        ("/widgets/fit-report", "POST"),
     ];
     for (path, method) in denied {
         assert!(

@@ -7,6 +7,7 @@
     { "value": "claude-sonnet-5-5",   "label": "Sonnet 5.5",   "description": "Latest Sonnet, best for everyday tasks", "context_window": 1000000 },
     { "value": "claude-sonnet-5-5[1m]", "label": "Sonnet 5.5 (1M)", "description": "Sonnet 5.5 for long sessions" },
     { "value": "claude-haiku-5-5",    "label": "Haiku 5.5",    "description": "Latest Haiku: fastest and cheapest", "context_window": 1000000 },
+    { "value": "claude-fable-5-2", "label": "Fable 5.2", "description": "Latest Fable generation", "context_window": 1000000, "offered": false },
     { "value": "claude-fable-5-1",    "label": "Fable 5.1",       "description": "Most powerful: tier above Opus", "context_window": 1000000, "offered": false },
     { "value": "claude-fable-5-1[1m]","label": "Fable 5.1 (1M)",  "description": "Fable 5.1 for long sessions", "offered": false },
     { "value": "claude-fable-5",    "label": "Fable 5",         "description": "Previous Fable generation", "context_window": 1000000, "offered": false },

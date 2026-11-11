@@ -1897,19 +1897,18 @@ static READ_ONLY_HEADS: &[&str] = &[
 /// * `less -o FILE`, which logs piped input to a named file
 ///
 /// None of those forms carries a `>` for `redirect_targets` to catch, so
-/// without this check `sort -o /etc/crontab data/f` settles `Safe`: no card on
-/// the chat lane, and `RequestVerdict::Benign` (unattended auto-allow) on the
-/// coding-agent lane. They stay on the allowlist because the common form really
+/// without this check `sort -o /etc/crontab data/f` settles `Safe`, and no
+/// lane cards it. They stay on the allowlist because the common form really
 /// is a read, but only while every path they name is inside the workspace and
 /// outside git metadata.
 ///
 /// The check is coarse on purpose, and it costs more than it once did. Telling
 /// `sort -o /etc/x data/f` from `sort /etc/passwd` needs per-head flag arity,
 /// which is exactly what listing the heads here avoids. So BOTH are a
-/// [`FastPathDecline::Refusal`]: a judge call on the chat lane, and a DENIAL
-/// on the unattended coding-agent lane, which fails closed on a refusal. To
-/// read outside the workspace unattended, reach for `cat` / `head` / `grep`,
-/// which are plain read-only heads and still settle Safe.
+/// [`FastPathDecline::Refusal`]: a judge call on the chat lane, and a card on
+/// the coding-agent lane. To read outside the workspace without either, reach
+/// for `cat` / `head` / `grep`, which are plain read-only heads and still
+/// settle Safe.
 static WRITE_CAPABLE_READ_ONLY_HEADS: &[&str] =
     &["sort", "uniq", "tree", "xxd", "yq", "base64", "less"];
 
@@ -1977,10 +1976,10 @@ const LUCIDOS_CLI_ENV_NAMES: [&str; 3] = [
 ];
 
 /// Why the Safe fast path did not settle a command. The two are NOT
-/// interchangeable, and two permissive paths separate them: the unattended
-/// coding-agent lane denies a [`FastPathDecline::Refusal`] and still runs a
-/// [`FastPathDecline::Omission`], and [`grant_covers_command`] refuses to let
-/// a stored grant cover a Refusal.
+/// interchangeable, and two paths separate them. The coding-agent escalation
+/// gate cards a [`FastPathDecline::Refusal`] without asking the judge, and
+/// asks it about a [`FastPathDecline::Omission`]. [`grant_covers_command`]
+/// refuses to let a stored grant cover a Refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FastPathDecline {
     /// The head is not what runs, or not all of it. The allowlist refuses
@@ -2244,8 +2243,8 @@ fn head_safety(
         //
         // Keyed on a real command operand, not on `args` being non-empty. A
         // trailing redirect and a lone `--version` both leave `args` non-empty
-        // while `arch` execs nothing. Refusing those would deny an ordinary
-        // read on the unattended lane.
+        // while `arch` execs nothing. Refusing those would card an ordinary
+        // read.
         "arch" if arch_runs_a_command(args) => Some(Refusal),
         _ if READ_ONLY_HEADS.contains(&base) => None,
         _ if CREATE_HEADS.contains(&base) => (!args
@@ -2264,8 +2263,7 @@ fn head_safety(
 /// The output-flag half is not redundant. "Read-only" here means "does not
 /// mutate the repository". The whole diff family accepts an output flag, which
 /// truncates and rewrites an arbitrary path with no `>` for `redirect_targets`
-/// to see. Such a call would settle `Safe`, with no card on the chat lane and
-/// an unattended auto-allow on the coding-agent one.
+/// to see. Such a call would settle `Safe`, with no card on either lane.
 fn git_subcommand_safety(args: &[&str]) -> Option<FastPathDecline> {
     let unquoted = shell_stripped(args);
     let args: Vec<&str> = unquoted.iter().map(String::as_str).collect();
@@ -5685,8 +5683,8 @@ fn wrapper_preamble_redirects(command: &str) -> bool {
 /// privilege itself. A head that runs its arguments is never covered by name
 /// ([`grants_nothing_by_name`]). `timeout 5 curl …`
 /// resolves to `timeout`, so `Bash(timeout:*)` would cover every program it wraps.
-/// Classification still reads it as an Omission, so the unattended lane keeps
-/// running `timeout 600 cargo test`; only the grant shortcut refuses.
+/// Classification still reads it as an Omission, so the judge still places
+/// `timeout 600 cargo test`; only the grant shortcut refuses.
 ///
 /// A head in `trusted` is no refusal. A grant covers it by its worktree-relative
 /// path, `label(./scripts/x.sh:*)`, and only as the FIRST segment: a segment
@@ -6741,9 +6739,9 @@ mod tests {
     /// `is_benign_prefix` never matches a `-`-prefixed token, so the head walk
     /// stopped on the FLAG: `sudo -E rm -rf /` resolved to head `-E`, matched
     /// none of the danger tables, and settled `Safe`, i.e. auto-allowed
-    /// outright on the unattended coding-agent lane with the catastrophic
-    /// hard-block skipped. Both flag arities are scanned now, so a `-u root`
-    /// that consumes its argument cannot hide the payload either.
+    /// outright with the catastrophic hard-block skipped. Both flag arities
+    /// are scanned now, so a `-u root` that consumes its argument cannot hide
+    /// the payload either.
     #[test]
     fn catastrophic_survives_a_flag_on_the_wrapper() {
         for cmd in [
@@ -7639,8 +7637,8 @@ mod tests {
 
     /// Regression: a `READ_ONLY_HEADS` entry that can be POINTED at an output
     /// file writes outside the workspace with no `>` for the redirect scan to
-    /// catch. It then settles `Safe`, with no card on chat and an auto-allow on
-    /// the unattended lane. See `WRITE_CAPABLE_READ_ONLY_HEADS`.
+    /// catch. It then settles `Safe`, with no card on either lane. See
+    /// `WRITE_CAPABLE_READ_ONLY_HEADS`.
     #[test]
     fn read_only_head_writing_outside_the_workspace_goes_to_judge() {
         for cmd in [
@@ -8021,8 +8019,8 @@ mod tests {
 
     /// The cost the refusal set carries, pinned so it stays deliberate. Each
     /// of these is ordinary work, and each is refused because the head is not
-    /// what runs, or not all of it. The unattended lane denies them; see
-    /// `RequestVerdict::Unclassified`.
+    /// what runs, or not all of it. No stored grant covers them; see
+    /// [`grant_covers_command`].
     #[test]
     fn ordinary_shapes_the_refusal_set_deliberately_catches() {
         for cmd in [
@@ -8234,7 +8232,7 @@ mod tests {
             assert_needs_judge(v.clone(), cmd);
             assert!(
                 matches!(v, StaticVerdict::NeedsJudge(ref ji) if ji.fast_path_refused),
-                "{cmd} must be a refusal, which the unattended lane denies"
+                "{cmd} must be a refusal, which no stored grant covers"
             );
         }
         // A pattern that merely contains an `O` is not the flag.
@@ -10402,7 +10400,7 @@ subprocess.run('ls\x3b id', shell=True)",
     }
 
     /// The refusal is the grant lane's alone. Classification keeps reading a
-    /// wrapped command as an Omission, so the unattended lane still runs it.
+    /// wrapped command as an Omission, so the judge still places it.
     #[test]
     fn an_exec_wrapper_head_stays_an_omission_for_classification() {
         assert_eq!(

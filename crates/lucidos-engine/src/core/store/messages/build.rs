@@ -121,6 +121,7 @@ fn push_spoken(
             .map(|uuid| uuid.to_string())
             .or(current_thread_id),
         agent,
+        sender_device_id: None,
     });
     *tail = Some(SpokenTail {
         index: messages.len() - 1,
@@ -141,6 +142,46 @@ fn authoring_agent(event: &EventRow) -> Option<AgentParticipant> {
         .ok()?
         .agent()
         .cloned()
+}
+
+/// The device a person typed this message on: a `MessageReceived` whose
+/// origin is a device, or a `PeopleMessagePosted`, whose actor is one. Every
+/// other sender (a trigger, a parent thread, an API caller) is nobody's.
+pub(crate) fn typed_on_device(event_type: &str, payload: &serde_json::Value) -> Option<String> {
+    let key = match event_type {
+        "MessageReceived" => "origin",
+        "PeopleMessagePosted" => "actor",
+        _ => return None,
+    };
+    match serde_json::from_value::<MessageOrigin>(payload.get(key)?.clone()).ok()? {
+        MessageOrigin::Device { device_id } => Some(device_id),
+        _ => None,
+    }
+}
+
+/// A string payload field, empty when absent.
+fn str_field(payload: &serde_json::Value, key: &str) -> String {
+    payload
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The blob hashes of a user message's attached images. The API layer writes
+/// them, and a startup migration (`core::image_migration`) rewrote every row
+/// carrying the legacy inline `images` shape.
+fn user_image_hashes_of(event: &EventRow) -> Vec<String> {
+    event
+        .payload
+        .get("user_image_hashes")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|h| h.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The status each change a child report names has now, keyed by change id.
@@ -514,6 +555,10 @@ pub(crate) fn build_session_messages_with(
     let mut current_request_event_id: Option<String> = None;
     let mut current_thread_id: Option<String> = None;
     let mut spoken_tail: Option<SpokenTail> = None;
+    // Between a message that opened a turn and the turn's terminal event.
+    let mut turn_open = false;
+    // People-only messages posted while a turn was open, in order.
+    let mut held_people: Vec<SessionMessage> = Vec::new();
 
     // `ContextDismissed` records ask the projection to drop the corresponding
     // history entry on every future read. They came from the retired
@@ -586,6 +631,7 @@ pub(crate) fn build_session_messages_with(
                         event_id: None,
                         thread_id: current_thread_id.clone(),
                         agent: None,
+                        sender_device_id: None,
                     });
                     last_cc_chunk_len = 0;
                     last_cc_event_len = 0;
@@ -621,34 +667,14 @@ pub(crate) fn build_session_messages_with(
                         event_id: None,
                         thread_id: current_thread_id.clone(),
                         agent: None,
+                        sender_device_id: None,
                     });
                     last_text_chunk_len = 0;
                     last_text_event_len = 0;
                 }
 
-                let content = event
-                    .payload
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                // Hashes are written by the API layer (or backfilled by the
-                // startup migration). Old DB rows whose payload still carries
-                // the legacy `images: [{base64, mime_type}, ...]` shape have
-                // been rewritten to `user_image_hashes` before HTTP binds —
-                // see `core::image_migration`. Reading from `images` is
-                // therefore a dead fallback and intentionally not implemented.
-                let user_image_hashes: Vec<String> = event
-                    .payload
-                    .get("user_image_hashes")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|h| h.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let content = str_field(&event.payload, "text");
+                let user_image_hashes = user_image_hashes_of(event);
 
                 pending_steps.clear();
                 pending_image_handles.clear();
@@ -678,6 +704,8 @@ pub(crate) fn build_session_messages_with(
 
                 current_request_event_id = Some(event.id.to_string());
                 current_thread_id = get_thread_id(event);
+                messages.append(&mut held_people);
+                turn_open = true;
 
                 messages.push(SessionMessage {
                     role: "user".to_string(),
@@ -697,6 +725,36 @@ pub(crate) fn build_session_messages_with(
                     event_id: Some(event.id.to_string()),
                     thread_id: current_thread_id.clone(),
                     agent: None,
+                    sender_device_id: typed_on_device(&event.event_type, &event.payload),
+                });
+            }
+            // A people-only message (ADR 0649). It opened no turn, so it
+            // leaves the open request and its streamed text alone. One posted
+            // during a turn follows that turn's reply, which never saw it.
+            "PeopleMessagePosted" => {
+                let target = match turn_open {
+                    true => &mut held_people,
+                    false => &mut messages,
+                };
+                target.push(SessionMessage {
+                    role: "user".to_string(),
+                    content: str_field(&event.payload, "text"),
+                    created_at: event.created,
+                    channel: None,
+                    steps: vec![],
+                    image_handles: thread_image_handles_of(event),
+                    user_image_hashes: user_image_hashes_of(event),
+                    image_description: image_descriptions.get(&event.id.to_string()).cloned(),
+                    completed: None,
+                    canceled: false,
+                    aborted: false,
+                    text_chunks: vec![],
+                    events: vec![],
+                    request_event_id: None,
+                    event_id: Some(event.id.to_string()),
+                    thread_id: get_thread_id(event),
+                    agent: None,
+                    sender_device_id: typed_on_device(&event.event_type, &event.payload),
                 });
             }
             // "Thinking" is the legacy DB string; T7 renamed the variant to
@@ -1055,9 +1113,12 @@ pub(crate) fn build_session_messages_with(
                     event_id: Some(event.id.to_string()),
                     thread_id: get_thread_id(event).or_else(|| current_thread_id.clone()),
                     agent: authoring_agent(event),
+                    sender_device_id: None,
                 });
                 last_cc_event_len = 0;
                 last_text_event_len = 0;
+                messages.append(&mut held_people);
+                turn_open = false;
             }
             "ResponseFailed" => {
                 let error = event
@@ -1102,7 +1163,10 @@ pub(crate) fn build_session_messages_with(
                     event_id: Some(event.id.to_string()),
                     thread_id: get_thread_id(event).or_else(|| current_thread_id.clone()),
                     agent: None,
+                    sender_device_id: None,
                 });
+                messages.append(&mut held_people);
+                turn_open = false;
             }
             "TriggerStarted" => {
                 let prompt = event
@@ -1124,6 +1188,8 @@ pub(crate) fn build_session_messages_with(
 
                 current_request_event_id = Some(event.id.to_string());
                 current_thread_id = get_thread_id(event);
+                messages.append(&mut held_people);
+                turn_open = true;
 
                 messages.push(SessionMessage {
                     role: "user".to_string(),
@@ -1144,6 +1210,7 @@ pub(crate) fn build_session_messages_with(
                     event_id: Some(event.id.to_string()),
                     thread_id: current_thread_id.clone(),
                     agent: None,
+                    sender_device_id: None,
                 });
             }
             "TriggerCompleted" => {
@@ -1189,6 +1256,7 @@ pub(crate) fn build_session_messages_with(
                     event_id: Some(event.id.to_string()),
                     thread_id: get_thread_id(event).or_else(|| current_thread_id.clone()),
                     agent: None,
+                    sender_device_id: None,
                 });
             }
             "ChildThreadStopped" | "ChildThreadDetached" => {
@@ -1218,6 +1286,7 @@ pub(crate) fn build_session_messages_with(
                     event_id: Some(event.id.to_string()),
                     thread_id: get_thread_id(event).or_else(|| current_thread_id.clone()),
                     agent: None,
+                    sender_device_id: None,
                 });
             }
             "SpokenReplyGenerated" => {
@@ -1291,6 +1360,7 @@ pub(crate) fn build_session_messages_with(
                         event_id: Some(event.id.to_string()),
                         thread_id: get_thread_id(event).or_else(|| current_thread_id.clone()),
                         agent: authoring_agent(event),
+                        sender_device_id: None,
                     });
                     // A note about what the CALLER said, not more of the
                     // conversation, so their sentence can still grow. Never
@@ -1377,6 +1447,7 @@ pub(crate) fn build_session_messages_with(
             event_id: None,
             thread_id: current_thread_id.clone(),
             agent: None,
+            sender_device_id: None,
         });
     }
 
@@ -1388,6 +1459,14 @@ pub(crate) fn build_session_messages_with(
             last_user.steps = pending_steps;
         }
     }
+
+    // A turn still running keeps its in-progress reply last, where new
+    // streamed text lands, so the messages it held go just before it.
+    let held_at = match messages.last() {
+        Some(last) if last.role == "assistant" && last.completed.is_none() => messages.len() - 1,
+        _ => messages.len(),
+    };
+    messages.splice(held_at..held_at, held_people);
 
     messages
 }

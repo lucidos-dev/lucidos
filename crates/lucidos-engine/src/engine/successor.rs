@@ -354,6 +354,7 @@ pub(crate) async fn pending_successor_request(
                 user_agent: None,
                 mode: super::thread_events::ActorMode::Human,
                 source_thread_id: None,
+                emitting_trigger_id: None,
             });
         PendingRequest {
             request: text("message").map(|message| HandoffRequest { message, by }),

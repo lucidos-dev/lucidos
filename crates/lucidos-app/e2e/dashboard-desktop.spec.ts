@@ -189,7 +189,7 @@ test.describe('dashboard on desktop', () => {
     const m = await box(tile(page, ids.medium));
     expect(Math.abs(m.height - s.height)).toBeLessThan(2);
     // The fade marks the clip. Opening it full size is the tile menu's job.
-    await expect(tile(page, ids.medium).locator('.widget-box-fade')).toBeVisible();
+    await expect(tile(page, ids.medium).locator('.widget-box-fade[data-edge="bottom"]')).toBeVisible();
     await expect(tile(page, ids.medium).locator('.widget-box-fade button')).toHaveCount(0);
     const html = frame(page, ids.medium).locator('html');
     expect(await html.evaluate((el) => getComputedStyle(el).overflow)).toBe('hidden');

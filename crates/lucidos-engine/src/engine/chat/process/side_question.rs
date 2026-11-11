@@ -81,9 +81,13 @@ impl LucidosEngine {
         // A Tree workspace's history is its memory views, read as a turn here
         // would read them.
         let context_window = self.context_window_for(&model, resolved.as_selection().provider);
+        let budget_model = self.request_budget_model_for(&model, resolved.as_selection().provider);
         let views = if capabilities.gates.memory_tree {
             let surface = self.chat_surface(thread_id, false).await;
-            let limit = crate::engine::context::agent_context_char_budget(context_window) / 2;
+            let limit = crate::engine::context::agent_context_char_budget_for(
+                &budget_model,
+                context_window,
+            ) / 2;
             self.turn_memory_views(thread_id, surface, &model, question, limit)
                 .await
         } else {
@@ -123,7 +127,12 @@ impl LucidosEngine {
         });
 
         let tools = self
-            .chat_turn_tools(thread_id, &capabilities.gates, context_window)
+            .chat_turn_tools(
+                thread_id,
+                &capabilities.gates,
+                context_window,
+                &budget_model,
+            )
             .await;
         let capture = crate::engine::AuxCapture::new(
             &self.event_bus,

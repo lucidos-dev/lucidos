@@ -1,6 +1,7 @@
 # 0002 — Lucidos Agent command safety: gate the dangerous slice, not every command
 
-- **Status:** Accepted
+- **Status:** Accepted; its off-by-default ("ships dark") is superseded by
+  [ADR 0644](0644-command-guard-on-by-default.md): the guard defaults on
 - **Date:** 2026-06-08
 
 ## Context
@@ -202,6 +203,10 @@ Implementation: `engine/cc_permission.rs` (`AttendMode`, `resolve_attend_mode`,
 
 **Amended by ADR 0628.** "Never hangs" now reads "never hangs past its
 *permission wait*". A refused shape parks a card when a device is reachable.
+
+**Superseded for coding agents by ADR 0641.** The unattended lane is gone.
+Every coding-agent session takes the workspace grants, and a trigger needs its
+*coding-agent grant* to start one at all.
 
 ## Addendum (2026-07-30): in-worktree writes auto-allow; session allows are durable
 
@@ -432,6 +437,8 @@ Implementation: `engine/command_guard.rs` (`FastPathDecline`, `segment_safety`,
 a push can reach a device, and is denied when nobody answers. With no reachable
 device, or a wait of `deny`, it is still denied at once.
 
+**Superseded for coding agents by ADR 0641**, which removes the unattended lane.
+
 ## Addendum (2026-09-21): the ATTENDED coding-agent lane may reach the judge
 
 Two earlier non-goals here said "no LLM judge in the permission path". Both were
@@ -460,7 +467,10 @@ the unattended lane and `grant_covers_command`.
 
 **Both command-guard toggles gate the LLM half.** The master `command_guard` and
 the `command_guard_judge` sub-switch, in the order `agentic_loop::run` reads
-them. The master ships off, so the judge half of this gate ships off with it.
+them. The master shipped off, so the judge half of this gate shipped off with
+it. Since ADR 0644 the master defaults on, and only coding-agent auto-answer,
+which defaults off, lets the judge answer a coding agent
+(`cc_permission::judge_escalation_lane`).
 The static half does not ask, and needs no model.
 
 Implementation: `engine/cc_permission.rs` (`attended_command_allowed`,
@@ -506,6 +516,9 @@ event or migration.
 Implementation: `engine/cc_permission.rs` (`human_acted_in`,
 `resolve_attend_mode`). Plan:
 `docs/plans/2026-09-28-a-human-in-the-spawn-tree-attends-the-session.md`.
+
+**Superseded by ADR 0641.** Presence no longer decides anything for a coding
+agent. Trust follows provenance, and the decision sits at spawn.
 
 ## Addendum (2026-10-09): a judge that fails asks
 
@@ -801,8 +814,8 @@ gates only a line nobody approved.
 
 | Guard | Setup | Approved start | Unapproved start |
 |---|---|---|---|
-| off (default) | runs, records nothing | runs | runs |
-| on | classified; Proceed approves | runs, no card | agent: classified, may card. Turn setup, lazy start, trigger: refused with a reason. User click: approves and runs. |
+| off | runs, records nothing | runs | runs |
+| on (default, ADR 0644) | classified; Proceed approves | runs, no card | agent: classified, may card. Turn setup, lazy start, trigger: refused with a reason. User click: approves and runs. |
 
 With the guard off the gate reaches nobody. The workspace audit's
 `mcp-servers` section then lists each unapproved line and its static verdict.

@@ -137,7 +137,7 @@ test.describe('Widgets', () => {
     seedThreadShowingWidget(threadId, appId);
     await openThread(page, threadId);
 
-    await expect(card(page).locator('.widget-box-fade')).toBeVisible({ timeout: 15_000 });
+    await expect(card(page).locator('.widget-box-fade[data-edge="bottom"]')).toBeVisible({ timeout: 15_000 });
     // The box sets the frame, so the frame never grows to the content.
     const [frameBox, boxBox] = await Promise.all([
       card(page).locator('.widget-frame').boundingBox(),

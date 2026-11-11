@@ -20,6 +20,9 @@ interface AllowlistEditorProps {
    *  heading rather than inside the loaded branch, so it stays readable while
    *  the file is loading and after a failed load. */
   description: ComponentChildren;
+  /** Rows drawn between the heading and the list, such as a switch that
+   *  answers what the list does not cover. Shown whatever the load state. */
+  lead?: ComponentChildren;
   /** Placeholder shown in an empty pattern row. */
   placeholder: string;
   /** Noun used in the failed-load message ("tool permissions" / "command permissions"). */
@@ -231,6 +234,7 @@ export function AllowlistEditor(props: AllowlistEditorProps) {
           {props.title}
           <Explainer title={props.title}>{props.description}</Explainer>
         </div>
+        {props.lead}
         <LoadableError noun={props.noun} error={loadable.error} />
       </div>
     );
@@ -242,6 +246,7 @@ export function AllowlistEditor(props: AllowlistEditorProps) {
         {props.title}
         <Explainer title={props.title}>{props.description}</Explainer>
       </div>
+      {props.lead}
       <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf containerClass="allowlist-rows" row={() => <AllowlistRow />} />}>
         {loadable.status === 'loaded' ? (
           <>

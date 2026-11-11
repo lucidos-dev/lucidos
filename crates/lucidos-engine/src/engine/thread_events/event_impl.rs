@@ -228,8 +228,11 @@ impl ThreadEvent {
             Self::WorkItemDriverTaken => "WorkItemDriverTaken",
             Self::WorkItemDriverReleased => "WorkItemDriverReleased",
             Self::WorkItemGateEscalated { .. } => "WorkItemGateEscalated",
-            Self::WorkItemWatched => "WorkItemWatched",
+            Self::WorkItemWatched { .. } => "WorkItemWatched",
             Self::WorkItemUnwatched => "WorkItemUnwatched",
+            Self::PeopleMessagePosted { .. } => "PeopleMessagePosted",
+            Self::AgentPaused { .. } => "AgentPaused",
+            Self::AgentResumed { .. } => "AgentResumed",
             Self::ThreadStarted { .. } => "ThreadStarted",
             Self::ThreadDiscarded { .. } => "ThreadDiscarded",
             Self::HomeThreadCreated => "HomeThreadCreated",
@@ -326,6 +329,7 @@ impl ThreadEvent {
             Self::PushNotificationRequested => "PushNotificationRequested",
             Self::AppUiRefreshRequested { .. } => "AppUiRefreshRequested",
             Self::AppUiCaptureRequested { .. } => "AppUiCaptureRequested",
+            Self::WidgetFitRequested { .. } => "WidgetFitRequested",
             Self::NavigationRequested { .. } => "NavigationRequested",
             Self::CodingAgentThreadSpawned { .. } => "CodingAgentThreadSpawned",
             Self::CodingAgentDiffChanged { .. } => "CodingAgentDiffChanged",
@@ -400,6 +404,9 @@ impl ThreadEvent {
         "WorkItemGateEscalated",
         "WorkItemWatched",
         "WorkItemUnwatched",
+        "PeopleMessagePosted",
+        "AgentPaused",
+        "AgentResumed",
         "ThreadStarted",
         "ThreadDiscarded",
         "HomeThreadCreated",
@@ -479,6 +486,7 @@ impl ThreadEvent {
         "PushNotificationRequested",
         "AppUiRefreshRequested",
         "AppUiCaptureRequested",
+        "WidgetFitRequested",
         "NavigationRequested",
         "CodingAgentThreadSpawned",
         "CodingAgentDiffChanged",
@@ -617,6 +625,7 @@ impl ThreadEvent {
                 | Self::PushNotificationRequested
                 | Self::AppUiRefreshRequested { .. }
                 | Self::AppUiCaptureRequested { .. }
+                | Self::WidgetFitRequested { .. }
                 | Self::NavigationRequested { .. }
                 | Self::CodingAgentThreadSpawned { .. }
                 | Self::CodingAgentDiffChanged { .. }
@@ -631,6 +640,7 @@ impl ThreadEvent {
     pub const INDEXABLE_EVENT_TYPES: &'static [&'static str] = &[
         "MessageReceived",
         "SpokenMessageReceived",
+        "PeopleMessagePosted",
         "PromptInjected",
         "ResponseGenerated",
         "ResponseCanceled",
@@ -653,6 +663,9 @@ impl ThreadEvent {
             // `MessageReceived` beside it until ADR 0201 stopped writing one.
             // Without this arm nothing spoken reaches memory at all.
             Self::SpokenMessageReceived { text, .. } => Some(text),
+            // What people said to each other in the thread. The agent reads
+            // it as context, so memory holds it too.
+            Self::PeopleMessagePosted { text, .. } => Some(text),
             // A `PromptInjected` carrying `injected_message_id` is an
             // ACKNOWLEDGEMENT of a `MessageReceived` that is already persisted
             // and already indexed, with the same text copied verbatim. Indexing

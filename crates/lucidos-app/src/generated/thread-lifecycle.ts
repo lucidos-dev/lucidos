@@ -71,6 +71,9 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   WorkItemGateEscalated: 'metadata',
   WorkItemWatched: 'metadata',
   WorkItemUnwatched: 'metadata',
+  PeopleMessagePosted: 'metadata',
+  AgentPaused: 'metadata',
+  AgentResumed: 'metadata',
   ThreadStarted: 'metadata',
   ThreadDiscarded: 'metadata',
   HomeThreadCreated: 'metadata',
@@ -211,6 +214,7 @@ export const LAST_ACTIVITY_EVENTS: ReadonlySet<string> = new Set([
   'VoiceSessionStarted',
   'SpokenMessageReceived',
   'SpokenReplyGenerated',
+  'PeopleMessagePosted',
 ]);
 
 export function isSectionLegal(threadType: ThreadType, section: ArchiveState): boolean {

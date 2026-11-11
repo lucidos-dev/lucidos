@@ -8,7 +8,6 @@
 use std::sync::Weak;
 
 use async_trait::async_trait;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::ThreadQueueRequest;
@@ -74,9 +73,6 @@ fn should_record_trigger_execution(
 pub struct ExecutableEntry {
     pub id: Uuid,
     pub request: ThreadQueueRequest,
-    /// Cooperative cancel from the submitter (cron task loop); `None` for
-    /// every other kind and for entries re-queued across a restart.
-    pub cancel: Option<CancellationToken>,
 }
 
 #[async_trait]
@@ -380,7 +376,6 @@ impl LucidosEngine {
                         &config,
                         invocation,
                         Some(&event_payload),
-                        entry.cancel,
                         entry.id,
                         retry_of,
                     )
@@ -444,7 +439,6 @@ impl LucidosEngine {
                             &config,
                             TriggerInvocation::Schedule,
                             None,
-                            entry.cancel,
                             entry.id,
                             retry_of,
                         )

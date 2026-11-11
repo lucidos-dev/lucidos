@@ -120,14 +120,18 @@ export function readsImages(modelId: string): boolean {
  *  row has that route, CONFIGURED OR NOT. A choice is honoured or refused,
  *  never substituted, so the picker shows the parked one rather than a backend
  *  the turn will not reach. Otherwise the first configured route wins, and with
- *  none configured the row's first. */
+ *  none configured the row's first that is not the ChatGPT plan. The plan
+ *  route leads only so a signed-in plan wins. */
 export function resolvedRoute(modelId: string): RouteInfo | undefined {
   const row = modelRow(modelId);
   if (!row) return undefined;
   const preferred = row.preferred_provider
     ? row.routes.find((r) => r.provider === row.preferred_provider)
     : undefined;
-  return preferred ?? row.routes.find((r) => isProviderConfigured(r.provider)) ?? row.routes[0];
+  return preferred
+    ?? row.routes.find((r) => isProviderConfigured(r.provider))
+    ?? row.routes.find((r) => r.provider !== 'chatgpt-plan')
+    ?? row.routes[0];
 }
 
 /** The reasoning efforts the engine says `modelId` supports on the route that

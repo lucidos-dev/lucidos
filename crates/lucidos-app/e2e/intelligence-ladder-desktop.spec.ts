@@ -31,6 +31,9 @@ test('the wide ladder shows column heads and moves a rung by its grip', async ({
   });
   const rows = section.locator('.ladder-row');
   await expect(rows.first()).toBeVisible();
+  // The chat ladder above is long enough to push this one below the fold, and
+  // a mouse press off screen hits nothing.
+  await section.scrollIntoViewIfNeeded();
 
   await expect(section.locator('.ladder-head > span')).toHaveText([
     '', 'Rung, least to most intelligent', 'Intelligence', 'Cost', 'Time', 'Default', 'On',
@@ -43,7 +46,10 @@ test('the wide ladder shows column heads and moves a rung by its grip', async ({
   const names = () => rows.locator('.title').allTextContents();
   const before = await names();
 
+  // Pointer coordinates need both rows in the viewport, even as the ladder grows.
+  await rows.nth(2).scrollIntoViewIfNeeded();
   // A mouse press on the grip lifts at once, and the release saves once.
+  await rows.nth(2).scrollIntoViewIfNeeded();
   const grip = (await rows.first().locator('.ladder-grip').boundingBox())!;
   const third = (await rows.nth(2).boundingBox())!;
   const write = page.waitForRequest((req) => req.method() === 'PUT' && req.url().includes(`key=${LADDER_KEY}`));

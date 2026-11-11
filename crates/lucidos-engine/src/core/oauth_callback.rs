@@ -15,7 +15,7 @@ use std::sync::{LazyLock, Mutex};
 
 use axum::http::HeaderMap;
 
-use super::oauth::{callback_received, query_param};
+use super::oauth::{callback_received, query_param, AuthorizationGrant};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -169,7 +169,7 @@ impl CallbackRoute {
 /// A gateway-mode flow's open slot, keyed by its full `state`.
 struct PendingEntry {
     provider: String,
-    deliver: tokio::sync::oneshot::Sender<Result<String, BoxError>>,
+    deliver: tokio::sync::oneshot::Sender<Result<AuthorizationGrant, BoxError>>,
 }
 
 static PENDING: LazyLock<Mutex<HashMap<String, PendingEntry>>> =
@@ -185,7 +185,7 @@ fn pending() -> std::sync::MutexGuard<'static, HashMap<String, PendingEntry>> {
 /// delivered to afterwards.
 pub(crate) struct PendingCallback {
     state: String,
-    received: tokio::sync::oneshot::Receiver<Result<String, BoxError>>,
+    received: tokio::sync::oneshot::Receiver<Result<AuthorizationGrant, BoxError>>,
 }
 
 impl PendingCallback {
@@ -205,8 +205,8 @@ impl PendingCallback {
         }
     }
 
-    /// The authorization code, or the provider's reason for refusing.
-    pub(crate) async fn received(mut self) -> Result<String, BoxError> {
+    /// The grant, or the provider's reason for refusing.
+    pub(crate) async fn received(mut self) -> Result<AuthorizationGrant, BoxError> {
         (&mut self.received)
             .await
             .unwrap_or_else(|_| Err("the OAuth callback slot closed without a result".into()))
@@ -241,8 +241,8 @@ pub fn deliver_callback(query: &str) -> CallbackDelivery {
         };
     };
     let received = callback_received(&entry.provider, query);
-    let ok = received.code.is_ok();
-    if entry.deliver.send(received.code).is_err() {
+    let ok = received.grant.is_ok();
+    if entry.deliver.send(received.grant).is_err() {
         crate::log!(
             "[OAuth] A {} callback arrived as its flow ended",
             entry.provider

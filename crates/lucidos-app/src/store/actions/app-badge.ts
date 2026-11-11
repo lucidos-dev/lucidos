@@ -10,7 +10,8 @@ import { computed, signal } from '@preact/signals';
 import { unreadCount } from '../store';
 import { IS_PICKER, WORKSPACE_ID } from '../../utils/basePath';
 import { isTauri } from '../../utils/platform';
-import { listWorkspaces, type WorkspaceStatus } from '../../api/client/control';
+import { listRemoteWorkspaces, listWorkspaces, type WorkspaceStatus } from '../../api/client/control';
+import { mergeRemoteListings, type RemoteGatewayView } from '../../utils/remoteWorkspaces';
 
 type BadgingNavigator = Navigator & {
   setAppBadge?: (count?: number) => Promise<void>;
@@ -41,6 +42,14 @@ export function applyAppBadge(count: number): void {
  *  computeds below and re-asserts the icon when a refresh moves the total. */
 export const peerWorkspaces = signal<WorkspaceStatus[]>([]);
 
+/** Every paired remote gateway's workspaces, as of the last refresh. Feeds the
+ *  Lucidos menu's notifications group only. The icon badge and the brand mark
+ *  count this gateway's workspaces, so a remote count never moves them.
+ *
+ *  Views rather than bare rows, so a gateway that falls silent keeps its last
+ *  rows marked unreachable, the same shape the picker holds. */
+export const remotePeerWorkspaces = signal<RemoteGatewayView[]>([]);
+
 /** Monotonic id of the newest refresh issued, so a slower earlier listing can
  *  never land on top of a fresher one. Three triggers can overlap (startup, a
  *  resume, the visible-only interval), and the gateway's listing takes as long
@@ -48,6 +57,10 @@ export const peerWorkspaces = signal<WorkspaceStatus[]>([]);
  *  on stale counts until the next refresh. Same guard `loadUnreadNotifications`
  *  uses for the unread set (`notifications.ts`). */
 let refreshSeq = 0;
+
+/** {@link refreshSeq}'s twin for the remote listing, which settles on its own
+ *  schedule: a slow gateway must not delay the local counts. */
+let remoteRefreshSeq = 0;
 
 /** True when this page is served by the workspace gateway under `/<slug>/`, and
  *  therefore when the icon badge is a CROSS-WORKSPACE total.
@@ -96,7 +109,8 @@ export const crossWorkspaceUnreadTotal = computed(
  *  renders (`GET /~/api/v1/control/workspaces`), refreshed by the gateway's 2s
  *  supervise loop. A stopped workspace reports no count and contributes 0, the
  *  same "running workspaces only" rule the picker badge and the desktop dock
- *  badge already follow.
+ *  badge already follow. It also re-reads every paired remote gateway through
+ *  {@link refreshRemotePeers}, for the notifications group's remote rows only.
  *
  *  The rows are stored whole, but only the OTHERS are counted. Our own row is
  *  dropped, and {@link crossWorkspaceUnreadTotal} supplies this workspace's
@@ -110,10 +124,14 @@ export const crossWorkspaceUnreadTotal = computed(
  *  the next push, which carries a fresh aggregate) recovers on its own. A toast
  *  would be noise about a number the user is not looking at. */
 export async function refreshOtherWorkspacesUnread(): Promise<void> {
+  if (IS_PICKER || !badgesEveryWorkspace()) return;
+  await Promise.all([refreshLocalPeers(), refreshRemotePeers()]);
+}
+
+async function refreshLocalPeers(): Promise<void> {
   // NOT gated on Tauri, unlike the icon write below. The desktop client badges
   // its dock from Rust. Its PAGE still draws the brand badge and the menu's
   // notifications group, and both need these rows.
-  if (IS_PICKER || !badgesEveryWorkspace()) return;
   const seq = ++refreshSeq;
   let rows: WorkspaceStatus[];
   try {
@@ -129,6 +147,26 @@ export async function refreshOtherWorkspacesUnread(): Promise<void> {
   if (seq !== refreshSeq) return; // superseded while in flight (see refreshSeq)
   peerWorkspaces.value = rows;
   syncWorkspaceAppBadge();
+}
+
+/** Re-read the paired remote gateways' workspaces for the notifications group.
+ *
+ *  Best-effort on the same terms as {@link refreshOtherWorkspacesUnread}: it
+ *  runs on a timer and on resume, a blip keeps the last rows, and the next
+ *  refresh recovers on its own. The listing reports each gateway apart, so one
+ *  that does not answer never hides the others. */
+async function refreshRemotePeers(): Promise<void> {
+  const seq = ++remoteRefreshSeq;
+  try {
+    const listings = await listRemoteWorkspaces();
+    if (seq !== remoteRefreshSeq) return;
+    remotePeerWorkspaces.value = mergeRemoteListings(remotePeerWorkspaces.value, listings);
+  } catch (e) {
+    // Telemetry carve-out (`.claude/rules/frontend.md`): nobody asked for this
+    // request, and a toast would announce a blip about rows the user is not
+    // looking at. The next refresh re-establishes them.
+    console.warn('[app-badge] remote workspace unread refresh failed; keeping the last rows', e);
+  }
 }
 
 /** Re-assert this install's app-icon badge: this workspace's `unreadCount` (the

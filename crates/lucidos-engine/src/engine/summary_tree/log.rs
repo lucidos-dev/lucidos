@@ -77,6 +77,7 @@ pub(crate) struct LogEntry {
     pub(crate) text: String,
     /// The event this entry is read back from by `zoom`.
     pub(crate) event_id: Uuid,
+    pub(crate) sender_device_id: Option<String>,
 }
 
 impl LogEntry {
@@ -116,6 +117,7 @@ impl ThreadKind {
 pub(crate) struct StoredEvent {
     pub(crate) id: Uuid,
     pub(crate) event: ThreadEvent,
+    pub(crate) actor: Option<MessageOrigin>,
 }
 
 /// A settled turn: the entries its settle event closed.
@@ -180,7 +182,15 @@ pub(crate) fn project(kind: ThreadKind, events: &[StoredEvent]) -> ThreadLog {
         questions: Vec::new(),
     };
     for e in events {
+        let start = p.log.entries.len();
         p.apply(e);
+        if let Some(MessageOrigin::Device { device_id }) = &e.actor {
+            for entry in &mut p.log.entries[start..] {
+                if entry.kind == EntryKind::Prompt(ActorMode::Human) {
+                    entry.sender_device_id = Some(device_id.clone());
+                }
+            }
+        }
     }
     p.log
 }
@@ -208,6 +218,7 @@ impl Projector {
             kind,
             text,
             event_id,
+            sender_device_id: None,
         });
     }
 

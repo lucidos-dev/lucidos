@@ -1717,6 +1717,25 @@ pub(super) async fn register_device(
     }
 }
 
+/// The device id the caller asserts in `x-lucidos-device-id`, or `None` for a
+/// missing or blank header (the loopback case).
+fn asserted_device_id(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(super::actor::HEADER_DEVICE_ID)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Tell a page which device id the gateway asserts for it.
+///
+/// Behind a relay that id is `<pairing id>:<device id>` (ADR 0591), which the
+/// page cannot derive. Only the gateway on the workspace's own host knows it.
+/// Reads the header and nothing else, so a caller learns only its own id.
+pub(super) async fn caller_device(headers: HeaderMap) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "device_id": asserted_device_id(&headers) }))
+}
+
 /// Why this caller may not act for device `target`, or `None` when it may.
 ///
 /// The rule is that a caller may only act for ITSELF. Behind the *workspace
@@ -1733,11 +1752,7 @@ pub(super) async fn register_device(
 /// satisfiable at all: the client still stores the old one when it asks. See
 /// `handOverDevice` in `api/client/settings.ts`.
 pub(super) fn claims_another_device(headers: &HeaderMap, target: &str) -> Option<String> {
-    let asserted = headers
-        .get(super::actor::HEADER_DEVICE_ID)
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())?;
+    let asserted = asserted_device_id(headers)?;
     if asserted == target {
         return None;
     }
@@ -2189,6 +2204,7 @@ pub(super) fn router() -> Router<AppState> {
         // Device endpoints
         .route("/devices/register", post(register_device))
         .route("/devices/hand-over", post(hand_over_device))
+        .route("/devices/caller", get(caller_device))
         .route("/devices", get(list_devices))
         .route("/devices/:device_id/name", put(rename_device))
         .route("/devices/:device_id/push", put(set_device_push))
@@ -2668,6 +2684,24 @@ mod hand_over_guard_tests {
             claims_another_device(&headers_with(Some("   ")), "dev-a"),
             None
         );
+    }
+
+    async fn caller_id(device_id: Option<&str>) -> serde_json::Value {
+        caller_device(headers_with(device_id)).await.0["device_id"].clone()
+    }
+
+    #[tokio::test]
+    async fn the_caller_read_returns_the_asserted_namespaced_id() {
+        assert_eq!(
+            caller_id(Some(" pairing-1:dev-a ")).await,
+            serde_json::json!("pairing-1:dev-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_caller_read_is_null_without_an_asserted_id() {
+        assert_eq!(caller_id(None).await, serde_json::Value::Null);
+        assert_eq!(caller_id(Some("   ")).await, serde_json::Value::Null);
     }
 }
 

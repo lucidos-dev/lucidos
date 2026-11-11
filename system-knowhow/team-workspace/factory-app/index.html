@@ -39,7 +39,7 @@
       const EMPTY = {
         mine: 'Nothing you drive or watch is open.',
         team: 'No gate is waiting on the team.',
-        all: 'No open work items.',
+        all: 'No open threads.',
       };
       let view = 'team';
       let list = null;
@@ -93,7 +93,7 @@
           ? items.map((item) => `
               <div class="list-row item" data-id="${esc(item.root_thread_id)}">
                 <button class="item-open" data-act="open">
-                  <div class="list-row-name">${esc(item.title || 'Untitled work item')}</div>
+                  <div class="list-row-name">${esc(item.title || 'Untitled thread')}</div>
                   <div class="chips">${chips(item)}</div>
                   <div class="meta">${esc(new Date(item.last_activity).toLocaleString())}</div>
                 </button>
@@ -104,11 +104,11 @@
 
       async function load() {
         try {
-          list = await lucidos.workItems.list();
+          list = await lucidos.threads.people.list();
           render();
         } catch (e) {
           document.getElementById('items').innerHTML =
-            `<div class="empty-state">Could not load the work items: ${esc(e.message || e)}</div>`;
+            `<div class="empty-state">Could not load the threads: ${esc(e.message || e)}</div>`;
         } finally {
           lucidos.ui.ready();
         }
@@ -131,7 +131,7 @@
           return;
         }
         try {
-          await lucidos.workItems[act](id);
+          await lucidos.threads.people[act](id);
           await load();
         } catch (err) {
           lucidos.ui.toast(err.message || String(err), 'error');
@@ -143,7 +143,7 @@
         'WorkItemDriverTaken', 'WorkItemDriverReleased', 'WorkItemWatched',
         'WorkItemUnwatched', 'WorkItemGateEscalated', 'UserQuestionAsked',
         'UserQuestionAnswered', 'ThreadArchived', 'ThreadUnarchived', 'TriggerStarted',
-        'MessageReceived', 'OperatorsChanged',
+        'MessageReceived', 'PeopleMessagePosted', 'OperatorsChanged',
       ]) {
         lucidos.sse.on(type, load);
       }

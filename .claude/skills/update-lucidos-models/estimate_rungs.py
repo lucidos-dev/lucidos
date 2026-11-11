@@ -31,6 +31,11 @@ Every pair carries two intelligence profiles:
   is flagged coding_estimated. A model with no measured pair has gap zero.
   CODING_UNMEASURED names models whose lone index row is ignored.
 
+Both capability profiles use a cumulative maximum in effort order before
+ranking or frontier selection. Downward observations emit review diagnostics;
+ties are estimates, not evidence of strict improvement. Raw inputs stay intact.
+coding_estimated indicates missing index coverage, not an unsmoothed score.
+
 Cost and time blend AA with the independent view the same way. Cost per task
 is the model's input cost plus output tokens per task at list price. Time is
 output tokens over the model's speed, calibrated against AA's times. The
@@ -94,6 +99,9 @@ SCORE_POINTS_PER_STEP = 2
 # that is not retired, at the tiers `llm::reasoning::supported_efforts` gives
 # it on any route.
 MODELS = {
+    "claude-fable-5-2": ("Claude Fable 5.2", {"chat": CODING_EFFORTS}),
+    "gemini-4-argon": ("Gemini 4 Argon", {"chat": ["low", "medium", "high"]}),
+    "gemini-4-carbon": ("Gemini 4 Carbon", {"chat": ["low", "medium", "high"]}),
     "claude-haiku-5-5": ("Claude Haiku 5.5", {
         "chat": CODING_EFFORTS, "claude_code": CODING_EFFORTS}),
     "claude-sonnet-5-5": ("Claude Sonnet 5.5", {
@@ -127,6 +135,11 @@ FIT_MODELS = [
     "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
 ]
 
+# Keep the established coding scale fixed on additive model releases, just as
+# FIT_MODELS anchors the independent view. A deliberate full recalibration can
+# revise this cohort; a newly measured model must not rescale existing bands.
+CODING_SCALE_MODELS = set(FIT_MODELS) | {"gemini-3.8-flash"}
+
 
 def read_csv(path):
     with open(path, newline="") as f:
@@ -146,6 +159,51 @@ def two_figures(value):
     return float(f"{value:.2g}")
 
 
+def observation_key(row, seen, source, efforts_only=False):
+    model, effort = row["model"], row["effort"]
+    if model not in MODELS or effort not in {e for es in MODELS[model][1].values() for e in es}:
+        raise ValueError(f"{source}: unknown model/effort {model}={effort}")
+    key = (model, effort)
+    if (effort if efforts_only else key) in seen:
+        raise ValueError(f"{source}: duplicate observation {model}={effort}")
+    return key
+
+
+def coding_observations(rows):
+    found = {}
+    for row in rows:
+        key = observation_key(row, found, "aa_coding.csv")
+        score = float(row["score"])
+        if not math.isfinite(score) or not 0 <= score <= 1:
+            raise ValueError(f"aa_coding.csv: {key[0]}={key[1]} needs a finite score in [0, 1]")
+        found[key] = score
+    return found
+
+
+def normalize_efforts(found):
+    """Operational estimates use a monotone envelope, not raw benchmark ranks.
+
+    Keep observations intact. A downward fluctuation is insufficient evidence
+    to demote a higher effort; preserve ties without inventing strict gains.
+    coding_estimated continues to describe missing coding-index coverage,
+    rather than whether a covered score was smoothed.
+    """
+    for model in sorted({model for model, _ in found}):
+        for profile in ("general", "coding"):
+            previous = None
+            for effort in ["none"] + CODING_EFFORTS:
+                row = found.get((model, effort))
+                if row is None:
+                    continue
+                score = row[profile]
+                if previous is not None and score < previous:
+                    print(f"normalized {model}={effort} {profile}: downward effort inversion; "
+                          "using the preceding effort estimate (review source variant/harness)",
+                          file=sys.stderr)
+                    row[profile] = previous
+                previous = row[profile]
+
+
 class Inputs:
     def __init__(self, folder):
         folder = Path(folder)
@@ -153,12 +211,12 @@ class Inputs:
         for row in read_csv(folder / "aa_rungs.csv"):
             if row["model"] not in MODELS:
                 sys.exit(f"aa_rungs.csv names {row['model']}, which MODELS lacks")
-            self.aa.setdefault(row["model"], {})[row["effort"]] = {
+            key = observation_key(row, self.aa.get(row["model"], {}), "aa_rungs.csv", efforts_only=True)
+            self.aa.setdefault(key[0], {})[key[1]] = {
                 key: number(row[key])
                 for key in ("score", "cost_usd", "time_s", "output_tokens_m", "output_speed_tps")
             }
-        self.coding = {(row["model"], row["effort"]): float(row["score"])
-                       for row in read_csv(folder / "aa_coding.csv")}
+        self.coding = coding_observations(read_csv(folder / "aa_coding.csv"))
         eci = {row["Model"]: float(row["eci"]) for row in read_csv(folder / "eci_scores.csv")}
         self.eci = {model: eci[name] for model, (name, _) in MODELS.items() if name in eci}
         self.price_out = output_prices_today()
@@ -274,6 +332,7 @@ def estimates(inputs):
                 "time": two_figures(blend(aa["time_s"], time) if aa["time_s"] else time),
             }
     add_coding(out, inputs.coding)
+    normalize_efforts(out)
     for row in out.values():
         row["shipped_cost"] = shipped_cost(row, out[REFERENCE], inputs.price_out)
     return out
@@ -284,7 +343,8 @@ def add_coding(found, coding):
     pair's coding score. A pair the index lacks adds its model's mean measured
     gap to its general score, so one model's pairs stay on one scale."""
     coding = {key: v for key, v in coding.items() if key[0] not in CODING_UNMEASURED}
-    both = [(coding[key], row["general"]) for key, row in found.items() if key in coding]
+    both = [(coding[key], row["general"]) for key, row in found.items()
+            if key in coding and key[0] in CODING_SCALE_MODELS]
     mean_c, mean_g = (statistics.mean(v) for v in zip(*both))
     spread = statistics.stdev(g for _, g in both) / statistics.stdev(c for c, _ in both)
 
@@ -389,7 +449,7 @@ def render(pairs, surfaces):
     return (
         "{\n"
         f'  "_note": {json.dumps(note)},\n'
-        f'  "source": {json.dumps(SOURCE)},\n'
+        f'  "source": {json.dumps(SOURCE + " Capability estimates use a nondecreasing effort envelope; covered coding scores may be smoothed.")},\n'
         f'  "estimated": "{date.today().isoformat()}",\n'
         '  "pairs": [\n'
         f"{one_per_line(pairs, 4)}\n"

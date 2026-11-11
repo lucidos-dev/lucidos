@@ -181,6 +181,63 @@
     white-space: nowrap;
 }
 
+/* The agent pause (ADR 0649): a muted line above the composer while typed
+   messages stay between people. Resume packs right of the words. */
+.agent-pause-strip {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-bottom: 0.375rem;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+}
+.agent-pause-strip-text strong {
+    color: var(--text-primary);
+    font-weight: 600;
+}
+.agent-pause-strip-resume {
+    font-size: var(--font-size-xs);
+    padding: 0.125rem 0.625rem;
+}
+.agent-pause-strip-failed {
+    color: var(--accent-red);
+}
+
+/* The mentions on offer while an @ word is typed (ADR 0649). */
+.mention-suggestions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+    margin-bottom: 0.375rem;
+}
+.mention-suggestion {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.375rem;
+    padding: 0.125rem 0.625rem;
+    /* Opaque: the row sits over the transcript, which must not show through. */
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-round);
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+    cursor: pointer;
+}
+@media (hover: hover) {
+    .mention-suggestion:hover {
+        border-color: var(--accent);
+    }
+}
+.mention-suggestion:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+.mention-suggestion-hint {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
 /* Side-question mode: Send asks the box as a side question. The × leaves it. */
 .side-question-mode-pill {
     display: inline-flex;
@@ -2256,6 +2313,34 @@ button.initiator-actor,
 .initiator-panel-bubble .initiator-body {
     display: flex;
     justify-content: flex-end;
+}
+/* A teammate's message reads as theirs: the bubble, the meta row and the name
+   all sit left. The name leads the meta row, parted from the timestamp by a
+   dot. The row takes a modifier class, because the turn-meta contract pins
+   `.initiator-meta` itself to the right. */
+.initiator-meta-teammate,
+.initiator-panel-teammate .initiator-body {
+    justify-content: flex-start;
+}
+/* The row never wraps: a long name truncates instead. A wrap would leave the
+   dot at the end of line one, parting nothing. */
+.initiator-meta-teammate {
+    flex-wrap: nowrap;
+    min-width: 0;
+}
+.initiator-meta > .initiator-sender {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    line-height: var(--turn-header-line);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+.initiator-sender-dot {
+    flex: none;
+    color: var(--text-muted);
 }
 .user-bubble {
     background: var(--picked-surface);

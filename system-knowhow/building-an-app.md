@@ -85,15 +85,21 @@ The host carries them in the frame URL, so they are visible there. Never put a c
 
 **Transparent: a widget with its own shape.** A tile draws a rounded surface behind the widget. Set `"transparent": true` for a widget that draws its own shape, such as a round clock: its tile and page are then see-through. Give the shape a fill of its own.
 
-**The widget box.** Seven rules, one contract for a thread card and a dashboard tile:
+**The widget box.** Eight rules, one contract for a thread card and a dashboard tile:
 
 1. **A widget draws into a widget box.** The box is fixed at its size. The host sets it, and content never sizes it.
 2. **The same box everywhere a size applies:** the thread card and a dashboard tile. What the thread shows is what a dashboard shows.
 3. **Read the size, never measure the page for it.** Style under `html[data-widget-size="small"]` and its siblings, or read `lucidos.widget.size()` and listen on `lucidos.widget.onSize()`. The document's viewport is the box, so `100%`, `100vh` and container units all mean the box.
 4. **Fit by dropping content, never by shrinking it.** Type stays on the theme tokens, in rem, so the UI scale reaches it. A smaller size shows less: the one value at small, the pick and its alternatives at medium, the full answer at large, the full answer beside its context at xl.
-5. **Never scroll inside the box.** Content past it is clipped under a fade, and the widget menu's Open in Canvas shows the widget full size. Where a dashboard or a thread is narrower than an XL box, the host clamps the tile or card and scrolls the box sideways. The widget still sees `xl` and its true 42.75rem width, and never scrolls itself. A sideways drag on a clamped XL widget pans the box, so the widget gets no pane swipe there.
+5. **Never scroll inside the box.** Content past its bottom or right edge is clipped under a fade, and the widget menu's Open in Canvas shows the widget full size. Where a dashboard or a thread is narrower than an XL box, the host clamps the tile or card and scrolls the box sideways. The widget still sees `xl` and its true 42.75rem width, and never scrolls itself. A sideways drag on a clamped XL widget pans the box, so the widget gets no pane swipe there.
 6. **Declare only the sizes you draw well.** A size the widget no longer declares, as after an update, falls back. The card or tile shows the nearest smaller declared size, else the nearest larger.
 7. **Two places have no size.** In Canvas the widget is a full page. In a question option it is as tall as its content, under the option's label. There `lucidos.widget.size()` returns `null`.
+8. **The widget fit check tells you what each box cuts off.** After you create a widget or write its `.html`, `.css`, `.js` or `manifest.json`, the tool result carries a `[WIDGET FIT]` note. An open Lucidos window renders every declared size on the desk tile and on a 360 px phone column. It uses the largest UI scale any device uses.
+   - A pass is one line: `fits small and large on the desk tile and the phone column`. Anything else names the size, the surface, the frame px and the cut text. Fix each line, then run `widgets(action="fit")` again.
+   - It counts text past an edge of the box, text an `overflow: hidden` ancestor cuts, text an ellipsis cuts, and media past an edge.
+   - Never cut data text in a widget with an ellipsis. Show less instead, and let the rest wrap.
+   - `not checked` is never a pass. It means no window could render the widget, as in a trigger run with no window open.
+   - A widget with a required param is checked without its params, so its note says `not checked with params`. Fix what it names. To see its real content, embed it with params in a reply.
 
 Sizes are names, never pixels. A cell is one size in rem, and a narrow phone column draws the cells smaller, as a narrow dashboard does.
 
@@ -261,7 +267,7 @@ An app opens in the *content pane*. On a laptop that is one column of a split la
 
 **The page never scrolls sideways.** `sdk-iframe.css` clips `<html>` and `<body>` on the x axis and caps images and video at `max-width: 100%`. So a too-wide element is **cut off** at the right edge, not scrollable. The clip hides the bug; it does not fix it. When something is cut off, find the element and fix it:
 
-- **Text that can grow wraps or shrinks.** Never put `flex: none` and `white-space: nowrap` on text that holds user data or a free-text note: it grows to the text's width. Use `flex: 0 1 auto; min-width: 0;` and let it wrap, or ellipsize it with `overflow: hidden; text-overflow: ellipsis`.
+- **Text that can grow wraps or shrinks.** Never put `flex: none` and `white-space: nowrap` on text that holds user data or a free-text note: it grows to the text's width. Use `flex: 0 1 auto; min-width: 0;` and let it wrap, or ellipsize it with `overflow: hidden; text-overflow: ellipsis`. A widget never ellipsizes data text: it shows less (§ The widget box, rule 8).
 - **A flex or grid child that should shrink takes `min-width: 0`.** Its default minimum is its content width, so one long word holds the whole row open.
 - **Never size with `100vw`.** It ignores the pane's padding. Use `width: 100%`.
 - **A sideways scroller is its own element.** A chip row or a wide table goes in a container with `overflow-x: auto`, and only that container scrolls.

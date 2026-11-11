@@ -2,6 +2,8 @@ import { API, json } from './_core';
 import type { App, AppReveal, TileSize, WidgetSize } from '../../store/types';
 import type { Dashboard } from '../../generated/thread-event-wire';
 import type { WidgetParams } from '../../utils/widgetParams';
+import type { FitFinding } from '@lucidos/widget-frame';
+import { readDeviceId } from '../../utils/deviceIdHeader';
 
 /** A widget on a dashboard, as its manifest describes it
  *  (`engine::dashboard::WidgetTile`). */
@@ -133,4 +135,17 @@ export function makeWidgetReusableApi(appId: string): Promise<unknown> {
 
 export function stopReusingWidgetApi(appId: string): Promise<unknown> {
   return post('/widgets/stop-reusing', { app_id: appId });
+}
+
+/** Where a widget fit check draws a box (`engine::widget_fit::FitSurface`). */
+export type WidgetFitSurface = 'desk-tile' | 'phone-column';
+
+/** What one box measured, or why it could not, as
+ *  `engine::widget_fit::FitBoxReport` reads it. */
+export type WidgetFitBox = { surface: WidgetFitSurface; size: WidgetSize }
+  & ({ box: { width: number; height: number }; findings: FitFinding[]; total: number } | { error: string });
+
+/** Answer a widget fit check. Only the device the check names may. */
+export function postWidgetFitReportApi(requestId: string, boxes: WidgetFitBox[]): Promise<unknown> {
+  return post('/widgets/fit-report', { request_id: requestId, device_id: readDeviceId(), boxes });
 }

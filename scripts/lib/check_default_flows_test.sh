@@ -136,6 +136,32 @@ expect "a drifted copy fails under forced colour" fail "$repo" "$PLAN_SKILL: its
 echo "test: the real tree passes"
 expect "the repository's own copies match" pass "$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 
+# These are flow contracts, not checkpoint policy: the engine owns whether
+# a named checkpoint pays. Pin the shared boundary and successor entry so a
+# new retry instruction cannot silently bypass them on either backend.
+echo "test: hardening iteration continuation contract"
+root="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+flow="$root/$FLOWS/hardening.md"
+playbook="$root/$HARDEN"
+contract_has() { # <file> <literal> <label>
+    if grep -qF -- "$2" "$1"; then pass "$3"; else fail "$3"; fi
+}
+contract_has "$flow" 'lucidos successor offer --at harden-iteration --default-floor' 'shared flow evaluates the iteration checkpoint'
+contract_has "$flow" 'Skip this checkpoint once' 'successor avoids an immediate handoff loop'
+contract_has "$flow" 'review head' 'shared continuation preserves incremental review'
+contract_has "$flow" 'suite' 'shared continuation carries verification state'
+contract_has "$playbook" '## Iteration boundary' 'all retry routes have one boundary'
+contract_has "$playbook" 'Every "return to Phase 1" routes through' 'retry instructions cannot bypass the boundary'
+contract_has "$playbook" 'Resume at scope selection' 'successor bypasses destructive initialization'
+contract_has "$playbook" 'Phase 4.5 validates retained suite evidence' 'successor validates retained suite evidence at verification'
+entry="$(sed '/^## Phase 0:/,$d' "$playbook")"
+if [[ "$entry" == *'Iteration successor entry'* ]]; then
+    pass 'continuation dispatch precedes destructive initialization'
+else
+    fail 'continuation dispatch precedes destructive initialization'
+fi
+contract_has "$playbook" 'Do not route a historical FAIL through the retry boundary again.' 'fixed historical failures cannot trigger another handoff'
+
 echo ""
 echo "passed: $PASS, failed: $FAIL"
 [ "$FAIL" -eq 0 ]

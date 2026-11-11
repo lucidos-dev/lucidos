@@ -2581,6 +2581,7 @@ async fn recent_subscriptions_skips_waits_another_thread_ended() {
             user_agent: None,
             mode: crate::engine::thread_events::ActorMode::Agent,
             source_thread_id: Some(Uuid::new_v4()),
+            emitting_trigger_id: None,
         }),
     )
     .await;
@@ -2626,6 +2627,7 @@ async fn recent_subscriptions_counts_self_wakes_unattributed_wakes_and_timeouts(
             user_agent: None,
             mode: crate::engine::thread_events::ActorMode::Agent,
             source_thread_id: Some(waiter),
+            emitting_trigger_id: None,
         }),
     )
     .await;
@@ -2709,6 +2711,7 @@ async fn recent_subscriptions_resets_on_a_human_answer_only() {
             user_agent: None,
             mode: crate::engine::thread_events::ActorMode::Human,
             source_thread_id: None,
+            emitting_trigger_id: None,
         },
     ))
     .await

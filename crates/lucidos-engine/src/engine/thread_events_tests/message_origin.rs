@@ -213,6 +213,7 @@ fn message_origin_mode_derives_human_for_device_and_api() {
         user_agent: None,
         mode: ActorMode::Human,
         source_thread_id: None,
+        emitting_trigger_id: None,
     };
     assert_eq!(device.mode(), ActorMode::Human);
     assert_eq!(api.mode(), ActorMode::Human);
@@ -373,6 +374,7 @@ fn only_a_verified_subprocess_names_a_source_thread() {
         user_agent: None,
         mode: ActorMode::Agent,
         source_thread_id: Some(thread),
+        emitting_trigger_id: None,
     };
     let elsewhere = MessageOrigin::Workspace {
         workspace: "dev".to_string(),

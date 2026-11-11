@@ -510,6 +510,21 @@ impl LucidosEngine {
         )
     }
 
+    /// Input/output limits belong to the selected wire model, including a
+    /// user-created alias whose registry identity has a different name.
+    pub(crate) fn request_budget_model_for(
+        &self,
+        model: &str,
+        chosen: Option<crate::llm::ProviderKind>,
+    ) -> String {
+        let configured = self.current_provider().configured_providers();
+        crate::llm::model_registry::resolve_route(&self.model_registry, model, chosen, |kind| {
+            configured.as_ref().is_none_or(|set| set.contains(&kind))
+        })
+        .map(|route| route.wire_id)
+        .unwrap_or_else(|_| model.to_string())
+    }
+
     /// Whether the installed LLM provider can actually serve calls. `false` only
     /// when the engine has no provider configured (the `UnconfiguredProvider`
     /// sentinel — packaged first run, before a credential is added). Reflects a

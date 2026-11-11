@@ -12,6 +12,7 @@ import { originPopoverHasContent, resolveOrigin } from './messageOrigin';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { appsList, contextViewer, repositories } from '../../store/store';
 import { devices } from '../../store/actions/devices';
+import { operators } from '../../store/actions/operators';
 import { pairedDevices } from '../../store/actions/pairedDevices';
 import type { EngineReason, Exchange, StoredEvent, ThreadMeta } from '../../store/thread-events';
 
@@ -568,6 +569,18 @@ describe('renderChannelSection', () => {
     seedDevice('d1', 'Chrome on Mac');
     const node = renderChannelSection({ kind: 'device', device_id: 'd1' });
     expect(JSON.stringify(node)).toContain('Chrome on Mac');
+  });
+  it('device origin names the person on a team gateway, and not on a personal one', () => {
+    seedDevice('d1', 'Chrome on Mac');
+    const holder = (id: string, name: string, device_ids: string[]) => ({ id, name, emails: [], device_ids });
+    operators.value = {
+      status: 'loaded',
+      data: { operators: [holder('o1', 'Owner', ['mine']), holder('o2', 'Sam', ['d1'])], relayed: [] },
+    };
+    expect(JSON.stringify(renderChannelSection({ kind: 'device', device_id: 'd1' }))).toContain('Sam');
+    operators.value = { status: 'loaded', data: { operators: [holder('o2', 'Sam', ['d1'])], relayed: [] } };
+    expect(JSON.stringify(renderChannelSection({ kind: 'device', device_id: 'd1' }))).not.toContain('Person');
+    operators.value = { status: 'not-loaded' };
   });
   // The raw user-agent is machine words: it lives in Technical details.
   it('api origin names an outside app in words, not by its user-agent', () => {

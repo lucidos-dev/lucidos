@@ -5,6 +5,7 @@ import { AppIcon } from '../shared/AppIcon';
 import { messageRoutePanel, closeMessageRoutePanel, contextViewer, triggers, threadMap, repositories, appsList, workspaceName } from '../../store/store';
 import { loadApps } from '../../store/actions/apps';
 import { turnDeviceName } from '../../store/actions/devices';
+import { operators, personName } from '../../store/actions/operators';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import {
   openThreadAcrossWorkspaces,
@@ -515,13 +516,23 @@ export function renderChannelSection(
   deviceLabel = 'Device',
 ): preact.JSX.Element | null {
   switch (origin.kind) {
-    case 'device':
+    case 'device': {
+      const person = personName(operators.value, origin.device_id);
       return (
-        <div class="route-row">
-          <strong>{deviceLabel}</strong>
-          <span>{turnDeviceName(origin.device_id)}</span>
-        </div>
+        <>
+          {person && (
+            <div class="route-row">
+              <strong>Person</strong>
+              <span>{person}</span>
+            </div>
+          )}
+          <div class="route-row">
+            <strong>{deviceLabel}</strong>
+            <span>{turnDeviceName(origin.device_id)}</span>
+          </div>
+        </>
       );
+    }
     case 'api': {
       // `source_thread_id` is set when the engine recognised this request
       // as coming from a Lucidos-spawned subprocess (CC, run_bash,

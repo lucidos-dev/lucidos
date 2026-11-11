@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 import { getSummaryTree, getSummaryTreeThreads, getRecallZoom, getRecallDate } from '../../api/client';
 import { summaryTreesVersion } from '../../store/store';
+import { operatorName, operators } from '../../store/actions/operators';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { useVersionedRefresh } from '../../hooks/useVersionedRefresh';
@@ -71,6 +72,9 @@ function TreeLineRow({ line }: { line?: RecallLine }) {
   const showLoading = useDelayedLoading(opened);
   const span = line ? lineSpan(line.id) : null;
   const kinded = line ? entryKindOf(line.text) : null;
+  const sender = kinded?.kind === 'prompt (human)' && line?.sender_device_id
+    ? operatorName(operators.value, line.sender_device_id)
+    : null;
 
   const read = useCallback(async (): Promise<Opened> => {
     const id = line!.id;
@@ -112,7 +116,7 @@ function TreeLineRow({ line }: { line?: RecallLine }) {
             <SkBlock w="4.5rem" h="1rem" round>
               <span class="tree-line-span">{span !== null && entriesLabel(span)}</span>
             </SkBlock>
-            {kinded?.kind && <span class="tree-line-kind" data-kind={kinded.kind}>{ENTRY_KIND_LABELS[kinded.kind]}</span>}
+            {kinded?.kind && <span class="tree-line-kind" data-kind={kinded.kind}>{sender ?? ENTRY_KIND_LABELS[kinded.kind]}</span>}
             {date && <DateLabel date={date} />}
           </span>
           <SkText class="tree-line-text" w="18rem">{kinded?.text}</SkText>

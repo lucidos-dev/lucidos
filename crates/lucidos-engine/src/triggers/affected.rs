@@ -267,7 +267,7 @@ mod tests {
             go_to_review: false,
             group_id: None,
             side_effect_grant: vec![],
-            permission_wait: None,
+            coding_agent_grant: false,
             context_ceiling: None,
             mcp_servers: vec![],
             plugin_id: None,

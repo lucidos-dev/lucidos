@@ -17,7 +17,8 @@ import { unsentMessages } from '../../store/unsentMessages';
 import { withScrollAnchor } from './CreateThreadView';
 import { QuestionBody } from './QuestionCard';
 import { agentExitCopy } from './agentExitCopy';
-import { originPopoverHasContent } from './messageOrigin';
+import { teammateName } from '../../store/actions/operators';
+import { originPopoverHasContent, resolveOrigin } from './messageOrigin';
 import { pendingAnswers, unsentPicks } from '../../store/pendingDecisions';
 import { CommandPermissionBody, McpPermissionBody, PermissionBody, engineResolutionNote, pendingVerdicts } from './PermissionCard';
 import { ChildCompletionRow, ChildMovedOutRow, ChildStoppedRow } from './ChildCompletionRow';
@@ -38,6 +39,10 @@ import type { BoundaryTurn } from './chat-exchange-parts';
 import { EditIcon, TrashIcon, PowerIcon, PersonIcon, ApiPlugIcon, TriggerFiredIcon, WarningIcon, ContinuedIcon } from '../shared/icons';
 import { useOnScreenInTranscript } from '../../hooks/useOnScreenInTranscript';
 import { engineReasonHeadline } from '../../utils/engineEventExplainers';
+import { lazyComponent } from '../../utils/lazyComponent';
+
+// Only a team thread records a pause, so the first frame skips it.
+const AgentPauseRow = lazyComponent(() => import('./AgentPauseRow').then((m) => m.AgentPauseRow));
 
 // Stable refs so the `loadedOr` fallback does not yield a fresh [] each render.
 // Without these, every dependent useMemo invalidates on every render while
@@ -443,6 +448,10 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   // it gets a header naming who spoke. The talker's greeting is the card this
   // changes, the caller's own bubbles being chromeless already.
   const isSpeechOnly = isSpeechOnlyTurn(exchange);
+  // A teammate's bubble names its sender and aligns left. Reading
+  // `teammateName` subscribes this turn to `operators`.
+  const senderOrigin = isUserMessageBubble ? resolveOrigin(exchange) : undefined;
+  const teammate = senderOrigin?.kind === 'device' ? teammateName(senderOrigin.device_id) : null;
   const isChromeless = isUserMessageBubble || isChangePanel || isSpeechOnly || initiator.chromeless === true;
   // Every chipless turn is exempt from the fold, on report. A change turn's body
   // is a summary, a description and a file list; a user message is the reader's
@@ -689,6 +698,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
         // terminal guard.
         onBodyClick={handleLinkClick}
         bubble={isUserMessageBubble}
+        teammate={teammate}
         chromeless={isChromeless}
         collapsible={canCollapseInitiator}
         collapsed={isInitiatorCollapsed}
@@ -1697,6 +1707,23 @@ export function describeInitiator(
         ),
       };
     }
+    // A message kept between people (ADR 0649). It reads like any typed
+    // message: the bubble, and the sender's name when it is a teammate's.
+    case 'PeopleMessagePosted':
+      return youInitiator({
+        details: userMessageHtml || userImageHashes.length > 0
+          ? <UserMessageBody html={userMessageHtml} imageHashes={userImageHashes} />
+          : undefined,
+      });
+    case 'AgentPaused':
+    case 'AgentResumed':
+      return {
+        variant: 'system',
+        icon: null,
+        label: '',
+        chromeless: true,
+        details: <AgentPauseRow paused={ev.type === 'AgentPaused'} cause={ev.cause} actor={ev.actor} />,
+      };
     case 'McpConsentRequested':
       // Iconless action label (ResponseCanceled style). No answer is ever
       // recorded, so its chip opens no popover. No body component: nothing

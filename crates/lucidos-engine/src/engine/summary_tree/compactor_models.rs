@@ -623,8 +623,8 @@ mod tests {
         let all = ProviderKind::ALL;
         assert_eq!(
             resolved(&registry, &all),
-            Some(("gpt-6.1-sol", "low", OpenAi)),
-            "every provider configured"
+            Some(("gpt-6.1-sol", "low", ChatGptPlan)),
+            "every provider configured: a signed-in plan leads the GPT row"
         );
         assert_eq!(
             resolved(&registry, &[Anthropic]),

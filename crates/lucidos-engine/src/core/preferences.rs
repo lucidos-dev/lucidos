@@ -316,6 +316,22 @@ impl PreferenceStore {
         Ok(map)
     }
 
+    /// Every registered device's own row for `key`, as `(device_id, value)`.
+    /// A row left under a removed device is not anyone's setting.
+    pub async fn device_values(
+        pool: &PgPool,
+        key: &str,
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT p.device_id, p.value FROM preferences p \
+             JOIN devices d ON d.id = p.device_id \
+             WHERE p.key = $1 ORDER BY p.device_id ASC",
+        )
+        .bind(key)
+        .fetch_all(pool)
+        .await
+    }
+
     /// Delete a global preference row. **Private on purpose**:
     /// [`Self::delete`] is the reachable mutator, and it emits.
     async fn delete_row(pool: &PgPool, key: &str) -> Result<bool, sqlx::Error> {
@@ -1364,6 +1380,22 @@ mod tests {
             prefs::BACKUP_RETENTION.default_number()
         );
         assert_eq!(prefs::LANGUAGE.read(&pool).await, None);
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// I1 of the command-guard plan: no row runs guarded, and only an explicit
+    /// `false` turns the guard off.
+    #[tokio::test]
+    async fn the_command_guard_is_on_without_a_row_and_off_only_when_stored_off() {
+        let (pool, db_name) = setup_test_db().await;
+        assert!(prefs::COMMAND_GUARD.read(&pool).await);
+        for (stored, on) in [("true", true), ("false", false)] {
+            PreferenceStore::set_row_for_test(&pool, prefs::COMMAND_GUARD.key(), stored)
+                .await
+                .unwrap();
+            assert_eq!(prefs::COMMAND_GUARD.read(&pool).await, on, "{stored}");
+        }
         pool.close().await;
         teardown_test_db(&db_name).await;
     }

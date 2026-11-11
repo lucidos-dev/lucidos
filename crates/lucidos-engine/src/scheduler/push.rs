@@ -364,6 +364,7 @@ async fn fan_out_os_surface(
     // here. A connected client still needs the toast or the native banner, and
     // the "nobody reachable" bail comes once the client count is known.
     let audience = push_audience(pool, notification_id, &tap, link_event_id).await;
+    let push_group = read_push_group(pool, notification_id).await;
     let subs_with_ua: Vec<_> = match PushSubscriptionStore::get_push_enabled(pool).await {
         Ok(subs) => subs
             .into_iter()
@@ -484,6 +485,7 @@ async fn fan_out_os_surface(
                     unread_counts.get(&sub.device_id).copied().flatten(),
                     cross_workspace_total,
                 ),
+                push_group.as_ref(),
             )
             .to_string();
             (sub, payload_bytes)
@@ -567,6 +569,21 @@ fn schedule_mac_chromium_wakes(
     }
 }
 
+/// The push group a notification's row recorded. A lookup that fails sends an
+/// ordinary push, which still reaches everyone it should.
+async fn read_push_group(
+    pool: &PgPool,
+    notification_id: Option<uuid::Uuid>,
+) -> Option<crate::scheduler::notifications::PushGroup> {
+    let id = notification_id?;
+    crate::scheduler::NotificationStore::push_group(pool, id)
+        .await
+        .unwrap_or_else(|e| {
+            log!("[Push] Cannot read the push group (ungrouped): {}", e);
+            None
+        })
+}
+
 /// Who a notification's OS push reaches: the audience its row recorded
 /// (ADR 0623). A push with no notification works the audience out from the
 /// thread it opens. Any lookup that fails reaches the whole team: a push must
@@ -576,8 +593,8 @@ async fn push_audience(
     notification_id: Option<uuid::Uuid>,
     tap: &crate::scheduler::notifications::Tap,
     link_event_id: Option<uuid::Uuid>,
-) -> crate::engine::work_item::Audience {
-    use crate::engine::work_item::{audience_of_notification, Audience};
+) -> crate::engine::thread_people::Audience {
+    use crate::engine::thread_people::{audience_of_notification, Audience};
     let resolved = match notification_id {
         Some(id) => crate::scheduler::NotificationStore::audience(pool, id)
             .await
@@ -844,6 +861,7 @@ async fn send_wake_push_to_device(
 
     let unread_count = read_unread_count(pool, &reader).await;
     let cross_workspace_total = cross_workspace_unread_total(&subscriptions).await;
+    let push_group = read_push_group(pool, Some(notification_id)).await;
     let deliveries: Vec<(PushSubscription, String)> = subscriptions
         .into_iter()
         .map(|sub| {
@@ -856,6 +874,7 @@ async fn send_wake_push_to_device(
                     unread_count,
                     cross_workspace_total,
                 ),
+                push_group.as_ref(),
             )
             .to_string();
             (sub, payload_bytes)
@@ -1338,6 +1357,7 @@ fn build_wake_payload(
     notification: &crate::scheduler::notifications::Notification,
     ios_scope_url: Option<&str>,
     app_badge: Option<i64>,
+    push_group: Option<&crate::scheduler::notifications::PushGroup>,
 ) -> serde_json::Value {
     fit_payload_body(
         &plain_text_body(&notification.message),
@@ -1356,12 +1376,16 @@ fn build_wake_payload(
                 app_badge,
             );
             payload["wake"] = serde_json::Value::Bool(true);
+            if let Some(group) = push_group {
+                group.apply(&mut payload);
+            }
             payload
         },
     )
 }
 
-/// [`build_push_payload`] with the body fitted to the transport ceiling.
+/// [`build_push_payload`] with the body fitted to the transport ceiling, and
+/// the notification's push group stamped on before each measurement.
 ///
 /// Every send path builds through this. `build_push_payload` stays the pure
 /// envelope builder underneath, so the wire shape is testable without the size
@@ -1378,9 +1402,10 @@ fn build_push_payload_fitted(
     tap: &crate::scheduler::notifications::Tap,
     ios_scope_url: Option<&str>,
     app_badge: Option<i64>,
+    push_group: Option<&crate::scheduler::notifications::PushGroup>,
 ) -> serde_json::Value {
     fit_payload_body(body, "notification", |candidate_body| {
-        build_push_payload(
+        let mut payload = build_push_payload(
             source_generation,
             title,
             candidate_body,
@@ -1391,7 +1416,11 @@ fn build_push_payload_fitted(
             tap,
             ios_scope_url,
             app_badge,
-        )
+        );
+        if let Some(group) = push_group {
+            group.apply(&mut payload);
+        }
+        payload
     })
 }
 

@@ -1013,27 +1013,61 @@ pub enum ThreadEvent {
     ThreadTriageProposed {
         entries: Vec<super::TriageProposalEntry>,
     },
-    /// Someone became the *driver* of this work item (ADR 0623), on its
-    /// family root. The actor names them: a device, or a trigger fire whose
+    /// Someone became the *driver* of this thread's family (ADR 0623), on its
+    /// root. The actor names them: a device, or a trigger fire whose
     /// actor email an operator holds. Recorded by Take, Take over, and by
-    /// answering a gate. Projects nothing: `engine::work_item` folds it.
+    /// answering a gate. Projects nothing: `engine::thread_people` folds it.
     WorkItemDriverTaken,
-    /// The work item's driver gave the role up, on its family root. The work
-    /// item has no driver until someone takes it.
+    /// The root thread's driver gave the role up, on its family root. It has
+    /// no driver until someone takes it.
     WorkItemDriverReleased,
     /// A gate waited on its driver past `driver_timeout_hours`, so it now
     /// reaches the whole team. Recorded once per gate, on the family root.
-    /// The driver keeps the work item.
+    /// The driver keeps the root thread.
     WorkItemGateEscalated {
         /// The thread the question card is on: the root or a sub-thread.
         gate_thread_id: uuid::Uuid,
         tool_use_id: String,
     },
-    /// The actor started watching this work item: its gate pushes reach them
+    /// Someone started watching this root thread: its gate pushes reach them
     /// beside the driver. Recorded on the family root.
-    WorkItemWatched,
-    /// The actor stopped watching this work item, from any of their devices.
+    WorkItemWatched {
+        /// The person a *person mention* made a watcher (ADR 0649). Absent
+        /// means the actor's own person, who tapped Watch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operator_id: Option<String>,
+    },
+    /// The actor stopped watching this root thread, from any of their devices.
     WorkItemUnwatched,
+    /// A person wrote to the other people in this thread, not to its agent: a
+    /// *people-only message* (ADR 0649). The meta actor names the sender.
+    ///
+    /// **`Metadata`, and that is why it is not a `MessageReceived`.** It starts
+    /// no turn and is never injected into a running one. The agent reads it as
+    /// context on its next woken turn.
+    PeopleMessagePosted {
+        text: String,
+        /// Blob hashes of attached images, as on `MessageReceived`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        user_image_hashes: Vec<String>,
+        /// The device the message came from, by id only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_id: Option<String>,
+        /// The operators the message mentions. An operator id, because that is
+        /// the only stable handle for a person. A removed operator's id
+        /// resolves to nobody.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mentioned_operator_ids: Vec<String>,
+    },
+    /// Typed messages in this thread stop waking its agent: the *agent pause*
+    /// (ADR 0649). A running turn carries on. The meta actor names who paused.
+    AgentPaused {
+        cause: super::AgentPauseCause,
+    },
+    /// Typed messages in this thread wake its agent again.
+    AgentResumed {
+        cause: super::AgentPauseCause,
+    },
     /// A thread was created in `composing` state. Emitted by the first
     /// successful POST /threads (debounced first user input: keystroke,
     /// image attach, or mode toggle on a fresh compose). The thread can
@@ -1597,7 +1631,7 @@ pub enum ThreadEvent {
         summary: String,
         /// The grant each "Always allow"-style button stores (ADR 0571). `None`
         /// on a card persisted before the engine stamped it, and on an
-        /// unattended auto-deny, which renders already answered.
+        /// auto-deny, which renders already answered.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         grant_offer: Option<crate::engine::claude_code::GrantOffer>,
     },
@@ -2274,6 +2308,19 @@ pub enum ThreadEvent {
         /// renders at the device pixel ratio, in this format.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         save_format: Option<CaptureFormat>,
+    },
+    /// A *widget fit check*. The chosen page renders the widget at each size,
+    /// on the desk tile and the phone column, at `ui_scale`. It answers with
+    /// `POST /api/v1/widgets/fit-report`.
+    WidgetFitRequested {
+        app_id: String,
+        request_id: String,
+        sizes: Vec<crate::core::apps::WidgetSize>,
+        ui_scale: f64,
+        /// The device that uses `ui_scale`, so the frames' first paint
+        /// carries it. Absent when the workspace-wide scale is the largest.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scale_device_id: Option<String>,
     },
     NavigationRequested {
         payload: String,

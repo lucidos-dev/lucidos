@@ -4679,6 +4679,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "image",
+ "jwt-simple",
  "kamadak-exif",
  "lettre",
  "libc",

@@ -364,7 +364,7 @@ export const PREF_MOBILE_DYNAMIC_BARS = {
   key: "mobile_dynamic_bars",
   scope: "global",
   type: "flag",
-  fallback: "false",
+  fallback: "true",
 } as const;
 
 export const PREF_AUTOMATIC_WIDGETS = {
@@ -737,7 +737,7 @@ export const PREF_COMMAND_GUARD = {
   key: "command_guard",
   scope: "global",
   type: "flag",
-  fallback: "false",
+  fallback: "true",
 } as const;
 
 export const PREF_COMMAND_GUARD_JUDGE = {
@@ -747,18 +747,11 @@ export const PREF_COMMAND_GUARD_JUDGE = {
   fallback: "true",
 } as const;
 
-export const PREF_COMMAND_GUARD_CODING_AGENTS = {
-  key: "command_guard_coding_agents",
+export const PREF_CODING_AGENT_AUTO_ANSWER = {
+  key: "coding_agent_auto_answer",
   scope: "global",
   type: "flag",
-  fallback: "true",
-} as const;
-
-export const PREF_UNATTENDED_PERMISSION_WAIT = {
-  key: "unattended_permission_wait",
-  scope: "global",
-  type: "text",
-  fallback: "30",
+  fallback: "false",
 } as const;
 
 export const PREF_MODEL_COMMAND_JUDGE = {
@@ -925,6 +918,13 @@ export const PREF_PROVIDER_ENABLED_CLAUDE_GATEWAY = {
   fallback: "true",
 } as const;
 
+export const PREF_PROVIDER_ENABLED_CHATGPT_PLAN = {
+  key: "provider_enabled_chatgpt_plan",
+  scope: "global",
+  type: "flag",
+  fallback: "true",
+} as const;
+
 export const PREF_PROVIDER_ENABLED_TYPESAFE = {
   key: "provider_enabled_typesafe",
   scope: "global",
@@ -958,6 +958,13 @@ export const PREF_CLAUDE_GATEWAY_URL = {
   scope: "global",
   type: "text",
   fallback: null,
+} as const;
+
+export const PREF_CHATGPT_PLAN_WELCOME_SHOWN = {
+  key: "chatgpt_plan_welcome_shown",
+  scope: "global",
+  type: "flag",
+  fallback: "false",
 } as const;
 
 export const PREF_SYSTEM_ONE_CUSTOM_URL = {
@@ -1076,8 +1083,7 @@ export const PREFERENCE_CATALOG = {
   "backup_reminder_dismissed": PREF_BACKUP_REMINDER_DISMISSED,
   "command_guard": PREF_COMMAND_GUARD,
   "command_guard_judge": PREF_COMMAND_GUARD_JUDGE,
-  "command_guard_coding_agents": PREF_COMMAND_GUARD_CODING_AGENTS,
-  "unattended_permission_wait": PREF_UNATTENDED_PERMISSION_WAIT,
+  "coding_agent_auto_answer": PREF_CODING_AGENT_AUTO_ANSWER,
   "model_command_judge": PREF_MODEL_COMMAND_JUDGE,
   "reasoning_command_judge": PREF_REASONING_COMMAND_JUDGE,
   "judgment_command_guard": PREF_JUDGMENT_COMMAND_GUARD,
@@ -1101,11 +1107,13 @@ export const PREFERENCE_CATALOG = {
   "provider_enabled_xai": PREF_PROVIDER_ENABLED_XAI,
   "provider_enabled_local": PREF_PROVIDER_ENABLED_LOCAL,
   "provider_enabled_claude_gateway": PREF_PROVIDER_ENABLED_CLAUDE_GATEWAY,
+  "provider_enabled_chatgpt_plan": PREF_PROVIDER_ENABLED_CHATGPT_PLAN,
   "provider_enabled_typesafe": PREF_PROVIDER_ENABLED_TYPESAFE,
   "provider_enabled_cloudflare_workers_ai": PREF_PROVIDER_ENABLED_CLOUDFLARE_WORKERS_AI,
   "provider_enabled_system_one_custom": PREF_PROVIDER_ENABLED_SYSTEM_ONE_CUSTOM,
   "local_base_url": PREF_LOCAL_BASE_URL,
   "claude_gateway_url": PREF_CLAUDE_GATEWAY_URL,
+  "chatgpt_plan_welcome_shown": PREF_CHATGPT_PLAN_WELCOME_SHOWN,
   "system_one_custom_url": PREF_SYSTEM_ONE_CUSTOM_URL,
   "system_one_custom_model": PREF_SYSTEM_ONE_CUSTOM_MODEL,
   "system_one_openrouter_model": PREF_SYSTEM_ONE_OPENROUTER_MODEL,

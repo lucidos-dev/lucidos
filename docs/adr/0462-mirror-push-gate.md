@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-10-12
+- **Amended by**: [0642](0642-mirror-main-moves-last.md): a `v*` tag may name a direct child of `main` while its release is in flight
 
 ## Context
 

@@ -20,8 +20,11 @@ use serde::Deserialize;
 
 use super::error::ApiError;
 use super::AppState;
+use crate::core::prefs::COMMAND_GUARD_JUDGE;
+use crate::engine::aux_purpose::unresolved_judge;
 use crate::engine::event_bus::SystemEvent;
 use crate::engine::release_notices;
+use crate::engine::ContextPurpose;
 
 /// The release this engine reports, which decides what a caller may see or
 /// answer.
@@ -34,12 +37,52 @@ fn running_release() -> Result<semver::Version, ApiError> {
     release_notices::running_release().map_err(ApiError::internal)
 }
 
+/// The workspace facts the notices read. The command guard's exposure needs
+/// the MCP manager and the judge's model selection, which only the running
+/// engine holds.
+async fn notice_facts(state: &AppState) -> release_notices::NoticeFacts {
+    let unapproved_mcp_server = match state.engine.mcp_manager.list_servers().await {
+        Ok(servers) => servers
+            .iter()
+            .any(|server| server.dispatchable && !server.launch_approved),
+        Err(e) => {
+            log!("[ReleaseNotices] Failed to list MCP servers: {}", e);
+            true
+        }
+    };
+    // A judge switched off needs no model, so nothing refuses a turn.
+    let judge_on = match COMMAND_GUARD_JUDGE.try_read(&state.pool).await {
+        Ok(on) => on,
+        Err(e) => {
+            log!("[ReleaseNotices] Failed to read the judge switch: {}", e);
+            true
+        }
+    };
+    let judge_unresolved = judge_on && {
+        let call = state.engine.aux_call(ContextPurpose::CommandJudge).await;
+        unresolved_judge(&state.pool, call.selection(), state.engine.model_registry())
+            .await
+            .is_some()
+    };
+    let exposure = release_notices::GuardExposure {
+        unapproved_mcp_server,
+        judge_unresolved,
+    };
+    release_notices::NoticeFacts::read(
+        &state.pool,
+        &state.workspace_path,
+        &state.engine.trigger_configs,
+        exposure,
+    )
+    .await
+}
+
 /// `GET /api/v1/release-notices`.
 async fn list(
     State(state): State<AppState>,
 ) -> Result<Json<release_notices::NoticeView>, ApiError> {
     let running = running_release()?;
-    let facts = release_notices::NoticeFacts::read(&state.pool, &state.workspace_path).await;
+    let facts = notice_facts(&state).await;
     let cursor = release_notices::stored_cursor(&state.pool).await;
     Ok(Json(release_notices::view(
         release_notices::all(),
@@ -74,7 +117,7 @@ async fn resolve(
     }
     // Before the resolve, which walks the workspace past the notice.
     let actor = crate::api::actor::require_user_actor(&headers, &state.pool, None).await?;
-    let facts = release_notices::NoticeFacts::read(&state.pool, &state.workspace_path).await;
+    let facts = notice_facts(&state).await;
     let moved = release_notices::resolve(&state.pool, notices, &running, &facts, &body.id)
         .await
         .map_err(ApiError::db)?;

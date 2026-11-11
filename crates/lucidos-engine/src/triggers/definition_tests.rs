@@ -2,7 +2,6 @@ use super::{
     ensure_trigger_toml_gitignored, rebuild_trigger_definitions, remove_trigger_definition,
     write_trigger_definition, TriggerDefinition,
 };
-use crate::core::permission_wait::PermissionWait;
 use crate::engine::command_guard::SideEffectCategory;
 use crate::triggers::config::{TriggerConfig, TriggerRun};
 use crate::triggers::EventSubscription;
@@ -34,7 +33,7 @@ fn config(slug: &str, run: TriggerRun) -> TriggerConfig {
         go_to_review: false,
         group_id: None,
         side_effect_grant: vec![],
-        permission_wait: None,
+        coding_agent_grant: false,
         context_ceiling: None,
         mcp_servers: vec![],
         plugin_id: None,
@@ -187,50 +186,22 @@ fn to_trigger_payload_carries_the_provider_pin() {
     assert_eq!(parsed.provider.as_deref(), Some("anthropic"));
 }
 
-/// `permission_wait` is a scalar, so the ordering rule binds it. Each wire form
-/// survives the file and the payload the scheduler parses.
+/// A `trigger.toml` written with the retired permission wait key still
+/// parses. The key is ignored.
 #[test]
-fn roundtrips_each_permission_wait() {
-    for wait in [
-        PermissionWait::Deny,
-        PermissionWait::Minutes(15),
-        PermissionWait::Indefinite,
-    ] {
-        let mut c = config(
-            "nightly-fix",
-            TriggerRun::Intent {
-                intent: "Fix the flaky test".to_string(),
-            },
-        );
-        c.permission_wait = Some(wait);
-        c.on = vec![EventSubscription {
-            event_type: "DayEnded".to_string(),
-            condition: None,
-        }];
-
-        let def = TriggerDefinition::from_config(&c);
-        let toml = def
-            .to_toml()
-            .expect("serialize a trigger with a permission wait");
-        let parsed = TriggerDefinition::from_toml(&toml).expect("parse it back");
-        assert_eq!(parsed.permission_wait, Some(wait), "{toml}");
-
-        let payload = def.to_trigger_payload("id", "my-plugin");
-        let created = TriggerConfig::from_created_payload(&payload).expect("payload parses");
-        assert_eq!(created.permission_wait, Some(wait));
-    }
-}
-
-#[test]
-fn a_trigger_on_the_workspace_wait_writes_no_key() {
+fn a_retired_permission_wait_key_is_ignored() {
     let c = config(
-        "plain",
+        "nightly-fix",
         TriggerRun::Intent {
-            intent: "hi".to_string(),
+            intent: "Fix the flaky test".to_string(),
         },
     );
-    let toml = TriggerDefinition::from_config(&c).to_toml().unwrap();
+    let def = TriggerDefinition::from_config(&c);
+    let toml = def.to_toml().unwrap();
     assert!(!toml.contains("permission_wait"), "{toml}");
+    let old = format!("permission_wait = 15\n{toml}");
+    let parsed = TriggerDefinition::from_toml(&old).expect("an old file still parses");
+    assert_eq!(parsed, def);
 }
 
 #[test]
@@ -257,6 +228,38 @@ fn to_trigger_payload_stamps_provenance_and_forces_event_driven() {
     assert_eq!(parsed.plugin_id.as_deref(), Some("my-plugin"));
     assert!(parsed.schedule.is_empty(), "schedule forced empty");
     assert_eq!(parsed.on.len(), 1);
+}
+
+/// The projection shows a granted trigger, but a plugin can never ship a
+/// grant: the payload omits both, so install creates it ungranted and an
+/// update leaves the owner's own answer alone.
+#[test]
+fn a_shipped_grant_never_reaches_the_payload() {
+    let mut c = config(
+        "on-x",
+        TriggerRun::Intent {
+            intent: "react".to_string(),
+        },
+    );
+    c.coding_agent_grant = true;
+    c.side_effect_grant = vec![SideEffectCategory::Email];
+    let def = TriggerDefinition::from_config(&c);
+    let parsed = TriggerDefinition::from_toml(&def.to_toml().expect("serialize")).expect("parse");
+    assert!(parsed.coding_agent_grant);
+    assert_eq!(parsed.side_effect_grant, [SideEffectCategory::Email]);
+
+    let payload = parsed.to_trigger_payload("new-id", "my-plugin");
+    assert!(payload.get("coding_agent_grant").is_none());
+    assert!(payload.get("side_effect_grant").is_none());
+    let mut created = TriggerConfig::from_created_payload(&payload).expect("payload parses");
+    assert!(!created.holds_a_grant());
+
+    // The owner grants it, and the plugin's next update keeps that answer.
+    created.coding_agent_grant = true;
+    created.side_effect_grant = vec![SideEffectCategory::CloudCli];
+    created.apply_update(&payload);
+    assert!(created.coding_agent_grant);
+    assert_eq!(created.side_effect_grant, [SideEffectCategory::CloudCli]);
 }
 
 #[test]

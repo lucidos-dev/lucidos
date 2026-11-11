@@ -32,12 +32,17 @@ pub const JUDGE_PROVIDER_VAR: &str = "LUCIDOS_EVAL_JUDGE_PROVIDER";
 /// Every provider the judge can be pinned to, in the engine's own vocabulary.
 /// The engine's own list, so a backend it gains is pinnable here at once.
 ///
-/// A Claude gateway is the one exception. Its sign-in lives in a workspace
-/// database, and the eval has none.
+/// A Claude gateway and the ChatGPT plan are the exceptions. Their sign-in
+/// lives in a workspace database, and the eval has none.
 fn provider_kinds() -> Vec<ProviderKind> {
     ProviderKind::ALL
         .into_iter()
-        .filter(|kind| *kind != ProviderKind::ClaudeGateway)
+        .filter(|kind| {
+            !matches!(
+                kind,
+                ProviderKind::ClaudeGateway | ProviderKind::ChatGptPlan
+            )
+        })
         .collect()
 }
 
@@ -359,6 +364,7 @@ pub(crate) fn judge_context(model: &str, registry: &ModelRegistry) -> ProviderBu
         model_registry: registry.clone(),
         not_served: Default::default(),
         claude_gateway_access: None,
+        chatgpt_plan_access: None,
     }
 }
 
@@ -409,7 +415,7 @@ fn how_to_configure(kind: ProviderKind) -> &'static str {
         ProviderKind::XAi => "set LUCIDOS_XAI_API_KEY",
         ProviderKind::OpenCodeFree => "set LUCIDOS_OPENCODE_FREE=1 (keyless, no account)",
         ProviderKind::Local => "set LUCIDOS_LOCAL_BASE_URL",
-        ProviderKind::ClaudeGateway => {
+        ProviderKind::ClaudeGateway | ProviderKind::ChatGptPlan => {
             "use another provider: the eval has no workspace to sign in from"
         }
     }

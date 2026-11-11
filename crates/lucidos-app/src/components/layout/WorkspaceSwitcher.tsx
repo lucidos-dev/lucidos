@@ -48,7 +48,7 @@ import { Disclosure } from '../shared/Disclosure';
 import { SkeletonProvider, SkText, SkBlock } from '../shared/Skeleton';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { CheckIcon, ChevronDownIcon } from '../shared/icons';
-import { listRemoteWorkspaces, listWorkspaces, type WorkspaceStatus } from '../../api/client/control';
+import { listRemoteWorkspaces, listWorkspacesWithOrder, type WorkspaceStatus } from '../../api/client/control';
 import { adoptWorkspaceDisplayName } from '../../store/actions/workspace-label';
 import { showToast, visibleWorkspaceName } from '../../store/store';
 import {
@@ -70,8 +70,14 @@ import {
   recallWorkspaceSwitcherExpanded,
 } from '../../utils/lastWorkspace';
 import { LoadableError } from '../shared/LoadableError';
-import { remoteSwitcherRows } from './RemoteSwitcherRows';
-import { mergeRemoteListings, recallRemoteListings, rememberRemoteListings, type RemoteGatewayView } from '../../utils/remoteWorkspaces';
+import {
+  mergeRemoteListings,
+  recallRemoteListings,
+  rememberRemoteListings,
+  remoteWorkspaceOpenable,
+  type RemoteGatewayView,
+} from '../../utils/remoteWorkspaces';
+import { orderWorkspaces, type OrderedWorkspace } from '../../utils/workspaceOrder';
 import { REMOTE_GATEWAY } from '../../utils/basePath';
 import { workspaceState, workspaceStateLabel } from '../../utils/workspaceState';
 
@@ -85,7 +91,8 @@ const DEFAULT_SKELETON_ROWS = 2;
 const SWITCHER_ACTION_INDENT = 'brand-menu-ws-action-under-dot';
 
 /** What the placeholder has to draw to stand exactly as tall as the list it
- *  replaces: one row per workspace the last listing saw, PLUS the footer.
+ *  replaces: one row per local workspace the last listing saw, one per cached
+ *  remote workspace, PLUS the footer.
  *
  *  The footer is the half that was missing. `workspaceSwitcherList` renders
  *  **Manage workspaces** under every listing that has a picker to reach, so a
@@ -97,9 +104,10 @@ const SWITCHER_ACTION_INDENT = 'brand-menu-ws-action-under-dot';
  *  sites happening to agree about the footer. */
 export function skeletonShape(
   remembered: number | null,
+  remoteRows: number,
   manageHref: string | null,
 ): { rows: number; manage: boolean } {
-  return { rows: remembered ?? DEFAULT_SKELETON_ROWS, manage: manageHref !== null };
+  return { rows: (remembered ?? DEFAULT_SKELETON_ROWS) + remoteRows, manage: manageHref !== null };
 }
 
 /** Whether the list opens unfolded: the device's last choice, but only where
@@ -255,6 +263,89 @@ export interface SwitcherListProps {
   onContext: (id: string) => void;
   /** The unfolded action row was pressed, in the mode it offered. */
   onAlternate: (w: WorkspaceStatus, mode: WorkspaceOpenMode) => void;
+  /** The remote gateways' workspaces, drawn in the same list. */
+  remote: readonly RemoteGatewayView[];
+  /** Why the remote gateways could not be asked, or null. */
+  remoteError: string | null;
+  /** The workspace order, so this list and the picker agree. */
+  order: readonly string[];
+  /** A remote row was activated, in the mode its gesture picked. */
+  onOpenRemote: (route: string, mode: WorkspaceOpenMode) => void;
+}
+
+type RemoteSwitcherEntry = Extract<OrderedWorkspace<WorkspaceStatus>, { kind: 'remote' }>;
+
+/** Remote rows only, until the local listing lands or after it failed. */
+const NO_LOCAL_WORKSPACES: readonly WorkspaceStatus[] = [];
+
+/** Why a remote row cannot be opened. */
+function remoteShutReason(view: RemoteGatewayView): string {
+  if (view.unreachable === null) return 'Not running. Start it on the remote gateway.';
+  const lastSeen = view.lastSeenAt ? ` · Last answer ${new Date(view.lastSeenAt).toLocaleString()}` : '';
+  return `${view.unreachable}${lastSeen}`;
+}
+
+/** A workspace on a remote gateway: a local row's shape with a quiet
+ *  `@gateway` tag. It opens through this gateway's relay. A row its gateway
+ *  cannot open right now stays greyed and shut, and its tooltip says why. */
+function remoteSwitcherRow({ key: route, workspace: w, view }: RemoteSwitcherEntry, props: SwitcherListProps) {
+  const { currentId, onOpenRemote } = props;
+  const state = workspaceState(w);
+  const reachable = remoteWorkspaceOpenable(view, w);
+  const status = reachable ? workspaceStateLabel(w) : remoteShutReason(view);
+  const body = (
+    <>
+      <span class={`ws-picker-dot ws-picker-dot-${state}`} data-tooltip={status} aria-hidden="true" />
+      <span class="brand-menu-ws-name">
+        {w.name} <span class="brand-menu-ws-gateway">@{view.gateway}</span>
+      </span>
+    </>
+  );
+
+  if (route === currentId) {
+    return (
+      <div class="brand-menu-ws-row is-current" role="menuitem" aria-disabled="true" aria-current="page" key={route}>
+        {body}
+        <CheckIcon className="brand-menu-ws-check" />
+      </div>
+    );
+  }
+
+  if (!reachable) {
+    return (
+      <div
+        class="brand-menu-ws-row is-shut"
+        role="menuitem"
+        aria-disabled="true"
+        data-tooltip={status}
+        aria-label={`${w.name} on ${view.gateway} · ${status}`}
+        key={route}
+      >
+        {body}
+      </div>
+    );
+  }
+
+  // An anchor, so a hover shows where the row goes. The gesture still picks the
+  // mode, as on a local row: a new window on the desktop client.
+  const activate = (e: MouseEvent) => {
+    e.preventDefault();
+    const mode = openModeForClick(e);
+    if (mode !== null) onOpenRemote(route, mode);
+  };
+  return (
+    <a
+      class="brand-menu-ws-row"
+      role="menuitem"
+      href={`/${route}/`}
+      aria-label={`Switch to ${w.name} on ${view.gateway} · ${status}`}
+      onClick={activate}
+      onAuxClick={middleClickActivates(state) ? middleClickHandler(activate) : undefined}
+      key={route}
+    >
+      {body}
+    </a>
+  );
 }
 
 /** One workspace. Three shapes, and which one it takes is the whole of this
@@ -380,7 +471,8 @@ function switcherRow(w: WorkspaceStatus, props: SwitcherListProps) {
   );
 }
 
-/** The unfolded list. Pure, so all four `Loadable` states are unit-testable.
+/** The unfolded list: local and remote workspaces in one run, in the
+ *  workspace order. Pure, so all four `Loadable` states are unit-testable.
  *
  *  `not-loaded` / `loading` render nothing at all: the skeleton the caller
  *  crossfades in owns that frame, and content peeking through it is what makes a
@@ -388,7 +480,7 @@ function switcherRow(w: WorkspaceStatus, props: SwitcherListProps) {
  *  as an empty list, and keeps the Manage row, so a gateway that dropped while
  *  the menu was open still leaves a way out. */
 export function workspaceSwitcherList(props: SwitcherListProps) {
-  const { state, currentId, manageHref, contextId, onNavigate, onAlternate } = props;
+  const { state, currentId, manageHref, contextId, onNavigate, onAlternate, remote, remoteError, order } = props;
   if (state.status === 'not-loaded' || state.status === 'loading') return null;
   return (
     <div class="brand-menu-ws-list" role="group" aria-label="Switch workspace">
@@ -411,21 +503,25 @@ export function workspaceSwitcherList(props: SwitcherListProps) {
             right-click is claimed. `contextId` and `state` arrive as independent
             props, so this function cannot assume its caller paired them: a row
             may only carry the action while its own state still justifies one. */}
-        {state.status === 'loaded' &&
-          state.data.flatMap((w) => {
-            const mode = alternateOpenMode(workspaceState(w), currentId, w.id);
-            return [
-              switcherRow(w, props),
-              workspaceActionRow({
-                open: w.id === contextId,
-                id: w.id,
-                name: w.name,
-                mode,
-                indentClass: SWITCHER_ACTION_INDENT,
-                onActivate: (m) => onAlternate(w, m),
-              }),
-            ];
-          })}
+        {orderWorkspaces(state.status === 'loaded' ? state.data : NO_LOCAL_WORKSPACES, remote, order).flatMap((entry) => {
+          if (entry.kind === 'remote') return [remoteSwitcherRow(entry, props)];
+          const w = entry.workspace;
+          const mode = alternateOpenMode(workspaceState(w), currentId, w.id);
+          return [
+            switcherRow(w, props),
+            workspaceActionRow({
+              open: w.id === contextId,
+              id: w.id,
+              name: w.name,
+              mode,
+              indentClass: SWITCHER_ACTION_INDENT,
+              onActivate: (m) => onAlternate(w, m),
+            }),
+          ];
+        })}
+        {remoteError !== null && (
+          <div role="alert"><LoadableError error={remoteError} noun="remote workspaces" /></div>
+        )}
       </div>
       {manageHref !== null && (
         <a
@@ -495,7 +591,9 @@ export function WorkspacesMenuRow({ onClose }: { onClose: () => void }) {
   const canList = WORKSPACE_ID !== null;
   const expanded = useSignal(initiallyExpanded(canList, recallWorkspaceSwitcherExpanded()));
   const list = useSignal<Loadable<WorkspaceStatus[]>>({ status: 'not-loaded' });
+  const order = useSignal<readonly string[]>([]);
   const remote = useSignal<Loadable<RemoteGatewayView[]>>({ status: 'not-loaded' });
+  // The last rows each remote gateway listed, drawn greyed until it answers.
   const cachedRemote = useRef(recallRemoteListings());
   // Sized to the count the last successful listing saw, on this device, so the
   // skeleton does not bounce into the list. Captured once per mount so it holds
@@ -504,7 +602,11 @@ export function WorkspacesMenuRow({ onClose }: { onClose: () => void }) {
   // `undefined` sentinel that means "not captured yet".
   const remembered = useRef<number | null | undefined>(undefined);
   if (remembered.current === undefined) remembered.current = recallLastWorkspaceCount();
-  const skeleton = skeletonShape(remembered.current, manageHref);
+  const skeleton = skeletonShape(
+    remembered.current,
+    cachedRemote.current.reduce((n, view) => n + view.workspaces.length, 0),
+    manageHref,
+  );
   // Which workspace has its action row unfolded, from a right-click on it.
   // Cleared by every fetch, so a row that left the registry since the last one
   // cannot keep an action unfolded on it. Closing the menu unmounts this whole
@@ -532,10 +634,11 @@ export function WorkspacesMenuRow({ onClose }: { onClose: () => void }) {
       cachedRemote.current = cachedRemote.current.map((view) => ({ ...view, unreachable: failure.error }));
       remote.value = failure;
     });
-    listWorkspaces()
-      .then((data) => {
+    listWorkspacesWithOrder()
+      .then(({ workspaces: data, order: stored }) => {
         if (!live) return;
         list.value = { status: 'loaded', data };
+        order.value = stored;
         // The same listing the rows render, so the pill above them cannot show a
         // pre-rename name while the list shows the new one. This is the second
         // adopter beside the boot probe (see store/actions/workspace-label.ts).
@@ -552,10 +655,9 @@ export function WorkspacesMenuRow({ onClose }: { onClose: () => void }) {
   }, [expanded.value]);
 
   const loading = list.value.status === 'not-loaded' || list.value.status === 'loading';
-  const remoteLoading = remote.value.status === 'not-loaded' || remote.value.status === 'loading';
-  const showLoading = useDelayedFlag(expanded.value && (loading || remoteLoading));
-  const showSkeleton = showLoading && loading;
-  const showRemoteSkeleton = showLoading && remoteLoading;
+  // Only the local listing gates the list. Remote rows draw from the cache,
+  // greyed while their gateway is asked, so a slow gateway holds nothing up.
+  const showSkeleton = useDelayedFlag(expanded.value && loading);
   const placeholder = <WorkspaceSwitcherSkeleton rows={skeleton.rows} manage={skeleton.manage} />;
 
   // Every way out of this list, in either mode. The menu always shuts. An
@@ -609,13 +711,15 @@ export function WorkspacesMenuRow({ onClose }: { onClose: () => void }) {
             contextId: contextId.value,
             onContext: (id) => { contextId.value = id; },
             onAlternate: open,
-          })}
-        </LoadingFade>
-        <LoadingFade showSkeleton={showRemoteSkeleton} skeleton={<WorkspaceSwitcherSkeleton rows={Math.max(1, cachedRemote.current.reduce((n, v) => n + v.workspaces.length, 0))} manage={false} />}>
-          {remote.value.status === 'failed' && <div role="alert"><LoadableError error={remote.value.error} noun="remote workspaces" /></div>}
-          {remoteSwitcherRows(remote.value.status === 'loaded' ? remote.value.data : cachedRemote.current, WORKSPACE_ID, (route) => {
-            onClose();
-            void openWorkspaceIn('in-place', route).catch((e: unknown) => showToast(`Could not open workspace: ${errorDetail(e)}`, 'error'));
+            remote: remote.value.status === 'loaded' ? remote.value.data : cachedRemote.current,
+            remoteError: remote.value.status === 'failed' ? remote.value.error : null,
+            order: order.value,
+            onOpenRemote: (route, mode) => {
+              onClose();
+              void openWorkspaceIn(mode, route).catch((e: unknown) => {
+                showToast(`Could not open ${route}: ${errorDetail(e)}`, 'error');
+              });
+            },
           })}
         </LoadingFade>
       </Disclosure>

@@ -285,8 +285,8 @@ pub enum MessageOrigin {
     /// the id (`DeviceStore::friendly_name`), so a rename reaches every event.
     /// Older rows carry a `label` key, which deserialization ignores.
     Device { device_id: String },
-    /// HTTP request without a `device_id` and without a `caller_workspace`
-    /// body field. Mode is carried explicitly so SDK callers can declare
+    /// HTTP request without a `device_id`, and without a `caller_workspace`
+    /// body field unless a verified origin token outranks it. Mode is carried explicitly so SDK callers can declare
     /// themselves as agent/engine; defaults to Human for back-compat.
     ///
     /// `source_thread_id` is populated when the request arrived from a
@@ -307,6 +307,11 @@ pub enum MessageOrigin {
         /// engines) and for legacy persisted rows that pre-date the field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_thread_id: Option<uuid::Uuid>,
+        /// The trigger whose fire this subprocess is, read off the same
+        /// verified token. A scheduled script has no thread, so the spawn gate
+        /// reads its trigger here.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emitting_trigger_id: Option<String>,
     },
     /// Mode = Human or Agent (carried in `mode`). HTTP request from another
     /// Lucidos workspace, identified by the `caller_workspace` body field.

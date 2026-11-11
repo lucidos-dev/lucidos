@@ -50,6 +50,13 @@ export function widgetCellCss(hostPx: number): string {
   return `min(${DASHBOARD_CELL_REM}rem, (${hostPx}px - ${pad}rem - ${DASHBOARD_GAP_REM}rem) / 2)`;
 }
 
+/** `widgetCellCss` in px, for a root font size of `remPx`: the cell a fit check
+ *  draws at a UI scale other than the window's own. */
+export function widgetCellPx(hostPx: number, remPx: number): number {
+  const pad = 2 * DASHBOARD_PAD_X_REM * remPx;
+  return Math.min(DASHBOARD_CELL_REM * remPx, (hostPx - pad - DASHBOARD_GAP_REM * remPx) / 2);
+}
+
 /** The space between cells, as CSS. */
 export const WIDGET_GAP_CSS = `${DASHBOARD_GAP_REM}rem`;
 

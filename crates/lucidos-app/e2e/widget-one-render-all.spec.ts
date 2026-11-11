@@ -87,7 +87,7 @@ async function inside(box: Locator, s: Size) {
   await expect(frame.locator('#first')).toBeVisible({ timeout: 15_000 });
   await expect(frame.locator('html'), 'told its size').toHaveAttribute('data-widget-size', s);
   const overflows = await frame.locator('body').evaluate((body) => body.scrollHeight - innerHeight > 1);
-  await expect(box.locator('.widget-box-fade'), 'fades exactly when it overflows').toHaveCount(overflows ? 1 : 0);
+  await expect(box.locator('.widget-box-fade[data-edge="bottom"]'), 'fades exactly when it overflows').toHaveCount(overflows ? 1 : 0);
   return {
     told: await frame.locator('html').getAttribute('data-widget-size'),
     fontSize: await frame.locator('#first').evaluate((el) => getComputedStyle(el).fontSize),
@@ -258,7 +258,7 @@ test.describe('One widget box', () => {
       }
       // The old contract's three cards wrap in a small box, so it clips there.
       await pickCardSize(page, 'small');
-      await expect(cardBox(page).locator('.widget-box-fade')).toHaveCount(1);
+      await expect(cardBox(page).locator('.widget-box-fade[data-edge="bottom"]')).toHaveCount(1);
     });
   }
 });

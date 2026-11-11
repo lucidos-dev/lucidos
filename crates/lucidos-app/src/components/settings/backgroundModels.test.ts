@@ -137,6 +137,7 @@ describe('backgroundRowCaveat', () => {
     not_served: [],
     needs_vision: false,
     asks_no_model: false,
+    unresolved: null,
     vision: false,
     recommended: [],
     ...more,

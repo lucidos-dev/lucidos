@@ -46,6 +46,10 @@ import { composeHasContent, sideQuestionModeActive, computeMorphMode, computeAns
 import { currentComposerEnterKey } from '../../store/actions/preferences';
 import { canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting } from '../../store/canceledQuestions';
 import { NotReadyStrip } from './NotReadyStrip';
+import { mentionCandidates, mentionQueryAt, type MentionCandidate } from './mentions';
+import { mentionablePeople, mentionsEnabled } from '../../store/actions/people';
+import { CODING_AGENT_NAME } from './agentExitCopy';
+import { LUCIDOS_AGENT_LABEL } from '../../store/thread-events';
 import { lazyComponent } from '../../utils/lazyComponent';
 export * from './prompt-input-helpers';
 import { composeHandlers } from './composeHandlers';
@@ -76,6 +80,9 @@ import { passSendGate, sendGateAsks } from './rungSwitch';
 /** The card draws only on a large thread at a clean idle, so its code loads off the first-paint set. */
 const SuccessorCard = lazyComponent(() => import('./SuccessorCard').then((m) => m.SuccessorCard));
 const HandedOffCard = lazyComponent(() => import('./HandedOffCard').then((m) => m.HandedOffCard));
+// Team-only: a personal gateway never draws them, so the first frame skips them.
+const AgentPauseStrip = lazyComponent(() => import('./AgentPauseStrip').then((m) => m.AgentPauseStrip));
+const MentionSuggestions = lazyComponent(() => import('./MentionSuggestions').then((m) => m.MentionSuggestions));
 
 const attachMenuOpen = signal(false);
 const cameraOpen = signal(false);
@@ -442,6 +449,17 @@ export function PromptInput() {
     return el ? attachDrawnCaret(el) : undefined;
   }, []);
 
+  // The `@` word being typed, and the mentions it can mean (ADR 0649).
+  const [mention, setMention] = useState<{ query: string; start: number } | null>(null);
+  const mentionThreadId = focusedThreadId.value;
+  const mentionBackend = effectiveCodingAgentBackend(
+    mentionThreadId ? threadMap.value.get(mentionThreadId) : undefined,
+    resolveCodingAgent(mentionThreadId),
+  );
+  const mentionOffer = mention && mentionsEnabled.value
+    ? mentionCandidates(mention.query, mentionablePeople.value, mentionBackend ? CODING_AGENT_NAME[mentionBackend] : LUCIDOS_AGENT_LABEL)
+    : [];
+
   function autoResize() {
     const el = inputRef.current;
     if (el) resizeTextarea(el);
@@ -459,6 +477,11 @@ export function PromptInput() {
     // as well as the Enter one. Escape mid-composition cancels the candidate,
     // and taking it here would abort the running turn instead.
     if (isImeComposingKey(e)) return;
+    if (e.key === 'Tab' && !e.getModifierState('Shift') && mentionOffer.length > 0) {
+      e.preventDefault();
+      pickMention(mentionOffer[0]);
+      return;
+    }
     if (e.key === 'Escape') {
       // Escape reaches the textarea only when no overlay is open: the central
       // overlay stack handles it first, in the capture phase, and stops
@@ -708,11 +731,22 @@ export function PromptInput() {
     });
   });
 
+  /** Replace the `@` word being typed with the picked mention. */
+  function pickMention(candidate: MentionCandidate) {
+    const el = inputRef.current;
+    if (!el || !mention) return;
+    const caret = el.selectionStart ?? el.value.length;
+    // setRangeText keeps the change in the textarea's native undo stack.
+    el.setRangeText(`@${candidate.token} `, mention.start, caret, 'end');
+    handleInput();
+  }
+
   function handleInput() {
     autoResize();
     const el = inputRef.current;
     if (!el) return;
     const val = el.value;
+    setMention(mentionsEnabled.value ? mentionQueryAt(val, el.selectionStart ?? val.length) : null);
     // Codex shares the legacy claude_code channel but has no slash-command
     // surface, so Codex prompts keep the slash as normal message text.
     const tid = focusedThreadId.value;
@@ -1571,7 +1605,9 @@ export function PromptInput() {
           </button>
         </div>
       </Disclosure>
+      <MentionSuggestions key="mentions" candidates={mentionOffer} onPick={pickMention} />
       <NotReadyStrip key="not-ready" />
+      <AgentPauseStrip key="agent-pause" />
       <SuccessorCard key="successor" onSend={() => void submit()} />
       <HandedOffCard key="handed-off" />
       <div key="prompt-box" class="prompt-box">
@@ -1592,6 +1628,7 @@ export function PromptInput() {
             // programmatic). focusPane is signal-only + no-op on mobile, so this
             // can't loop with the pane-focus DOM-focus logic.
             onFocus={() => focusPane('thread')}
+            onBlur={() => setMention(null)}
           />
         </div>
         {/* Single hidden file input lives at the top of prompt-box so the menu

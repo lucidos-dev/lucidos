@@ -855,8 +855,8 @@ const PERMISSION_ASK_RULE: &str = "\n\n\
 /// turn-end gate forces a decision the session skipped. The chat agent learns
 /// the same from the `request_read` tool's own description.
 const READ_DECISION_RULE: &str = "\n\n\
-    READ DECISION: End every turn that asks no question with `lucidos request-read yes|no`, \
-    in a prose-free message, then answer once. Yes for an answer and no change (investigation, \
+    READ DECISION: End every turn asking no question: run `lucidos request-read yes|no` \
+    as a prose-free tool call, then answer once. Yes for an answer and no change (investigation, \
     review), or one read later. Else no.";
 
 /// Backend-independent, riding [`append_backend_rules`] like the rules above.
@@ -2994,13 +2994,15 @@ mod tests {
     /// An agent that wrote its answer beside the read decision's call then
     /// wrote it again after the call, and the user read it twice. Other tool
     /// calls may share its message, so it batches with a skill's last step.
+    /// An agent once typed the command as its answer text, so the rule says
+    /// to run it as a tool call.
     #[test]
     fn the_read_decision_comes_before_the_answer_in_every_flavor() {
         for (label, base) in all_prompt_flavors() {
             for (backend, backend_label) in all_backends() {
                 let built = append_backend_rules(base.clone(), backend);
                 assert!(
-                    built.contains("in a prose-free message, then answer once"),
+                    built.contains("as a prose-free tool call, then answer once"),
                     "{label}/{backend_label}"
                 );
             }

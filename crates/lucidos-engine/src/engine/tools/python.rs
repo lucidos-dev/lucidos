@@ -47,6 +47,7 @@ impl LucidosEngine {
         &self,
         args: &serde_json::Value,
         thread_id: uuid::Uuid,
+        device_id: Option<&str>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let code = args["code"].as_str().unwrap_or("");
         let commit_message = args.get("commit_message").and_then(|v| v.as_str());
@@ -169,6 +170,8 @@ impl LucidosEngine {
             for path in created.iter().chain(updated.iter()) {
                 response.push_str(&app_lint_note_on_disk(&data_dir, path).unwrap_or_default());
             }
+            let written = created.iter().chain(updated.iter()).map(String::as_str);
+            response.push_str(&self.widget_fit_notes(written, thread_id, device_id).await);
         }
 
         Ok(crate::core::redact_subprocess_output(

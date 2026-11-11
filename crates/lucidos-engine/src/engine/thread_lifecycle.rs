@@ -292,12 +292,15 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         "ThreadUnarchived" => EventClass::Metadata,
         // A proposal records what the agent offered; the reply moves things.
         "ThreadTriageProposed" => EventClass::Metadata,
-        // Work item roles mark who steers it, not its work (ADR 0623).
+        // Thread people mark who steers a family, not its work (ADR 0623).
         "WorkItemDriverTaken"
         | "WorkItemDriverReleased"
         | "WorkItemGateEscalated"
         | "WorkItemWatched"
         | "WorkItemUnwatched" => EventClass::Metadata,
+        // A people-only message and the agent pause start no turn and move no
+        // status: that is the whole point of them (ADR 0649).
+        "PeopleMessagePosted" | "AgentPaused" | "AgentResumed" => EventClass::Metadata,
         // A read decision and a sighting mark the reply, not the thread's
         // work, so none bumps recency (ADR 0409).
         "ThreadReadRequested" | "ThreadReadNotRequested" | "ThreadReplySeen" => {
@@ -575,6 +578,9 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "WorkItemGateEscalated",
         "WorkItemWatched",
         "WorkItemUnwatched",
+        "PeopleMessagePosted",
+        "AgentPaused",
+        "AgentResumed",
         "ThreadStarted",
         "ThreadDiscarded",
         "HomeThreadCreated",
@@ -953,6 +959,9 @@ pub fn resolve_transition(
         | "WorkItemGateEscalated"
         | "WorkItemWatched"
         | "WorkItemUnwatched"
+        | "PeopleMessagePosted"
+        | "AgentPaused"
+        | "AgentResumed"
         | "TriggerStarted"
         | "TriggerCompleted"
         | "ChangeReverted"
@@ -1795,6 +1804,8 @@ pub const LAST_ACTIVITY_EVENTS: &[&str] = &[
     "VoiceSessionStarted",
     "SpokenMessageReceived",
     "SpokenReplyGenerated",
+    // People talking in a thread is activity on it, though no turn runs.
+    "PeopleMessagePosted",
 ];
 
 /// Event types that increment message_count in the thread_summaries projection.

@@ -6,9 +6,9 @@ test.describe('Mobile header in compose view', () => {
 
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
-    // Dynamic bars default OFF, which pins the header. These tests assert the
-    // header hides on prompt focus / stays out of the way, so turn them on
-    // before the page boots.
+    // The e2e baseline pins the header. These tests assert the header hides
+    // on prompt focus / stays out of the way, so turn dynamic bars on before
+    // the page boots.
     await enableMobileDynamicBars(page);
   });
 

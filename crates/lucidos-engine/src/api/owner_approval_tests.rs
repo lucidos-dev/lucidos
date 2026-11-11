@@ -393,6 +393,7 @@ async fn nothing_but_a_devices_allow_grants() {
         user_agent: None,
         mode: ActorMode::Agent,
         source_thread_id: Some(p.asker),
+        emitting_trigger_id: None,
     };
     let cases: Vec<(AnswerKind, Option<MessageOrigin>)> = vec![
         (option_labelled(DONT_ALLOW_LABEL), Some(owner_device())),

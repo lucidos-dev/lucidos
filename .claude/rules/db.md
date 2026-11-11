@@ -33,7 +33,7 @@ The schema is in `migrations/`. Notes on who writes each table and which invaria
 | `thread_queue`, `apply_all_batches`, `standing_applies`, `thread_input_chains` | Admission and apply bookkeeping. Live rows only, with `events` as the audit trail. |
 | `hardened_branches`, `planned_branches` | The harden marker and the plan marker. |
 | `notifications`, `devices`, `push_subscriptions`, `device_presence`, `pinned_apps`, `preferences` | Notification and device state. |
-| `credentials`, `oauth_accounts`, `email_accounts`, `vapid_keys`, `backup_recipient`, `claude_gateway_accounts`, `claude_gateway_telemetry_cursor` | Secrets and accounts. Secret columns hold sealed values only. |
+| `credentials`, `oauth_accounts`, `email_accounts`, `vapid_keys`, `backup_recipient`, `claude_gateway_accounts`, `claude_gateway_telemetry_cursor`, `chatgpt_plan_accounts` | Secrets and accounts. Secret columns hold sealed values only. |
 | `environment_variables` | User-managed non-secret variables. |
 | `mcp_servers`, `models`, `chat_ladder_upgrade_models`, `repositories` | Registries and configuration. |
 | `repo_names` | Projection. Keeps the name of every repo ever added. `RepositoryRemoved` deliberately leaves it alone. |

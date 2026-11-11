@@ -1,6 +1,6 @@
 # 0553: The installed iOS app always runs dynamic bars and the strip is gone, superseding 0552
 
-- **Status**: Accepted
+- **Status**: Accepted (the default for other clients is amended by 0648)
 - **Date**: 2026-10-23
 
 ## Context

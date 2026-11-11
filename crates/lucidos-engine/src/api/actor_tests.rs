@@ -976,6 +976,7 @@ fn build_origin_subprocess_overrides_human_to_agent_api() {
             user_agent,
             mode,
             source_thread_id,
+            ..
         }) => {
             assert_eq!(user_agent.as_deref(), Some("curl/8.7.1"));
             assert_eq!(
@@ -1030,27 +1031,32 @@ fn build_origin_subprocess_overrides_device_id_too() {
     );
 }
 
+/// Only this engine's subprocesses hold a token it verifies, so a
+/// `caller_workspace` beside one names this workspace. Its caller thread is a
+/// claim the agent wrote: the token replaces it, trigger included, so a
+/// scheduled script cannot spawn as the owner (the spawn gate reads this).
 #[test]
-fn build_origin_cross_workspace_caller_still_wins_over_subprocess() {
-    // Cross-workspace calls go through their own resolution (Workspace
-    // origin); a subprocess token presented on the SAME request would be
-    // confusing but the cross-workspace contract is "caller wins".
-    let token = token_for(Some(Uuid::new_v4()));
+fn build_origin_a_verified_token_outranks_the_caller_claim() {
+    let token = token_for_fire(None, Some("trig-script"));
     let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &token)]);
+    let forged = Uuid::new_v4();
     let origin = build_message_origin(
         &h,
-        ActorMode::Human,
+        ActorMode::Agent,
         None,
         None,
         None,
         None,
-        caller("dev", None, None, ActorMode::Human),
+        caller("dev", Some(forged), None, ActorMode::Agent),
     );
-    assert!(
-        matches!(origin, Some(MessageOrigin::Workspace { .. })),
-        "caller_workspace beats subprocess token (cross-workspace path is \
-         documented as authoritative), got {:?}",
-        origin
+    assert_eq!(
+        origin,
+        Some(MessageOrigin::Api {
+            user_agent: None,
+            mode: ActorMode::Agent,
+            source_thread_id: None,
+            emitting_trigger_id: Some("trig-script".into()),
+        })
     );
 }
 

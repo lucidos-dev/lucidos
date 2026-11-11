@@ -2,6 +2,7 @@
 //! The struct, shared stream types, and dispatch live in the parent `openai`
 //! module.
 
+use crate::llm::chatgpt_plan::{ChatGptPlanError, ChatGptPlanFailure, TOOL_NAMESPACE};
 use crate::llm::prefill::{pair_of, BeatShape, PrefillPair, StableEnd, TurnRoute};
 use crate::llm::provider::{
     ContentBlock, LlmResponse, Message, MessageContent, TokenCallback, ToolDefinition,
@@ -159,8 +160,27 @@ impl OpenAiProvider {
         serde_json::json!({ "type": "function", "name": tool })
     }
 
+    /// The plan route's tool list: every function inside one namespace, as
+    /// its docs require.
+    fn namespaced_tools(functions: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+        vec![serde_json::json!({
+            "type": "namespace",
+            "name": TOOL_NAMESPACE,
+            "description": "Lucidos workspace tools.",
+            "tools": functions,
+        })]
+    }
+
     /// `model` is the one sent, already resolved. The rest of the request's
     /// options come from `selection`.
+    ///
+    /// The plan endpoint sends its own profile (ADR 0636): no output cap, no
+    /// tier, no cache marks, and tools in a namespace. Each field it drops is
+    /// one the plan route refuses or the docs say to omit.
+    ///
+    /// A forced tool keeps its tools top-level, which the plan route accepts.
+    /// A `tool_choice` has no namespace field, so it may not name a function
+    /// inside one.
     fn build_responses_body(
         &self,
         model: &str,
@@ -169,17 +189,25 @@ impl OpenAiProvider {
         system_prompt: Option<&str>,
         selection: &ModelSelection<'_>,
     ) -> serde_json::Value {
-        let breakpoints =
-            super::takes_cache_breakpoints(model).then_some(match selection.cache_mode {
+        let plan = self.plan_tokens().is_some();
+        let namespaced = plan && selection.forced_tool.is_none();
+        let breakpoints = (!plan && super::takes_cache_breakpoints(model)).then_some(
+            match selection.cache_mode {
                 CacheMode::Implicit => MAX_BREAKPOINTS,
                 CacheMode::Explicit => MAX_EXPLICIT_BREAKPOINTS,
-            });
-        let input = Self::convert_messages_responses(messages, breakpoints);
+            },
+        );
+        let mut input = Self::convert_messages_responses(messages, breakpoints);
+        if namespaced {
+            // A replayed call names the namespace its function lives in.
+            for item in input.iter_mut().filter(|i| i["type"] == "function_call") {
+                item["namespace"] = TOOL_NAMESPACE.into();
+            }
+        }
 
         let mut body = serde_json::json!({
             "model": model,
             "stream": true,
-            "max_output_tokens": DEFAULT_MAX_COMPLETION_TOKENS,
             "input": input,
             // Opt out of OpenAI's server-side response storage: the Responses
             // API defaults to `store: true` and keeps the response object
@@ -194,12 +222,19 @@ impl OpenAiProvider {
             // instead of flipping this back.
             "store": false,
         });
+        if !plan {
+            body["max_output_tokens"] = DEFAULT_MAX_COMPLETION_TOKENS.into();
+        }
 
         if let Some(instructions) = system_prompt {
             body["instructions"] = serde_json::Value::String(instructions.to_string());
         }
 
         if let Some(tool_defs) = Self::convert_tools_responses(tools) {
+            let tool_defs = match namespaced {
+                true => Self::namespaced_tools(tool_defs),
+                false => tool_defs,
+            };
             body["tools"] = serde_json::Value::Array(tool_defs);
         }
 
@@ -215,7 +250,7 @@ impl OpenAiProvider {
             body["prompt_cache_options"] = serde_json::json!({ "mode": "explicit" });
         }
 
-        if let Some(tier) = selection.service_tier {
+        if let Some(tier) = selection.service_tier.filter(|_| !plan) {
             body["service_tier"] = serde_json::Value::String(tier.as_wire().to_string());
         }
 
@@ -296,12 +331,14 @@ impl OpenAiProvider {
                         &mut item_id_map,
                         &mut meta,
                     )
-                    .map_err(|e| {
-                        crate::llm::stream_failure(
+                    .map_err(|e| match e.downcast::<ChatGptPlanError>() {
+                        Err(e) => crate::llm::stream_failure(
                             e.to_string(),
                             on_token.is_some() && prev_len > 0,
                             STREAM_LOG_TAG,
-                        )
+                        ),
+                        // Kept typed, so the limit pause can read it.
+                        Ok(plan) => plan,
                     })?;
                     if content.len() > prev_len {
                         if let Some(cb) = on_token {
@@ -417,6 +454,13 @@ impl OpenAiProvider {
             // A top-level `error` event carries `code` and `message` on the
             // event itself.
             "response.failed" | "error" => {
+                let error_object = data
+                    .pointer("/response/error")
+                    .or_else(|| data.get("error"))
+                    .unwrap_or(&data);
+                if let Some(plan) = ChatGptPlanError::from_error_object(error_object) {
+                    return Err(Box::new(plan));
+                }
                 let error_msg = data
                     .pointer("/response/error/message")
                     .or_else(|| data.pointer("/error/message"))
@@ -479,12 +523,20 @@ impl OpenAiProvider {
             log!("[OpenAI] Responses API request: model={}, tools=0", model);
         }
 
+        let mut bearer = match self.plan_bearer(model).await? {
+            Some(plan) => Some(plan),
+            None => self.bearer().await?,
+        };
+        let mut refreshed = false;
         let mut attempt = 0u32;
         loop {
             attempt += 1;
 
             let builder = self
-                .apply_headers(self.streaming_client.post(&self.responses_url))
+                .apply_headers(
+                    self.streaming_client.post(&self.responses_url),
+                    bearer.as_deref(),
+                )
                 .json(&body);
             let resp = match crate::llm::send_streaming_request(
                 builder,
@@ -501,20 +553,44 @@ impl OpenAiProvider {
 
             let status = resp.status();
             if !status.is_success() {
+                let request_id = crate::llm::call_trace::request_id_of(resp.headers());
                 let error_body = resp.text().await.unwrap_or_default();
+                let plan_error = self.plan_tokens().and_then(|_| {
+                    ChatGptPlanError::from_http(status.as_u16(), &error_body, request_id.clone())
+                });
 
-                if crate::llm::is_retryable_status(status.as_u16())
-                    && attempt <= crate::llm::MAX_RETRIES
-                {
-                    let delay = crate::llm::retry_delay(attempt, 1);
-                    crate::llm::log_retry(model, &format!("HTTP {}", status), attempt, delay);
-                    tokio::time::sleep(delay).await;
-                    continue;
+                match http_failure_step(
+                    self.plan_tokens().is_some(),
+                    status.as_u16(),
+                    plan_error.as_ref().map(|e| &e.failure),
+                    refreshed,
+                    attempt,
+                ) {
+                    HttpFailureStep::Refresh => {
+                        if let (Some(tokens), Some(rejected)) = (self.plan_tokens(), &bearer) {
+                            log!("[OpenAI] ChatGPT plan rejected its token ({status}); refreshing once");
+                            bearer = Some(tokens.after_rejection(rejected).await?);
+                            refreshed = true;
+                            continue;
+                        }
+                    }
+                    HttpFailureStep::Backoff => {
+                        let delay = crate::llm::retry_delay(attempt, 1);
+                        crate::llm::log_retry(model, &format!("HTTP {}", status), attempt, delay);
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    HttpFailureStep::Fail => {}
                 }
 
+                if let Some(plan_error) = plan_error {
+                    self.observe_plan_failure(&plan_error).await;
+                    return Err(Box::new(plan_error));
+                }
                 log!(
-                    "[OpenAI] Responses API error ({}): {}",
+                    "[OpenAI] Responses API error ({}, request_id={}): {}",
                     status,
+                    request_id.as_deref().unwrap_or("none"),
                     &error_body[..error_body.floor_char_boundary(500)]
                 );
                 return Err(crate::llm::not_served::failure(
@@ -548,6 +624,12 @@ impl OpenAiProvider {
                     });
                 }
                 Err(e) => {
+                    // A mid-stream plan failure may follow rendered text, so it
+                    // ends the turn rather than re-sending.
+                    if let Some(plan_error) = e.downcast_ref::<ChatGptPlanError>() {
+                        self.observe_plan_failure(plan_error).await;
+                        return Err(e);
+                    }
                     let err_str = e.to_string();
                     if crate::llm::retry_after_stream_error(model, &err_str, attempt).await {
                         continue;
@@ -556,6 +638,57 @@ impl OpenAiProvider {
                 }
             }
         }
+    }
+}
+
+impl OpenAiProvider {
+    /// Log a plan failure, and pause plan requests when it is the limit.
+    async fn observe_plan_failure(&self, error: &ChatGptPlanError) {
+        log!("[OpenAI] ChatGPT plan error: {}", error.log_line());
+        if let Some(access) = self.plan_access() {
+            access.pause.observe(error).await;
+        }
+    }
+}
+
+/// What the retry loop does after an HTTP error status.
+#[derive(Debug, PartialEq, Eq)]
+enum HttpFailureStep {
+    /// Refresh the plan token, then send again.
+    Refresh,
+    /// Back off, then send again.
+    Backoff,
+    Fail,
+}
+
+/// The step after an HTTP error. `plan_failure` is the classified body on the
+/// plan endpoint.
+///
+/// The platform keeps its old rule. The plan route never retries a 429 in
+/// place: its docs say to pause new plan requests instead. A 401 there gets
+/// one refresh, since an expired or revoked token is the usual cause.
+fn http_failure_step(
+    plan: bool,
+    status: u16,
+    plan_failure: Option<&ChatGptPlanFailure>,
+    refreshed: bool,
+    attempt: u32,
+) -> HttpFailureStep {
+    let attempts_left = attempt <= crate::llm::MAX_RETRIES;
+    if !plan {
+        return match crate::llm::is_retryable_status(status) && attempts_left {
+            true => HttpFailureStep::Backoff,
+            false => HttpFailureStep::Fail,
+        };
+    }
+    let rejected_token = status == 401 || plan_failure == Some(&ChatGptPlanFailure::InvalidUser);
+    match plan_failure {
+        _ if rejected_token && !refreshed => HttpFailureStep::Refresh,
+        Some(failure) if failure.is_retryable() && attempts_left => HttpFailureStep::Backoff,
+        None if status != 429 && crate::llm::is_retryable_status(status) && attempts_left => {
+            HttpFailureStep::Backoff
+        }
+        _ => HttpFailureStep::Fail,
     }
 }
 
@@ -1488,6 +1621,521 @@ mod tests {
             panic!("expected a turn and a beat, saw {}", sent.len());
         };
         assert_eq!(beat_body, &json(&pair.stable.body));
+    }
+
+    /// A history that touches every item kind the Responses wire writes.
+    fn every_item_kind() -> Vec<Message> {
+        vec![
+            user(vec![
+                view("[THREAD MEMORY VIEW]\n[0+8] old\n"),
+                text("look at this"),
+                image("AAAA"),
+            ]),
+            Message {
+                role: "assistant".to_string(),
+                content: MessageContent::Blocks(vec![
+                    text("checking"),
+                    ContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "list_files".to_string(),
+                        input: serde_json::json!({"path": "artifacts"}),
+                        thought_signature: None,
+                    },
+                ]),
+            },
+            user(vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: "a.md".to_string(),
+            }]),
+        ]
+    }
+
+    fn two_tools() -> Vec<ToolDefinition> {
+        ["list_files", "request_read"]
+            .into_iter()
+            .map(|name| ToolDefinition {
+                name: name.to_string(),
+                description: format!("{name} does a thing"),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                }),
+            })
+            .collect()
+    }
+
+    /// A Responses server that records each request's raw bytes and answers
+    /// with one completed turn. Returns the base URL a provider takes.
+    async fn serve_raw() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = bodies.clone();
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(move |body: String| {
+                record.lock().unwrap().push(body);
+                async { ([("content-type", "text/event-stream")], COMPLETED_TURN) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}/v1"), bodies)
+    }
+
+    /// The platform body is byte for byte what the build before the ChatGPT
+    /// plan endpoint sent: a turn with a forced tool and flex, and an
+    /// explicit-mode call. The fixture was written by that build, so
+    /// regenerating it to pass is the failure.
+    #[tokio::test]
+    async fn the_platform_body_is_byte_identical_to_the_pre_plan_build() {
+        let (base, bodies) = serve_raw().await;
+        let provider =
+            OpenAiProvider::new_with_base_url("k".into(), SOL.into(), &base, Vec::new(), false)
+                .unwrap();
+        let turn = ModelSelection::model(SOL)
+            .with_effort(Some("high"))
+            .with_forced_tool(Some("request_read"))
+            .with_service_tier(Some(crate::llm::ServiceTier::Flex));
+        let explicit = ModelSelection::model(SOL).with_cache_mode(CacheMode::Explicit);
+        for selection in [turn, explicit] {
+            provider
+                .chat_responses(
+                    &every_item_kind(),
+                    &two_tools(),
+                    selection,
+                    Some("system"),
+                    None,
+                )
+                .await
+                .expect("the turn completes");
+        }
+        let sent: Vec<serde_json::Value> = bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|raw| serde_json::from_str(raw).unwrap())
+            .collect();
+        let raw = bodies.lock().unwrap().clone();
+        for (raw, value) in raw.iter().zip(&sent) {
+            assert_eq!(raw, &serde_json::to_string(value).unwrap(), "sorted keys");
+        }
+        let snapshot = serde_json::to_string_pretty(&sent).unwrap();
+        assert_eq!(snapshot, include_str!("responses_platform_body.json"));
+    }
+
+    // --- The ChatGPT plan endpoint (ADR 0636) ---
+
+    /// A token source that hands out `plan-token-1`, and `plan-token-2` after
+    /// a rejection.
+    #[derive(Default)]
+    struct FakeTokens {
+        rejections: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::llm::chatgpt_plan::ChatGptPlanTokens for FakeTokens {
+        async fn access_token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            Ok("plan-token-1".to_string())
+        }
+
+        async fn after_rejection(
+            &self,
+            rejected: &str,
+        ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            self.rejections.lock().unwrap().push(rejected.to_string());
+            Ok("plan-token-2".to_string())
+        }
+    }
+
+    /// Fields the plan route refuses or its docs say to omit, plus the two
+    /// Lucidos sends on the platform that the probes saw refused. A pinned
+    /// wire contract: the literals are the docs' list, less `max_tool_calls`.
+    /// That one also names a preference, which ADR 0368 keeps to the catalog,
+    /// and no route sends it.
+    const PLAN_FORBIDDEN_FIELDS: &[&str] = &[
+        "background",
+        "conversation",
+        "max_output_tokens",
+        "metadata",
+        "moderation",
+        "multi_agent",
+        "prompt",
+        "prompt_cache_retention",
+        "safety_identifier",
+        "temperature",
+        "top_logprobs",
+        "top_p",
+        "truncation",
+        "user",
+        "previous_response_id",
+        "service_tier",
+        "prompt_cache_options",
+    ];
+
+    /// The `unsupported_capability` answer a strict mock gives a body the
+    /// plan route would refuse, or `None` for a body it accepts.
+    fn plan_refusal(body: &serde_json::Value) -> Option<String> {
+        let refused = PLAN_FORBIDDEN_FIELDS
+            .iter()
+            .find(|field| body.get(**field).is_some())
+            .map(|field| field.to_string())
+            .or_else(|| {
+                body.to_string()
+                    .contains("prompt_cache_breakpoint")
+                    .then(|| "prompt_cache_breakpoint".to_string())
+            })
+            .or_else(|| {
+                (body["store"] != false || body["stream"] != true).then(|| "store".to_string())
+            })?;
+        Some(format!(
+            r#"{{"error":{{"message":"unsupported","type":"invalid_request_error","param":"{refused}","code":"subscription_sharing_unsupported_capability"}}}}"#
+        ))
+    }
+
+    type PlanRequests = std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>;
+
+    /// The plan's model listing, in its own shape: `SOL` listed, one hidden.
+    const PLAN_MODELS: &str = r#"{"models":[{"slug":"gpt-6.1-sol","visibility":"list"},{"slug":"gpt-reserve","visibility":"hide"}]}"#;
+
+    /// A plan Responses mock. `answer` gets the request's index and returns a
+    /// status and body; a strict check answers first. Records each request's
+    /// `Authorization` header and body.
+    async fn serve_plan(answer: fn(usize) -> (u16, &'static str)) -> (String, PlanRequests) {
+        let requests = PlanRequests::default();
+        let record = requests.clone();
+        let app = axum::Router::new()
+            .route("/v1/models", axum::routing::get(|| async { PLAN_MODELS }))
+            .route(
+                "/v1/responses",
+                axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+                    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let index = {
+                        let mut record = record.lock().unwrap();
+                        record.push((auth, body.clone()));
+                        record.len() - 1
+                    };
+                    async move {
+                        let (status, reply) = match plan_refusal(&body) {
+                            Some(refusal) => (400, refusal),
+                            None => {
+                                let (status, reply) = answer(index);
+                                (status, reply.to_string())
+                            }
+                        };
+                        let kind = if status == 200 {
+                            "text/event-stream"
+                        } else {
+                            "application/json"
+                        };
+                        (
+                            axum::http::StatusCode::from_u16(status).unwrap(),
+                            [("content-type", kind), ("x-request-id", "req_mock")],
+                            reply,
+                        )
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}/v1"), requests)
+    }
+
+    fn plan_provider(base: &str, tokens: std::sync::Arc<FakeTokens>) -> OpenAiProvider {
+        let access = crate::llm::chatgpt_plan::ChatGptPlanAccess {
+            tokens,
+            pause: std::sync::Arc::new(crate::llm::chatgpt_plan::LimitPause::unannounced()),
+        };
+        OpenAiProvider::new_chatgpt_plan(access, SOL.into(), base).unwrap()
+    }
+
+    /// Every option the platform would turn into a refused field.
+    fn everything_selected() -> ModelSelection<'static> {
+        ModelSelection::model(SOL)
+            .with_effort(Some("high"))
+            .with_service_tier(Some(crate::llm::ServiceTier::Flex))
+            .with_cache_mode(CacheMode::Explicit)
+    }
+
+    async fn plan_turn(provider: &OpenAiProvider) -> Result<LlmResponse, String> {
+        provider
+            .chat_responses(
+                &every_item_kind(),
+                &two_tools(),
+                everything_selected(),
+                Some("system"),
+                None,
+            )
+            .await
+            .map_err(|e| {
+                let plan = e
+                    .downcast_ref::<ChatGptPlanError>()
+                    .map(|p| p.failure.clone());
+                format!("{plan:?}|{e}")
+            })
+    }
+
+    /// A plan body carries no refused field, keeps the effort and the
+    /// required `store` and `stream`, and puts tools in the namespace. A
+    /// replayed call names that namespace.
+    #[test]
+    fn the_plan_body_follows_the_plan_profile() {
+        let provider = plan_provider("http://127.0.0.1:9/v1", Default::default());
+        let body = provider.build_responses_body(
+            SOL,
+            &every_item_kind(),
+            &two_tools(),
+            Some("system"),
+            &everything_selected(),
+        );
+        assert_eq!(plan_refusal(&body), None, "{body:#}");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["instructions"], "system");
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "namespace");
+        assert_eq!(tools[0]["name"], TOOL_NAMESPACE);
+        assert_eq!(tools[0]["tools"].as_array().unwrap().len(), 2);
+        let call = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .unwrap();
+        assert_eq!(call["namespace"], TOOL_NAMESPACE);
+        assert!(body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["role"] != "system"));
+    }
+
+    /// A forced tool on the plan route keeps its tools top-level, where the
+    /// `tool_choice` can name one, and its replayed calls name no namespace.
+    #[test]
+    fn a_forced_tool_on_the_plan_route_keeps_tools_top_level() {
+        let provider = plan_provider("http://127.0.0.1:9/v1", Default::default());
+        let body = provider.build_responses_body(
+            SOL,
+            &every_item_kind(),
+            &two_tools(),
+            Some("system"),
+            &everything_selected().with_forced_tool(Some("request_read")),
+        );
+        assert_eq!(plan_refusal(&body), None, "{body:#}");
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert!(tools.iter().all(|t| t["type"] == "function"), "{body:#}");
+        assert!(body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item.get("namespace").is_none()));
+    }
+
+    /// A plan turn reaches a strict mock with the plan token as its bearer,
+    /// and nothing it sends draws a refusal.
+    #[tokio::test]
+    async fn a_plan_turn_sends_the_plan_token_and_passes_a_strict_mock() {
+        let (base, requests) = serve_plan(|_| (200, COMPLETED_TURN)).await;
+        let response = plan_turn(&plan_provider(&base, Default::default()))
+            .await
+            .expect("the strict mock accepts the plan body");
+        assert_eq!(response.content.as_deref(), Some("done"));
+        assert!(response.prefill.is_none(), "a plan turn offers no beat");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "Bearer plan-token-1");
+    }
+
+    const LIMIT_BODY: &str = r#"{"error":{"message":"You have hit your usage limit.","type":"usage_limit","param":null,"code":"subscription_sharing_usage_limit_exceeded"}}"#;
+
+    /// A plan 429 is sent once and fails typed, never retried in place.
+    #[tokio::test]
+    async fn a_plan_limit_is_not_retried_in_place() {
+        let (base, requests) = serve_plan(|_| (429, LIMIT_BODY)).await;
+        let err = plan_turn(&plan_provider(&base, Default::default()))
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("Some(LimitReached)|"), "{err}");
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    /// A limit that arrives as `response.failed` mid-stream fails typed too.
+    #[tokio::test]
+    async fn a_mid_stream_plan_limit_fails_typed() {
+        const FAILED: &str = concat!(
+            "event: response.failed\n",
+            r#"data: {"response":{"status":"failed","error":{"code":"subscription_sharing_usage_limit_exceeded","message":"limit"}}}"#,
+            "\n\n",
+        );
+        let (base, requests) = serve_plan(|_| (200, FAILED)).await;
+        let err = plan_turn(&plan_provider(&base, Default::default()))
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("Some(LimitReached)|"), "{err}");
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    /// After a limit answer the next plan turn fails fast, typed, with no
+    /// request sent.
+    #[tokio::test]
+    async fn a_plan_limit_pauses_the_next_turn_with_no_request() {
+        let (base, requests) = serve_plan(|_| (429, LIMIT_BODY)).await;
+        let provider = plan_provider(&base, Default::default());
+        plan_turn(&provider).await.unwrap_err();
+        let err = plan_turn(&provider).await.unwrap_err();
+        assert!(err.starts_with("Some(LimitReached)|"), "{err}");
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    /// A usage limit on the model listing fails typed and starts the pause,
+    /// so the next turn asks nothing.
+    #[tokio::test]
+    async fn a_limit_on_the_model_listing_fails_typed_and_pauses() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let listed = std::sync::Arc::new(AtomicUsize::new(0));
+        let count = listed.clone();
+        let app = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(move || {
+                count.fetch_add(1, SeqCst);
+                async {
+                    (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        [("content-type", "application/json")],
+                        LIMIT_BODY,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = plan_provider(&format!("http://{addr}/v1"), Default::default());
+
+        let err = plan_turn(&provider).await.unwrap_err();
+        assert!(err.starts_with("Some(LimitReached)|"), "{err}");
+        let again = plan_turn(&provider).await.unwrap_err();
+        assert!(again.starts_with("Some(LimitReached)|"), "{again}");
+        assert_eq!(listed.load(SeqCst), 1);
+    }
+
+    /// A model the plan does not list is refused as not served before any
+    /// request spends the plan. So is a hidden one.
+    #[tokio::test]
+    async fn a_model_the_plan_does_not_list_is_not_served() {
+        let (base, requests) = serve_plan(|_| (200, COMPLETED_TURN)).await;
+        let provider = plan_provider(&base, Default::default());
+        for model in ["gpt-5.4", "gpt-reserve"] {
+            let err = provider
+                .chat_responses(
+                    &every_item_kind(),
+                    &[],
+                    ModelSelection::model(model),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                err.downcast_ref::<crate::llm::ModelNotServed>().is_some(),
+                "{model}: {err}"
+            );
+            assert!(err.to_string().contains("gpt-6.1-sol"), "{err}");
+        }
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    const INVALID_USER_BODY: &str = r#"{"error":{"message":"invalid user","type":"invalid_request_error","param":null,"code":"subscription_sharing_invalid_user"}}"#;
+
+    /// A rejected token is refreshed once, and the retry carries the new one.
+    #[tokio::test]
+    async fn a_rejected_plan_token_is_refreshed_once() {
+        let (base, requests) = serve_plan(|index| match index {
+            0 => (401, INVALID_USER_BODY),
+            _ => (200, COMPLETED_TURN),
+        })
+        .await;
+        let tokens = std::sync::Arc::new(FakeTokens::default());
+        plan_turn(&plan_provider(&base, tokens.clone()))
+            .await
+            .expect("the refreshed token is accepted");
+        let auths: Vec<String> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(auth, _)| auth.clone())
+            .collect();
+        assert_eq!(auths, ["Bearer plan-token-1", "Bearer plan-token-2"]);
+        assert_eq!(*tokens.rejections.lock().unwrap(), ["plan-token-1"]);
+    }
+
+    /// A second rejection after the refresh fails, telling the user to sign
+    /// in again.
+    #[tokio::test]
+    async fn a_second_rejection_fails() {
+        let (base, requests) = serve_plan(|_| (401, INVALID_USER_BODY)).await;
+        let err = plan_turn(&plan_provider(&base, Default::default()))
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("Some(InvalidUser)|"), "{err}");
+        assert!(err.contains("Sign in again"), "{err}");
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    /// The step table: the platform keeps retrying 429 and 5xx, and the plan
+    /// route backs off only on a passing unavailability or a plain 5xx.
+    #[test]
+    fn the_plan_route_never_backs_off_on_a_429() {
+        use HttpFailureStep::*;
+        let unavailable = ChatGptPlanFailure::Unavailable;
+        let limit = ChatGptPlanFailure::LimitReached;
+        let invalid = ChatGptPlanFailure::InvalidUser;
+        let cases = [
+            (false, 429, None, false, 1, Backoff),
+            (false, 500, None, false, 1, Backoff),
+            (false, 401, None, false, 1, Fail),
+            (false, 429, None, false, 4, Fail),
+            (true, 429, Some(&limit), false, 1, Fail),
+            (true, 429, None, false, 1, Fail),
+            (true, 503, Some(&unavailable), false, 1, Backoff),
+            (true, 503, Some(&unavailable), false, 4, Fail),
+            (true, 500, None, false, 1, Backoff),
+            (true, 401, Some(&invalid), false, 1, Refresh),
+            (true, 401, None, false, 1, Refresh),
+            (true, 401, Some(&invalid), true, 1, Fail),
+        ];
+        for (plan, status, failure, refreshed, attempt, step) in cases {
+            assert_eq!(
+                http_failure_step(plan, status, failure, refreshed, attempt),
+                step,
+                "plan={plan} status={status} failure={failure:?} refreshed={refreshed}"
+            );
+        }
+    }
+
+    /// A plan provider refuses a keep-alive beat without sending it: a beat
+    /// spends the user's weekly limit.
+    #[tokio::test]
+    async fn a_plan_provider_refuses_a_prefill() {
+        let (base, requests) = serve_plan(|_| (200, COMPLETED_TURN)).await;
+        let platform = turn_body(SOL, &tree_turn());
+        let pair = prefill_pair(&platform, route(SOL)).expect("a platform pair");
+        let provider = plan_provider(&base, Default::default());
+        let refused = crate::llm::LlmProvider::prefill(
+            &provider,
+            &pair.stable,
+            crate::llm::metered::CallToken::for_test(),
+        )
+        .await;
+        assert!(refused.is_err());
+        assert!(requests.lock().unwrap().is_empty());
     }
 
     /// The first text or tool-call delta stamps the call trace. A chunk that

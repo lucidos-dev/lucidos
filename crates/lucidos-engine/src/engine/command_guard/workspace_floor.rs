@@ -2,7 +2,8 @@
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
-const REASON: &str = "workspace destruction (requires the gateway's device-confirmed cleanup)";
+const REASON: &str = "a command that deletes a Lucidos workspace (only the gateway may do that, \
+                      after the user confirms it on a paired device)";
 
 pub(super) fn reason(command: &str, cwd: Option<&Path>) -> Option<&'static str> {
     let lower = command.to_ascii_lowercase();

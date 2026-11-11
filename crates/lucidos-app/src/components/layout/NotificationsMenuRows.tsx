@@ -26,10 +26,11 @@
 
 import { useSignal } from '@preact/signals';
 import type { WorkspaceStatus } from '../../api/client/control';
-import { peerWorkspaces } from '../../store/actions/app-badge';
+import { peerWorkspaces, remotePeerWorkspaces } from '../../store/actions/app-badge';
 import { switchMenuItem } from '../../store/actions/menu';
 import { showToast, unreadCount, visibleWorkspaceName } from '../../store/store';
-import { WORKSPACE_ID } from '../../utils/basePath';
+import { REMOTE_GATEWAY, WORKSPACE_ID } from '../../utils/basePath';
+import { remoteWorkspaceRoute, type RemoteGatewayView } from '../../utils/remoteWorkspaces';
 import { errorDetail } from '../../utils/errorDetail';
 import {
   alternateOpenMode,
@@ -71,6 +72,9 @@ export interface NotificationsGroupProps {
   /** Every workspace the gateway serves, from the shared cache in
    *  `store/actions/app-badge.ts`. Empty outside a gateway-served page. */
   peers: WorkspaceStatus[];
+  /** Every paired remote gateway's workspaces, from the same cache. A gateway
+   *  that did not answer the newest ask contributes no row. */
+  remotePeers: readonly RemoteGatewayView[];
   /** This workspace's LIVE unread count, never its polled row. See
    *  {@link notifyRows}. */
   ownUnread: number;
@@ -97,7 +101,8 @@ export interface NotificationsGroupProps {
 const OWN_FALLBACK_NAME = 'This workspace';
 
 /** The rows to draw, in order: this workspace first, then the peers as the
- *  gateway listed them.
+ *  gateway listed them, then the remote gateways' workspaces named
+ *  `<name> @<gateway>` as the switcher names them.
  *
  *  Two count sources, deliberately. This workspace's comes from the caller's
  *  LIVE `unreadCount`, so an optimistic mark-read empties the row on the same
@@ -111,7 +116,7 @@ const OWN_FALLBACK_NAME = 'This workspace';
  *  A workspace with nothing unread is not a row. A stopped one reports no count
  *  at all and is therefore never a row either, which is the same
  *  running-workspaces-only rule the icon badge follows. */
-export function notifyRows({ peers, ownUnread, ownId, ownName }: NotificationsGroupProps): NotifyRow[] {
+export function notifyRows({ peers, remotePeers, ownUnread, ownId, ownName }: NotificationsGroupProps): NotifyRow[] {
   const rows: NotifyRow[] = [];
   if (ownUnread > 0) {
     rows.push({
@@ -127,6 +132,16 @@ export function notifyRows({ peers, ownUnread, ownId, ownName }: NotificationsGr
     const count = w.unread_count ?? 0;
     if (count > 0) {
       rows.push({ id: w.id, name: w.name, count, isSelf: false, state: workspaceState(w) });
+    }
+  }
+  for (const view of remotePeers) {
+    if (view.unreachable !== null) continue;
+    for (const w of view.workspaces) {
+      const route = remoteWorkspaceRoute(view, w);
+      const count = w.unread_count ?? 0;
+      if (route !== ownId && count > 0) {
+        rows.push({ id: route, name: `${w.name} @${view.gateway}`, count, isSelf: false, state: workspaceState(w) });
+      }
     }
   }
   return rows;
@@ -264,9 +279,13 @@ export function NotificationsMenuGroup({ onClose }: { onClose: () => void }) {
 
   return notificationsMenuGroup({
     peers: peerWorkspaces.value,
+    remotePeers: remotePeerWorkspaces.value,
     ownUnread: unreadCount.value,
     ownId: WORKSPACE_ID,
-    ownName: visibleWorkspaceName.value,
+    // An empty name means `/health` has not answered, so the row falls back.
+    ownName: visibleWorkspaceName.value
+      ? visibleWorkspaceName.value + (REMOTE_GATEWAY ? ` @${REMOTE_GATEWAY}` : '')
+      : null,
     onOpenOwn: () => { onClose(); switchMenuItem('notifications'); },
     // A null mode is a gesture that is not an activation at all (a macOS
     // Ctrl-click, which the action row already answers).

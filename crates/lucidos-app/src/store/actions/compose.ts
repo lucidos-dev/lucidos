@@ -31,6 +31,7 @@ import {
   clearComposeSelection,
   seedComposeSelection,
   takePendingComposeSelection,
+  resolvePerson,
   resolveScope,
   resolveCodingAgent,
   resolveModel,
@@ -98,6 +99,7 @@ function scopeEquals(a: Scope, b: Scope): boolean {
  *  active, the channel is locked server-side and the picker is hidden. */
 export function applyDestination(threadId: string | null, d: ComposeDestination): void {
   const mode: ComposeMode = d.kind === 'coding' ? 'claude_code' : 'lucidos';
+  const person = d.kind === 'person' ? d.personId : null;
   const modeType = mode === 'claude_code' ? 'coding_agent' : 'do';
   if (inputMode.value.type !== modeType) {
     inputMode.value = mode === 'claude_code' ? { type: 'coding_agent' } : { type: 'do' };
@@ -127,6 +129,13 @@ export function applyDestination(threadId: string | null, d: ComposeDestination)
         noteLocalComposeEdit(threadId);
         schedulePush(threadId);
       }
+    }
+  }
+  if (resolvePerson(threadId) !== person) {
+    patchComposeSelection(threadId, { person });
+    if (threadId) {
+      noteLocalComposeEdit(threadId);
+      schedulePush(threadId);
     }
   }
   // Only a real composing draft has a per-draft mode to lock; the pending
@@ -1246,6 +1255,8 @@ export async function sendCompose(
   const providerOverride = resolveProvider(threadId) ?? undefined;
   const ccModelOverride = resolveCcModel(threadId);
   const ccReasoningEffortOverride = resolveCcReasoningEffort(threadId);
+  // A coding-agent send addresses its agent, never a teammate.
+  const person = opts.useCodingAgent ? null : resolvePerson(threadId);
   // Must run before the draft clear — see `markHashesAsSent`.
   if (wireHashes.length > 0) markHashesAsSent(wireHashes);
   const releaseImages = retainSendingImageHashes(wireHashes);
@@ -1279,6 +1290,7 @@ export async function sendCompose(
       providerOverride,
       ccModelOverride,
       ccReasoningEffortOverride,
+      alsoMention: person ? [person] : undefined,
       threadStarted: () => awaitThreadStarted(threadId),
       settlement: { kind: 'first-send', mode, engineDraftAtSend },
     });

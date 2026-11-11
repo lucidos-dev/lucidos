@@ -112,6 +112,14 @@
 //!
 //! A newly-hidden event is one more arm in [`GapEvent`], not a redesign.
 //!
+//! ## People-only messages
+//!
+//! A `PeopleMessagePosted` (ADR 0649) is talk between people that woke
+//! nothing. The same window carries every one since the previous turn, so the
+//! agent reads each exactly once, at the head of its next woken prompt. They
+//! render as their own block after the note ([`people_talk_block`]), each
+//! under its operator name on a team gateway.
+//!
 //! Like `external_edits`, the helper is best-effort: any query error degrades
 //! silently to `None` (resume proceeds without the note rather than failing),
 //! and a payload that will not parse degrades to vaguer wording rather than
@@ -187,6 +195,17 @@ const COVERED_EVENT_TYPES: &[&str] = &[
 /// still running. The real fix is a delivery marker on the resume path.
 const EXTRA_BOUNDARY_EVENT_TYPES: &[&str] = &["CodingAgentPromptSent"];
 
+/// Talk between people that woke nothing. See the module docs.
+const PEOPLE_MESSAGE_EVENT_TYPE: &str = "PeopleMessagePosted";
+
+/// Max people-only messages one prompt carries, newest kept. A long paused
+/// conversation must not crowd out the message that woke the agent.
+const MAX_PEOPLE_MESSAGES: usize = 50;
+
+/// Max characters of one people-only message a prompt carries. A pasted log
+/// must not crowd out the rest either.
+const MAX_PEOPLE_MESSAGE_CHARS: usize = 2000;
+
 /// A change description is the agent's own summary and can be long; keep the
 /// bullet readable.
 const MAX_DESCRIPTION_CHARS: usize = 80;
@@ -201,7 +220,8 @@ const MAX_ERROR_CHARS: usize = 200;
 
 /// The turn-gap note plus the one fact its caller needs back.
 pub(crate) struct TurnGapNote {
-    /// The rendered note, ready to prepend to the resumed prompt.
+    /// The rendered note, then the people-only messages since the previous
+    /// turn, ready to prepend to the resumed prompt.
     pub note: String,
     /// True when the gap held an event that moved the worktree out from under
     /// the agent: an Apply or a Discard (both reset the worktree to `main`), or
@@ -215,6 +235,9 @@ pub(crate) struct TurnGapNote {
     /// main repo, not the worktree), an apply failure and a tier-1 clean (build
     /// artifacts only) touch no ref, so they leave the flag alone.
     pub explains_worktree_reset: bool,
+    /// The `PeopleMessagePosted` events the note carries. A fresh session's
+    /// thread history leaves them out, so the agent reads each once.
+    pub people_event_ids: Vec<Uuid>,
 }
 
 /// One covered event, parsed out of its payload.
@@ -461,7 +484,11 @@ pub(crate) async fn compute_turn_gap_note_until(
     // workspace's first read predates read reports, and counts as before.
     let rows: Vec<(Uuid, String, serde_json::Value)> =
         sqlx::query_as::<_, (Uuid, String, serde_json::Value)>(&format!(
-            "SELECT e.id, e.event_type, e.payload - 'stdout' - 'stderr' - 'text' FROM events e \
+            "SELECT e.id, e.event_type, \
+                CASE WHEN e.event_type = $9 THEN jsonb_set(e.payload, '{{text}}', \
+                       to_jsonb(left(COALESCE(e.payload->>'text', ''), $10))) \
+                     ELSE e.payload - 'stdout' - 'stderr' - 'text' END \
+             FROM events e \
          WHERE e.thread_id = $1 AND e.event_type = ANY($2) \
            AND ($7::bigint IS NULL OR e.sequence < $7) \
            AND e.sequence > COALESCE(( \
@@ -513,6 +540,7 @@ pub(crate) async fn compute_turn_gap_note_until(
             COVERED_EVENT_TYPES
                 .iter()
                 .chain(ThreadEvent::TERMINATOR_EVENT_TYPES)
+                .chain(&[PEOPLE_MESSAGE_EVENT_TYPE])
                 .copied()
                 .collect::<Vec<&str>>(),
         )
@@ -522,6 +550,9 @@ pub(crate) async fn compute_turn_gap_note_until(
         .bind(SELF_STOP_REAP_WINDOW_SECS)
         .bind(until_sequence)
         .bind(crate::engine::thread_events::CACHE_KEEP_ALIVE_REASON_KIND)
+        .bind(PEOPLE_MESSAGE_EVENT_TYPE)
+        // One past the cap, so the block can tell a cut message.
+        .bind((MAX_PEOPLE_MESSAGE_CHARS + 1) as i32)
         .fetch_all(pool)
         .await
         .map_err(|e| {
@@ -534,6 +565,17 @@ pub(crate) async fn compute_turn_gap_note_until(
         })
         .ok()?;
 
+    let (people, rows): (Vec<_>, Vec<_>) = rows
+        .into_iter()
+        .partition(|(_, event_type, _)| event_type == PEOPLE_MESSAGE_EVENT_TYPE);
+    let people_event_ids: Vec<Uuid> = people.iter().map(|(id, _, _)| *id).collect();
+    let people_talk = people_talk_block(
+        &people
+            .into_iter()
+            .map(|(_, _, payload)| payload)
+            .collect::<Vec<_>>(),
+        &crate::gateway_operators::current(),
+    );
     let (terminals, covered): (Vec<_>, Vec<_>) =
         rows.into_iter().partition(|(_, event_type, _)| {
             ThreadEvent::TERMINATOR_EVENT_TYPES.contains(&event_type.as_str())
@@ -549,18 +591,61 @@ pub(crate) async fn compute_turn_gap_note_until(
     }
 
     if events.is_empty() {
-        return None;
+        return people_talk.map(|note| TurnGapNote {
+            note,
+            explains_worktree_reset: false,
+            people_event_ids,
+        });
     }
 
     let facts = load_change_facts(pool, &events).await;
     let explains_worktree_reset = events
         .iter()
         .any(|e| e.moved_the_worktree(branch_for(e, &facts), session_branch));
+    let gap_note = build_note(&events, &facts, session_branch);
 
     Some(TurnGapNote {
-        note: build_note(&events, &facts, session_branch),
+        note: match people_talk {
+            Some(talk) => format!("{gap_note}\n\n{talk}"),
+            None => gap_note,
+        },
         explains_worktree_reset,
+        people_event_ids,
     })
+}
+
+/// The people-only messages a prompt carries, oldest first, from their
+/// `PeopleMessagePosted` payloads. `None` when there are none.
+///
+/// Each reads under the name `history.rs` gives the same message.
+fn people_talk_block(
+    payloads: &[serde_json::Value],
+    operators: &crate::gateway_operators::OperatorSnapshot,
+) -> Option<String> {
+    if payloads.is_empty() {
+        return None;
+    }
+    let skipped = payloads.len().saturating_sub(MAX_PEOPLE_MESSAGES);
+    let mut block = String::from(
+        "[People-only messages: since your previous prompt, people in this thread talked to \
+         each other without waking you. Read them for context. Answer only what the message \
+         below asks.",
+    );
+    if skipped > 0 {
+        block.push_str(&format!("\n… {skipped} earlier message(s) not shown"));
+    }
+    for payload in &payloads[skipped..] {
+        let device = crate::core::store::typed_on_device(PEOPLE_MESSAGE_EVENT_TYPE, payload);
+        let speaker = operators.speaker_of_device(device.as_deref());
+        let mut text = str_field(payload, "text");
+        if let Some((cut, _)) = text.char_indices().nth(MAX_PEOPLE_MESSAGE_CHARS) {
+            text.truncate(cut);
+            text.push_str("… [cut]");
+        }
+        block.push_str(&format!("\n{speaker}: {text}"));
+    }
+    block.push(']');
+    Some(block)
 }
 
 /// True when the gap's newest coding-agent terminal is an abort an engine

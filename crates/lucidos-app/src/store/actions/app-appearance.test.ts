@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { APPEARANCE_CHANNEL } from '@lucidos/appearance';
-import { installAppAppearanceSync, pushAppearanceToFrame } from './app-appearance';
+import { installAppAppearanceSync, pushAppearanceToFrame, WIDGET_FIT_SCALE_ATTRIBUTE } from './app-appearance';
 import { applyThemeMode, applyUiScale } from './preferences';
 
 function appFrame(): { frame: HTMLIFrameElement; postMessage: ReturnType<typeof vi.fn> } {
@@ -53,5 +53,27 @@ describe('the appearance push to app frames', () => {
       expect(pushes).toHaveLength(1);
       expect(pushes[0].data).toMatchObject({ 'ui-scale': '150', 'theme-mode': 'light' });
     }
+  });
+
+  /** Invariant: a fit check's frame keeps the scale it measures at. */
+  it('hands a frame on a fit check surface that surface\'s scale', async () => {
+    installAppAppearanceSync();
+    await Promise.resolve();
+    const surface = document.createElement('div');
+    surface.setAttribute(WIDGET_FIT_SCALE_ATTRIBUTE, '125');
+    const probe = appFrame();
+    surface.appendChild(probe.frame);
+    document.body.appendChild(surface);
+    const plain = appFrame();
+
+    pushAppearanceToFrame(probe.frame);
+    expect(pushesOf(probe.postMessage)[0].data).toMatchObject({ 'ui-scale': '125' });
+
+    applyUiScale(100);
+    applyThemeMode('light');
+    await Promise.resolve();
+    const last = (postMessage: ReturnType<typeof vi.fn>) => pushesOf(postMessage).slice(-1)[0].data;
+    expect(last(probe.postMessage)).toMatchObject({ 'ui-scale': '125', 'theme-mode': 'light' });
+    expect(last(plain.postMessage)).toMatchObject({ 'ui-scale': '100' });
   });
 });

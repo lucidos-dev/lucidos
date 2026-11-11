@@ -4,6 +4,17 @@
   "currency": "USD",
   "unpriced_cache_shares": { "read": 0.1, "write_5m": 1.25, "write_1h": 2.0, "write_12h": 2.5 },
   "models": {
+    "claude-fable-5-2": [
+      {"uncached_in": 8.0, "cache_write": 10.0, "cache_write_1h": 16.0, "cache_read": 0.2, "out": 40.0, "source": "https://platform.claude.com/docs/en/models/fable-5-2/overview", "from": "2026-11-09"}
+    ],
+    "gemini-4-argon": [
+      {"uncached_in": 2.0, "cache_write": 2.0, "cache_read": 0.1, "out": 10.0, "source": "https://cloud.google.com/model-garden/pricing. Global standard tier; introductory effective rates include promotional credits through November 30. Implicit caching writes at no premium."},
+      {"uncached_in": 4.0, "cache_write": 4.0, "cache_read": 0.2, "out": 20.0, "source": "https://cloud.google.com/model-garden/pricing. Global standard tier; introductory effective rates include promotional credits through November 30. Implicit caching writes at no premium.", "from": "2026-12-01"}
+    ],
+    "gemini-4-carbon": [
+      {"uncached_in": 2.0, "cache_write": 2.0, "cache_read": 0.1, "out": 10.0, "source": "https://cloud.google.com/model-garden/pricing. Global standard tier; introductory effective rates include promotional credits through November 30. Implicit caching writes at no premium."},
+      {"uncached_in": 4.0, "cache_write": 4.0, "cache_read": 0.2, "out": 20.0, "source": "https://cloud.google.com/model-garden/pricing. Global standard tier; introductory effective rates include promotional credits through November 30. Implicit caching writes at no premium.", "from": "2026-12-01"}
+    ],
     "gpt-6.1-sol": [
       {
         "uncached_in": 2.0,

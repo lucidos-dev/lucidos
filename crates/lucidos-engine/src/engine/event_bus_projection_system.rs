@@ -12,7 +12,7 @@ use super::super::{EventBus, SystemEvent};
 
 impl EventBus {
     /// Fill in the audience of a `NotificationCreated` that names none, from
-    /// the work item of the thread it opens (ADR 0623). The event then carries
+    /// the root thread of the thread it opens (ADR 0623). The event then carries
     /// it, so a replay projects the same row. A lookup that fails leaves the
     /// whole team: a notification must never silently reach nobody.
     pub(crate) async fn with_notification_audience(&self, event: SystemEvent) -> SystemEvent {
@@ -27,12 +27,13 @@ impl EventBus {
             tap,
             actor,
             audience: None,
+            push_group,
         } = event
         else {
             return event;
         };
         let link_event = event_id.as_deref().and_then(|e| Uuid::parse_str(e).ok());
-        let audience = crate::engine::work_item::audience_of_notification(
+        let audience = crate::engine::thread_people::audience_of_notification(
             self.pool(),
             &tap,
             link_event,
@@ -44,7 +45,7 @@ impl EventBus {
                 "[EventBus] Cannot read a notification's audience (team): {}",
                 e
             );
-            crate::engine::work_item::Audience::Team
+            crate::engine::thread_people::Audience::Team
         })
         .device_ids();
         SystemEvent::NotificationCreated {
@@ -58,6 +59,7 @@ impl EventBus {
             tap,
             actor,
             audience,
+            push_group,
         }
     }
 
@@ -81,14 +83,15 @@ impl EventBus {
                 tap,
                 actor: _,
                 audience,
+                push_group,
             } => {
                 let notification_id = Uuid::parse_str(id).unwrap_or(event_id);
                 let task_uuid = task_id.as_ref().and_then(|s| Uuid::parse_str(s).ok());
                 let thread_uuid = thread_id.as_ref().and_then(|s| Uuid::parse_str(s).ok());
                 let event_uuid = link_event_id.as_ref().and_then(|s| Uuid::parse_str(s).ok());
                 sqlx::query(
-                    "INSERT INTO notifications (id, task_id, app_id, thread_id, event_id, title, message, read, created_at, tap, audience) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, false, NOW(), $8, $9)"
+                    "INSERT INTO notifications (id, task_id, app_id, thread_id, event_id, title, message, read, created_at, tap, audience, push_group) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, false, NOW(), $8, $9, $10)"
                 )
                 .bind(notification_id)
                 .bind(task_uuid)
@@ -99,6 +102,7 @@ impl EventBus {
                 .bind(message)
                 .bind(sqlx::types::Json(tap))
                 .bind(audience.as_deref())
+                .bind(push_group.as_ref().map(sqlx::types::Json))
                 .execute(&mut **tx)
                 .await?;
                 Ok(())

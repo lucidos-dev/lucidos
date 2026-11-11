@@ -479,6 +479,7 @@ mod origin_invariants {
             user_agent: Some("curl/8".into()),
             mode: ActorMode::Human,
             source_thread_id: None,
+            emitting_trigger_id: None,
         };
         let res = make_message_received_with_origin(
             std::path::Path::new(""),
@@ -505,6 +506,7 @@ mod origin_invariants {
             user_agent: Some("MyApp/1.0".into()),
             mode: ActorMode::Agent,
             source_thread_id: None,
+            emitting_trigger_id: None,
         };
         let res = make_message_received_with_origin(
             std::path::Path::new(""),
@@ -534,6 +536,7 @@ mod origin_invariants {
             user_agent: Some("ScriptRunner/2.0".into()),
             mode: ActorMode::Engine,
             source_thread_id: None,
+            emitting_trigger_id: None,
         };
         let res = make_message_received_with_origin(
             std::path::Path::new(""),
@@ -560,6 +563,7 @@ mod origin_invariants {
             user_agent: None,
             mode: ActorMode::Agent,
             source_thread_id: None,
+            emitting_trigger_id: None,
         };
         let res = make_message_received_with_origin(
             std::path::Path::new(""),

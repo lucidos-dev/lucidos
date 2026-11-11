@@ -1649,6 +1649,65 @@ fn parse_result_is_error_with_no_subtype_and_no_errors_yields_no_error() {
     }
 }
 
+/// The final `result` of a turn after `assistant_lines`, all on one stream.
+fn turn_result_error(assistant_lines: &[&str], result_line: &str) -> Option<String> {
+    let mut state = CcStreamState::default();
+    for line in assistant_lines {
+        parse_line(&mut state, line);
+    }
+    match parse_line(&mut state, result_line).pop() {
+        Some(AgentEvent::Result { error, .. }) => error,
+        other => panic!("Expected Result, got {:?}", other),
+    }
+}
+
+const SPEND_CAP_BANNER: &str = r#"{"type":"assistant","is_api_error_message":true,"error":"rate_limit","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"spend limit reached (daily) - raise your cap"}]}}"#;
+const SPEND_CAP_RESULT: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"spend limit reached (daily) - raise your cap","duration_ms":100}"#;
+
+/// A gateway's own 429 body has no `API Error` prefix, and CC may stamp the
+/// result successful. The banner flag alone marks the turn as failed.
+#[test]
+fn turn_ending_on_api_error_banner_fails_with_its_text() {
+    assert_eq!(
+        turn_result_error(&[SPEND_CAP_BANNER], SPEND_CAP_RESULT).as_deref(),
+        Some("spend limit reached (daily) - raise your cap"),
+    );
+}
+
+/// The banner is only the cause while it is the turn's last word. Real
+/// prose after it means CC recovered.
+#[test]
+fn api_error_banner_followed_by_prose_does_not_fail() {
+    let prose = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Recovered."}]}}"#;
+    let result = r#"{"type":"result","subtype":"success","is_error":false,"result":"Recovered.","duration_ms":100}"#;
+    assert_eq!(turn_result_error(&[SPEND_CAP_BANNER, prose], result), None);
+}
+
+/// A sub-agent's failed call is the sub-agent's business. The parent turn
+/// can still finish.
+#[test]
+fn sub_agent_api_error_banner_does_not_fail_the_turn() {
+    let banner = r#"{"type":"assistant","is_api_error_message":true,"parent_tool_use_id":"toolu_1","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"API Error: 500"}]}}"#;
+    let result = r#"{"type":"result","subtype":"success","is_error":false,"result":"Done.","duration_ms":100}"#;
+    assert_eq!(turn_result_error(&[banner], result), None);
+}
+
+/// The banner belongs to one turn. The next turn starts clean.
+#[test]
+fn api_error_banner_does_not_leak_into_the_next_turn() {
+    let mut state = CcStreamState::default();
+    parse_line(&mut state, SPEND_CAP_BANNER);
+    parse_line(&mut state, SPEND_CAP_RESULT);
+    let next = parse_line(
+        &mut state,
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"Fine.","duration_ms":100}"#,
+    );
+    assert!(matches!(
+        next.last(),
+        Some(AgentEvent::Result { error: None, .. })
+    ));
+}
+
 #[test]
 fn parse_empty_line() {
     assert!(parse_one_line("").is_empty());

@@ -72,15 +72,6 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Rust engine
 
-- **An in-thread engine reason classed `Interactive` grants nothing.**
-  `resolve_attend_mode` reads only a thread's first origin-bearing
-  `MessageReceived` or `TriggerStarted`. Reasons stamped later inside a running
-  thread, such as `ContextCeiling`, `MissingHardening` and `CacheKeepAlive`,
-  never decide its mode. A scheduler thread that crosses its ceiling still
-  resolves through its `Scheduler` origin.
-  Re-flag only if such a reason can start a thread.
-  (`crates/lucidos-engine/src/engine/cc_permission.rs`.)
-
 - **The read-time mask leaves secret-reference credentials out on purpose.**
   A reviewer asks `stored_secret_values` to fail closed whenever a reference
   credential exists, since its resolved value stays unmasked. Resolving runs
@@ -1506,6 +1497,13 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   evidence the fallthrough cannot reach a browser.
 
 ## Frontend
+
+- **A widget box's `body.scrollWidth` counts a sideways spill.** Reviewers
+  read `overflow-x: clip` on `body` in `sdk_iframe.css` and expect a clipped
+  `scrollWidth`. In a box, `holdStillInBox` sets `overflow: hidden` on both
+  `<html>` and `<body>`, so the body is a scroll container and reports the
+  spill. Re-flag only if that hold stops covering the body.
+  (`packages/lucidos-sdk/src/widgetFrame.ts`, `contentWidth`.)
 
 - **A clamped XL widget box pans from a wheel or trackpad over its frame.**
   Reviewers see the hidden scrollbar and the frame covering `.widget-box-scroll`,
@@ -4865,3 +4863,29 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag if those APIs become reachable, dependency features change, or a new
   advisory affects these bounded reads or validated writes. This finding does
   not certify unrelated uses in transitive dependencies.
+
+- **A bare `window.localStorage` read in the host shell is not a boot risk.**
+  A reviewer notes that reading the property can throw a `SecurityError` in a
+  storage-blocked context, before any `try` around `getItem` runs. It was
+  raised against `trackAppHeight`'s `keyboardBandMemory(window.localStorage)`.
+
+  The host app never reaches that code in such a context.
+  `installWorkspaceStorage` (`utils/workspaceStorage.ts`) and `utils/motion.ts`
+  touch `localStorage` unguarded at boot, before any component mounts. Guarding
+  one later site changes nothing for a user.
+
+  Re-flag if the boot path gains a storage fallback, or if the site runs in an
+  app iframe or another realm the host boot does not cover.
+
+- **A device-id adoption that finishes after its boot deadline is meant to.**
+  A reviewer notes that `withDeadline` stops waiting but does not cancel
+  `adoptGatewayDeviceId` or `adoptRelayedDeviceId`. So a late result can switch
+  the page's id after boot registered the old one.
+
+  That switch is the convergence. Each adoption commits only after its
+  hand-over lands, and the hand-over moves the row boot registered. Ignoring a
+  late result would leave the page sending an id whose row has just moved. Its
+  next registration would then split the device in two.
+
+  Re-flag if an adoption commits before its hand-over resolves, or if boot
+  registers anything that the hand-over does not move.

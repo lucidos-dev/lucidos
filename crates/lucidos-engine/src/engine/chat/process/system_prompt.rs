@@ -733,7 +733,7 @@ impl MandatoryPref {
 const MANDATORY_PREFS: &[(MandatoryPref, &str)] = &[
     (MandatoryPref::Optional(&prefs::TIMEZONE), "- TIMEZONE: Ask what timezone they are in and call preferences(action=\"set\", key=\"timezone\", value=\"…\") with an IANA name (e.g., \"America/New_York\", \"Europe/London\", \"Asia/Tokyo\")."),
     (MandatoryPref::Optional(&prefs::LANGUAGE), "- LANGUAGE: Ask what language they prefer, and mention that English is recommended for best results (the models are strongest in English). They can still write in any language; replies come back in whichever language they set here. Then call preferences(action=\"set\", key=\"language\", value=\"…\") to save it."),
-    (MandatoryPref::Optional(&prefs::PUSH_NOTIFICATIONS), "- PUSH NOTIFICATIONS: Ask if they want to enable push notifications for scheduled task alerts (do NOT call them \"browser\" notifications: Lucidos runs as a native desktop app too, where these are native OS alerts). When you describe how they arrive, key off the last used device in [USER DEVICE & PREFERENCES]: if its details say \"Lucidos desktop app\" they are in the native desktop app (native macOS notifications, no browser or site permission); otherwise they are in a browser/PWA (the browser will prompt for permission). If yes, call preferences(action=\"set\", key=\"push_notifications\", value=\"enabled\"). If no, call preferences(action=\"set\", key=\"push_notifications\", value=\"declined\") so you don't ask again."),
+    (MandatoryPref::Optional(&prefs::PUSH_NOTIFICATIONS), "- PUSH NOTIFICATIONS: Ask if they want to enable push notifications, which reach them when they are away from Lucidos: anything an agent sends them, trigger and scheduled-task results, and system alerts such as a failed backup. Never narrow them to one source such as scheduled tasks (do NOT call them \"browser\" notifications: Lucidos runs as a native desktop app too, where these are native OS alerts). When you describe how they arrive, key off the last used device in [USER DEVICE & PREFERENCES]: if its details say \"Lucidos desktop app\" they are in the native desktop app (native macOS notifications, no browser or site permission); otherwise they are in a browser/PWA (the browser will prompt for permission). If yes, call preferences(action=\"set\", key=\"push_notifications\", value=\"enabled\"). If no, call preferences(action=\"set\", key=\"push_notifications\", value=\"declined\") so you don't ask again."),
     (MandatoryPref::Text(&prefs::TECHNICAL_LITERACY), "- TECHNICAL LITERACY: Ask \"How technical should I be with you?\" as a card with exactly these three options, label then description, word for word: \"Keep it plain\" / \"Everyday words, no jargon.\"; \"Technical\" / \"Technical terms are fine.\"; \"I write software\" / \"Talk to me like a developer.\". Store the pick with preferences(action=\"set\", key=\"technical_literacy\", value=…) as \"non-technical\", \"technical\" or \"developer\". If they decline, set value=\"not-set\" so you don't ask again. Word the rest of this reply at the level they picked."),
 ];
 
@@ -1754,7 +1754,16 @@ mod tests {
     /// of its own, and `fragment` naming a settings row. A link to a provider's
     /// block is written while the agent writes the call. The `fragment`
     /// description was cut to the original's length first.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 134_817;
+    ///
+    /// Raised by 30 to a measured 134,847 for ADR 0636: the ninth provider
+    /// name, `chatgpt-plan`, in the `triggers` and `manage_models` enums,
+    /// which the tools validate against.
+    ///
+    /// Raised by 82 to a measured 134,929 for the widget fit check (ADR 0643):
+    /// the `fit` action on the `widgets` tool, and one widget rule naming its
+    /// note and the ellipsis ban. The stale title-bar clause was cut, and both
+    /// texts trimmed, first.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 134_929;
 
     /// The gate set the ratchet bills.
     ///
@@ -1922,7 +1931,7 @@ mod tests {
         ),
         (
             "triggers",
-            3_907,
+            3_922,
             "seven actions, each contributing its own summary line and its own \
              `(requires: …)` clause, plus the create schema's union shapes for \
              `cron` and `on`. system-knowhow/triggers.md deliberately does NOT \
@@ -1937,6 +1946,7 @@ mod tests {
              Raised from 2,980 by the trigger `provider` pin: a null-union over \
              the provider names, declared once on create like `model`, and \
              from 3,401 by the eighth, `claude-gateway` (ADR 0508). \
+             Raised from 3,907 by the ninth, `chatgpt-plan` (ADR 0636). \
              Raised from 3,250 by `mcp_servers` (ADR 0430): a null-union over a \
              string array, since a trigger's fires may call only the MCP servers \
              it lists. Raised from 3,418 by ADR 0623: `continue_key` is a \
@@ -1946,7 +1956,7 @@ mod tests {
         (
             "manage_models",
             1_986,
-            "six actions, the eight-value provider enum, and `routes`: an array \
+            "six actions, the nine-value provider enum, and `routes`: an array \
              of objects whose item shape (provider, wire id, window) is what \
              the model writes a multi-backend model from. The context-window \
              warning stays, because an omitted window silently budgets a large \

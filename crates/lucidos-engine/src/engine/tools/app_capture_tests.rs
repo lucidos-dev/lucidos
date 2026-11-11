@@ -4,12 +4,10 @@
 //! last used device. A quick "No app UI is currently open" from another device
 //! must never beat the real capture.
 
-use super::{
-    app_ui_tool_impl, parse_save_target, resolve_capture, CaptureRefusal, PendingCaptures,
-    SaveTarget, CAPTURE_TIMEOUT,
-};
+use super::{app_ui_tool_impl, parse_save_target, PendingCaptures, SaveTarget, CAPTURE_TIMEOUT};
 use crate::core::ArtifactManager;
 use crate::engine::event_bus::{BusEvent, EmittedEvent, EventBus};
+use crate::engine::pending_answers::{resolve_answer, AnswerRefusal};
 use crate::engine::thread_events::{CaptureFormat, MessageOrigin, ThreadEvent};
 use crate::engine::CaptureResult;
 use crate::test_support::{seed_device, setup_test_db, teardown_test_db};
@@ -168,11 +166,11 @@ async fn a_page_without_the_app_cannot_beat_the_last_used_device() {
     );
 
     assert_eq!(
-        resolve_capture(&pending, &request_id, Some(PHONE), answer("", NO_APP_OPEN)),
-        Err(CaptureRefusal::OtherDevice),
+        resolve_answer(&pending, &request_id, Some(PHONE), answer("", NO_APP_OPEN)),
+        Err(AnswerRefusal::OtherDevice),
         "the phone's quick error must be refused"
     );
-    resolve_capture(
+    resolve_answer(
         &pending,
         &request_id,
         Some(LAPTOP),
@@ -224,7 +222,7 @@ async fn refresh_is_scoped_to_the_last_used_device_too() {
     assert_eq!(refresh_actor.as_deref(), Some(LAPTOP));
 
     let (request_id, _) = next_capture(&mut rx, thread_id).await;
-    resolve_capture(
+    resolve_answer(
         &pending,
         &request_id,
         Some(LAPTOP),
@@ -255,7 +253,7 @@ async fn an_error_from_the_last_used_device_names_it() {
         CAPTURE_TIMEOUT,
     );
     let (request_id, _) = next_capture(&mut rx, thread_id).await;
-    resolve_capture(&pending, &request_id, Some(LAPTOP), answer("", NO_APP_OPEN))
+    resolve_answer(&pending, &request_id, Some(LAPTOP), answer("", NO_APP_OPEN))
         .expect("the laptop answers");
 
     let out = tool.await.expect("tool task");
@@ -285,8 +283,8 @@ async fn a_timeout_names_the_device_that_did_not_answer() {
     );
     let (request_id, _) = next_capture(&mut rx, thread_id).await;
     assert_eq!(
-        resolve_capture(&pending, &request_id, Some(PHONE), answer("", NO_APP_OPEN)),
-        Err(CaptureRefusal::OtherDevice)
+        resolve_answer(&pending, &request_id, Some(PHONE), answer("", NO_APP_OPEN)),
+        Err(AnswerRefusal::OtherDevice)
     );
 
     let out = tool.await.expect("tool task");
@@ -298,8 +296,8 @@ async fn a_timeout_names_the_device_that_did_not_answer() {
         "a timed-out request is removed"
     );
     assert_eq!(
-        resolve_capture(&pending, &request_id, Some(LAPTOP), answer("late", "")),
-        Err(CaptureRefusal::Unknown),
+        resolve_answer(&pending, &request_id, Some(LAPTOP), answer("late", "")),
+        Err(AnswerRefusal::Unknown),
         "a late answer finds nothing to resolve"
     );
 
@@ -326,7 +324,7 @@ async fn with_no_last_used_device_any_page_may_answer() {
     );
     let (request_id, scoped_to) = next_capture(&mut rx, thread_id).await;
     assert_eq!(scoped_to, None, "an untargeted request names no device");
-    resolve_capture(&pending, &request_id, Some(PHONE), answer("", NO_APP_OPEN))
+    resolve_answer(&pending, &request_id, Some(PHONE), answer("", NO_APP_OPEN))
         .expect("any page may answer");
     assert_eq!(tool.await.expect("tool task"), NO_APP_OPEN);
 
@@ -366,11 +364,11 @@ async fn a_named_device_answers_instead_of_the_last_used_one() {
         "the request names the phone"
     );
     assert_eq!(
-        resolve_capture(&pending, &request_id, Some(LAPTOP), answer("", NO_APP_OPEN)),
-        Err(CaptureRefusal::OtherDevice),
+        resolve_answer(&pending, &request_id, Some(LAPTOP), answer("", NO_APP_OPEN)),
+        Err(AnswerRefusal::OtherDevice),
         "the last used laptop must not answer for the phone"
     );
-    resolve_capture(
+    resolve_answer(
         &pending,
         &request_id,
         Some(PHONE),
@@ -384,7 +382,7 @@ async fn a_named_device_answers_instead_of_the_last_used_one() {
 
     let tool = start_with(&bus, &pool, &pending, &artifacts, args, thread_id);
     let (request_id, _) = next_capture(&mut rx, thread_id).await;
-    resolve_capture(&pending, &request_id, Some(PHONE), answer("", NO_APP_OPEN))
+    resolve_answer(&pending, &request_id, Some(PHONE), answer("", NO_APP_OPEN))
         .expect("the phone answers");
     let out = tool.await.expect("tool task");
     assert!(
@@ -512,7 +510,7 @@ async fn saved_capture(
     let args = json!({ "app_id": "habit-tracker", "save_as_artifact": path });
     let tool = start_with(&bus, &pool, &pending, &artifacts, args, thread_id);
     let (request_id, _, format) = next_capture_with_format(&mut rx, thread_id).await;
-    resolve_capture(&pending, &request_id, Some(LAPTOP), answer(screenshot, dom))
+    resolve_answer(&pending, &request_id, Some(LAPTOP), answer(screenshot, dom))
         .expect("the laptop answers");
     let out = tool.await.expect("tool task");
 
@@ -630,7 +628,7 @@ async fn a_failed_write_is_reported() {
     let tool = start_with(&bus, &pool, &pending, &artifacts, args, thread_id);
     let (request_id, _) = next_capture(&mut rx, thread_id).await;
     let png = picture(image::ImageFormat::Png);
-    resolve_capture(&pending, &request_id, Some(LAPTOP), answer(&png, "<main/>")).unwrap();
+    resolve_answer(&pending, &request_id, Some(LAPTOP), answer(&png, "<main/>")).unwrap();
     let out = tool.await.expect("tool task");
     assert!(
         out.starts_with("Error: Saving artifacts/shots/board.png failed:"),
@@ -659,7 +657,7 @@ async fn a_plain_capture_asks_for_no_format() {
     );
     let (request_id, _, format) = next_capture_with_format(&mut rx, thread_id).await;
     assert_eq!(format, None);
-    resolve_capture(
+    resolve_answer(
         &pending,
         &request_id,
         Some(LAPTOP),

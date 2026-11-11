@@ -350,6 +350,12 @@ pub fn mcp_tool_char_ceiling(context_window: usize) -> usize {
     crate::engine::context::agent_context_char_budget(context_window) / MCP_BUDGET_DIVISOR
 }
 
+/// Request-path ceiling for a model whose reply may share its input window.
+pub(crate) fn mcp_tool_char_ceiling_for(model: &str, context_window: usize) -> usize {
+    crate::engine::context::agent_context_char_budget_for(model, context_window)
+        / MCP_BUDGET_DIVISOR
+}
+
 /// From this share of the MCP tool ceiling, the cost report warns before any tool
 /// is left out.
 const MCP_WARNING_PERCENT: usize = 80;
@@ -375,9 +381,14 @@ pub struct McpBudget {
 }
 
 impl McpBudget {
-    fn new(context_window: usize, sent: &[ToolDefinition], dropped: Vec<McpDroppedTools>) -> Self {
+    fn new(
+        model: &str,
+        context_window: usize,
+        sent: &[ToolDefinition],
+        dropped: Vec<McpDroppedTools>,
+    ) -> Self {
         let sent_chars = tool_definitions_chars(sent);
-        let mcp_ceiling_chars = mcp_tool_char_ceiling(context_window);
+        let mcp_ceiling_chars = mcp_tool_char_ceiling_for(model, context_window);
         let left_out: usize = dropped.iter().map(|d| d.tools.len()).sum();
         let warning = if left_out > 0 {
             Some(format!(
@@ -401,7 +412,10 @@ impl McpBudget {
             None
         };
         Self {
-            request_chars: crate::engine::context::agent_context_char_budget(context_window),
+            request_chars: crate::engine::context::agent_context_char_budget_for(
+                model,
+                context_window,
+            ),
             mcp_ceiling_chars,
             sent_tools: sent.len(),
             sent_chars,
@@ -1354,13 +1368,14 @@ impl McpManager {
     /// thread's request would carry.
     pub async fn budget(
         &self,
+        model: &str,
         context_window: usize,
     ) -> Result<McpBudget, Box<dyn std::error::Error + Send + Sync>> {
         let (sent, dropped) = fit_to_ceiling(
             self.offers_if_enabled().await?,
-            mcp_tool_char_ceiling(context_window),
+            mcp_tool_char_ceiling_for(model, context_window),
         );
-        Ok(McpBudget::new(context_window, &sent, dropped))
+        Ok(McpBudget::new(model, context_window, &sent, dropped))
     }
 
     /// One `[MCP SERVERS]` line per configured server, stating its status in a
@@ -2240,7 +2255,7 @@ mod tests {
     #[test]
     fn the_budget_report_agrees_with_the_request_budget_and_warns_near_the_ceiling() {
         let ceiling = mcp_tool_char_ceiling(200_000);
-        let quiet = McpBudget::new(200_000, &[definition_of(ceiling / 2)], Vec::new());
+        let quiet = McpBudget::new("", 200_000, &[definition_of(ceiling / 2)], Vec::new());
         assert_eq!(
             quiet.request_chars,
             crate::engine::context::agent_context_char_budget(200_000)
@@ -2250,11 +2265,12 @@ mod tests {
         assert_eq!(quiet.sent_tokens, estimate_tokens_from_chars(ceiling / 2));
         assert_eq!(quiet.warning, None);
 
-        let near = McpBudget::new(200_000, &[definition_of(ceiling / 10 * 9)], Vec::new());
+        let near = McpBudget::new("", 200_000, &[definition_of(ceiling / 10 * 9)], Vec::new());
         let warning = near.warning.expect("90% of the ceiling warns");
         assert!(warning.contains("90%"), "{warning}");
 
         let past = McpBudget::new(
+            "",
             200_000,
             &[definition_of(ceiling)],
             vec![McpDroppedTools {
@@ -2269,7 +2285,7 @@ mod tests {
         );
         assert!(warning.contains("server 'github'"), "{warning}");
 
-        assert_eq!(McpBudget::new(200_000, &[], Vec::new()).warning, None);
+        assert_eq!(McpBudget::new("", 200_000, &[], Vec::new()).warning, None);
     }
 
     // -----------------------------------------------------------------------
@@ -2762,7 +2778,20 @@ done
         state.is_empty() || state.starts_with('Z')
     }
 
+    /// One manager over one stub server whose launch line the owner approved,
+    /// so the default-on command guard lets it start.
     async fn manager_with(
+        pool: &sqlx::PgPool,
+        id: &str,
+        stub: &StubServer,
+    ) -> (McpManager, crate::engine::event_bus::EventBus) {
+        let (manager, bus) = manager_with_unapproved(pool, id, stub).await;
+        approve_all(&manager).await;
+        (manager, bus)
+    }
+
+    /// As [`manager_with`], with the launch line nobody approved.
+    async fn manager_with_unapproved(
         pool: &sqlx::PgPool,
         id: &str,
         stub: &StubServer,
@@ -2824,7 +2853,15 @@ done
             .await
             .unwrap();
         }
-        McpManager::new(pool.clone(), bus, test_workspace_root())
+        let manager = McpManager::new(pool.clone(), bus, test_workspace_root());
+        approve_all(&manager).await;
+        manager
+    }
+
+    async fn approve_all(manager: &McpManager) {
+        for server in McpServerStore::list(&manager.pool).await.unwrap() {
+            manager.approve_launch(&server, None).await.unwrap();
+        }
     }
 
     /// The round trip the whole feature rests on: connect, cache what the
@@ -2944,12 +2981,35 @@ done
         assert!(cut.dropped_notice().is_some());
 
         // A window small enough that its ceiling fits no tool at all.
-        let budget = manager.budget(0).await.unwrap();
+        let budget = manager.budget("", 0).await.unwrap();
         assert_eq!(budget.mcp_ceiling_chars, 0);
         assert_eq!((budget.sent_tools, budget.sent_chars), (0, 0));
         assert_eq!(budget.dropped[0].tools.len(), 3);
         assert!(budget.warning.is_some());
 
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn gemini_four_budget_report_matches_the_live_tool_surface() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha", "beta"]));
+        let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        let thread = thread_enabling(&manager, &["stub"]).await;
+        manager.start_server("stub").await.unwrap();
+        for model in ["gemini-4-argon", "gemini-4-carbon"] {
+            let report = manager.budget(model, 1_048_576).await.unwrap();
+            let surface = manager
+                .tool_surface(thread, mcp_tool_char_ceiling_for(model, 1_048_576))
+                .await;
+            assert_eq!(report.sent_chars, tool_definitions_chars(&surface.tools));
+            assert_eq!(report.request_chars, (1_048_576 - 32_768) * 3 / 2);
+            assert_eq!(
+                report.mcp_ceiling_chars,
+                report.request_chars / MCP_BUDGET_DIVISOR
+            );
+        }
+        manager.stop_server("stub").await.unwrap();
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
@@ -2968,7 +3028,7 @@ done
         manager.stop_server("down").await.unwrap();
         manager.start_server("up").await.unwrap();
 
-        let budget = manager.budget(200_000).await.unwrap();
+        let budget = manager.budget("", 200_000).await.unwrap();
         assert_eq!(budget.sent_tools, 3, "up's one tool and down's two");
         assert!(budget.dropped.is_empty());
 
@@ -3157,6 +3217,15 @@ done
             .contains(CALLABLE_NOW));
 
         let (pool, db_name) = crate::test_support::setup_test_db().await;
+        // The `mcp` tool asks before a guarded setup. This test calls the
+        // manager below that card, so it runs with the guard off.
+        crate::core::preferences::PreferenceStore::set_row_for_test(
+            &pool,
+            crate::core::prefs::COMMAND_GUARD.key(),
+            "false",
+        )
+        .await
+        .unwrap();
         let stub = StubServer::new(&priced_tools(&["alpha"]));
         let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
         let registered = manager
@@ -3592,7 +3661,7 @@ done
         use crate::core::preferences::PreferenceStore;
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let stub = StubServer::new(&priced_tools(&["alpha"]));
-        let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        let (manager, _bus) = manager_with_unapproved(&pool, "stub", &stub).await;
         let thread_id = thread_enabling(&manager, &["stub"]).await;
         PreferenceStore::set_row_for_test(&pool, crate::core::prefs::COMMAND_GUARD.key(), "true")
             .await
@@ -3616,12 +3685,16 @@ done
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// With the guard off, the default, an unapproved line starts as before.
+    /// With the guard turned off, an unapproved line starts as before.
     #[tokio::test]
     async fn with_the_guard_off_an_unapproved_launch_line_starts() {
+        use crate::core::preferences::PreferenceStore;
         let (pool, db_name) = crate::test_support::setup_test_db().await;
+        PreferenceStore::set_row_for_test(&pool, crate::core::prefs::COMMAND_GUARD.key(), "false")
+            .await
+            .unwrap();
         let stub = StubServer::new(&priced_tools(&["alpha"]));
-        let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        let (manager, _bus) = manager_with_unapproved(&pool, "stub", &stub).await;
         let server = McpServerStore::get(&pool, "stub").await.unwrap().unwrap();
         assert!(!manager.is_launch_approved(&server).await.unwrap());
 
@@ -3643,7 +3716,7 @@ done
     async fn the_server_list_reports_the_launch_line_and_its_approval() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let stub = StubServer::new(&priced_tools(&["alpha"]));
-        let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        let (manager, _bus) = manager_with_unapproved(&pool, "stub", &stub).await;
         let server = McpServerStore::get(&pool, "stub").await.unwrap().unwrap();
         let before = manager.list_servers().await.unwrap().remove(0);
         assert!(!before.launch_approved);
@@ -3954,6 +4027,7 @@ done
         )
         .await
         .unwrap();
+        approve_all(&manager).await;
         assert_eq!(
             manager.start_server("empty").await.unwrap(),
             McpStartOutcome::Started { tool_count: 0 }

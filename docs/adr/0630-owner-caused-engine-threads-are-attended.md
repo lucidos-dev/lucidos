@@ -1,6 +1,7 @@
 # 0630: Owner-caused engine threads are attended, and only a trigger announces a parked card; amends ADR 0628
 
-- **Status**: Accepted
+- **Status**: Superseded by [ADR 0641](0641-coding-agents-trust-by-provenance.md), which removes attend mode from the
+  coding-agent lane
 - **Date**: 2026-11-08
 
 ## Context

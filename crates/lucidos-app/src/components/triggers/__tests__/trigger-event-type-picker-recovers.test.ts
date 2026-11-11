@@ -40,6 +40,7 @@ function trigger(): TriggerInfo {
     cron_expressions: [],
     timezone: 'UTC',
     paused: false,
+    coding_agent_grant: false,
     run: { type: 'intent', intent: 'check CI' },
     on: [{ event_type: 'DeployFinished' }],
   };

@@ -122,6 +122,7 @@ fn agent() -> Option<MessageOrigin> {
         user_agent: None,
         mode: ActorMode::Agent,
         source_thread_id: Some(Uuid::new_v4()),
+        emitting_trigger_id: None,
     })
 }
 

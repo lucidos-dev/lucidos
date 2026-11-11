@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use super::log::{self, StoredEvent, ThreadKind, ThreadLog};
 use super::{NodeAddr, SummaryScope, HORIZON_SECS};
-use crate::engine::thread_events::ThreadEvent;
+use crate::engine::thread_events::{EventMeta, ThreadEvent};
 
 type StoreResult<T> = Result<T, sqlx::Error>;
 
@@ -407,7 +407,8 @@ async fn thread_events(pool: &PgPool, id: Uuid, through: i64) -> StoreResult<Vec
     Ok(rows
         .into_iter()
         .filter_map(|(id, event_type, payload)| {
-            parse_event(id, &event_type, payload).map(|event| StoredEvent { id, event })
+            let actor = EventMeta::from_payload(&payload).actor;
+            parse_event(id, &event_type, payload).map(|event| StoredEvent { id, event, actor })
         })
         .collect())
 }

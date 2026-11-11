@@ -211,11 +211,11 @@ Identifiers: the child row's `parent_thread_id` points up to the parent. `child_
 A child stops being one when it is *moved to top level*.
 
 ### Command guard
-An opt-in safety gate over the *Lucidos Agent*'s shell/Python tools, under **Settings → Permissions → Command safety** (off by default). A fast static check settles the obvious cases, and a cheap LLM **judge** decides the ambiguous middle, erring toward asking. Most commands run untouched, including reads anywhere and writes inside the workspace.
+A safety gate over the *Lucidos Agent*'s shell/Python tools, under **Settings → Permissions → Command safety**. It is on unless the workspace turned it off. A fast static check settles the obvious cases, and a cheap LLM **judge** decides the ambiguous middle, erring toward asking. Most commands run untouched, including reads anywhere and writes inside the workspace.
 
 Three lanes. A clearly catastrophic command (`rm -rf /`, a fork bomb, formatting a disk) is refused. An irreversible real-world side-effect, or destruction outside the workspace, pauses on a *command permission card*. An in-workspace deletion or overwrite runs after a *command checkpoint*, leaving a one-click Undo.
 
-Two sub-settings apply while the guard is on. Turning off the **LLM judge** uses the static dangerous-command classifier and destruction scan, and a command it cannot see through asks. If an enabled judge fails, the permission card asks the user and explains why. The **judge model** defaults to `gemini-3.1-flash-lite`.
+Two sub-settings apply while the guard is on. Turning off the **LLM judge** uses the static dangerous-command classifier and destruction scan, and a command it cannot see through asks. If an enabled judge fails, the permission card asks the user and explains why. The **judge model** lives in Settings → Models and defaults to `gemini-3.1-flash-lite`, then `gpt-6-luna`, then `claude-haiku-5-5`, whichever a provider serves. It never runs on the chat model: with no judge model served, a turn under the guard and its judge refuses to start and says how to fix it.
 
 A third sub-setting, **Answer coding-agent questions** (on by default), lets the guard also answer the permission cards of coding-agent commands (Codex, Claude Code `Bash`). It sees only what would otherwise card: the Claude Code permission mode and the Coding agent permissions list settle the rest first. On, a command the guard places as safe or reversible runs without a card, and a wrong reversible verdict has no undo. Off, the guard runs no Claude Code command unasked. Whatever the switches say, it refuses a catastrophic command it recognises. A Codex card means Codex's own sandbox blocked the command, so one the guard places as safe runs whatever the switches say.
 
@@ -475,7 +475,7 @@ See also: `system-knowhow/thread-events.md` § "Today the scheduler uses a block
 ### Dynamic bars
 On a phone, the header, the thread title and the prompt glide away as you scroll down a thread. The header also glides away over an app that loads the SDK, once your finger lifts. They glide back as you scroll up or swipe to another pane. The header returns near the top of the thread, the prompt near the end, and the prompt stays put while you type. A reply never moves them, even while the follow toggle carries you through it.
 
-The installed iOS app always runs dynamic bars, whatever the setting says: iOS keeps its status bar clear there, so the header runs behind it with its controls lowered 24px. Elsewhere it is off by default, and set in Settings > Appearance & Behavior > Mobile or the `mobile_dynamic_bars` preference.
+The installed iOS app always runs dynamic bars, whatever the setting says: iOS keeps its status bar clear there, so the header runs behind it with its controls lowered 24px. Elsewhere it is on by default, and set in Settings > Appearance & Behavior > Mobile or the `mobile_dynamic_bars` preference.
 
 ### Endpoint catalog
 The knowhow half of a *derived proxy entry*: a `data/knowhow/<name>-api.md` file listing the endpoints observed on a site, each with its params, response shape and quirks. The `apis.json` entry beside it is pure transport and names no paths. Without the catalog the LLM knows only that a proxy exists, so a derivation that emits one without the other has failed. It never records the user's own rows, only field names and types.
@@ -791,6 +791,8 @@ The backend that serves a *model*. Each *model registry* entry names its provide
 
 **Claude gateway** (`claude-gateway`) is an organisation's own *Claude gateway*, signed in to with a device code rather than a stored key. No launch env var sets it up, since the sign-in needs a person.
 
+**ChatGPT plan** (`chatgpt-plan`) is the *ChatGPT plan provider*: GPT models on the user's own ChatGPT subscription, set up with Sign in with ChatGPT. No launch env var sets it up either.
+
 OpenAI, OpenRouter, xAI, OpenCode Free and Local all speak the OpenAI Chat Completions wire format but are distinct backends.
 
 A model naming several providers stays ONE picker entry, served by whichever has credentials. The first-party Claude models list Vertex and Anthropic, since their ids match on both. A backend that spells a model differently says so per provider: Grok is `grok-4.6` on xAI and `x-ai/grok-4.6` on OpenRouter.
@@ -818,17 +820,29 @@ A record of each model call made through a *Claude gateway*, sent when its *gate
 Calls made while it was off are never sent later, and one sign-in's records never reach another gateway. An engine started with `CLAUDE_CODE_ENABLE_TELEMETRY=0` or `DISABLE_TELEMETRY=1` sends nothing.
 See also: *Claude gateway*.
 
+### ChatGPT plan provider
+The `chatgpt-plan` *provider*: GPT models served on the user's own ChatGPT plan instead of an OpenAI API key. Set it up with **Continue with ChatGPT** on the ChatGPT plan card under **Settings → Providers**, or with `lucidos chatgpt-plan sign-in`. OpenAI decides which plans may use it.
+
+Signing in opens ChatGPT's own page. ChatGPT then sends the browser back to the Lucidos gateway on that computer, so start it from a browser on a computer running Lucidos. A phone is refused before any page opens. Each workspace signs in as its own app, named `Lucidos (<workspace name>)` in ChatGPT's usage settings. After the first sign-in, a one-time dialog explains the plan, with **Manage usage** opening ChatGPT's usage page.
+
+While you are signed in, GPT models run on the plan ahead of the `openai` route. Background calls such as titles and summaries do too. A route you picked yourself still wins. Lucidos signs in as itself and never reuses the Codex CLI's ChatGPT login. The tokens stay sealed in the workspace database, and no response, app, script or proxy receives them. Web search and the *builtin provider proxy* never use the plan.
+
+When the plan's usage limit is reached, the failed turn says so and Lucidos sends no plan requests for ten minutes. It never moves the call to your API key. When OpenAI ends the sign-in, Settings and the failed turn say to sign in again.
+
+Only the first ChatGPT account may sign in to a workspace again. To switch accounts, sign out, then press **Use another account**, or run `lucidos chatgpt-plan sign-out --forget-account`. Lucidos then registers with OpenAI afresh, and a usage limit set for the old registration does not carry over.
+See also: *provider*, *preferred provider*.
+
 ### System One model
 A model that answers typed questions with a probability for every answer, rather than writing text. It cannot hold a conversation, so it never appears in the chat model picker. Six are offered: TypeSafe's **Jev**, Jev through **OpenRouter**, Cloudflare's **Clef** and **Clef-flash**, **OpenAI Decisions**, and a **custom** endpoint. OpenAI Decisions is GPT-6 Luna on OpenAI's Decisions API. A custom endpoint can be a model hosted on the user's own machine.
 
 Each is set up on a row in Settings → Providers. OpenRouter and OpenAI use the key and the switch of their chat provider rows.
 
-A System One model is picked in the model control of a decision Lucidos makes: the command guard's Judge model, Query classification, the Read decision and the Wake decision. Picking one sends what that decision judges to its vendor. If a System One call fails, the chat model answers instead. For the Wake decision that holds only for a chat model Lucidos measured for it, or one you picked: otherwise the parent wakes.
+A System One model is picked in the model control of a decision Lucidos makes: the Command judge, Query classification, the Read decision and the Wake decision. Picking one sends what that decision judges to its vendor. If a System One call fails, the chat model answers instead. For the Wake decision that holds only for a chat model Lucidos measured for it, or one you picked: otherwise the parent wakes.
 
 Most decisions run on a chat model until you pick, and storing a key moves none of them. One is the exception: the Wake decision runs on OpenAI Decisions while the OpenAI provider is set up, unless you picked a model for it.
 
 ### Builtin provider proxy
-A *provider*'s API exposed through the engine's proxy **without** re-entering the credential in `data/config/apis.json`. Apps reach it with `lucidos.proxy(<name>).fetch(path, init)`, scripts with `lucidos proxy <name>`, and the Lucidos Agent with `proxy_request`. The builtin names are `anthropic`, `claude-gateway`, `local`, `openai`, `openrouter`, `typesafe`, `vertex` and `xai`. `opencode-free` has none (ADR 0104). The `claude-gateway` proxy uses the engine's issuer-bound sign-in and managed model policy (ADR 0614).
+A *provider*'s API exposed through the engine's proxy **without** re-entering the credential in `data/config/apis.json`. Apps reach it with `lucidos.proxy(<name>).fetch(path, init)`, scripts with `lucidos proxy <name>`, and the Lucidos Agent with `proxy_request`. The builtin names are `anthropic`, `claude-gateway`, `local`, `openai`, `openrouter`, `typesafe`, `vertex` and `xai`. `opencode-free` has none (ADR 0104), and neither has `chatgpt-plan`: apps and scripts never spend the user's ChatGPT plan (ADR 0636). The `claude-gateway` proxy uses the engine's issuer-bound sign-in and managed model policy (ADR 0614).
 
 When `<name>` matches one and no `apis.json` entry exists, the engine forwards to that provider's API root (every default root includes `/v1`). It injects the credential from Settings → Providers server-side, so the secret never reaches the caller. A same-named `apis.json` entry is consulted first and overrides the builtin. The Lucidos Agent's context lists every builtin and whether it is configured. `request_credential` refuses a key a configured builtin already injects (ADR 0350).
 
@@ -927,14 +941,18 @@ Minting a *pairing secret* asks who it is for, and the device that uses it joins
 
 Events keep the device, or an *actor* email for outside input, never the operator. So moving a device or an email also moves the credit for older actions. Removing an operator revokes all its devices, which is how a team offboards someone.
 
+On a gateway with people to tell apart, the transcript names a teammate's message: their name leads the timestamp, and the bubble aligns left like the agent's reply. A device no operator holds reads "Unknown person". The message's origin popover gains a Person row. Your own messages look as before.
+
+Operators can also talk to each other inside a thread, without its agent: see *person mention*, *agent mention*, *agent pause* and *people-only message*.
+
 A gateway with one operator looks exactly as before.
-See also: *paired device*, *actor*, *team workspace*, *driver*.
+See also: *paired device*, *actor*, *team workspace*, *driver*, *people-only message*.
 
 ### Team workspace
 A *workspace* that more than one *operator* pairs devices to, run as the team's factory. The workspace is the only principal: it holds the bot credentials and does the work, and people steer it. No person-level permission exists (ADR 0623).
 
-Tickets and chat threads reach it through *triggers*, each fire a *work item*. Policy on where work stops for a person lives in knowhow, as *gates*. Questions and outcomes go back to the source through workspace script triggers, each a short message with a link to the thread. The *factory app* shows the team its work items.
-See also: *operator*, *work item*, *gate*, *factory app*.
+Tickets and chat threads reach it through *triggers*, each fire a *root thread*. Policy on where work stops for a person lives in knowhow, as *gates*. Questions and outcomes go back to the source through workspace script triggers, each a short message with a link to the thread. The *factory app* shows the team its open root threads.
+See also: *operator*, *root thread*, *gate*, *factory app*.
 
 ### Gateway event log
 The append-only file in the *workspace gateway*'s data directory that records every pairing, revoke and *operator* change. The device list and the operators are rebuilt from it, so it is their only source of truth. It needs no Postgres, so devices still pair and sign in while Postgres is down. The older `paired-devices.json` moves into it once, with every device under one operator.
@@ -987,7 +1005,7 @@ Another *workspace gateway* this one has a *gateway pairing* with, listed under 
 See also: *gateway pairing*, *remote workspace*, `system-knowhow/remote-access.md` § Pair a gateway.
 
 ### Remote workspace
-A *workspace* on a *remote gateway*, opened through this gateway at `/<slug>@<name>/`, such as `/dev@cloud/`. The Workspaces list shows it under the local ones, greyed while its gateway does not answer. A thread link names one as `thread:dev@cloud/<uuid>`. Inside a remote workspace, a link without `@` means a workspace on that same remote gateway, since that gateway's agent wrote it.
+A *workspace* on a *remote gateway*, opened through this gateway at `/<slug>@<name>/`, such as `/dev@cloud/`. The Workspaces list shows it among the local ones in the *workspace order*, tagged `@<name>` and greyed while its gateway does not answer. Its gateway owns starting, stopping, renaming and deleting it, so this gateway offers none of those. A thread link names one as `thread:dev@cloud/<uuid>`. Inside a remote workspace, a link without `@` means a workspace on that same remote gateway, since that gateway's agent wrote it.
 See also: *remote gateway*, *gateway pairing*.
 
 ### External address
@@ -1012,9 +1030,6 @@ Paused is a *verdict* about the interrupted turn, not a resting state, so events
 **Not a stopped child.** A *child thread* paused by a user Stop waits on the user, not the engine. That makes it a *stopped child*, and it counts toward attention.
 
 **A pending change does not change the verdict.** A thread interrupted mid-turn reads Paused (or *failed*) whether or not it carries a *change*. Nothing writes `waiting` for that now: the thread's change state carries the change, not its status. The change stays in the thread and the review list.
-
-### Permission wait
-How long a parked permission card in an *unattended* coding-agent thread waits for an answer before the engine denies it. A card parks only for a command the *command guard* refused to classify. It also needs an enabled trigger that announces the card, such as "When agent needs me". The value is `"deny"` (never park), whole minutes from 1 to 1440, or `"indefinite"`. It comes from the root trigger's `permission_wait`, else the workspace preference `unattended_permission_wait` (default 30 minutes). See `system-knowhow/triggers.md` § Permission wait.
 
 ### Pinned thread
 A *thread* the user pinned to keep at hand, in the Pinned section of the *thread drawer*. A pinned thread is never archived: pinning an archived thread brings it back, and archiving a pinned thread unpins it. So a settled pinned thread offers Archive beside Unpin. Only the user's own Archive unpins. Automatic archiving (a finished, unwatched trigger run) and an agent's archive leave a pinned thread alone.
@@ -1173,16 +1188,17 @@ A positive integer, `setup_revision` in the *plugin manifest*. The author raises
 
 An update re-runs setup only when the staged revision is **greater** than the installed one. A missing field counts as 0. A lowered or removed one never re-runs setup, and a fresh install ignores it. An optional `setup_reason` says why, in one line of at most 200 characters. It shows in the confirmation panel and the thread's first message. Rules and the authoring step: `system-knowhow/plugins.md` § "A release can ask for setup to run again".
 
+### Coding-agent grant
+Whether a *trigger*'s runs may start a *coding-agent thread*, set per trigger under "Allow coding agents". The default is off: such a spawn is refused, and the run fails with a notification naming the trigger and the missing grant. It covers intent and script triggers alike.
+
+Only the user grants it. An agent, an app frame or a plugin's `trigger.toml` cannot, though anyone may revoke it. An agent's edit to the trigger's work clears it. A granted trigger's coding agents hold every grant the user gave coding agents. So grant it only to a trigger whose input you trust. See `triggers.md` § "Coding-agent grant".
+
 ### Side-effect grant
 The irreversible side-effect categories a *trigger* may perform unattended, set per trigger under "Allowed side-effects". No human is present to ask, so the *command guard* consults the grant instead. An irreversible command (email, a mutating HTTP request, a cloud-CLI change, out-of-workspace destruction, anything else irreversible) runs only if its category is granted. Otherwise it is blocked and the run fails, with a notification naming the missing grant.
 
-Categories: **email**, **external API**, **cloud CLI**, **out-of-workspace destruction**, **other**. The default is empty. Consulted only while the *command guard* is on; chat turns ignore it, since they ask every time. Only the user sets it: the `triggers(action="create")` / `triggers(action="update")` LLM tools cannot, so an agent can't widen its own unattended authority.
+Categories: **email**, **external API**, **cloud CLI**, **out-of-workspace destruction**, **other**. The default is empty. Consulted only while the *command guard* is on; chat turns ignore it, since they ask every time. Only the user widens it, so an agent can't widen its own unattended authority. An agent, an app frame or a plugin's `trigger.toml` cannot add a category, though anyone may narrow it. An agent's edit to the trigger's work clears it.
 
-The same grant **also governs *coding-agent thread*s a trigger spawns** (Claude Code / Codex), inherited down the spawn tree. The engine resolves their permission cards from the root trigger's grant instead of hanging. Benign in-workspace work and granted categories are auto-allowed; an ungranted category or a catastrophic command is auto-denied. Unlike the chat guard, this denies the single request rather than failing the run, whatever the command-guard toggle. See `coding-agent-events.md` § "Unattended auto-resolution".
-
-The spawn tree means *child* spawns. A *top-thread* is outside its spawning thread's tree, so a coding agent a trigger starts as a top spawn asks a human. A human in the tree also ends the inheritance: once you send a message or answer a question in that thread or any above it, its cards ask you.
-
-Some denials sit outside the grant. A command the *command guard* cannot read is denied whatever the grant holds. Those are shapes whose head is not what runs: a substitution, a code-loading `VAR=` preamble, a path-qualified head, a write outside the workspace. An unrecognised command (`cargo build`) is not one of them, and still runs.
+A *coding-agent thread* a trigger starts does not read this grant. It needs the trigger's *coding-agent grant* to start at all, then takes the workspace's own grants like every coding-agent session. See `coding-agent-events.md` § "Every session uses the workspace's grants".
 
 ### Signer manifest
 The `<name>.manifest.json` sidecar next to a `<name>.wasm` signer artifact in `data/auth-modules/`. Carries WASM-host metadata (`secret_handles`, `body_mode`, `capabilities`). The engine never loads provider config from it: `data/config/apis.json` is the single source of truth for proxy entries.
@@ -1307,32 +1323,50 @@ Questions come first, then the newest. Its count rides the *grouping button* und
 
 While it holds threads, its tile wears the waiting colour. A halo breathes around it while a blocked thread is still unseen. Selecting Blocked sees them all, and opening one sees that one. Only a newly blocked thread starts the halo again. With Reduce motion on, the halo holds still.
 
-### Work item
-One piece of work in a *team workspace*: a root *thread* and its *sub-threads*. It is not a separate record. The root thread's own state is the work item's state.
+### Root thread
+A *thread* with no parent: the top of its *sub-threads*. In a *team workspace* a root thread and its sub-threads are one piece of work. Its *driver* and *watchers* hold for the whole family. The retired name was *work item*.
 
 A person starts one by writing a thread. A *trigger* starts one per fire, unless the fire's *continue key* matches an open thread, which then gets the fire as a new message.
-See also: *continue key*, *driver*, *gate*.
+See also: *sub-thread*, *continue key*, *driver*, *gate*.
 
 ### Gate
-A question card on a *work item*: the point where the work waits for a person. Which work stops where is policy, written in knowhow. No engine code decides when to stop.
+A question card in a *root thread* or one of its *sub-threads*: the point where the work waits for a person. Which work stops where is policy, written in knowhow. No engine code decides when to stop.
 
 A gate is live. Anyone's answer clears it from every view, for every *operator*. A gate always reaches someone: with no reachable *driver*, its push goes to the whole team.
-See also: *driver*, *Blocked*, *work item*.
+See also: *driver*, *Blocked*, *root thread*.
 
 ### Driver
-The one *operator* responsible for a *work item* right now. A thread you start makes you its driver. A trigger's work item starts with none. Answering a *gate*, or tapping **Take**, makes you the driver, and **Take over** moves the role in one tap.
+The one *operator* responsible for a *root thread* and its *sub-threads* right now. A thread you start makes you its driver. A trigger's root thread starts with none. Answering a *gate*, or tapping **Take**, makes you the driver, and **Take over** moves the role in one tap.
 
-**The driver is soft.** Anyone can still answer any gate. A gate its driver leaves past the team's timeout escalates once: it pushes the whole team and shows in the Team view. The driver keeps the work item. An answer from the source, through a keyed trigger fire, sets a driver only when its *actor* matches an operator.
+**The driver is soft.** Anyone can still answer any gate. A gate its driver leaves past the team's timeout escalates once: it pushes the whole team and shows in the Team view. The driver keeps the root thread. An answer from the source, through a keyed trigger fire, sets a driver only when its *actor* matches an operator.
 
 The timeout is the `driver_timeout_hours` preference, and `0` never escalates. **Release** gives the role up.
 See also: *watcher*, *gate*, *operator*.
 
 ### Watcher
-An *operator* who follows a *work item* without being responsible for it. Tap **Watch** in the *factory app*. A watcher gets the work item's gate pushes beside the *driver*, and sees it under Mine.
-See also: *driver*, *work item*.
+An *operator* who follows a *root thread* without being responsible for it. Tap **Watch** on the thread's People row or in the *factory app*. A *person mention* also makes you one. A watcher gets the root thread's gate pushes beside the *driver*, and sees it under Mine. **Unwatch** on the People row, or on a *people-only message* push, stops it.
+See also: *driver*, *root thread*, *person mention*.
+
+### Person mention
+`@Name` in a message, naming an *operator*. It pushes that person and makes them a *watcher* of the *root thread*. The composer suggests names as you type `@`, and **Tab** takes the first. A message that mentions only people is a *people-only message*, and it starts the *agent pause*. Team gateways only.
+See also: *agent mention*, *agent pause*, *operator*.
+
+### Agent mention
+`@agent` in a message. It wakes the thread's agent, and ends an *agent pause*. One message may carry it beside *person mentions*: then the agent answers, and only the people it names get a push.
+See also: *person mention*, *agent pause*.
+
+### Agent pause
+The state in which typed messages in a thread stop waking its agent. A message that mentions only people starts it. While it holds, an untagged message stays between people too. An *agent mention* or **Resume** ends it. The pause belongs to the thread and reads the same for everyone. An "Agent paused" or "Agent resumed" card marks each change in the transcript.
+
+While it holds, a hint line above the composer reads "Agent paused. Mention @agent or Resume". A pause never stops a running turn. Input that no person typed (a trigger fire, a *sub-thread*'s report, a question answer) still wakes the agent. Team gateways only (ADR 0649).
+See also: *people-only message*, *agent mention*.
+
+### People-only message
+A message a person writes to the other people in a thread, not to its agent. It starts no turn. The agent reads it, under the writer's name, the next time something wakes it. It pushes the people it mentions plus the *driver* and *watchers*, minus the writer, and one banner per thread replaces the last. Every one sits between an "Agent paused" card and the next "Agent resumed" card, so it carries no mark of its own.
+See also: *agent pause*, *person mention*, *watcher*.
 
 ### Notification audience
-The devices a notification is for: the people a work item notice names, or else the work item's. A notification that opens a *work item* is for its *driver*'s and *watchers*' devices. It widens to the whole team when the work item has no driver, has an escalated *gate*, or names nobody who holds a device. Every other notification, and every notification on a gateway with one *operator*, is for everyone. Push skips devices outside it, where it reads as read.
+The devices a notification is for: the people a notice names, or else the root thread's. A notification that opens a thread is for its *root thread*'s *driver* and *watchers*. It widens to the whole team when the root thread has no driver, has an escalated *gate*, or names nobody who holds a device. Every other notification, and every notification on a gateway with one *operator*, is for everyone. Push skips devices outside it, where it reads as read.
 See also: *driver*, *watcher*, *gate*, *read state*.
 
 ### Read state
@@ -1344,7 +1378,7 @@ A repository, trigger, MCP server or credential that someone added, changed or r
 See also: *team workspace*, *operator*.
 
 ### Factory app
-The Lucidos app a *team workspace* installs from its setup knowhow (`system-knowhow/team-workspace`). It lists *work items* with their *driver* chips, split into Mine, Team and All, and offers **Take** and **Watch**. Team lists the *gates* nobody owns: no driver, or escalated past the team's timeout. The core thread drawer does not change.
+The Lucidos app a *team workspace* installs from its setup knowhow (`system-knowhow/team-workspace`). It lists open *root threads* with their *driver* chips, split into Mine, Team and All, and offers **Take** and **Watch**. Team lists the *gates* nobody owns: no driver, or escalated past the team's timeout. The core thread drawer does not change.
 See also: *team workspace*, *driver*, *watcher*.
 
 ### Translation script
@@ -1636,7 +1670,7 @@ An opaque value that ties later *trigger* fires to the thread an earlier fire st
 A fire whose key matches an open thread becomes a new message there. If that thread waits on a *gate*, the fire answers it as free text, and the agent asks again if it does not. Otherwise a new thread starts and keeps the key. One key maps to at most one open thread. The Archive action releases a thread's key, and unarchiving does not take it back. An unattended run that lands in Archive on its own keeps its key.
 
 The key is only for input. Lucidos compares it and never parses it, so it names no provider. Replies go out through workspace script triggers, addressed from the thread's first delivery.
-See also: *work item*, *field path*, *actor*, `system-knowhow/triggers.md` § "Continue key".
+See also: *root thread*, *field path*, *actor*, `system-knowhow/triggers.md` § "Continue key".
 
 ### Actor
 The person behind a *trigger* fire, named by email. A trigger's `actor` field names the payload field that holds the email. Lucidos maps the email to an *operator*, and an email no operator holds reads as a stranger. A source that sends ids instead of emails gets a workspace script trigger that looks the email up and emits a domain event carrying it.
@@ -1859,6 +1893,13 @@ A reply draws one from each *widget embed* it holds, and an old `WidgetShown` st
 ### Widget box
 The fixed box a *widget* draws into wherever it has a *widget size*: its *inline widget* in a thread and its tile on a *dashboard*. Both draw the same box at the same size, so what the thread shows is what the dashboard shows. The host sets the box, content never sizes it, and a host narrower than an XL box scrolls the box sideways. The widget fits by showing less, never by shrinking its text, and never scrolls inside. Content past the box is clipped under a fade, and Open in Canvas shows the widget full size. A question option and the Canvas draw a widget with no box (ADR 0621).
 
+### Widget fit check
+A check that renders a *widget* at every *widget size* it declares and says what each *widget box* cuts off. An open Lucidos window draws each box off screen, on the desk tile and on a 360 px phone column. It uses the largest UI scale any device uses. The engine writes the answer as a `[WIDGET FIT]` note.
+
+The note rides the tool result when the agent creates a widget or writes its own files. `widgets(action="fit")`, `lucidos widgets fit` and `POST /api/v1/widgets/fit` run it on demand. It never refuses or changes a write. With no visible window, no answer, or a box it could not measure, it says `not checked`, never a pass.
+
+See also: *widget box*, `system-knowhow/building-an-app.md` § The widget box, rule 8.
+
 ### Widget shape
 A class the app stylesheet serves for a *widget*'s main shape: `.ring` for a gauge, `.bar-run` for a short series, and `.choice-row` for the tap targets of a pick. Each draws from the theme tokens and follows the motion setting. A widget leads with one instead of a table (`system-knowhow/building-an-app.md` § Widgets, `system-knowhow/js-sdk.md` § Widget shapes).
 
@@ -1911,6 +1952,18 @@ starting or stopping go through the picker, linked from the list's last row. On
 first run the picker offers both ways in side by side: name your first workspace
 (suggesting "personal" or "work"), or restore one from a backup. Nothing is
 auto-created.
+
+### Workspace order
+The order of the one Workspaces list, local and *remote workspaces* mixed. You
+set it in the workspace picker: drag a row by its grip, hold it on a touch
+device, or pick Move up or Move down in its ⋯ menu. The Lucidos menu's list
+follows the same order but cannot change it.
+
+The gateway stores the order, so every device paired to it sees the same list.
+A workspace you never placed goes at the end: local ones first, in the order
+they were created, then remote ones by gateway. Two gateways keep separate
+orders. Renaming a remote gateway sends its workspaces to the end until you
+place them again.
 
 ### Workspace origin
 The provenance recorded when a workspace is registered: `user`, `eval`, `e2e`,
@@ -2271,7 +2324,11 @@ A rung's rough intelligence, cost or time per task, as a multiple of the default
 Cost is the rung's tokens per task at today's *price table* price. On a free route, such as OpenCode's free tier, cost reads `included`. A paid route reads a price, whoever pays, so a Claude gateway subscription reads one too. On Claude Code, a cost band includes the *long-prompt share*.
 
 ### Intelligence profile
-The benchmark mix an intelligence *band* is scored on. Each rung has two. `general` weighs Artificial Analysis's Intelligence Index 75% and Epoch's ECI 25%. `coding` is Artificial Analysis's Coding Agent Index, and, where that index has no score, takes `general` plus the model's measured coding gap, marked estimated. Coding agents rank their rungs on `coding`. The Lucidos Agent's ladder ranks on `general`.
+The benchmark mix an intelligence *band* is scored on. Each rung has two. `general` weighs Artificial Analysis's Intelligence Index 75% and Epoch's ECI 25%. `coding` is Artificial Analysis's Coding Agent Index, and, where that index has no score, takes `general` plus the model's measured coding gap, marked estimated.
+
+Both profiles smooth downward fluctuations within a model: higher effort never gets a lower capability estimate. Ties remain possible. These are operational estimates, including smoothed benchmark observations.
+
+Coding agents rank their rungs on `coding`. The Lucidos Agent's ladder ranks on `general`.
 
 ### Ladder surface
 A place that picks from its own *intelligence ladder*: the Lucidos Agent, Claude Code and Codex. The UI names each by its agent, so the Lucidos Agent's ladder is never "the chat ladder". Its wire and storage key stays `chat` (`--surface chat`, `intelligence_ladder_chat`). The surfaces share one set of rung estimates, and each keeps its own on-list: the shipped one, or the owner's edit.

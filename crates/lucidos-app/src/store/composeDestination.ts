@@ -30,7 +30,10 @@ import { appIdFromFolder } from '../utils/appIdFromFolder';
 
 export type ComposeDestination =
   | { kind: 'lucidos-agent' }
-  | { kind: 'coding'; scope: Scope };
+  | { kind: 'coding'; scope: Scope }
+  /** A teammate, by person id: a chat thread that starts with the agent
+   *  paused (ADR 0649). */
+  | { kind: 'person'; personId: string };
 
 /** Display name of the Lucidos source as a repository — the registered repo is
  *  named "Lucidos", so a Lucidos-source coding-agent thread shows this string
@@ -52,15 +55,17 @@ export const LUCIDOS_AGENT_BLURB = 'Chat, research, build and refine apps & trig
 /** Derive the current destination from the channel + scope state. The mode
  *  side comes from `effectiveSendMode` (caller resolves it — composing drafts
  *  read `draft.mode`, the bare compose view reads the global `inputMode`). */
-export function destinationFromState(mode: ComposeMode, scope: Scope): ComposeDestination {
-  return mode === 'claude_code' ? { kind: 'coding', scope } : { kind: 'lucidos-agent' };
+export function destinationFromState(mode: ComposeMode, scope: Scope, person: string | null = null): ComposeDestination {
+  if (mode === 'claude_code') return { kind: 'coding', scope };
+  return person ? { kind: 'person', personId: person } : { kind: 'lucidos-agent' };
 }
 
 /** Encode a destination as a Dropdown option value. The Dropdown round-trips
  *  plain strings, so the discriminated union is flattened to:
- *  `agent` | `code:lucidos` | `repo:<uuid>` | `app:<id>`. */
+ *  `agent` | `person:<id>` | `code:lucidos` | `repo:<uuid>` | `app:<id>`. */
 export function destinationToOptionValue(d: ComposeDestination): string {
   if (d.kind === 'lucidos-agent') return 'agent';
+  if (d.kind === 'person') return `person:${d.personId}`;
   switch (d.scope.kind) {
     case 'lucidos': return 'code:lucidos';
     case 'external': return `repo:${d.scope.repoId}`;
@@ -75,6 +80,7 @@ export function parseOptionValue(v: string): ComposeDestination {
   if (v === 'code:lucidos') return { kind: 'coding', scope: { kind: 'lucidos' } };
   if (v.startsWith('repo:')) return { kind: 'coding', scope: { kind: 'external', repoId: v.slice(5) } };
   if (v.startsWith('app:')) return { kind: 'coding', scope: { kind: 'app', appId: v.slice(4) } };
+  if (v.startsWith('person:')) return { kind: 'person', personId: v.slice(7) };
   return { kind: 'lucidos-agent' };
 }
 
@@ -145,9 +151,12 @@ export function composeDraftContextName(
 /** One-line consequence caption for the current destination — the compose
  *  view renders it under the picker. Names are resolved by the caller (it
  *  already holds the repos/apps Loadables). */
-export function destinationCaption(d: ComposeDestination, names: { appName?: string; repoName?: string } = {}): string {
+export function destinationCaption(d: ComposeDestination, names: { appName?: string; repoName?: string; personName?: string } = {}): string {
   if (d.kind === 'lucidos-agent') {
     return `${LUCIDOS_AGENT_BLURB}.`;
+  }
+  if (d.kind === 'person') {
+    return `A thread with ${names.personName ?? 'a teammate'}. The agent stays paused until someone mentions @agent.`;
   }
   switch (d.scope.kind) {
     case 'lucidos':

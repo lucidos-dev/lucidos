@@ -1081,6 +1081,16 @@ div.brand-menu-ws-row {
     white-space: nowrap;
 }
 
+/* A remote workspace's gateway, quiet after its name. */
+.brand-menu-ws-gateway {
+    color: var(--text-muted);
+}
+
+/* A remote workspace its gateway cannot open now: greyed, and the tooltip says why. */
+.brand-menu-ws-row.is-shut {
+    opacity: 0.6;
+}
+
 /* A workspace's unread count, on the notifications group's rows
    (`NotificationsMenuRows.tsx`). The same blue every count in the app uses (see
    `.badge` in header.css), but not that rule: `.badge` is `position: absolute`,
@@ -1489,8 +1499,16 @@ div.brand-menu-ws-row {
     }
 }
 
-.remote-workspace-gateway { color: var(--accent); }
-.brand-menu-remote-workspaces { padding: var(--space-sm); }
-.brand-menu-ws-heading { color: var(--text-muted); font-size: var(--font-size-sm); }
-.brand-menu-remote-workspaces small { display: block; color: var(--text-muted); font-size: var(--font-size-xs); }
-.brand-menu-remote-workspaces [aria-disabled="true"] { opacity: 0.6; cursor: default; }
+/* inline-block so WorkspaceNameLabel can read its width from its own box. */
+.remote-workspace-gateway {
+    display: inline-block;
+    margin-left: 0.3em;
+    color: var(--accent);
+}
+
+/* Out of flow, so the label shrinks to the bare name, but still laid out, so
+   its box keeps the width that decides when it comes back. */
+.remote-workspace-gateway.is-collapsed {
+    position: absolute;
+    visibility: hidden;
+}

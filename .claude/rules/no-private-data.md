@@ -47,7 +47,7 @@ governance owner (`GOVERNANCE.md`), as code-of-conduct contact
 The guard expresses this as an **exceptions list**: each name is denied outright
 and its attribution sites are enumerated beside it. So the same name is a
 release-blocking hit anywhere else, as a fixture, a device label, a home path, an
-email, a work-item id, or an incidental mention. To add a contributor to the
+email, a ticket id, or an incidental mention. To add a contributor to the
 credits, add the name to the `private-data-exceptions` block in `WORKSPACES.md`
 with `GOVERNANCE.md` as its allowed path, never to the credits file alone.
 

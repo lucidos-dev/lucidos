@@ -40,13 +40,18 @@ pub enum ProviderKind {
     /// kind, apart from [`Self::Anthropic`], so each credential stays on its
     /// own host.
     ClaudeGateway,
+    /// The user's ChatGPT plan, through Sign in with ChatGPT
+    /// (`llm::chatgpt_plan`). The OpenAI Responses API with a plan token in
+    /// place of an API key. Its own kind, so a plan token never rides the
+    /// platform key's route, and a platform key never rides this one.
+    ChatGptPlan,
 }
 
 impl ProviderKind {
     /// Every backend, in the order `/health` reports them. One list, so a new
     /// variant cannot reach the router while missing from what `/health` says
     /// is configured, which is what the picker filters against.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Vertex,
         Self::Anthropic,
         Self::OpenAi,
@@ -55,6 +60,7 @@ impl ProviderKind {
         Self::OpenCodeFree,
         Self::Local,
         Self::ClaudeGateway,
+        Self::ChatGptPlan,
     ];
 
     /// Parse a provider name strictly: `None` for anything that is not one.
@@ -91,6 +97,7 @@ impl ProviderKind {
             Self::OpenCodeFree => "opencode-free",
             Self::Local => "local",
             Self::ClaudeGateway => "claude-gateway",
+            Self::ChatGptPlan => "chatgpt-plan",
         }
     }
 
@@ -169,6 +176,13 @@ pub type ModelRegistry = Arc<RwLock<HashMap<String, ModelRouting>>>;
 /// Build an empty registry handle (before the first DB load, and in tests).
 pub fn empty() -> ModelRegistry {
     Arc::new(RwLock::new(HashMap::new()))
+}
+
+/// Direct non-streaming Gemini 4 output ceiling. Shared with input packing
+/// because these models use one window for input, thinking and answer tokens.
+/// Google Cloud: /models/start/get-started-with-gemini-4.
+pub(crate) fn unified_output_limit(model: &str) -> Option<usize> {
+    matches!(model, "gemini-4-argon" | "gemini-4-carbon").then_some(32_768)
 }
 
 /// Last-resort context window guessed from the model-id shape, for ids with no
@@ -501,8 +515,9 @@ pub struct Unconfigured(pub ProviderKind);
 ///
 /// With no choice on either side, the first configured route wins.
 ///
-/// With no configured route at all, the error names the row's FIRST route. That
-/// keeps the message pointing at the backend the model actually wants.
+/// With no configured route at all, the error names the row's first route that
+/// is not the ChatGPT plan. That keeps the message pointing at the backend the
+/// model actually wants. The plan route leads only so a signed-in plan wins.
 ///
 /// With no row at all the prefix heuristic answers, as it always has. That
 /// covers an unknown id, a saved preference for a deleted model, and a poisoned
@@ -537,7 +552,9 @@ pub fn resolve_route(
         None => Err(Unconfigured(
             routing
                 .routes
-                .first()
+                .iter()
+                .find(|r| r.provider != ProviderKind::ChatGptPlan)
+                .or(routing.routes.first())
                 .map_or_else(|| prefix_heuristic(model), |r| r.provider),
         )),
     }
@@ -1293,6 +1310,33 @@ mod tests {
             ),
             Err(Unconfigured(ProviderKind::Vertex))
         );
+    }
+
+    /// The plan route leads a GPT row only to win once signed in. With nothing
+    /// configured, the refusal names the API route it shadows, since a user
+    /// who set up nothing never chose the plan.
+    #[test]
+    fn an_unconfigured_gpt_model_names_the_api_route_not_the_plan() {
+        let routing = ModelRouting {
+            routes: vec![
+                RouteEntry::new(ProviderKind::ChatGptPlan, "gpt-x"),
+                RouteEntry::new(ProviderKind::OpenAi, "gpt-x"),
+            ],
+            ..dual_routed("gpt-x")
+        };
+        let reg = registry_of(&[("gpt-x", routing)]);
+        assert_eq!(
+            resolve_route(&reg, "gpt-x", None, only(&[])),
+            Err(Unconfigured(ProviderKind::OpenAi))
+        );
+        let route = resolve_route(
+            &reg,
+            "gpt-x",
+            None,
+            only(&[ProviderKind::ChatGptPlan, ProviderKind::OpenAi]),
+        )
+        .expect("the plan serves it");
+        assert_eq!(route.provider, ProviderKind::ChatGptPlan);
     }
 
     /// A pick the row cannot serve is STALE, not a refusal: the model moved off

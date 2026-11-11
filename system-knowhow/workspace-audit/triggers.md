@@ -1,7 +1,7 @@
 ---
 name: Workspace audit: triggers
-description: The triggers audit section: procedure in intent, stale run.knowhow, subscriptions on retired event names, slugs, orphaned trigger knowhow, notification taps, MCP servers a trigger uses but does not list.
-sources: ["docs/taxonomy.md", "system-knowhow/triggers.md", "system-knowhow/thread-events.md", "system-knowhow/coding-agent-events.md", "system-knowhow/plugins.md", "system-knowhow/js-sdk.md", "system-knowhow/best-practices.md", "crates/lucidos-engine/src/engine/chat/process/system_prompt.rs", "crates/lucidos-engine/src/engine/thread_events/*", "crates/lucidos-engine/src/scheduler/notifications.rs"]
+description: The triggers audit section. Procedure in intent, stale run.knowhow, subscriptions on retired event names, slugs, orphaned trigger knowhow, notification taps. Unlisted MCP servers a trigger uses. Grants: coding agents started without one, side effects outside one, and plugin-shipped side-effect grants.
+sources: ["docs/taxonomy.md", "crates/lucidos-engine/src/triggers/definition.rs", "system-knowhow/triggers.md", "system-knowhow/running-python.md", "system-knowhow/thread-events.md", "system-knowhow/coding-agent-events.md", "system-knowhow/plugins.md", "system-knowhow/js-sdk.md", "system-knowhow/best-practices.md", "crates/lucidos-engine/src/engine/chat/process/system_prompt.rs", "crates/lucidos-engine/src/engine/thread_events/*", "crates/lucidos-engine/src/scheduler/notifications.rs", "crates/lucidos-engine/src/engine/agent_session/spawn_gate.rs"]
 ---
 
 # Workspace audit section: triggers
@@ -83,6 +83,24 @@ Per the engine prompt's taxonomy section and the worked example in `docs/taxonom
 
   Compare each row with that live trigger's `mcp_servers` from `lucidos triggers list`. Report every server it used but does not list, with the fires that used it. Severity: **smell**, since each fire now fails that call loud, with a notification. This is the ADR 0214 migration check for ADR 0430.
 
+- **A trigger that starts coding agents without the coding-agent grant.** A trigger's runs may start a coding-agent thread only with that grant (`system-knowhow/triggers.md` § "Coding-agent grant"). Find each trigger whose runs have started one. The query follows each thread back to its cause, as the engine's check does, so top-level and CLI spawns count. It also follows the parent link, which older threads carry alone:
+
+  ```bash
+  psql "$LUCIDOS_DATABASE_URL" -At -F ' ' -c "WITH RECURSIVE origin AS (SELECT DISTINCT ON (thread_id) thread_id, payload->'origin' AS o, (payload->>'parent_thread_id')::uuid AS linkage FROM events WHERE event_type IN ('TriggerStarted', 'MessageReceived') AND payload ? 'origin' AND payload->'origin' != 'null'::jsonb ORDER BY thread_id, sequence), edge AS (SELECT thread_id, CASE o->>'kind' WHEN 'thread_link' THEN CASE WHEN o->>'direction' = 'parent' THEN coalesce(linkage, (o->>'thread_id')::uuid) END WHEN 'workspace' THEN (o->>'thread_id')::uuid WHEN 'api' THEN CASE WHEN o->>'mode' <> 'human' THEN (o->>'source_thread_id')::uuid END END AS caused_by FROM origin UNION SELECT thread_id, parent_thread_id FROM thread_summaries WHERE parent_thread_id IS NOT NULL), fire AS (SELECT thread_id, o->'reason'->>'trigger_id' AS trigger_id FROM origin WHERE o->'reason'->>'kind' = 'scheduler' UNION SELECT thread_id, o->>'emitting_trigger_id' FROM origin WHERE o->>'kind' = 'api' AND o ? 'emitting_trigger_id' UNION SELECT thread_id, payload->'origin'->'reason'->>'trigger_id' FROM events WHERE event_type = 'MessageReceived' AND payload->'origin'->'reason'->>'kind' = 'scheduler' UNION SELECT thread_id, trigger_id FROM thread_summaries WHERE trigger_id IS NOT NULL), tree AS (SELECT thread_id, trigger_id, 0 AS depth FROM fire UNION SELECT e.thread_id, t.trigger_id, t.depth + 1 FROM edge e JOIN tree t ON e.caused_by = t.thread_id WHERE t.depth < 16) SELECT t.trigger_id, count(DISTINCT t.thread_id), max(s.last_activity) FROM tree t JOIN thread_summaries s USING (thread_id) WHERE s.is_coding_agent GROUP BY 1"
+  ```
+
+  Keep each row whose trigger is live with `coding_agent_grant` false in `lucidos triggers list`. For each one, read its `run.intent`, script and knowhow, and say what steers it. Name every outside source it reads, such as email, chat messages, web pages, issue trackers or webhooks, since that content steers its coding agents too. Link the trigger as `[Name](trigger:<id>)`, and tell the user to tick *Allow coding agents* there. Severity: **broken**, since each such run is now refused, with a notification.
+
+- **A plugin trigger holding a side-effect grant its plugin shipped.** Only the owner grants a trigger, and a plugin's `trigger.toml` never does (`system-knowhow/plugins.md` § "Shipping triggers"). A plugin installed before that rule could still ship one. In `lucidos triggers list`, find each live trigger with a `plugin_id` and a non-empty `side_effect_grant`. Report its link, its plugin, its categories and what steers its run. Severity: **smell**, since nobody chose that grant, though the owner may keep it.
+
+- **A trigger whose recent runs performed a side effect outside its grant.** With the command guard on, a run may perform an irreversible side effect only within the trigger's *side-effect grant* (`system-knowhow/triggers.md` § "Side-effect grant"). The guard now defaults on, so a trigger that ran unguarded may fail its next run. Find the commands its runs issued over the last 30 days:
+
+  ```bash
+  psql "$LUCIDOS_DATABASE_URL" -At -F ' ' -c "SELECT ts.trigger_id, e.payload->>'name', left(e.payload->>'args', 400) FROM events e JOIN thread_summaries ts ON ts.thread_id = e.thread_id WHERE ts.trigger_id IS NOT NULL AND e.created >= now() - interval '30 days' AND e.event_type = 'ToolCalled' AND e.payload->>'name' IN ('run_bash', 'run_bash_background', 'run_python', 'run_python_background')"
+  ```
+
+  Place each command in a category per `system-knowhow/running-python.md` § "The command guard". Compare the categories with that live trigger's `side_effect_grant` in `lucidos triggers list`. Report each trigger with its link as `[Name](trigger:<id>)`, the missing categories, and one example command for each. Severity: **broken** while the guard is on, since the next such run fails with a notification. Skip the check when the workspace turned the guard off.
+
 - **A trigger script that reaches the workspace database through libpq defaults.** The `scripts` section owns the check and its fix (`system-knowhow/workspace-audit/scripts.md`, the `db-defaults` scan). Its scan covers `data/triggers/**/scripts/**` too. Report those hits once, under the trigger. Severity: **broken**, since each fire now fails to connect.
 
 - **A trigger relying on knowhow a plugin removed, with no warning on record.** An update or uninstall now records its *affected triggers* and warns each fire (`system-knowhow/plugins.md` § "Affected triggers"). Two cases escape it: a removal from before that, and a trigger made after the removal. Find them by hand:
@@ -121,6 +139,10 @@ route.
 ### Listing an MCP server a trigger uses
 
 **Route: inline**, one `triggers(action="update")` call. Add the server to the trigger's `mcp_servers`. The field is a full replacement, so send the existing list plus the new id. It is reversible, so it may join "Do all suggested fixes". A server the fire enabled once and never called is not worth listing: report it, and leave the choice to the user.
+
+### Granting a trigger its coding agents or side-effects
+
+**Route: the user only.** No agent may widen a trigger's grants, so never try the `triggers` tool, the CLI or the HTTP API. The report is the fix: one line per trigger with its link, what steers it, and a recommendation. Recommend against the coding-agent grant where outside content steers the trigger, and suggest an owner-started coding agent instead. An agent may narrow a side-effect grant the owner asks to drop.
 
 ### Rewriting an old-form `tap`
 

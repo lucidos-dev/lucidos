@@ -117,6 +117,9 @@ cred-env hit token = os.environ["CRED_GITHUB_TOKEN"]
 auth-header hit headers: { Authorization: "Bearer " + t }
 retired-tools hit Use execute_intent(intent_id: "triage") to run it.
 retired-tools miss load_knowhow(id: "triage")
+retired-work-items hit const { items } = await lucidos.workItems.list();
+retired-work-items hit curl -s "$BASE/api/v1/work-items/$id/take"
+retired-work-items miss const roles = await lucidos.threads.people.get(threadId);
 machine-path hit open("/Users/me/notes.txt")
 machine-path miss open(os.path.expanduser("~/notes.txt"))
 db-defaults hit out = subprocess.run(["psql","-A","-t","-c",sql])

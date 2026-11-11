@@ -60,7 +60,6 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tokio::sync::oneshot;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
@@ -93,10 +92,6 @@ struct QueueEntry {
     summary: String,
     request: ThreadQueueRequest,
     queued_at: DateTime<Utc>,
-    /// Cooperative cancel from the submitter (cron task loop). Lost on
-    /// restart — a re-queued entry runs uncancellable, same as a
-    /// missed-grace cron catch-up. Allowed-ephemeral.
-    cancel: Option<CancellationToken>,
     /// Resolved on admit-completion or drop so a waiting submitter (the cron
     /// task loop) unblocks. Allowed-ephemeral — after restart nobody waits.
     completion_tx: Option<oneshot::Sender<()>>,
@@ -566,7 +561,6 @@ impl ThreadQueue {
         self: &Arc<Self>,
         mut request: ThreadQueueRequest,
         actor: Option<MessageOrigin>,
-        cancel: Option<CancellationToken>,
     ) -> SubmitOutcome {
         // Before anything else, so the chain depth travels ON the request
         // rather than in a task-local the spawn below would drop. Read here
@@ -602,7 +596,6 @@ impl ThreadQueue {
             summary: request.summary(trigger_name.as_deref()),
             request,
             queued_at: Utc::now(),
-            cancel,
             completion_tx: Some(completion_tx),
         };
 
@@ -748,7 +741,6 @@ impl ThreadQueue {
             summary: request.summary(trigger_name.as_deref()),
             request,
             queued_at: Utc::now(),
-            cancel: None,
             completion_tx: None,
         };
         self.try_emit_queued(&entry, false, None).await?;
@@ -1648,7 +1640,6 @@ impl ThreadQueue {
         let executable = ExecutableEntry {
             id: entry.id,
             request: entry.request,
-            cancel: entry.cancel,
         };
         let mgr = self.clone();
         let dispatch = self.clone();
@@ -1934,7 +1925,6 @@ impl ThreadQueue {
                 summary: row.summary,
                 request,
                 queued_at: if requeue { Utc::now() } else { row.queued_at },
-                cancel: None,
                 completion_tx: None,
             };
             if requeue {
@@ -2197,6 +2187,7 @@ impl ThreadQueue {
                     tap: tap.clone(),
                     actor: None,
                     audience: None,
+                    push_group: None,
                 }),
                 "[ThreadQueue] NotificationCreated",
             )

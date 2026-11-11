@@ -5,7 +5,7 @@ import './utils/pageHealthLog.install';
 import { render, type ComponentChildren } from 'preact';
 import { lazyComponent, lazyModule } from './utils/lazyComponent';
 import { provideMarkdownEngine } from './utils/renderMarkdown';
-import { IS_PICKER, WORKSPACE_ID, baseContextIsValid } from './utils/basePath';
+import { IS_PICKER, WORKSPACE_ID, baseContextIsValid, parseWorkspaceRoute } from './utils/basePath';
 import { rememberLastWorkspace } from './utils/lastWorkspace';
 import { updateAvailable } from './store/store';
 import { installActionBtnBlurListener } from './components/chat/promptFocus';
@@ -23,7 +23,7 @@ import { isIOSPwa, isTauri, isTauriPreGatewayEntry } from './utils/platform';
 import { invoke, windowReadyToShow } from './utils/tauri';
 import { handOverBootOwnership, setBootStatus } from './utils/bootSplash';
 import { startStartupStatusPolling } from './utils/startupStatus';
-import { adoptGatewayDeviceId, reconcileDesktopDeviceId } from './store/actions/devices';
+import { adoptGatewayDeviceId, adoptRelayedDeviceId, reconcileDesktopDeviceId } from './store/actions/devices';
 import { adoptDeviceIdFromUrl } from './utils/deviceIdSeed';
 import { takePairingCodeFromUrl } from './utils/pairingCodeSeed';
 import { openAppById } from './store/actions/apps';
@@ -261,6 +261,13 @@ async function boot() {
   const namedByGateway = IS_PICKER
     ? false
     : await adoptGatewayDeviceId(WORKSPACE_ID ?? null);
+
+  // A workspace on a remote gateway is relayed, and that gateway asserts a
+  // namespaced id to the engine. Name it before registration, so the row this
+  // page keeps is the one the engine already knows.
+  if (!IS_PICKER && WORKSPACE_ID && parseWorkspaceRoute(WORKSPACE_ID)?.gateway) {
+    await adoptRelayedDeviceId();
+  }
 
   // Desktop with no gateway answering: reconcile the per-workspace device id
   // with the native store instead, so it survives a DMG reinstall. Skipped when

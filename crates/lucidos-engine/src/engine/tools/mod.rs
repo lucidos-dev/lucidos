@@ -216,7 +216,10 @@ impl LucidosEngine {
             | tn::GLOB_FILES
             | tn::GREP_FILES
             | tn::COPY_FILE
-            | tn::DELETE_FILE => to_outcome(self.execute_file_tool(name, args, thread_id).await),
+            | tn::DELETE_FILE => to_outcome(
+                self.execute_file_tool(name, args, thread_id, device_id)
+                    .await,
+            ),
             tn::BROWSER_OPEN
             | tn::BROWSER_EXTRACT
             | tn::BROWSER_CLICK
@@ -284,10 +287,13 @@ impl LucidosEngine {
                 self.execute_credential_tool(name, args, thread_id, device_id)
                     .await,
             ),
-            tn::CREATE_APP | tn::LIST_APPS | tn::LOAD_KNOWHOW | tn::UNLOAD_KNOWHOW => {
-                to_outcome(self.execute_app_tool(name, args, thread_id).await)
+            tn::CREATE_APP | tn::LIST_APPS | tn::LOAD_KNOWHOW | tn::UNLOAD_KNOWHOW => to_outcome(
+                self.execute_app_tool(name, args, thread_id, device_id)
+                    .await,
+            ),
+            tn::RUN_PYTHON => {
+                to_outcome(self.execute_python_tool(args, thread_id, device_id).await)
             }
-            tn::RUN_PYTHON => to_outcome(self.execute_python_tool(args, thread_id).await),
             tn::RUN_PYTHON_BACKGROUND => self.execute_python_background_tool(args, thread_id).await,
             tn::RUN_BASH => to_outcome(self.execute_bash_tool(args, thread_id).await),
             tn::RUN_BASH_BACKGROUND => self.execute_bash_background_tool(args, thread_id).await,
@@ -514,6 +520,7 @@ impl LucidosEngine {
                     tap: tap.clone(),
                     actor,
                     audience: None,
+                    push_group: None,
                 },
             ))
             .await

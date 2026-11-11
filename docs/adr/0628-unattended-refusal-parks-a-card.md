@@ -1,6 +1,7 @@
 # 0628: An unattended refusal parks a card for its permission wait when a device is reachable; amends ADR 0002
 
-- **Status**: Accepted; clauses 1 and 2 amended by [ADR 0630](0630-owner-caused-engine-threads-are-attended.md)
+- **Status**: Superseded by [ADR 0641](0641-coding-agents-trust-by-provenance.md): no coding-agent session parks a card or
+  has a permission wait
 - **Date**: 2026-11-08
 
 ## Context

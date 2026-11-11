@@ -1448,6 +1448,15 @@ export function currentClaudeGatewayUrl(): string {
   return preferences.value.data['claude_gateway_url'] || '';
 }
 
+/** Whether the first Sign in with ChatGPT already showed its welcome dialog. */
+export function chatGptPlanWelcomeShown(): boolean {
+  return currentPreference('chatgpt_plan_welcome_shown') === 'true';
+}
+
+export function markChatGptPlanWelcomeShown(): Promise<void> {
+  return savePreference('chatgpt_plan_welcome_shown', 'true');
+}
+
 // --- OpenCode Free (keyless) ---
 
 /** Whether the keyless OpenCode Free tier is on. Off by default, because
@@ -1464,9 +1473,10 @@ export function setOpenCodeFreeEnabled(enabled: boolean): Promise<void> {
 
 /** Providers whose switch is the `provider_enabled_<id>` preference. OpenCode
  *  Free is deliberately absent: it is opt-IN under its own key (ADR 0104),
- *  where these seven are opt-OUT. Ids match the engine's `ProviderKind`. */
+ *  where these eight are opt-OUT. Ids match the engine's `ProviderKind`. */
 export type SwitchableProvider =
-  | 'vertex' | 'anthropic' | 'openai' | 'openrouter' | 'xai' | 'local' | 'claude-gateway';
+  | 'vertex' | 'anthropic' | 'openai' | 'openrouter' | 'xai' | 'local' | 'claude-gateway'
+  | 'chatgpt-plan';
 
 /** The kebab-case provider id becomes the snake_case key suffix. */
 function providerEnabledKey(id: SwitchableProvider): string {
@@ -1926,15 +1936,14 @@ export function setCommandGuardJudge(enabled: boolean): Promise<void> {
   return savePreference('command_guard_judge', enabled ? 'true' : 'false');
 }
 
-/** Sub-toggle: let the command guard answer coding-agent command cards
- *  (Codex, Claude Code `Bash`). Only meaningful while the master
- *  `command_guard` toggle is on. */
-export function currentCommandGuardCodingAgents(): boolean {
-  return currentPreference('command_guard_coding_agents') === 'true';
+/** *Coding-agent auto-answer*: Lucidos answers coding-agent command cards
+ *  (Codex, Claude Code `Bash`). Independent of `command_guard`. */
+export function currentCodingAgentAutoAnswer(): boolean {
+  return currentPreference('coding_agent_auto_answer') === 'true';
 }
 
-export function setCommandGuardCodingAgents(enabled: boolean): Promise<void> {
-  return savePreference('command_guard_coding_agents', enabled ? 'true' : 'false');
+export function setCodingAgentAutoAnswer(enabled: boolean): Promise<void> {
+  return savePreference('coding_agent_auto_answer', enabled ? 'true' : 'false');
 }
 
 // --- Voice ---

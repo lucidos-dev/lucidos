@@ -57,6 +57,8 @@ its own copy in `artifacts/token-cost/pricing.json`, so the two drift.
   profile a higher effort can read lower, where the Coding Agent Index
   measures it lower. A model's unmeasured efforts keep its measured gap, so
   its higher efforts still rise.
+- **0653:** supersedes the coding-dip policy above. Both profiles now use
+  nondecreasing operational effort estimates; raw inputs remain unchanged.
 - **0526:** the Lucidos Agent's rung control lists the chat ladder's rungs,
   as a coding agent's does, and its ‹ › steps move along them. A rung with a choice
   of backend then opens the preferred-provider step.

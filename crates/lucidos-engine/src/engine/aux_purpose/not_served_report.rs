@@ -99,6 +99,7 @@ impl NotServedRecorder {
                     },
                     actor: None,
                     audience: None,
+                    push_group: None,
                 }),
                 "[AuxPurpose] not-served NotificationCreated",
             )

@@ -1,7 +1,8 @@
 # 0634: A Bash grant covers a command that only mentions .claude/ or .git/; only a write there asks
 
 - **Status**: Accepted. Widened by ADR 0638, which reads a printing `sed`, a
-  read-only substitution, and loop keywords.
+  read-only substitution, and loop keywords. Amended by [ADR 0641](0641-coding-agents-trust-by-provenance.md): a bare
+  `Bash` grant covers a protected write, and the walk guards narrow grants only.
 - **Date**: 2026-11-09
 
 ## Context

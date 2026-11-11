@@ -74,7 +74,7 @@ impl Recorder {
 
 #[async_trait]
 impl SchedulerEffects for Arc<Recorder> {
-    async fn apply_trigger_lifecycle(&self, _: &str, _: &str, _: &serde_json::Value) {}
+    async fn apply_trigger_lifecycle(&self, _: &str, _: &str) {}
 
     async fn rearm_cron_after_lag(&self) {}
 
@@ -166,7 +166,7 @@ fn event_trigger(id: &str, event_type: &str) -> TriggerConfig {
         go_to_review: false,
         group_id: None,
         side_effect_grant: vec![],
-        permission_wait: None,
+        coding_agent_grant: false,
         context_ceiling: None,
         mcp_servers: vec![],
         plugin_id: None,

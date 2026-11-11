@@ -28,6 +28,7 @@ vi.mock('../../../api/client', async (importOriginal) => ({
 }));
 
 import { SummaryTreeBrowser, THREADS_PAGE_SIZE } from '../SummaryTreeBrowser';
+import { operators } from '../../../store/actions/operators';
 
 const THREAD = '3f2c1d4e-0000-4000-8000-000000000000';
 const DATE = { from: '2026-09-02T10:00:00Z', to: '2026-09-19T10:00:00Z' };
@@ -58,6 +59,7 @@ function line(id: string): HTMLButtonElement {
 }
 
 beforeEach(() => {
+  operators.value = { status: 'not-loaded' };
   for (const fn of Object.values(api)) fn.mockReset();
   api.getRecallDate.mockImplementation(async (id) => ({ id, ...DATE }));
   host = document.createElement('div');
@@ -159,6 +161,23 @@ it('draws a line\'s entry kind as a label and keeps the rest as its text', async
   expect(keyed.querySelector('.tree-line-text')?.textContent).toBe('reset the badge at midnight');
   expect(plain.querySelector('.tree-line-kind')).toBeNull();
   expect(plain.querySelector('.tree-line-text')?.textContent).toBe('a line with no key');
+});
+
+it('labels a human prompt with the operator holding its sending device', async () => {
+  operators.value = {
+    status: 'loaded',
+    data: {
+      operators: [{ id: 'owner', name: 'Sam', emails: [], device_ids: ['sams-device'] }],
+      relayed: [],
+    },
+  };
+  api.getSummaryTree.mockResolvedValue({
+    entries: 1,
+    lines: [{ id: `${THREAD}/0+1`, text: 'prompt (human): find the plan', sender_device_id: 'sams-device' }],
+  });
+  await mount();
+  expect(host.querySelector('.tree-line-kind')?.textContent).toBe('Sam');
+  expect(host.querySelector('.tree-line-text')?.textContent).toBe('find the plan');
 });
 
 it('says when nothing is summarised yet', async () => {

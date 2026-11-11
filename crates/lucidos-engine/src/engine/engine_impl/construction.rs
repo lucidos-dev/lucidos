@@ -1417,8 +1417,10 @@ impl LucidosEngine {
         // runtime credential subscriber rebuilds from the same context, so a
         // hot-swapped provider matches a fresh boot.
         let claude_gateway_access = claude_gateway_access_factory(pool.clone(), event_bus.clone());
+        let plan_access = chatgpt_plan_access(pool.clone(), event_bus.clone());
         let provider_build_ctx = crate::llm::ProviderBuildContext {
             claude_gateway_access: Some(claude_gateway_access.clone()),
+            chatgpt_plan_access: Some(plan_access.clone()),
             ..provider_ctx
         };
         let crate::llm::ProviderBuildContext {
@@ -1638,7 +1640,10 @@ impl LucidosEngine {
             proxy_token_cache: Arc::new(crate::api::proxy_token_cache::ProxyTokenCache::new()),
             wasm_engine,
             pending_captures: Arc::default(),
+            pending_widget_fits: Arc::default(),
             claude_gateway_sign_in: Arc::default(),
+            chatgpt_plan_sign_in: Arc::default(),
+            chatgpt_plan_access: plan_access,
             pending_installs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_uninstalls: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             frontend_origin: std::sync::Mutex::new(None),

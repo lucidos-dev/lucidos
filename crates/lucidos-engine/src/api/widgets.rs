@@ -11,6 +11,7 @@ use crate::core::apps::WidgetSize;
 use crate::core::App;
 use crate::engine::dashboard::{self, DashboardChange, DashboardView};
 use crate::engine::thread_events::{ArrangedTile, Dashboard};
+use crate::engine::widget_fit::FitBoxReport;
 use crate::engine::widgets::{self, WidgetCheckFailed, WidgetInstance, WidgetInstanceArgs};
 
 /// A card size body: the thread, the widget instance and its size.
@@ -25,6 +26,21 @@ pub(super) struct CardSizeBody {
 #[derive(Debug, Deserialize)]
 pub(super) struct WidgetBody {
     app_id: String,
+}
+
+/// A widget fit check: the widget, and the thread its request rides on.
+#[derive(Debug, Deserialize)]
+pub(super) struct FitBody {
+    app_id: String,
+    thread_id: Option<String>,
+}
+
+/// A page's answer to a widget fit check: what each box measured.
+#[derive(Debug, Deserialize)]
+pub(super) struct FitReportBody {
+    request_id: String,
+    device_id: Option<String>,
+    boxes: Vec<FitBoxReport>,
 }
 
 /// An HTTP caller has no thread of its own, so it names one.
@@ -244,11 +260,72 @@ async fn arrange_dashboard(
     read_dashboard(&state, which).await
 }
 
+/// POST /api/v1/widgets/fit - Render a widget at every size it declares in an
+/// open Lucidos window, and answer `{"note"}`: what each box cuts off. The
+/// caller's own window renders it when it is visible.
+async fn check_fit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<FitBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let caller = super::actor::user_actor(&headers, None);
+    let thread_id = required_thread(body.thread_id.as_deref())?;
+    let preferred = match &caller {
+        Some(crate::engine::thread_events::MessageOrigin::Device { device_id }) => {
+            Some(device_id.as_str())
+        }
+        _ => None,
+    };
+    let note = state
+        .engine
+        .check_widget_fit(&body.app_id, thread_id, preferred)
+        .await;
+    Ok(Json(serde_json::json!({ "note": note })))
+}
+
+/// POST /api/v1/widgets/fit-report - A page answers a widget fit check. Only
+/// the device the check names may answer; any other is refused and the check
+/// stays open for that one.
+async fn submit_fit_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<FitReportBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use crate::engine::pending_answers::{resolve_answer, AnswerRefusal};
+    let claimed = body.device_id.as_deref();
+    let answering = match super::actor::require_user_actor(&headers, &state.pool, claimed).await? {
+        crate::engine::thread_events::MessageOrigin::Device { device_id } => Some(device_id),
+        _ => None,
+    };
+    match resolve_answer(
+        &state.engine.pending_widget_fits,
+        &body.request_id,
+        answering.as_deref(),
+        body.boxes,
+    ) {
+        Ok(()) => Ok(Json(serde_json::json!({ "ok": true }))),
+        Err(AnswerRefusal::Unknown) => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!(
+                "No widget fit check is waiting under request {}",
+                body.request_id
+            ),
+        )),
+        Err(AnswerRefusal::OtherDevice) => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!("Widget fit check {} is for another device", body.request_id),
+        )
+        .with_reason("fit-check-for-another-device")),
+    }
+}
+
 /// Routes for the `/widgets` surface.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/widgets", get(list_reusable_widgets))
         .route("/widgets/size", post(size_cards))
+        .route("/widgets/fit", post(check_fit))
+        .route("/widgets/fit-report", post(submit_fit_report))
         .route("/widgets/make-reusable", post(make_reusable))
         .route("/widgets/stop-reusing", post(stop_reusing))
         .route("/widgets/dashboard-add", post(add_to_dashboard))

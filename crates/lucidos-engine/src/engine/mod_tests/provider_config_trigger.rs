@@ -82,6 +82,29 @@ fn a_claude_gateway_sign_in_or_out_triggers_a_rebuild() {
     assert!(provider_config_trigger(&pref(prefs::CLAUDE_GATEWAY_URL.key())).is_some());
 }
 
+/// A ChatGPT plan sign-in or sign-out installs or drops the plan. A limit
+/// pause rebuilds nothing: the pause outlives every build.
+#[test]
+fn a_chatgpt_plan_sign_in_or_out_triggers_a_rebuild() {
+    for event in [
+        SystemEvent::ChatGptPlanSignedIn {
+            email: None,
+            actor: None,
+        },
+        SystemEvent::ChatGptPlanSignedOut {
+            reason: crate::llm::chatgpt_plan::ChatGptPlanSignOutReason::Rejected,
+            actor: None,
+        },
+    ] {
+        let trigger = provider_config_trigger(&BusEvent::System(event));
+        assert!(trigger.is_some_and(|t| t.contains("ChatGPT plan")));
+    }
+    let paused = SystemEvent::ChatGptPlanLimitReached {
+        paused_until: chrono::Utc::now(),
+    };
+    assert!(provider_config_trigger(&BusEvent::System(paused)).is_none());
+}
+
 /// Every other preference leaves the provider alone. The bus carries one on
 /// almost every settings change, and rebuilding on each would discard warm
 /// Vertex tokens for nothing.

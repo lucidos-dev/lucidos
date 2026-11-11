@@ -71,7 +71,7 @@ describe('handlePresenceCheck', () => {
     expect(submitPongMock).not.toHaveBeenCalled();
   });
 
-  // A work item's push names its driver's and watchers' devices (ADR 0623).
+  // A root thread's push names its driver's and watchers' devices (ADR 0623).
   test('outside the audience it shows nothing and answers not_shown at once', () => {
     localStorage.setItem(DEVICE_ID_KEY, 'dev-test');
     const outcome = handlePresenceCheck(check({ audience: ['someone-else'] }));

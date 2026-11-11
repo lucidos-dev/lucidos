@@ -2,8 +2,9 @@
  * Where the workspace name is shown, on each viewport.
  *
  * DESKTOP shows it in the bar, beside the Lucidos mark, for as long as the pane
- * can hold it WHOLE. There are only two states: the full name, or no name. It
- * never ellipsises, because half a workspace name identifies nothing, and it
+ * can hold it WHOLE. There are only two states: the full name, or no name. (A
+ * remote workspace's `@gateway` suffix drops first; WorkspaceNameLabel.test.tsx
+ * covers that, since this suite runs no remote workspace.) It never ellipsises, because half a workspace name identifies nothing, and it
  * never overlaps a header icon.
  *
  * MOBILE has no room for it in any header row, so the name lives inside the

@@ -188,7 +188,7 @@ mod unit {
         assert!(!ir.transient.contains("MessageReceived"));
         assert_eq!(
             ir.transient.len(),
-            10,
+            11,
             "the transient list changed; check `is_persisted` and the frontend's \
              `TransientEvent` union together"
         );

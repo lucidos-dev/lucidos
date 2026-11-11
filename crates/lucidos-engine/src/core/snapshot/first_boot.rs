@@ -114,6 +114,7 @@ impl VerifiedRestoreBoot<'_> {
                 },
                 actor: Some(journal.actor),
                 audience: None,
+                push_group: None,
             },
         )
         .await
@@ -608,6 +609,7 @@ mod tests {
             model_registry: Default::default(),
             not_served: Default::default(),
             claude_gateway_access: None,
+            chatgpt_plan_access: None,
         };
         let engine =
             crate::engine::LucidosEngine::new_with_restore(workspace.clone(), &url, ctx, verified)

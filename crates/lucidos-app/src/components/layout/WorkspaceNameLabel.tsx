@@ -3,6 +3,10 @@ import { visibleWorkspaceName } from '../../store/store';
 import { REMOTE_GATEWAY } from '../../utils/basePath';
 import { getRemPx } from '../../utils/dom';
 
+/** How much of the label the brand box can hold: the name with its remote
+ *  gateway, the bare name, or nothing. */
+type LabelFit = 'full' | 'name' | 'none';
+
 /** The workspace name beside the desktop mark, shown while the pane can hold it.
  *
  *  DESKTOP ONLY. Mobile names the workspace inside the Lucidos menu, on the
@@ -10,25 +14,24 @@ import { getRemPx } from '../../utils/dom';
  *  desktop shows it in the bar AND keeps that row, so the name is reachable at
  *  any pane width.
  *
- *  It used to render the connection dot as well, which is what it was named for
- *  (`ConnectionStatus`). The mark took that job over (`data-conn` in
- *  styles/header-mark.css), and one light per row means the dot is gone: this is
- *  the name and its fit measurement, nothing else.
+ *  A remote workspace adds its gateway (`@cloud`). That suffix is the first
+ *  thing to go: when `name @gateway` does not fit, the bare name shows.
  *
- *  Shown WHOLE or not at all, never ellipsised: half a workspace name is not an
- *  identification, and the menu's Workspaces row carries the full one either
- *  way.
+ *  Each part is shown WHOLE or not at all, never ellipsised: half a workspace
+ *  name is not an identification, and the menu's Workspaces row carries the
+ *  full one either way.
  *
  *  The measurement: the host `.pane-header-brand-center` is the flex middle of a
  *  fixed-span cluster (the two thread chevrons take its ends), so its
- *  `clientWidth` is the room actually available to the brand. When the mark plus
- *  this name's leading gap plus the name itself do not fit in it, the name
- *  hides. It stays in the DOM while hidden so `scrollWidth` keeps reporting its
- *  natural width, which is what decides when to bring it back. */
+ *  `clientWidth` is the room actually available to the brand. The label stays
+ *  in the DOM while hidden so `scrollWidth` keeps reporting the name's natural
+ *  width. A collapsed suffix is taken out of flow but still laid out, so its
+ *  own box keeps reporting its width. Both decide when a part comes back. */
 export function WorkspaceNameLabel() {
   const name = visibleWorkspaceName.value;
   const labelRef = useRef<HTMLSpanElement>(null);
-  const [hidden, setHidden] = useState(false);
+  const suffixRef = useRef<HTMLSpanElement>(null);
+  const [fit, setFit] = useState<LabelFit>('full');
 
   useLayoutEffect(() => {
     if (!name || !labelRef.current) return;
@@ -50,13 +53,15 @@ export function WorkspaceNameLabel() {
         const cs = getComputedStyle(child);
         nonWorkspace += child.scrollWidth + (parseFloat(cs.marginLeft) || 0) + (parseFloat(cs.marginRight) || 0);
       }
-      // The name is shown WHOLE or not at all: it never ellipsises. Half a
-      // workspace name is not an identification, and the menu's Workspaces row
-      // has the full one either way, so the honest states are "here it is" and
-      // "no room". `scrollWidth` is the natural width, which the element keeps
-      // reporting while hidden, so the measurement can bring it back.
+      const suffix = suffixRef.current;
+      const suffixWidth = suffix
+        ? suffix.getBoundingClientRect().width + (parseFloat(getComputedStyle(suffix).marginLeft) || 0)
+        : 0;
+      const suffixInFlow = suffix !== null && !suffix.classList.contains('is-collapsed');
+      const nameWidth = label.scrollWidth - (suffixInFlow ? suffixWidth : 0);
       // 0.5px tolerance for subpixel rounding.
-      setHidden(nonWorkspace + wsMarginPx + label.scrollWidth > brandLabel.clientWidth + 0.5);
+      const room = brandLabel.clientWidth + 0.5 - nonWorkspace - wsMarginPx;
+      setFit(nameWidth + suffixWidth <= room ? 'full' : nameWidth <= room ? 'name' : 'none');
     };
 
     // The box tracks the pane, so watch the brand region it is centred in as
@@ -70,8 +75,14 @@ export function WorkspaceNameLabel() {
 
   if (!name) return null;
   return (
-    <span ref={labelRef} class={`workspace-name-label${hidden ? ' is-hidden' : ''}`}>
-      {name}{REMOTE_GATEWAY && <> <span class="remote-workspace-gateway">@{REMOTE_GATEWAY}</span> <small>remote</small></>}
+    <span ref={labelRef} class={`workspace-name-label${fit === 'none' ? ' is-hidden' : ''}`}>
+      {name}
+      {REMOTE_GATEWAY && (
+        <span
+          ref={suffixRef}
+          class={`remote-workspace-gateway${fit === 'full' ? '' : ' is-collapsed'}`}
+        >@{REMOTE_GATEWAY}</span>
+      )}
     </span>
   );
 }

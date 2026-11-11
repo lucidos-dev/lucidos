@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
 import { aliasRetiredSettingsAnchor, currentModel, preferences, showToast, showConfirm, oauthAccounts, credentials, settingsSubview, settingsScrollTarget, settingsLinkedFragment, settingsSubviewLabel, repositories, knownOAuthProviders, oauthConnectPrefill } from '../../store/store';
 import { devices, getDeviceId, updateDeviceName, removeDevice } from '../../store/actions/devices';
-import { setImageModel, setThemeMode, setFontFamily, setChatModelSelection, setTriggerModelSelection, currentTriggerModel, accountChatEffort, currentThemeMode, currentFontFamily, currentUiScale, currentImageModel,  currentMemoryModule, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentCommandGuardCodingAgents, setCommandGuardCodingAgents, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_MAX, currentStyleOverrides, clearStyleOverrides, setMotion, setThemeEffects, type ExternalLinkTarget, type ThemeMode, type FontPreference } from '../../store/actions/preferences';
+import { setImageModel, setThemeMode, setFontFamily, setChatModelSelection, setTriggerModelSelection, currentTriggerModel, accountChatEffort, currentThemeMode, currentFontFamily, currentUiScale, currentImageModel,  currentMemoryModule, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentCodingAgentAutoAnswer, setCodingAgentAutoAnswer, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_MAX, currentStyleOverrides, clearStyleOverrides, setMotion, setThemeEffects, type ExternalLinkTarget, type ThemeMode, type FontPreference } from '../../store/actions/preferences';
 import { DEFAULT_THEME_MODE, THEME_EFFECTS_PREFS, THEME_MODES, MOTION_PREFS, type ThemeEffectsPref, type MotionPref } from '@lucidos/appearance';
 import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
 import { openScaleModal } from '../shared/scaleModalState';
@@ -84,7 +84,7 @@ import { LoadableError } from '../shared/LoadableError';
 import { LoadableToggle } from '../shared/LoadableToggle';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
-import { openIntelligenceLadder, openSettingsSubview } from '../../store/actions/menu';
+import { openCommandJudgeModelSettings, openIntelligenceLadder, openSettingsSubview } from '../../store/actions/menu';
 import { focusFirstFocusableWithin } from '../layout/paneFocus';
 import { formatTimeAgo } from '../../utils/formatTime';
 import type { ImageModel } from '../../store/actions/preferences';
@@ -987,9 +987,9 @@ export function SettingsView() {
   }
 
   function commandSafetySection() {
-    // Parent master (`command_guard`) gates the whole feature; the children
-    // (LLM judge on/off + judge model) are independent but only take effect —
-    // and are only enabled — while the master is on.
+    // Parent master (`command_guard`) gates the whole feature. The LLM judge
+    // switch takes effect, and is enabled, only while the master is on. The
+    // judge model lives under Models, linked from here.
     // `command_guard` / `command_guard_judge` default to a definite value while
     // `preferences` is still loading; gate the toggles on the loaded status so
     // they mount in their persisted position rather than animating across on
@@ -997,7 +997,6 @@ export function SettingsView() {
     const loaded = preferences.value.status === 'loaded';
     const guardOn = currentCommandGuard();
     const judgeOn = currentCommandGuardJudge();
-    const codingAgentsOn = currentCommandGuardCodingAgents();
     return (
       <div class="settings-section">
         {/* On the section title, not on the Command guard row: the copy is
@@ -1016,16 +1015,20 @@ export function SettingsView() {
               every command the agent runs goes straight through.
             </p>
             <p>
-              With the guard off, it does not gate a coding agent's tools. Claude Code asks
-              through its own permissions list below. Codex asks when a command has to
-              escape its sandbox. With the guard on, it also judges those commands, unless
-              you turn off Answer coding-agent questions. Lucidos answers the plain reads for
-              you, whatever these toggles say.
+              The guard does not answer a coding agent's cards. Claude Code asks through
+              its own permissions list below. Codex asks when a command has to escape its
+              sandbox. Auto-answer coding-agent cards, under Coding agent permissions,
+              hands those to Lucidos. Lucidos answers the plain reads for you, whatever
+              these toggles say.
             </p>
             <p>
               The <strong>LLM judge</strong> places the commands the static check cannot.
-              That is where it reaches past the Lucidos Agent: it can answer an unusual
-              Codex sandbox escape too. Turn the guard off and those ask you instead.
+              It answers a coding agent only under auto-answer.
+            </p>
+            <p>
+              The judge never runs on your chat model. With no judge model a provider
+              serves, a Lucidos Agent turn refuses to start and says why. Pick one under
+              Models, or turn the judge off to let the static check decide alone.
             </p>
           </Explainer>
         </div>
@@ -1046,53 +1049,65 @@ export function SettingsView() {
             onChange={(c) => void setCommandGuardJudge(c)}
           />
         </div>
-        <div class="settings-row settings-row-child" data-search-anchor="command-safety:coding-agents">
-          <span class="settings-row-label">
-            Answer coding-agent questions
-            <Explainer title="Answer coding-agent questions">
-              <p>
-                When <strong>Claude Code</strong> or <strong>Codex</strong> asks to run a
-                command, the guard can answer for you. A command it places as safe or
-                reversible runs. An irreversible or catastrophic one never runs unasked.
-              </p>
-              <p>
-                It sees only what would otherwise ask you. The Claude Code permission mode
-                and the Coding agent permissions list settle the rest first.
-              </p>
-              <p>
-                Nothing takes a checkpoint first, so a wrong reversible call has no undo.
-              </p>
-              <p>
-                Off, the guard runs no Claude Code command for you, so what Claude Code
-                asks reaches you.
-              </p>
-              <p>
-                Whatever these switches say, the guard refuses a catastrophic command it
-                recognises, such as wiping a disk, without asking.
-              </p>
-              <p>
-                <strong>Codex is different.</strong> It asks only when its own sandbox
-                blocked a command, such as <code>ps</code> on macOS. You never chose that
-                block, so the guard lets a safe one run whatever these switches say.
-              </p>
-            </Explainer>
-          </span>
-          <LoadableToggle
-            loaded={loaded}
-            checked={codingAgentsOn}
-            disabled={!guardOn}
-            onChange={(c) => void setCommandGuardCodingAgents(c)}
-          />
-        </div>
-        {/* Every System One row is in this picker, not a switch beside it: a
-            backend is picked where the model is. */}
-        <JudgmentModelRow
-          site="command-guard"
-          label="Judge model"
-          anchor="command-safety:judge-model"
-          nested
-          background={background}
-          disabled={!guardOn || !judgeOn}
+        {commandJudgeLinkRow()}
+      </div>
+    );
+  }
+
+  /** A link to the judge model's row under Models. The guard and coding-agent
+   *  auto-answer both run on it, so neither section owns the picker. Search
+   *  finds the picker itself, so the link carries no anchor. */
+  function commandJudgeLinkRow() {
+    return (
+      <div class="settings-row settings-row-child">
+        <span class="settings-row-label">Judge model</span>
+        <button type="button" class="action-btn" onClick={openCommandJudgeModelSettings}>
+          Choose in Models
+        </button>
+      </div>
+    );
+  }
+
+  /** The *coding-agent auto-answer* switch. Independent of the command guard,
+   *  so it sits with the coding-agent list it answers beyond. */
+  function codingAgentAutoAnswerRow() {
+    return (
+      <div class="settings-row" data-search-anchor="permissions:coding-agent-auto-answer">
+        <span class="settings-row-label">
+          Auto-answer coding-agent cards
+          <Explainer title="Auto-answer coding-agent cards">
+            <p>
+              When <strong>Claude Code</strong> or <strong>Codex</strong> asks to run a
+              command, Lucidos can answer for you. It uses the command guard's checks and
+              its judge. A command placed as safe or reversible runs. An irreversible or
+              catastrophic one never runs unasked.
+            </p>
+            <p>
+              It sees only what would otherwise ask you. The Claude Code permission mode
+              and the list below settle the rest first.
+            </p>
+            <p>
+              Nothing takes a checkpoint first, so a wrong reversible call has no undo.
+            </p>
+            <p>
+              Off, Lucidos runs no Claude Code command for you, so what Claude Code asks
+              reaches you. The command guard switch does not change this.
+            </p>
+            <p>
+              Whatever these switches say, Lucidos refuses a catastrophic command it
+              recognises, such as wiping a disk, without asking.
+            </p>
+            <p>
+              <strong>Codex is different.</strong> It asks only when its own sandbox
+              blocked a command, such as <code>ps</code> on macOS. You never chose that
+              block, so Lucidos lets a safe one run whatever these switches say.
+            </p>
+          </Explainer>
+        </span>
+        <LoadableToggle
+          loaded={preferences.value.status === 'loaded'}
+          checked={currentCodingAgentAutoAnswer()}
+          onChange={(c) => void setCodingAgentAutoAnswer(c)}
         />
       </div>
     );
@@ -1126,6 +1141,12 @@ export function SettingsView() {
           placeholder="Bash(npm:*)"
           load={getCcAllowedTools}
           save={putCcAllowedTools}
+          lead={(
+            <>
+              {codingAgentAutoAnswerRow()}
+              {commandJudgeLinkRow()}
+            </>
+          )}
           description={
             <>
               Tools and commands coding agents may run without asking. Claude Code reads every line, Codex the command lines: <code>Bash(git:*)</code> covers <code>git</code> for both.
@@ -1345,6 +1366,15 @@ export function SettingsView() {
           />
           {/* The System One rows are among its models, as for query
               classification. */}
+          {/* Every System One row is in this picker, not a switch beside it:
+              a backend is picked where the model is. Never disabled by the
+              guard's switches, since coding-agent auto-answer runs on it too. */}
+          <JudgmentModelRow
+            site="command-guard"
+            label="Command judge"
+            anchor="models:command-judge"
+            background={background}
+          />
           <JudgmentModelRow
             site="read-decision"
             label="Read decision"

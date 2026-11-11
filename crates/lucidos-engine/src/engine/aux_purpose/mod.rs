@@ -22,6 +22,7 @@
 //! have joined the first in silence.
 
 mod default;
+mod judge_model;
 mod not_served_report;
 mod reach;
 
@@ -40,6 +41,9 @@ use crate::engine::event_bus::EventBus;
 use crate::llm::AuxProvider;
 pub use default::ModelSource;
 pub(crate) use default::{asks_no_model, recommended, recommended_effort, select as select_model};
+pub(crate) use judge_model::{
+    guarded_turn_refusal, unresolved_judge, unresolved_reason as judge_unresolved,
+};
 use not_served_report::NotServedRecorder;
 pub(crate) use reach::{seed_not_served, Reach};
 

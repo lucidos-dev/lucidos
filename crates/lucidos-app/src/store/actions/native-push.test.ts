@@ -126,7 +126,7 @@ describe('NativePushRequested → native desktop banner', () => {
     expect(showNativeNotification).not.toHaveBeenCalled();
   });
 
-  it("skips a banner meant for other devices (a work item's audience)", async () => {
+  it("skips a banner meant for other devices (a root thread's audience)", async () => {
     localStorage.setItem(DEVICE_ID_KEY, 'this-mac');
     emit({ audience: ['someone-elses-phone'] });
     await flush();

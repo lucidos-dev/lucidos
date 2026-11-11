@@ -367,3 +367,28 @@ fn collect_price_keys(
         _ => {}
     }
 }
+
+#[test]
+fn november_models_use_standard_prices_and_december_boundary() {
+    let table = shipped_table();
+    for model in ["gemini-4-argon", "gemini-4-carbon"] {
+        for (date, input, output, read) in [
+            ("2026-11-30", 2.0, 10.0, 0.1),
+            ("2026-12-01", 4.0, 20.0, 0.2),
+        ] {
+            let card = table.card_on(model, day(date)).unwrap();
+            assert_eq!(card.rates.uncached_in, input);
+            assert_eq!(card.rates.out, output);
+            assert_eq!(card.rates.cache_read, read);
+            assert_eq!(card.rates.cache_write, input);
+        }
+    }
+    let card = table
+        .card_on("claude-fable-5-2", day("2026-11-10"))
+        .unwrap();
+    assert_eq!(card.rates.uncached_in, 8.0);
+    assert_eq!(card.rates.out, 40.0);
+    assert_eq!(card.rates.cache_read, 0.2);
+    assert_eq!(card.rates.cache_write, 10.0);
+    assert_eq!(card.rates.cache_write_1h, Some(16.0));
+}

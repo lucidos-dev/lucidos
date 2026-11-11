@@ -91,8 +91,10 @@ describe('settings search — Permissions section', () => {
   it('finds the Command safety rows by name', () => {
     const guard = getSettingsSearchResults('command guard', 20);
     expect(guard.some((r) => r.id === 'command-safety:guard')).toBe(true);
+    // The judge model lives under Models: the guard and coding-agent
+    // auto-answer both run on it.
     const judge = getSettingsSearchResults('judge model', 20);
-    expect(judge.some((r) => r.id === 'command-safety:judge-model')).toBe(true);
+    expect(judge.some((r) => r.id === 'models:command-judge')).toBe(true);
   });
 
   it('finds both allowlist editors by name', () => {

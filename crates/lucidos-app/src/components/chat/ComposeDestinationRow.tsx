@@ -1,7 +1,8 @@
 import { useRef } from 'preact/hooks';
 import type { CodingAgent } from '../../api/types';
 import { repositories, appsList, enginePackaged, settingsScrollTarget } from '../../store/store';
-import { resolveScope, resolveCodingAgent } from '../../store/composeSelections';
+import { resolvePerson, resolveScope, resolveCodingAgent } from '../../store/composeSelections';
+import { mentionablePeople } from '../../store/actions/people';
 import { loadApps } from '../../store/actions/apps';
 import { loadRepositories } from '../../store/actions/chat';
 import { applyDestination, updateComposeSelection, type ComposeMode } from '../../store/actions/compose';
@@ -126,7 +127,8 @@ export function ComposeDestinationRow({ threadId, toggleMode, fading }: {
   const lastDestRef = useRef<ComposeDestination>({ kind: 'lucidos-agent' });
   // Per-draft target: resolve THIS draft's scope override (falls back to the
   // global default), so switching one draft's target never changes another's.
-  let dest = destinationFromState(toggleMode, resolveScope(threadId));
+  const people = mentionablePeople.value;
+  let dest = destinationFromState(toggleMode, resolveScope(threadId), resolvePerson(threadId));
   if (fading) dest = lastDestRef.current;
   else lastDestRef.current = dest;
 
@@ -140,6 +142,7 @@ export function ComposeDestinationRow({ threadId, toggleMode, fading }: {
     listsPending,
     reposError: reposLoadable.status === 'failed' ? reposLoadable.error : null,
     appsError: appsLoadable.status === 'failed' ? appsLoadable.error : null,
+    people,
   });
 
   const codingScope = dest.kind === 'coding' ? dest.scope : null;
@@ -147,12 +150,13 @@ export function ComposeDestinationRow({ threadId, toggleMode, fading }: {
   const scopeRepoId = codingScope?.kind === 'external' ? codingScope.repoId : null;
   const appName = scopeAppId ? apps.find(a => a.id === scopeAppId)?.name : undefined;
   const repoName = scopeRepoId ? repos.find(r => r.id === scopeRepoId)?.name : undefined;
+  const personName = dest.kind === 'person' ? people.find(p => p.id === dest.personId)?.name : undefined;
 
   const value = destinationToOptionValue(dest);
 
   return (
     <>
-      <div class="compose-destination-caption">{destinationCaption(dest, { appName, repoName })}</div>
+      <div class="compose-destination-caption">{destinationCaption(dest, { appName, repoName, personName })}</div>
       <div class="compose-destination-row">
         <Dropdown
           options={options}

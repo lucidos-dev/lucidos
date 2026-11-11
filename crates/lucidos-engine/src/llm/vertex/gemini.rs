@@ -220,10 +220,10 @@ fn grounded_search_result(
     ))
 }
 
-/// Build the `generationConfig.thinkingConfig` for a Gemini call. Only Gemini 3.x
+/// Build the `generationConfig.thinkingConfig` for a Gemini call. Gemini 3.x and 4
 /// models get a thinking config; everything else returns `None` (unchanged).
 ///
-/// Gemini 3.x wants `thinkingLevel` (never the deprecated `thinkingBudget` — it
+/// Gemini 3.x and 4 want `thinkingLevel` (never the deprecated `thinkingBudget` — it
 /// can 400 and degrades quality on 3.x), and `includeThoughts` routes the
 /// model's deliberation into `thought:true` parts that `build_gemini_llm_response`
 /// strips — so the visible answer stops "reasoning out loud". Extracted from
@@ -232,10 +232,13 @@ fn gemini_generation_config(
     model: &str,
     reasoning_effort: Option<&str>,
 ) -> Option<VertexGenerationConfig> {
-    if !model.starts_with("gemini-3") {
+    if !model.starts_with("gemini-3")
+        && crate::llm::model_registry::unified_output_limit(model).is_none()
+    {
         return None;
     }
     Some(VertexGenerationConfig {
+        max_output_tokens: crate::llm::model_registry::unified_output_limit(model),
         thinking_config: VertexThinkingConfig {
             thinking_level: reasoning_effort.map(|effort| gemini_thinking_level(model, effort)),
             include_thoughts: true,
@@ -252,14 +255,14 @@ pub(crate) fn sdk_request_defaults(model: &str, effort: Option<&str>) -> serde_j
     serde_json::json!({ "body": body, "headers": {} })
 }
 
-/// Map the unified `reasoning_effort` to a Gemini 3.x `thinkingLevel`, clamped to
+/// Map the unified `reasoning_effort` to a Gemini `thinkingLevel`, clamped to
 /// the levels the specific model accepts: Gemini 3 Flash supports
 /// `minimal`/`low`/`medium`/`high`; Gemini 3 Pro supports only `low`/`high`
 /// (sending Pro `minimal` or `medium` 400s). Gemini 3 can't fully disable
 /// thinking, so `none` maps to the model's floor: `minimal` on Flash, `low` on
 /// Pro and on a model that always reasons (Gemini 3.8 Flash answers `minimal`
 /// with a 400). Unknown/higher efforts default to `high`, the model's own
-/// default. Lowercase per Google's REST docs.
+/// default for Gemini 3 (Gemini 4 defaults to medium when omitted). Lowercase per Google's REST docs.
 fn gemini_thinking_level(model: &str, effort: &str) -> &'static str {
     let flash = model.contains("flash");
     match effort {
@@ -272,9 +275,9 @@ fn gemini_thinking_level(model: &str, effort: &str) -> &'static str {
             }
         }
         "low" => "low",
-        // `medium` is Flash-only; Pro rounds up to its nearest valid level.
+        // Gemini 4 and Flash accept medium; Gemini 3 Pro rounds up.
         "medium" => {
-            if flash {
+            if flash || crate::llm::model_registry::unified_output_limit(model).is_some() {
                 "medium"
             } else {
                 "high"
@@ -445,6 +448,8 @@ impl VertexToolConfig {
 
 #[derive(Serialize)]
 struct VertexGenerationConfig {
+    #[serde(rename = "maxOutputTokens", skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<usize>,
     #[serde(rename = "thinkingConfig")]
     thinking_config: VertexThinkingConfig,
 }
@@ -1423,6 +1428,27 @@ mod tests {
         let rendered = grounded_search_result(&body, 5).expect("a real answer is a success");
         assert!(rendered.contains("Rust 1.99 shipped."), "{rendered}");
         assert!(rendered.contains("https://example.com/rust"), "{rendered}");
+    }
+
+    #[test]
+    fn gemini_four_preserves_efforts_and_caps_nonstreaming_output() {
+        for model in ["gemini-4-argon", "gemini-4-carbon"] {
+            for effort in ["low", "medium", "high"] {
+                let defaults = sdk_request_defaults(model, Some(effort));
+                let config = &defaults["body"]["generationConfig"];
+                assert_eq!(config["thinkingConfig"]["thinkingLevel"], effort);
+                assert_eq!(config["maxOutputTokens"], 32_768);
+                assert_eq!(config["thinkingConfig"]["includeThoughts"], true);
+                assert!(config["thinkingConfig"].get("thinkingBudget").is_none());
+            }
+            assert_eq!(
+                crate::llm::reasoning::supported_efforts(
+                    crate::llm::model_registry::ProviderKind::Vertex,
+                    model
+                ),
+                &["low", "medium", "high"]
+            );
+        }
     }
 
     #[test]

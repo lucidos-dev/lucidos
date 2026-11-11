@@ -178,24 +178,26 @@ export function isGhostFocus(args: {
  *  current visual viewport, layout viewport, and focus state? Extracted so
  *  the wake/resize bug can be unit-tested without jsdom + fake visualViewport.
  *
- *  Keyboard up iff `vv.height` is meaningfully shrunk relative to
- *  `window.innerHeight` (the layout viewport, which doesn't shrink for the
- *  iOS keyboard) AND a text input that triggers the OS keyboard is focused.
- *  When keyboard is up, render the app shell at `vv.height` (shrunk to fit
- *  above the keyboard). Otherwise use `innerHeight` as the truth — this is
- *  what fixes the iOS PWA wake bug, where a delayed `vv.resize` fires with
- *  a stale shrunk `vv.height` even though the keyboard is actually dismissed.
+ *  The shell is `innerHeight` (the layout viewport, which the iOS keyboard
+ *  does not shrink) minus `keyboardBandPx`, which says when the band is
+ *  non-zero. With no field focused it is 0, whatever `vv.height` says. That
+ *  fixes the iOS PWA wake bug, where a delayed `vv.resize` fires with a stale
+ *  shrunk `vv.height` even though the keyboard is actually dismissed.
  *  The companion fix is in `onWake`, which blurs any iOS-preserved focus on
  *  a text input so the `activeElementOpensKeyboard` signal correctly reports
  *  false when the keyboard is actually down. */
-export function computeAppHeight(args: {
+export function computeAppHeight(args: KeyboardReading): number {
+  return args.innerHeight - keyboardBandPx(args);
+}
+
+/** What the shell reads to decide where the keyboard is. */
+interface KeyboardReading {
   vvHeight: number;
   innerHeight: number;
   activeElementOpensKeyboard: boolean;
-}): number {
-  const { vvHeight, innerHeight, activeElementOpensKeyboard } = args;
-  const isKeyboard = viewportIsKeyboardShrunk(vvHeight, innerHeight) && activeElementOpensKeyboard;
-  return isKeyboard ? vvHeight : innerHeight;
+  /** The band to assume when the visual viewport is *blind*, and 0 when it
+   *  sees. See `trackAppHeight`. */
+  blindBandPx?: number;
 }
 
 /** Pure decision: how much room the software keyboard is taking off the foot of
@@ -209,17 +211,14 @@ export function computeAppHeight(args: {
  *  reveal land differently on the same form twice running. The padding is the
  *  slack that stops iOS reaching for the offset.
  *
- *  Same two terms as `computeAppHeight`, so the shell's height and the slack it
- *  needs cannot disagree about whether the keyboard is up.
+ *  `computeAppHeight` subtracts this band, so the shell's height and the slack
+ *  it needs cannot disagree about whether the keyboard is up.
  *  See `docs/plans/2026-09-19-the-keyboard-reveal-stops-fighting-ios.md`. */
-export function keyboardBandPx(args: {
-  vvHeight: number;
-  innerHeight: number;
-  activeElementOpensKeyboard: boolean;
-}): number {
-  const { vvHeight, innerHeight, activeElementOpensKeyboard } = args;
-  if (!activeElementOpensKeyboard || !viewportIsKeyboardShrunk(vvHeight, innerHeight)) return 0;
-  return Math.max(0, innerHeight - vvHeight);
+export function keyboardBandPx(args: KeyboardReading): number {
+  const { vvHeight, innerHeight, activeElementOpensKeyboard, blindBandPx = 0 } = args;
+  if (!activeElementOpensKeyboard) return 0;
+  if (viewportIsKeyboardShrunk(vvHeight, innerHeight)) return innerHeight - vvHeight;
+  return blindBandPx;
 }
 
 /** Pure decision: the padding a scroller must keep when the band drops, in px,
@@ -254,21 +253,60 @@ export function heldBandPx(args: {
  *  over-reserving costs only scrollable slack nobody scrolls into. */
 const ASSUMED_KEYBOARD_FRACTION = 0.45;
 
-/** The widest band measured this session, so a focus can reserve the slack
+/** Where the last measured band per orientation is kept, for a launch whose
+ *  visual viewport is blind from the start. */
+export const KEYBOARD_BAND_STORAGE_KEY = 'lucidos-keyboard-band';
+
+type Orientation = 'portrait' | 'landscape';
+
+/** The stored bands, skipping any entry that is not a positive number.
+ *
+ *  Storage failures only warn. The memory runs without user intent, so a toast
+ *  would report nothing the user did. A miss falls back to the assumed band,
+ *  and the next measured keyboard rewrites the stored copy. */
+function loadStoredBands(storage: Pick<Storage, 'getItem'>): Record<Orientation, number> {
+  const bands = { portrait: 0, landscape: 0 };
+  try {
+    const parsed: unknown = JSON.parse(storage.getItem(KEYBOARD_BAND_STORAGE_KEY) ?? 'null');
+    if (typeof parsed !== 'object' || parsed === null) return bands;
+    for (const key of ['portrait', 'landscape'] as const) {
+      const px = (parsed as Record<string, unknown>)[key];
+      if (typeof px === 'number' && Number.isFinite(px) && px > 0) bands[key] = px;
+    }
+  } catch (err) {
+    console.warn('Keyboard band memory: ignoring unreadable stored bands', err);
+  }
+  return bands;
+}
+
+/** The band to reserve per orientation: the widest seen this session, seeded
+ *  from the last one stored. A focus uses it to reserve the slack
  *  before the keys have animated in. iOS picks between scrolling the container
  *  and offsetting the viewport at FOCUS time. Slack arriving with the first
  *  resize arrives too late to change that decision.
  *
  *  Kept per orientation, since the phone layout survives a rotation. A
- *  portrait keyboard is most of a landscape screen. */
-export function keyboardBandMemory() {
-  const widest = { portrait: 0, landscape: 0 };
-  const orientationOf = (v: { width: number; height: number }) =>
+ *  portrait keyboard is most of a landscape screen.
+ *
+ *  Given storage, it starts from the last band an earlier launch measured, and
+ *  stores each new measurement. The latest is stored, not the widest, so a
+ *  keyboard that got shorter is not over-reserved forever. */
+export function keyboardBandMemory(storage?: Pick<Storage, 'getItem' | 'setItem'>) {
+  const widest = storage ? loadStoredBands(storage) : { portrait: 0, landscape: 0 };
+  const stored = { ...widest };
+  const orientationOf = (v: { width: number; height: number }): Orientation =>
     (v.width > v.height ? 'landscape' : 'portrait');
   return {
     note(bandPx: number, viewport: { width: number; height: number }) {
       const key = orientationOf(viewport);
       if (bandPx > widest[key]) widest[key] = bandPx;
+      if (!storage || bandPx <= 0 || bandPx === stored[key]) return;
+      stored[key] = bandPx;
+      try {
+        storage.setItem(KEYBOARD_BAND_STORAGE_KEY, JSON.stringify(stored));
+      } catch (err) {
+        console.warn('Keyboard band memory: could not store the measured band', err);
+      }
     },
     reserve(viewport: { width: number; height: number }): number {
       return widest[orientationOf(viewport)] || Math.round(viewport.height * ASSUMED_KEYBOARD_FRACTION);
@@ -434,22 +472,45 @@ export function trackAppHeight(): (() => void) | undefined {
     document.documentElement.style.setProperty('--app-height', `${h}px`);
   };
 
-  // One computation site, so every write makes the same keyboard-aware
-  // decision. A rotation or mount with the keys up must keep the shrunk
-  // height. Writing innerHeight blindly would put the prompt behind the keys.
+  const bandMemory = keyboardBandMemory(window.localStorage);
+  const layoutViewport = () => ({ width: window.innerWidth, height: window.innerHeight });
+
+  // The visual viewport is *blind* when it reads zero before its first real
+  // reading, until it next measures a keyboard. iOS can launch the PWA that
+  // way and keep the full height with the keys up until a relaunch. Focus
+  // then decides alone, and the band is the remembered keyboard. A zero after
+  // a real reading is a wake's transient one and leaves this alone: with a
+  // hardware keyboard no measurement would ever clear it. Registered in
+  // `docs/temporary-measures.md` § 1, "Blind visual viewport".
+  let viewportBlind = false;
+  let viewportHasRead = false;
+  // One reading site, so every write makes the same keyboard-aware decision.
+  // A rotation or mount with the keys up must keep the shrunk height. Writing
+  // innerHeight blindly would put the prompt behind the keys.
+  const keyboardReading = (): KeyboardReading => {
+    const activeElementOpensKeyboard = opensSoftwareKeyboard(document.activeElement);
+    if (!readableVisualViewport()) {
+      if (!viewportHasRead) viewportBlind = true;
+    } else {
+      viewportHasRead = true;
+      if (viewportIsKeyboardShrunk(vv.height, window.innerHeight)) {
+        viewportBlind = false;
+        if (activeElementOpensKeyboard) bandMemory.note(window.innerHeight - vv.height, layoutViewport());
+      }
+    }
+    return {
+      vvHeight: vv.height,
+      innerHeight: window.innerHeight,
+      activeElementOpensKeyboard,
+      blindBandPx: viewportBlind ? bandMemory.reserve(layoutViewport()) : 0,
+    };
+  };
   const layoutViewportKey = () => `${window.innerWidth}x${window.innerHeight}`;
   let measuredLayoutViewport = '';
   const currentAppHeight = () => {
     measuredLayoutViewport = layoutViewportKey();
-    return computeAppHeight({
-      vvHeight: vv.height,
-      innerHeight: window.innerHeight,
-      activeElementOpensKeyboard: opensSoftwareKeyboard(document.activeElement),
-    });
+    return computeAppHeight(keyboardReading());
   };
-
-  const bandMemory = keyboardBandMemory();
-  const layoutViewport = () => ({ width: window.innerWidth, height: window.innerHeight });
   let lastSetBand = -1;
   // Each scroller's band hold (`heldBandPx`): the content height it anchors,
   // and the scroll listener and mutation observer that re-measure it.
@@ -506,19 +567,17 @@ export function trackAppHeight(): (() => void) | undefined {
     lastSetBand = px;
     document.documentElement.style.setProperty('--keyboard-band', `${px}px`);
   };
-  const syncBand = () => {
-    const band = keyboardBandPx({
-      vvHeight: vv.height,
-      innerHeight: window.innerHeight,
-      activeElementOpensKeyboard: opensSoftwareKeyboard(document.activeElement),
-    });
-    bandMemory.note(band, layoutViewport());
-    setBand(band);
+  const syncBand = () => setBand(keyboardBandPx(keyboardReading()));
+  const syncShell = () => {
+    setHeight(currentAppHeight());
+    syncBand();
   };
-  /** Reserve the slack now, on the best figure available. */
+  /** Reserve the slack now, on the best figure available. A blind viewport
+   *  sends no resize when the keys rise, so the focus moves the shell too. */
   const armBand = (e: FocusEvent) => {
     if (!opensSoftwareKeyboard(e.target)) return;
-    setBand(bandMemory.reserve(layoutViewport()));
+    if (viewportBlind) syncShell();
+    else setBand(bandMemory.reserve(layoutViewport()));
   };
 
   /** The last height ANY observer here acted on. See the poll below, whose
@@ -564,7 +623,8 @@ export function trackAppHeight(): (() => void) | undefined {
   // handoff is left alone, as `useHideOnScroll` leaves its own.
   const onFocusOut = (e: FocusEvent) => {
     if (opensSoftwareKeyboard(e.relatedTarget)) return;
-    syncBand();
+    if (viewportBlind) syncShell();
+    else syncBand();
   };
   // An iOS resume often drops the keyboard and fires no visual-viewport
   // resize. Without this recompute the shell keeps its keyboard-up height.
@@ -578,14 +638,16 @@ export function trackAppHeight(): (() => void) | undefined {
   //      height, so the wake blurs it. The user taps again to type.
   //
   // The blur runs only when `vv.height` looks shrunk, or gives no reading
-  // (iOS 27 reports 0). A quick return to a focused search box keeps focus.
+  // (iOS 27 reports 0). It also runs while the viewport is blind, which
+  // cannot say the keys went down. A quick return to a focused search box
+  // keeps focus.
   //
   // Resetting lastSetHeight forces the write even when the value is cached.
   const onWake = () => {
     const vvLooksShrunk =
       !readableVisualViewport() || viewportIsKeyboardShrunk(vv.height, window.innerHeight);
     const active = document.activeElement;
-    if (vvLooksShrunk && active instanceof HTMLElement && opensSoftwareKeyboard(active)) {
+    if ((vvLooksShrunk || viewportBlind) && active instanceof HTMLElement && opensSoftwareKeyboard(active)) {
       active.blur();
     }
     lastSetHeight = -1;

@@ -2278,8 +2278,8 @@ describe('mobile dynamic bars: always on in the installed iOS app', () => {
     vi.restoreAllMocks();
   });
 
-  it('is off while nothing is stored, as the catalog says', () => {
-    expect(currentMobileDynamicBars()).toBe(false);
+  it('is on while nothing is stored, as the catalog says', () => {
+    expect(currentMobileDynamicBars()).toBe(true);
   });
 
   it('follows the stored preference outside the installed iOS app', () => {

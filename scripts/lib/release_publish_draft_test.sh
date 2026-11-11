@@ -6,7 +6,8 @@
 # scripts/lib/release_draft_test.sh covers the lib those two scripts call. This
 # covers how they call it, which is where the ordering invariant actually lives:
 #
-#   wait for the platform tarballs -> publish the draft -> emit LucidosReleased
+#   wait for the platform tarballs -> publish the draft -> move the mirror's
+#   main (ADR 0642) -> emit LucidosReleased
 #
 # Every step of that order is load-bearing. Publishing before the assets are
 # attached is the outage this whole change removes. Emitting LucidosReleased
@@ -19,10 +20,11 @@
 #     against a version that has no state and no worktree. It gets no further
 #     than a local `git remote get-url`, so the assertion is offline and touches
 #     no network, no mirror and no release;
-#   • the orderings are read out of the two scripts. They cannot be executed
-#     here (each one force-pushes a public mirror), so source order is the
-#     honest instrument, and comment lines are stripped first so prose ABOUT the
-#     rule cannot satisfy it.
+#   • the orderings are read out of the two scripts. The whole scripts cannot
+#     run here (each one pushes to a public mirror), so source order is the
+#     instrument, and comment lines are stripped first so prose ABOUT the
+#     rule cannot satisfy it. Section 6 runs the two publish tails' real text
+#     with every effect stubbed, so the main-last order is executed too.
 # shellcheck disable=SC2016 # file-wide, and a genuine false positive throughout:
 # every needle here is LITERAL text to find in a release script, so the '$' in
 # `"$PHASE"`, `"$REPO_ROOT"` and `"$tag"` must reach grep UNEXPANDED. Expanding
@@ -322,6 +324,142 @@ for f in "$RELEASE_SH" "$PUBLISH_SH"; do
         fail "$name does not source both release_draft.sh and headless_tarball.sh (the expected-asset list needs headless_tarball_stem)"
     fi
 done
+
+# ── 6. the mirror's main moves last, executed with stubbed effects ────────────
+# The real source text runs here, with every effect replaced by a recorder.
+# What it proves: main moves only after a successful publish, never after a
+# failed wait, and LucidosReleased (settle_after_publish) only after main moved.
+STUB_LOG="$(mktemp)"
+STUB_STATE="$(mktemp)"
+trap 'rm -f "$STUB_LOG" "$STUB_STATE"' EXIT
+printf 'RELEASE_VERSION=0.77.0\n' >"$STUB_STATE"
+
+# stubbed_run <wait-rc> <advance-rc> <code> [draft-state]: run <code> under the
+# recorders and print the log, one call per line.
+stubbed_run() {
+    : >"$STUB_LOG"
+    WAIT_RC="$1" ADV_RC="$2" CODE="$3" DRAFT_STATE="${4:-draft}" LOG="$STUB_LOG" STATE_FILE="$STUB_STATE" bash -c '
+        set -Eeuo pipefail
+        fail() { echo "fail" >>"$LOG"; exit 1; }
+        step() { :; }; begin_step() { :; }; end_step() { :; }
+        gh() { :; }
+        git() {
+            case "$*" in
+                *"show -s"*) echo PARENT ;;
+                *) return 0 ;;
+            esac
+        }
+        release_mirror_branch() { printf main; }
+        release_mirror_fetch() { :; }
+        release_mirror_tag_sha() { echo COMMIT; }
+        release_draft_state() { echo "$DRAFT_STATE"; }
+        release_draft_wait_then_publish() { echo "publish $4" >>"$LOG"; return "$WAIT_RC"; }
+        release_mirror_main_advance() { echo "advance $3 $4" >>"$LOG"; return "$ADV_RC"; }
+        settle_after_publish() { echo "settle" >>"$LOG"; }
+        REPO_ROOT=/nonexistent REMOTE=lucidos REPO_SLUG=lucidos-dev/lucidos
+        VERSION=0.77.0 NEW_TAG=v0.77.0 WORKTREE_DIR=/nonexistent STAGING_DIR=/nonexistent
+        ALLOW_MISSING_TARBALLS=0
+        release=0.77.0 tag=v0.77.0 commit=COMMIT parent=PARENT BRANCH=main
+        eval "$CODE"
+        if declare -F run_publish_draft >/dev/null; then run_publish_draft; fi
+    ' >/dev/null 2>&1 || true
+    tr '\n' ',' <"$STUB_LOG"
+}
+
+echo ""
+echo "test: release-to-lucidos.sh moves main only after the publish succeeds (executed)"
+PUB_TAIL="$(awk '/^begin_step event "Waiting/{on=1} on{print} on && /did not move to it/{exit}' "$PUBLISH_SH")"
+if [ -z "$PUB_TAIL" ]; then
+    fail "could not extract the publish tail of release-to-lucidos.sh"
+else
+    got="$(stubbed_run 0 0 "$PUB_TAIL")"
+    if [ "$got" = "publish COMMIT,advance COMMIT PARENT," ]; then
+        pass "publish, then main advances from the parent to the commit"
+    else
+        fail "expected publish then advance, got: $got"
+    fi
+    got="$(stubbed_run 1 0 "$PUB_TAIL")"
+    if [ "$got" = "publish COMMIT,fail," ]; then
+        pass "a failed wait fails the run and never moves main"
+    else
+        fail "a failed wait must not move main, got: $got"
+    fi
+fi
+
+echo ""
+echo "test: a rival in-flight tag after the tag push backs this release off (executed)"
+# race_run <tag-before> <check-rc>: run the tag push and its recount under
+# recorders, and print the calls, one per comma.
+RACE_CODE="$(awk '/^tag_was_present=/{on=1} on{print} on && /^fi$/{exit}' "$PUBLISH_SH")"
+race_run() {
+    : >"$STUB_LOG"
+    TAG_BEFORE="$1" CHECK_RC="$2" CODE="$RACE_CODE" LOG="$STUB_LOG" bash -c '
+        set -Eeuo pipefail
+        fail() { echo "fail" >>"$LOG"; exit 1; }
+        release_mirror_tag_sha() { printf "%s" "$TAG_BEFORE"; }
+        release_tree_push() { echo "push $3 $4" >>"$LOG"; }
+        release_mirror_history_check() { echo "check $3 $4" >>"$LOG"; return "$CHECK_RC"; }
+        release_tree_delete_release_tag() { echo "delete $3" >>"$LOG"; }
+        REPO_ROOT=/nonexistent REMOTE=lucidos BRANCH=main
+        release=0.77.0 tag=v0.77.0 commit=COMMIT mirror_main=PARENT
+        eval "$CODE"
+    ' >/dev/null 2>&1 || true
+    tr '\n' ',' <"$STUB_LOG"
+}
+if [ -z "$RACE_CODE" ]; then
+    fail "could not extract the tag push and its recount from release-to-lucidos.sh"
+else
+    got="$(race_run "" 0)"
+    if [ "$got" = "push COMMIT refs/tags/v0.77.0,check PARENT v0.77.0," ]; then
+        pass "the tag push is recounted against main, and a clean count goes on"
+    else
+        fail "expected push then check, got: $got"
+    fi
+    got="$(race_run "" 1)"
+    if [ "$got" = "push COMMIT refs/tags/v0.77.0,check PARENT v0.77.0,delete v0.77.0,fail," ]; then
+        pass "a rival tag deletes the tag this run created, then refuses"
+    else
+        fail "a rival tag must delete this run's new tag and refuse, got: $got"
+    fi
+    got="$(race_run COMMIT 1)"
+    if [ "$got" = "push COMMIT refs/tags/v0.77.0,check PARENT v0.77.0,fail," ]; then
+        pass "a tag an earlier run pushed is kept, and the run refuses"
+    else
+        fail "a resumed run must keep its earlier tag, got: $got"
+    fi
+fi
+
+echo ""
+echo "test: run_publish_draft publishes, moves main, THEN settles (executed)"
+DRAFT_FN="$(awk '/^run_publish_draft\(\) \{/{on=1} on{print} on && /^\}$/{exit}' "$RELEASE_SH")"
+if [ -z "$DRAFT_FN" ]; then
+    fail "could not extract run_publish_draft from release.sh"
+else
+    got="$(stubbed_run 0 0 "$DRAFT_FN" draft)"
+    if [ "$got" = "publish COMMIT,advance COMMIT PARENT,settle," ]; then
+        pass "a draft is published, main moves, and only then the release settles"
+    else
+        fail "expected publish, advance, settle; got: $got"
+    fi
+    got="$(stubbed_run 0 0 "$DRAFT_FN" published)"
+    if [ "$got" = "advance COMMIT PARENT,settle," ]; then
+        pass "an already-published release still moves main before it settles"
+    else
+        fail "a published release with main behind must move main; got: $got"
+    fi
+    got="$(stubbed_run 1 0 "$DRAFT_FN" draft)"
+    if [ "$got" = "publish COMMIT,fail," ]; then
+        pass "a failed wait moves no main and settles nothing"
+    else
+        fail "a failed wait must stop before main; got: $got"
+    fi
+    got="$(stubbed_run 0 1 "$DRAFT_FN" draft)"
+    if [ "$got" = "publish COMMIT,advance COMMIT PARENT,fail," ]; then
+        pass "a refused main advance stops before LucidosReleased"
+    else
+        fail "a refused advance must not settle; got: $got"
+    fi
+fi
 
 echo ""
 echo "── the draft publish wiring: $PASS passed, $FAIL failed ──"

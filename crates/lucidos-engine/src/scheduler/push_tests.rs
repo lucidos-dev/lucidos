@@ -400,7 +400,7 @@ fn wake_payload_carries_wake_flag_plus_original_content() {
         created_at: chrono::Utc::now(),
         tap: nav_thread(&tid.to_string(), Some(&eid.to_string())),
     };
-    let payload = build_wake_payload(None, &n, None, None);
+    let payload = build_wake_payload(None, &n, None, None, None);
     assert_eq!(payload["wake"], true);
     assert_eq!(payload["web_push"], 8030);
     let notif = &payload["notification"];
@@ -796,6 +796,7 @@ fn real_world_overflow_payload(body: &str) -> serde_json::Value {
         &tap,
         Some("https://lucidos.test/dev/"),
         Some(7),
+        None,
     )
 }
 
@@ -916,6 +917,7 @@ fn s4_5_short_body_passes_through_byte_identical() {
         &tap,
         Some("https://lucidos.test/dev/"),
         Some(2),
+        None,
     );
     assert_eq!(
         fitted.to_string(),
@@ -945,6 +947,7 @@ fn s4_5_truncation_is_utf8_safe_with_multibyte_content() {
             &Tap::Modal,
             Some("https://lucidos.test/dev/"),
             Some(1),
+            None,
         );
         let sent = payload["notification"]["body"].as_str().unwrap();
         assert!(
@@ -983,6 +986,7 @@ fn s4_5_truncation_preserves_every_structural_envelope_field() {
         &tap,
         Some("https://lucidos.test/dev/"),
         Some(7),
+        None,
     );
 
     assert_eq!(payload["web_push"], 8030);
@@ -1025,7 +1029,7 @@ fn a_markdown_body_reaches_the_banner_as_plain_text() {
         created_at: chrono::Utc::now(),
         tap: Tap::Modal,
     };
-    let payload = build_wake_payload(None, &n, None, None);
+    let payload = build_wake_payload(None, &n, None, None, None);
     assert_eq!(
         payload["notification"]["body"],
         "The fix is live.\n\n• Weight: normal\n\nWhat next?"
@@ -1053,7 +1057,7 @@ fn s4_5_wake_payload_of_an_overflowing_body_also_builds() {
         tap: nav_thread(&tid.to_string(), Some(&eid.to_string())),
     };
     let payload =
-        build_wake_payload(None, &n, Some("https://lucidos.test/dev/"), Some(7)).to_string();
+        build_wake_payload(None, &n, Some("https://lucidos.test/dev/"), Some(7), None).to_string();
     assert!(
         payload.len() <= MAX_PUSH_PAYLOAD_BYTES,
         "fitted wake payload is {} B, over the ceiling",
@@ -1087,7 +1091,13 @@ fn s4_5_wake_budget_is_tighter_than_the_original_send() {
         tap: Tap::Modal,
     };
     let generation = Some(uuid::Uuid::new_v4());
-    let wake = build_wake_payload(generation, &n, Some("https://lucidos.test/dev/"), Some(7));
+    let wake = build_wake_payload(
+        generation,
+        &n,
+        Some("https://lucidos.test/dev/"),
+        Some(7),
+        None,
+    );
     let send = build_push_payload_fitted(
         generation,
         &n.title,
@@ -1099,6 +1109,7 @@ fn s4_5_wake_budget_is_tighter_than_the_original_send() {
         &n.tap,
         Some("https://lucidos.test/dev/"),
         Some(7),
+        None,
     );
     assert_eq!(
         wake["notification"]["data"]["restore_generation"],
@@ -1144,6 +1155,7 @@ fn s4_5_escape_heavy_body_keeps_what_actually_fits() {
             &Tap::Modal,
             Some("https://lucidos.test/dev/"),
             Some(7),
+            None,
         );
         let serialized = payload.to_string();
         assert!(
@@ -1229,6 +1241,7 @@ fn s4_5_envelope_inside_the_safety_reserve_still_keeps_what_fits() {
         &Tap::Modal,
         None,
         Some(1),
+        None,
     );
     let serialized = payload.to_string();
     assert!(
@@ -1260,6 +1273,7 @@ fn s4_5_envelope_alone_over_the_ceiling_degrades_instead_of_panicking() {
         &Tap::Modal,
         Some("https://lucidos.test/dev/"),
         Some(1),
+        None,
     );
     assert_eq!(
         payload["notification"]["body"], "",
@@ -1301,6 +1315,7 @@ fn s4_5_body_fits_exactly_at_the_ceiling_is_not_truncated() {
         None,
         None,
         &Tap::Modal,
+        None,
         None,
         None,
     );
@@ -1750,6 +1765,84 @@ fn the_service_worker_falls_back_to_the_same_tag() {
     assert!(sw.contains(&needle), "sw.js must carry `{needle}`");
 }
 
+/// `sw.js` routes the Unwatch action by name, so it pins its copy too.
+#[test]
+fn the_service_worker_knows_the_unwatch_action() {
+    use crate::scheduler::notifications::UNWATCH_PUSH_ACTION;
+    let sw = include_str!("../../../lucidos-app/public/sw.js");
+    let needle = format!("const UNWATCH_PUSH_ACTION = '{UNWATCH_PUSH_ACTION}';");
+    assert!(sw.contains(&needle), "sw.js must carry `{needle}`");
+}
+
+/// Every push about a people-only message in one thread carries that
+/// thread's tag and an Unwatch action, so a burst replaces one banner. The
+/// group survives the size fitting, and the wake push carries it too.
+#[test]
+fn a_people_message_push_groups_per_thread_with_an_unwatch_action() {
+    use crate::scheduler::notifications::{Notification, PushGroup, UNWATCH_PUSH_ACTION};
+    let thread = uuid::Uuid::new_v4();
+    let group = PushGroup::PeopleMessages {
+        thread_id: thread,
+        to_driver: false,
+    };
+    let push = |nid: uuid::Uuid, body: &str| {
+        build_push_payload_fitted(
+            None,
+            "Sam in \"Launch\"",
+            body,
+            Some(nid),
+            None,
+            Some(thread),
+            None,
+            &Tap::Modal,
+            None,
+            None,
+            Some(&group),
+        )
+    };
+    let first = push(uuid::Uuid::new_v4(), "Kim, can you look?");
+    let second = push(uuid::Uuid::new_v4(), &"long ".repeat(2000));
+    assert_eq!(first["notification"]["tag"], second["notification"]["tag"]);
+    assert_eq!(first["notification"]["tag"], format!("people-{thread}"));
+    assert!(second.to_string().len() <= MAX_PUSH_PAYLOAD_BYTES);
+    for payload in [&first, &second] {
+        let notification = &payload["notification"];
+        assert_eq!(notification["actions"][0]["action"], UNWATCH_PUSH_ACTION);
+        assert_eq!(
+            notification["data"]["unwatch_thread_id"],
+            thread.to_string()
+        );
+    }
+
+    let n = Notification {
+        id: uuid::Uuid::new_v4(),
+        task_id: None,
+        app_id: None,
+        thread_id: Some(thread),
+        event_id: None,
+        title: "Sam".into(),
+        message: "Kim, can you look?".into(),
+        read: false,
+        created_at: chrono::Utc::now(),
+        tap: Tap::Modal,
+    };
+    let wake = build_wake_payload(None, &n, None, None, Some(&group));
+    assert_eq!(wake["notification"]["tag"], first["notification"]["tag"]);
+
+    let ordinary = build_wake_payload(None, &n, None, None, None);
+    assert_eq!(ordinary["notification"]["tag"], n.id.to_string());
+    assert!(ordinary["notification"].get("actions").is_none());
+
+    // The driver cannot unwatch, so its copy shares the tag but offers none.
+    let to_driver = PushGroup::PeopleMessages {
+        thread_id: thread,
+        to_driver: true,
+    };
+    let driven = build_wake_payload(None, &n, None, None, Some(&to_driver));
+    assert_eq!(driven["notification"]["tag"], first["notification"]["tag"]);
+    assert!(driven["notification"].get("actions").is_none());
+}
+
 #[test]
 fn payload_provenance_survives_fitting() {
     for generation in [None, Some(uuid::Uuid::new_v4())] {
@@ -1762,6 +1855,7 @@ fn payload_provenance_survives_fitting() {
             None,
             None,
             &Tap::Modal,
+            None,
             None,
             None,
         );
@@ -1785,6 +1879,7 @@ fn navigate_urls_preserve_push_generation() {
             None,
             None,
             &Tap::Modal,
+            None,
             None,
             None,
         );

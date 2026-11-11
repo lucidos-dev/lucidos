@@ -715,8 +715,8 @@ fn guard_blocks_update_trigger_during_fire() {
 fn guard_allows_self_delete_during_fire() {
     // The trigger's intent text may legitimately say "stop firing after
     // this" — the LLM's only correct call is delete_trigger on its own id.
-    // Already covered by the existing `is_self_deleting_trigger` plumbing
-    // for cancellation; this guard must let that call through.
+    // The self-deletion flag handles config reconciliation; this guard
+    // must let the call through.
     let result = check_scheduling_tool_in_trigger(
         tn::DELETE_TRIGGER,
         Some("self-id"),

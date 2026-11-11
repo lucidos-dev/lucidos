@@ -692,7 +692,7 @@ impl LucidosEngine {
                     reasoning_effort: spawn_effort,
                     origin,
                 };
-                let outcome = self.thread_queue.submit(request, None, None).await;
+                let outcome = self.thread_queue.submit(request, None).await;
                 Some(if outcome.admitted {
                     let ws = current_ws.unwrap_or_else(|| self.workspace_name());
                     relation.run_coding_agent_success_text(cc_thread_id, &ws, coding_agent)
@@ -790,7 +790,7 @@ impl LucidosEngine {
                                     pre_emitted_origin: None,
                                     origin,
                                 };
-                            let outcome = self.thread_queue.submit(request, None, None).await;
+                            let outcome = self.thread_queue.submit(request, None).await;
                             if outcome.admitted {
                                 relation.run_thread_success_text(
                                     child_thread_id,

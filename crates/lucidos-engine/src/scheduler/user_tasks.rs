@@ -7,7 +7,6 @@ use crate::triggers::continue_key::FireTarget;
 use crate::triggers::{TriggerConfig, TriggerRun};
 use chrono::Datelike;
 use sqlx::PgPool;
-use tokio_util::sync::CancellationToken;
 
 /// Suppress duplicate error notifications for the same task within this window.
 const ERROR_DEDUP_MINUTES: i64 = 30;
@@ -153,12 +152,11 @@ pub fn current_trigger_id() -> Option<String> {
     ACTIVE_TRIGGER_ID.try_with(|id| id.clone()).ok()
 }
 
-/// True when the currently running trigger is deleting itself — i.e. the LLM
-/// called `delete_trigger` with its own trigger ID. The scheduler's
-/// `TriggerDeleted` handler reads this flag (carried in the event payload) to
-/// skip cancellation, so the in-flight agentic loop finishes cleanly and emits
-/// `ResponseGenerated`. Without this, the running task would be torn down
-/// mid-tool and the thread would stay stuck "running" with no terminal event.
+/// True when the currently running trigger is deleting itself: the LLM
+/// called `delete_trigger` with its own trigger ID. Config reconciliation
+/// reads this event flag to skip nudging the thread performing the deletion.
+/// Scheduler cancellation is independent: every deletion stops scheduling
+/// while leaving any admitted run alone.
 pub fn is_self_deleting_trigger(trigger_id: &str) -> bool {
     ACTIVE_TRIGGER_ID
         .try_with(|active| *active == trigger_id)
@@ -265,6 +263,22 @@ fn transient_failure_message(
     format!("Temporary error. {notice} Error: {reason}")
 }
 
+/// The title of a trigger's failure notification. The dedup window matches
+/// on its suffix.
+pub(crate) fn trigger_failure_title(trigger_name: &str) -> String {
+    format!("{trigger_name}{ERROR_TITLE_SUFFIX}")
+}
+
+/// Tell the user an agent's or app's edit removed `config`'s grants, so the
+/// next refused run is no surprise.
+pub(crate) async fn notify_trigger_grants_cleared(engine: &SharedEngine, config: &TriggerConfig) {
+    let title = format!("{} lost its grants", config.name);
+    let message = "An agent or app changed what this trigger runs, so Lucidos removed its \
+                   coding-agent grant and its allowed side-effects. A run that needs one \
+                   fails until you open the trigger and tick them again.";
+    emit_failure_notification(engine, config, title, message.to_string()).await;
+}
+
 /// Emit a `NotificationCreated` for a trigger failure and send push to all devices.
 /// Failure notifications never deep-link to the trigger's owning app.
 async fn emit_failure_notification(
@@ -341,6 +355,7 @@ pub(crate) async fn emit_trigger_notification(
             tap,
             actor: None,
             audience: None,
+            push_group: None,
         },
     ))
     .await?;
@@ -357,7 +372,6 @@ pub async fn execute_user_task(
     config: &TriggerConfig,
     invocation: TriggerInvocation,
     event_payload: Option<&serde_json::Value>,
-    external_cancel: Option<CancellationToken>,
     queue_entry_id: uuid::Uuid,
     retry_of: Option<crate::engine::thread_events::RetryOf>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -378,7 +392,6 @@ pub async fn execute_user_task(
                 intent,
                 invocation,
                 event_payload,
-                external_cancel,
                 queue_entry_id,
                 retry_of,
             )
@@ -454,7 +467,7 @@ async fn execute_script_task(
             Ok(())
         }
         Err(e) => {
-            let title = format!("{}{}", config.name, ERROR_TITLE_SUFFIX);
+            let title = trigger_failure_title(&config.name);
             // Normalize the error reason so a failed run never surfaces a blank
             // message (the "[trigger: id]" prefix keeps the line non-empty even
             // if the reason were empty, but normalize the reason for parity with
@@ -476,7 +489,6 @@ async fn execute_llm_task(
     intent: &str,
     invocation: TriggerInvocation,
     event_payload: Option<&serde_json::Value>,
-    external_cancel: Option<CancellationToken>,
     queue_entry_id: uuid::Uuid,
     retry_of: Option<crate::engine::thread_events::RetryOf>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -548,7 +560,6 @@ async fn execute_llm_task(
             config.model.as_deref(),
             config.reasoning_effort.as_deref(),
             config.provider.as_deref(),
-            external_cancel,
             queue_entry_id,
             retry_of,
             target,
@@ -608,7 +619,7 @@ async fn execute_llm_task(
                 return Err(e);
             }
 
-            let title = format!("{}{}", config.name, ERROR_TITLE_SUFFIX);
+            let title = trigger_failure_title(&config.name);
             let reason = crate::triggers::ensure_non_empty_error(&err_str, &config.name);
             let message = if is_transient {
                 let user_tz = engine.user_timezone().await.parse().ok();

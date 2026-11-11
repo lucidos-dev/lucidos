@@ -794,6 +794,8 @@ interface InitiatorPanelProps {
   onBodyClick?: (e: MouseEvent) => void;
   /** User message → render the body as a right-aligned gray bubble. */
   bubble?: boolean;
+  /** A teammate's message: the bubble aligns left and the header names them. */
+  teammate?: string | null;
   /** Drop the actor chip (icon + name) entirely — used for user messages and
    *  change-lifecycle turns. Attribution is reached via the clickable timestamp,
    *  which opens the route popover. */
@@ -816,7 +818,7 @@ function ActorChipBody({ initiator }: { initiator: InitiatorDescriptor }) {
   );
 }
 
-export function InitiatorPanel({ initiator, timestamp, onActorClick, collapsible, collapsed, onToggle, onBodyClick, bubble = false, chromeless = false, held }: InitiatorPanelProps) {
+export function InitiatorPanel({ initiator, timestamp, onActorClick, collapsible, collapsed, onToggle, onBodyClick, bubble = false, teammate = null, chromeless = false, held }: InitiatorPanelProps) {
   const accentClass = initiator.accent ? ` initiator-panel-${initiator.accent}` : '';
   const hasBody = !!initiator.summary || !!initiator.details;
 
@@ -835,7 +837,7 @@ export function InitiatorPanel({ initiator, timestamp, onActorClick, collapsible
     : null;
 
   return (
-    <div class={`initiator-panel initiator-panel-${initiator.variant}${accentClass}${bubble ? ' initiator-panel-bubble' : ''}`} data-held={held ? '' : undefined}>
+    <div class={`initiator-panel initiator-panel-${initiator.variant}${accentClass}${bubble ? ' initiator-panel-bubble' : ''}${teammate ? ' initiator-panel-teammate' : ''}`} data-held={held ? '' : undefined}>
       {/* The row is inert, like the response header's: the control owns folding.
           A row that swallowed a click announced it with nothing but a cursor,
           and it fired for any click that missed the chip. */}
@@ -859,7 +861,9 @@ export function InitiatorPanel({ initiator, timestamp, onActorClick, collapsible
             That order is the response header's, read across: controls, then
             meta. Chromeless turns have no actor chip, so the timestamp is the
             popover trigger. */}
-        <span class="initiator-meta">
+        <span class={`initiator-meta${teammate ? ' initiator-meta-teammate' : ''}`}>
+          {teammate && <span class="initiator-sender">{teammate}</span>}
+          {teammate && <span class="initiator-sender-dot" aria-hidden="true">{'·'}</span>}
           {initiator.status}
           {chromeless && onActorClick ? (
             <button

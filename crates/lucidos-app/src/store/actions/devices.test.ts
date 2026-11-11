@@ -22,6 +22,7 @@ vi.mock('../../api/client', () => ({
   setDevicePush: (...args: unknown[]) => setDevicePush(...args),
   deleteDevice: vi.fn(),
   handOverDevice: (...args: unknown[]) => handOverDeviceMock(...args),
+  getCallerDevice: vi.fn(),
   setPreference: (...args: unknown[]) => setPreference(...args),
 }));
 
@@ -456,6 +457,166 @@ describe('adoptGatewayDeviceIdentity', () => {
 
     await expect(adoptGatewayDeviceId(null)).resolves.toBe(true);
     expect(postClientLog).not.toHaveBeenCalled();
+  });
+});
+
+describe('adoptRelayedDeviceIdentity', () => {
+  const PLAIN_KEY = 'lucidos-device-id';
+  const RELAYED_KEY = 'lucidos-relayed-device-id';
+
+  function makeStorage(init: Record<string, string> = {}) {
+    const m = new Map(Object.entries(init));
+    return {
+      getItem: (k: string) => (m.has(k) ? (m.get(k) as string) : null),
+      setItem: vi.fn((k: string, v: string) => {
+        m.set(k, v);
+      }),
+      read: (k: string) => (m.has(k) ? (m.get(k) as string) : null),
+    };
+  }
+
+  afterEach(async () => {
+    const { setRelayedDeviceId } = await import('../../utils/deviceIdHeader');
+    setRelayedDeviceId(null);
+  });
+
+  it('holds the caller id for the page, hands the plain row over, and leaves the plain slot alone', async () => {
+    const { adoptRelayedDeviceIdentity, getDeviceId } = await import('./devices');
+    const { readDeviceId, deviceIdHeader } = await import('../../utils/deviceIdHeader');
+    const storage = makeStorage({ [PLAIN_KEY]: 'plain-id' });
+    const handOver = vi.fn().mockResolvedValue(undefined);
+
+    const named = await adoptRelayedDeviceIdentity({
+      caller: async () => ({ device_id: 'gw:plain-id' }),
+      storage,
+      handOver,
+    });
+
+    expect(named).toBe(true);
+    expect(handOver).toHaveBeenCalledTimes(1);
+    expect(handOver).toHaveBeenCalledWith('plain-id', 'gw:plain-id');
+    expect(storage.read(PLAIN_KEY)).toBe('plain-id');
+    expect(storage.read(RELAYED_KEY)).toBe('gw:plain-id');
+    expect(getDeviceId()).toBe('gw:plain-id');
+    expect(readDeviceId()).toBe('gw:plain-id');
+    expect(Object.values(deviceIdHeader())).toEqual(['gw:plain-id']);
+  });
+
+  it('skips the hand-over in the steady state but still names the page', async () => {
+    const { adoptRelayedDeviceIdentity, getDeviceId } = await import('./devices');
+    const storage = makeStorage({ [PLAIN_KEY]: 'plain-id', [RELAYED_KEY]: 'gw:plain-id' });
+    const handOver = vi.fn();
+
+    const named = await adoptRelayedDeviceIdentity({
+      caller: async () => ({ device_id: 'gw:plain-id' }),
+      storage,
+      handOver,
+    });
+
+    expect(named).toBe(true);
+    expect(handOver).not.toHaveBeenCalled();
+    expect(storage.setItem).not.toHaveBeenCalled();
+    expect(getDeviceId()).toBe('gw:plain-id');
+  });
+
+  it('hands nothing over when the plain slot is empty', async () => {
+    const { adoptRelayedDeviceIdentity } = await import('./devices');
+    const storage = makeStorage();
+    const handOver = vi.fn();
+
+    await adoptRelayedDeviceIdentity({
+      caller: async () => ({ device_id: 'gw:plain-id' }),
+      storage,
+      handOver,
+    });
+
+    expect(handOver).not.toHaveBeenCalled();
+    expect(storage.read(RELAYED_KEY)).toBe('gw:plain-id');
+  });
+
+  it('does nothing when no gateway names a caller', async () => {
+    const { adoptRelayedDeviceIdentity } = await import('./devices');
+    const { getRelayedDeviceId } = await import('../../utils/deviceIdHeader');
+    const storage = makeStorage({ [PLAIN_KEY]: 'plain-id' });
+    const handOver = vi.fn();
+
+    for (const device_id of [null, '  ']) {
+      const named = await adoptRelayedDeviceIdentity({ caller: async () => ({ device_id }), storage, handOver });
+      expect(named).toBe(false);
+    }
+
+    expect(handOver).not.toHaveBeenCalled();
+    expect(storage.setItem).not.toHaveBeenCalled();
+    expect(getRelayedDeviceId()).toBeNull();
+  });
+
+  it('writes no key when the lookup rejects, so the next load retries', async () => {
+    const { adoptRelayedDeviceIdentity } = await import('./devices');
+    const storage = makeStorage({ [PLAIN_KEY]: 'plain-id' });
+
+    await expect(
+      adoptRelayedDeviceIdentity({
+        caller: async () => {
+          throw new Error('down');
+        },
+        storage,
+        handOver: vi.fn(),
+      }),
+    ).rejects.toThrow('down');
+    expect(storage.setItem).not.toHaveBeenCalled();
+  });
+
+  it('keeps the old id and writes no key when the hand-over rejects, so the next load retries', async () => {
+    const { adoptRelayedDeviceIdentity } = await import('./devices');
+    const { getRelayedDeviceId } = await import('../../utils/deviceIdHeader');
+    const storage = makeStorage({ [PLAIN_KEY]: 'plain-id' });
+
+    await expect(
+      adoptRelayedDeviceIdentity({
+        caller: async () => ({ device_id: 'gw:plain-id' }),
+        storage,
+        handOver: vi.fn().mockRejectedValue(new Error('refused')),
+      }),
+    ).rejects.toThrow('refused');
+    expect(storage.setItem).not.toHaveBeenCalled();
+    expect(getRelayedDeviceId()).toBeNull();
+  });
+
+  it('names the page only once the hand-over resolves', async () => {
+    const { adoptRelayedDeviceIdentity } = await import('./devices');
+    const { getRelayedDeviceId } = await import('../../utils/deviceIdHeader');
+    const storage = makeStorage({ [PLAIN_KEY]: 'plain-id' });
+    let finish = () => {};
+    const handOver = vi.fn(() => new Promise<void>((resolve) => (finish = resolve)));
+
+    const adopting = adoptRelayedDeviceIdentity({
+      caller: async () => ({ device_id: 'gw:plain-id' }),
+      storage,
+      handOver,
+    });
+    await vi.waitFor(() => expect(handOver).toHaveBeenCalled());
+    expect(getRelayedDeviceId()).toBeNull();
+
+    finish();
+    await adopting;
+    expect(getRelayedDeviceId()).toBe('gw:plain-id');
+  });
+
+  it('hands over from the last adopted id when the caller id changes', async () => {
+    const { adoptRelayedDeviceIdentity, getDeviceId } = await import('./devices');
+    const storage = makeStorage({ [PLAIN_KEY]: 'plain-id', [RELAYED_KEY]: 'gw1:plain-id' });
+    const handOver = vi.fn().mockResolvedValue(undefined);
+
+    await adoptRelayedDeviceIdentity({
+      caller: async () => ({ device_id: 'gw2:plain-id' }),
+      storage,
+      handOver,
+    });
+
+    expect(handOver).toHaveBeenCalledTimes(1);
+    expect(handOver).toHaveBeenCalledWith('gw1:plain-id', 'gw2:plain-id');
+    expect(storage.read(RELAYED_KEY)).toBe('gw2:plain-id');
+    expect(getDeviceId()).toBe('gw2:plain-id');
   });
 });
 

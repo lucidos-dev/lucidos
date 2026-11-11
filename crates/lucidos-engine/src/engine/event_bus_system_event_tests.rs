@@ -52,6 +52,7 @@ fn domain_event_to_payload_with_api_actor_keeps_mode_and_user_agent() {
             user_agent: Some("curl/8".to_string()),
             mode: ActorMode::Human,
             source_thread_id: None,
+            emitting_trigger_id: None,
         }),
     };
     let payload = evt.to_payload();

@@ -1434,6 +1434,56 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     background: var(--bg-secondary);
 }
 
+/* People in this thread (ADR 0649), under the title on both layouts: a round
+ * mark per person, who drives, and this person's own Watch and Take. It shares
+ * the title row's left inset. */
+.thread-people-row {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.25rem var(--header-padding-x) 0.375rem 1rem;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+}
+.thread-people-mark {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    justify-content: center;
+    min-width: 1.5rem;
+    height: 1.5rem;
+    padding: 0 0.375rem;
+    border-radius: var(--radius-round);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+}
+.thread-people-mark-you {
+    color: var(--accent);
+}
+.thread-people-summary {
+    flex: 1;
+    min-width: 0;
+    margin-left: 0.25rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.thread-people-actions {
+    display: flex;
+    flex: none;
+    justify-content: flex-end;
+    gap: 0.375rem;
+}
+.thread-people-actions .action-btn {
+    font-size: var(--font-size-xs);
+    padding: 0.125rem 0.625rem;
+}
+.thread-people-row-failed {
+    color: var(--accent-red);
+}
+
 /* The desktop title hugs its text on one line, so the pin sits right beside
  * it, and ellipsises once the row is too narrow. Its cap leaves the pin's box
  * and the row's column gap. */

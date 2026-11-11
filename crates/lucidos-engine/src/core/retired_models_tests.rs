@@ -96,6 +96,11 @@ const SEED_SUCCESSORS: &str = include_str!(
 const RETIRE_SUPERSEDED: &str = include_str!(
     "../../migrations/20261018074151_retire_superseded_models_and_seed_their_successors.sql"
 );
+/// Every later migration that changes a successor's row, in order. A workspace
+/// that lost the rows runs them after the retirement migration too.
+const LATER_ROUTE_MIGRATIONS: &[&str] = &[include_str!(
+    "../../migrations/20261109174659_add_chatgpt_plan_routes_to_gpt_models.sql"
+)];
 
 /// The newest migration whose successors another migration seeds. Later ones
 /// seed their own. It and older ones are applied history, and sqlx refuses
@@ -187,6 +192,9 @@ async fn the_retirement_migration_restores_successors_the_workspace_lost() {
         .execute(&pool)
         .await
         .unwrap();
+    for later in LATER_ROUTE_MIGRATIONS {
+        sqlx::raw_sql(later).execute(&pool).await.unwrap();
+    }
 
     assert_eq!(snapshot(pool.clone(), successors.clone()).await, before);
     let fable = ModelStore::get(&pool, "claude-fable-5")

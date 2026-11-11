@@ -47,7 +47,17 @@ fn derive_allow_pattern_codex_persists_claude_codes_bash_lines() {
     );
     // Claude Code's protected-path rule follows the line it persists.
     let hook = serde_json::json!({ "command": "/bin/zsh -lc 'echo x > .git/hooks/pre-commit'" });
-    for scope in [AllowScope::Broad, AllowScope::Narrow] {
+    assert_eq!(
+        derive_allow_pattern(
+            "command_execution",
+            &hook,
+            AllowScope::Broad,
+            &TrustedHeads::NONE
+        )
+        .as_deref(),
+        Some("Bash")
+    );
+    for scope in [AllowScope::Narrow, AllowScope::Session] {
         assert_eq!(
             derive_allow_pattern("command_execution", &hook, scope, &TrustedHeads::NONE),
             None
@@ -405,8 +415,8 @@ fn derive_allow_pattern_narrow_remains_none_for_path_tools() {
     );
 }
 
-/// A write under `.claude/` or `.git/` is protected: no persisted grant
-/// covers it, so it could not widen the agent's permissions or plant a hook.
+/// A write under `.claude/` or `.git/` is protected: no head grant covers it,
+/// so a narrow click could not widen the agent's permissions or plant a hook.
 #[test]
 fn input_touches_protected_path_detects_a_write_under_a_protected_dir() {
     for command in [
@@ -702,14 +712,14 @@ fn input_touches_protected_path_returns_false_for_non_bash_tools() {
 }
 
 #[test]
-fn derive_allow_pattern_broad_returns_none_when_bash_command_touches_dot_claude() {
+fn derive_allow_pattern_broad_offers_bash_when_bash_command_touches_dot_claude() {
     let input = serde_json::json!({
         "command": "rm -rf /Users/me/.claude/skills/grill"
     });
     assert_eq!(
-        derive_allow_pattern("Bash", &input, AllowScope::Broad, &TrustedHeads::NONE),
-        None,
-        "no persisted Bash line covers a write under `.claude/`"
+        derive_allow_pattern("Bash", &input, AllowScope::Broad, &TrustedHeads::NONE).as_deref(),
+        Some("Bash"),
+        "the bare Bash line covers a write under `.claude/`"
     );
 }
 
@@ -735,17 +745,15 @@ fn derive_allow_pattern_narrow_returns_none_when_bash_command_touches_dot_git() 
 }
 
 #[test]
-fn derive_allow_pattern_session_unaffected_by_protected_path() {
-    // Session scope uses the engine's pre-prompt intercept, which fires
-    // before CC's gate — so it works even for `.claude/` paths. Documented
-    // in `api/internal.rs::permission_prompt`.
+fn derive_allow_pattern_session_returns_none_when_bash_command_touches_dot_claude() {
+    // A session pattern is a head grant like the narrow one, so it never
+    // covers a protected-path write either.
     let input = serde_json::json!({
         "command": "rm -rf /Users/me/.claude/skills/grill"
     });
     assert_eq!(
-        derive_allow_pattern("Bash", &input, AllowScope::Session, &TrustedHeads::NONE).as_deref(),
-        Some("Bash(rm:*)"),
-        "session scope must remain Some — engine-side intercept bypasses CC's protected-path routing"
+        derive_allow_pattern("Bash", &input, AllowScope::Session, &TrustedHeads::NONE),
+        None,
     );
 }
 

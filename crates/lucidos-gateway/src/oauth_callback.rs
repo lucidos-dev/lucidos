@@ -4,8 +4,8 @@
 //! run on another install. This gateway binds it for its whole life and routes
 //! each callback by the prefix the engine wrote into `state` (`/dev/~<nonce>`).
 //!
-//! - Only `code`, `state`, `error` and `error_description` cross. The engine
-//!   checks the nonce and renders the page. This module only routes.
+//! - Only `code`, `state`, `error`, `error_description` and `client_id` cross.
+//!   The engine checks the nonce and renders the page. This module only routes.
 //! - A `/dev@cloud/~<nonce>` callback crosses the relay as a device-less claim.
 //! - With no own engine claiming it, the callback goes to each same-machine peer
 //!   at [`HANDOFF_PATH`]. A gateway that lost the bind keeps retrying.
@@ -38,8 +38,9 @@ pub const HANDOFF_PATH: &str = "/~/oauth/handoff";
 /// route answers its path with the picker shell, which is no claim.
 pub const HANDOFF_ANSWERED_HEADER: &str = "x-lucidos-oauth-handoff";
 
-/// The callback fields a provider sends, and the only ones forwarded.
-const FORWARDED_FIELDS: [&str; 4] = ["code", "state", "error", "error_description"];
+/// The callback fields a provider sends, and the only ones forwarded. Sign in
+/// with ChatGPT returns the issued `client_id` beside the code (ADR 0636).
+const FORWARDED_FIELDS: [&str; 5] = ["code", "state", "error", "error_description", "client_id"];
 
 /// How long the engine may take to settle a delivered callback.
 const ENGINE_TIMEOUT: Duration = Duration::from_secs(10);

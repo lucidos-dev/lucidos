@@ -9,14 +9,13 @@ use crate::core::{prefs, PreferenceStore};
 use crate::engine::agentic_loop::{
     cancel_cause_for_turn, meta_with_cancel_actor, terminal_result, until_canceled,
 };
-use crate::engine::context::{agent_context_char_budget, trim_history_from_oldest};
+use crate::engine::context::trim_history_from_oldest;
 use crate::engine::event_wait::OwnerTurn;
 use crate::engine::thread_events::{ActorMode, EventChannel, MessageOrigin};
 use crate::engine::types::*;
 use crate::engine::{InjectedPrompt, LucidosEngine, ThreadGuard};
 use crate::llm::Message;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::super::events::{describe_images, emit_routing_failure, make_message_received};
@@ -165,6 +164,7 @@ impl LucidosEngine {
         thread_id: Uuid,
         gates: &crate::llm::ToolCapabilities,
         context_window: usize,
+        model: &str,
     ) -> crate::engine::agentic_loop::TurnTools {
         let mut tools = super::system_prompt::chat_tools(gates);
         if crate::engine::turn_end::wake_decision::WakeDuty::owes_a_decision(&self.pool, thread_id)
@@ -177,7 +177,7 @@ impl LucidosEngine {
         // join here (ADR 0430). The stamp rides with the tools so the loop
         // can tell whether what it holds is still current. It is the only
         // part of the array that can move mid-turn; see `TurnTools`.
-        let mcp_char_ceiling = crate::mcp::mcp_tool_char_ceiling(context_window);
+        let mcp_char_ceiling = crate::mcp::mcp_tool_char_ceiling_for(model, context_window);
         let mcp_surface = self
             .mcp_manager
             .tool_surface(thread_id, mcp_char_ceiling)
@@ -327,7 +327,6 @@ impl LucidosEngine {
         title: Option<&str>, // caller-provided title (skips async LLM title gen)
         origin: Option<MessageOrigin>,
         voice_session_id: Option<Uuid>, // set when this message was spoken on a call
-        external_cancel: Option<CancellationToken>, // forwarded into the per-thread cancel_token (used by triggers)
         urgency: crate::engine::FollowUpUrgency, // child follow-up only: preempt the child's in-flight turn
         input_turn: Option<crate::engine::InputTurn>, // released once this message is recorded and routed
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
@@ -1218,27 +1217,6 @@ impl LucidosEngine {
         let provider_override = resolved.provider.as_deref();
         let chosen_provider = resolved.as_selection().provider;
 
-        // Trigger-driven runs hand the scheduler's per-trigger cancel down here.
-        // Forward it onto the per-thread token so deleting/disabling/updating the
-        // trigger mid-flight signals the agentic loop to exit cleanly (the loop
-        // observes `cancel_token` between iterations) instead of being aborted
-        // — which would tear it down mid-tool and leave the thread "running".
-        // The DropGuard fires when this fn returns so the forwarder exits even
-        // when the trigger completes without `ext` ever being cancelled —
-        // otherwise one forwarder leaks per trigger run.
-        let _forwarder_done_guard = external_cancel.map(|ext| {
-            let thread_token = cancel_token.clone();
-            let done = CancellationToken::new();
-            let done_in_forwarder = done.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = ext.cancelled() => { thread_token.cancel(); }
-                    _ = done_in_forwarder.cancelled() => {}
-                }
-            });
-            done.drop_guard()
-        });
-
         // Persist + broadcast the exchange boundary event via EventBus.
         // When pre_emitted_origin is set, MessageReceived was already emitted by
         // spawn_thread — skip to avoid double-emitting (and double-incrementing
@@ -1771,6 +1749,7 @@ impl LucidosEngine {
         let provider = self.current_provider();
         let resolved_model = model_override.unwrap_or_else(|| provider.default_model());
         let context_window = self.context_window_for(resolved_model, chosen_provider);
+        let budget_model = self.request_budget_model_for(resolved_model, chosen_provider);
 
         // The setup awaits that are checkpointed rather than raced: starting
         // the thread's MCP servers spawns processes, and dropping that half
@@ -1796,7 +1775,12 @@ impl LucidosEngine {
         };
         mcp_start_failures.extend(self.mcp_manager.start_enabled_servers(thread_id).await);
         let tools = self
-            .chat_turn_tools(thread_id, &capabilities.gates, context_window)
+            .chat_turn_tools(
+                thread_id,
+                &capabilities.gates,
+                context_window,
+                &budget_model,
+            )
             .await;
         if cancel_token.is_cancelled() {
             return Ok(self
@@ -1809,7 +1793,8 @@ impl LucidosEngine {
         // window (e.g. ~1.49M chars for a 1M model vs ~288k chars for default
         // 200k-token Claude), so a big-window turn isn't trimmed back to the
         // smaller model's limit.
-        let total_budget = agent_context_char_budget(context_window);
+        let total_budget =
+            crate::engine::context::agent_context_char_budget_for(&budget_model, context_window);
         let prompt_overhead: usize = system_prompt.len() + tools.defs_chars();
         let message_budget = total_budget.saturating_sub(prompt_overhead);
 

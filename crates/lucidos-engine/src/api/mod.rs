@@ -10,6 +10,7 @@ mod blobs;
 pub(crate) mod browser_origin;
 pub(crate) mod changes;
 pub(crate) mod chat;
+mod chatgpt_plan;
 mod claude_code;
 mod claude_gateway;
 mod command_checkpoint;
@@ -64,6 +65,7 @@ mod themes;
 /// would let a prefix change refuse every exempt route instead.
 pub(crate) const API_V1_PREFIX: &str = "/api/v1";
 pub(crate) mod owner_approval;
+mod people_messages;
 mod plugin_media;
 mod plugins;
 mod presence;
@@ -96,6 +98,7 @@ mod settings;
 pub mod sse_connections;
 pub(crate) mod standing_instruction;
 pub(crate) mod target_workspace;
+mod thread_people;
 mod thread_queue;
 pub(crate) mod thread_reach;
 pub(crate) mod threads;
@@ -106,7 +109,6 @@ mod voice;
 pub(crate) mod voice_ticket;
 mod webhooks;
 mod widgets;
-mod work_items;
 mod workspace_label;
 mod workspace_prompt_footprint;
 mod ws_echo;
@@ -770,6 +772,15 @@ pub struct ChatRequest {
     /// `mode=human` send cannot carry it and gets a 400.
     #[serde(default)]
     pub integrated: bool,
+    /// *Person mentions*, by operator id (ADR 0649). A message mentioning only
+    /// people pauses the agent and starts no turn. A gateway with fewer than
+    /// two people refuses a non-empty list.
+    #[serde(default)]
+    pub mentions: Vec<String>,
+    /// The *agent mention*: the message wakes the thread's agent, and resumes
+    /// it when paused.
+    #[serde(default)]
+    pub agent_mentioned: bool,
 }
 
 /// Body of `POST /api/v1/chat/cancel` and the default (Stop) mode of
@@ -1020,8 +1031,8 @@ pub struct CreateModelRequest {
     #[serde(default)]
     pub label: String,
     /// Backend that serves the model: "vertex" | "anthropic" | "openai" |
-    /// "openrouter" | "xai" | "opencode-free" | "local" | "claude-gateway".
-    /// Validated by `core::validate_routes`.
+    /// "openrouter" | "xai" | "opencode-free" | "local" | "claude-gateway" |
+    /// "chatgpt-plan". Validated by `core::validate_routes`.
     ///
     /// The single-route shorthand, and what nearly every caller sends. With
     /// `routes` given it is ignored; with neither, the request is refused.
@@ -1589,6 +1600,7 @@ pub fn create_router(
         .merge(chat::router())
         .merge(claude_code::router())
         .merge(claude_gateway::router())
+        .merge(chatgpt_plan::router())
         .merge(intelligence_ladder::router())
         .merge(model_prices::router())
         .merge(side_questions::router())
@@ -1638,7 +1650,8 @@ pub fn create_router(
         .merge(plugins::router())
         .merge(plugin_media::router())
         .merge(webhooks::router())
-        .merge(work_items::router())
+        .merge(thread_people::router())
+        .merge(people_messages::router())
         .merge(config_changes::router())
         .merge(operators::router())
         .merge(workspace_label::router())

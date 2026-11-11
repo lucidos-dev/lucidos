@@ -29,6 +29,8 @@ pub struct ProviderSelectionInputs {
     pub has_local: bool,
     /// Lucidos is signed in to the configured Claude gateway.
     pub has_claude_gateway: bool,
+    /// Lucidos is signed in with ChatGPT.
+    pub has_chatgpt_plan: bool,
 }
 
 impl ProviderSelectionInputs {
@@ -41,6 +43,7 @@ impl ProviderSelectionInputs {
             || self.has_opencode_free
             || self.has_local
             || self.has_claude_gateway
+            || self.has_chatgpt_plan
     }
 }
 
@@ -85,6 +88,7 @@ mod tests {
             has_opencode_free: false,
             has_local: false,
             has_claude_gateway: false,
+            has_chatgpt_plan: false,
         }
     }
 
@@ -119,6 +123,7 @@ mod tests {
             |i: &mut ProviderSelectionInputs| i.has_opencode_free = true,
             |i: &mut ProviderSelectionInputs| i.has_local = true,
             |i: &mut ProviderSelectionInputs| i.has_claude_gateway = true,
+            |i: &mut ProviderSelectionInputs| i.has_chatgpt_plan = true,
         ] {
             let mut i = none();
             set(&mut i);

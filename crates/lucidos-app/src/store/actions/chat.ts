@@ -44,6 +44,7 @@ import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
 import { isTauri } from '../../utils/platform';
 import { getWebviewContent } from '../../utils/tauri';
 import { errorDetail } from '../../utils/errorDetail';
+import { sendAddressing } from './people';
 import { acceptComposeReport, parseComposeReport } from '../composeSync';
 
 /** Safety timeout (ms) for an accepted send's pending row. If SSE doesn't
@@ -355,6 +356,9 @@ export async function sendMessage(
     providerOverride?: string;
     ccModelOverride?: CodingAgentModelValue | null;
     ccReasoningEffortOverride?: CodingAgentReasoningEffort | null;
+    /** People the send addresses outright, by person id, as a compose to a
+     *  teammate does. Joins the mentions in the text (ADR 0649). */
+    alsoMention?: string[];
     /** Which kind of send this is, for a decision after the first attempt.
      *  Absent means a follow-up, or a raw new send when it creates its thread. */
     settlement?: SendSettlement;
@@ -455,6 +459,13 @@ async function buildAndPostSend({ message, imageHashes, options, eventId, thread
     ...(options?.context ?? {}),
   };
   if (imageHashes?.length) body.image_hashes = imageHashes;
+  // On a team gateway the engine reads the mentions to decide whether the
+  // agent wakes. Elsewhere the body carries none, as before people existed.
+  const addressing = sendAddressing(message, options?.alsoMention);
+  if (addressing) {
+    if (addressing.mentions.length > 0) body.mentions = addressing.mentions;
+    if (addressing.agentMentioned) body.agent_mentioned = true;
+  }
   // A raw new send mints its own thread id above (`threadId = ... || eventId`),
   // so the engine has never seen it. Say so: an unknown id with no create
   // signal is a 404 rather than a thread conjured out of whatever the caller

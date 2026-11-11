@@ -16,6 +16,7 @@
 
 use std::time::Duration;
 
+use crate::engine::aux_purpose::{judge_unresolved, recommended};
 use crate::engine::command_guard::{JudgeInput, RiskLane, SideEffectCategory};
 use crate::engine::command_judge_questions;
 use crate::engine::{AuxCapture, ContextPurpose, LucidosEngine};
@@ -164,13 +165,16 @@ pub async fn classify_for_eval(
 impl LucidosEngine {
     /// Ask the picked judgment provider to classify one ambiguous command.
     ///
-    /// Returns `Err` only when nothing answered: the call failed, or it ran out
-    /// of time. The caller then asks, through [`JudgeVerdict::judge_failed`].
+    /// Returns `Err` only when nothing answered: no judge model resolves, the
+    /// call failed, or it ran out of time. The caller then asks, through
+    /// [`JudgeVerdict::judge_failed`].
     /// A reply it cannot read is `Ok` with [`JudgeVerdict::uncertain`] (ask).
     ///
     /// `judgment_command_guard` picks the backend and is `chat` unless the
-    /// user set it. A System One pick has the chat model behind it, inside the
-    /// same deadline, because a user waits on the permission card.
+    /// user set it. A System One pick has the chat judge model behind it,
+    /// inside the same deadline, because a user waits on the permission card.
+    /// With no chat judge model resolved, the System One pick runs alone: the
+    /// judge never falls back to the chat model.
     ///
     /// `thread_id` anchors the capture. Every caller runs inside a turn and
     /// holds one, so the judge's spend is never filed against nothing.
@@ -180,16 +184,24 @@ impl LucidosEngine {
         thread_id: uuid::Uuid,
     ) -> Result<JudgeVerdict, Box<dyn std::error::Error + Send + Sync>> {
         let call = self.aux_call(ContextPurpose::CommandJudge).await;
-        let deadline = call.deadline();
-        let capture = AuxCapture::new(&self.event_bus, thread_id, ContextPurpose::CommandJudge);
+        let recommended = recommended(ContextPurpose::CommandJudge, &self.model_registry);
+        let unresolved = judge_unresolved(call.selection(), &recommended);
         let system_one = system_one_for(
             &self.pool,
             JudgmentSite::CommandGuard,
             call.attempt_timeout(),
         )
         .await;
-        let chat = ChatJudgmentProvider::new(call.provider(), call.reasoning().map(str::to_string));
-        let provider = for_site(system_one, chat);
+        let provider = match (system_one, unresolved) {
+            (Some(system_one), Some(_)) => system_one,
+            (None, Some(reason)) => return Err(reason.into()),
+            (system_one, None) => for_site(
+                system_one,
+                ChatJudgmentProvider::new(call.provider(), call.reasoning().map(str::to_string)),
+            ),
+        };
+        let deadline = call.deadline();
+        let capture = AuxCapture::new(&self.event_bus, thread_id, ContextPurpose::CommandJudge);
         judge_with(provider.as_ref(), input, deadline, &capture)
             .await
             .map_err(|e| {

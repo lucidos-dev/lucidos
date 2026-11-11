@@ -114,4 +114,28 @@ describe('the widget frame budget', () => {
     });
     expect(host.querySelectorAll('iframe')).toHaveLength(count);
   });
+
+  /** Invariant: the fit check never evicts a frame the user can see. */
+  it('keeps a fit check\'s frames outside the cap, so they evict nothing', () => {
+    act(() => {
+      render(
+        <div>
+          {Array.from({ length: MAX_MOUNTED_WIDGET_FRAMES }, (_, i) => (
+            <div key={i} data-index={i}>
+              <WidgetFrame appId="player" params={{ clip: `${i}.mp3` }} reveal="on-load" place="option" />
+            </div>
+          ))}
+          {(['large', 'xl'] as const).map((size) => (
+            <div key={size} data-index={0} data-probe>
+              <WidgetFrame appId="trip" reveal="on-load" place="dashboard" size={size} probe={{ measure: size, device: null, onFit: () => {} }} />
+            </div>
+          ))}
+        </div>,
+        host,
+      );
+    });
+    expect(host.querySelectorAll('[data-index]:not([data-probe]) iframe')).toHaveLength(MAX_MOUNTED_WIDGET_FRAMES);
+    expect(host.querySelectorAll('[data-probe] iframe')).toHaveLength(2);
+    expect(mountedWidgetFrameCount()).toBe(MAX_MOUNTED_WIDGET_FRAMES);
+  });
 });

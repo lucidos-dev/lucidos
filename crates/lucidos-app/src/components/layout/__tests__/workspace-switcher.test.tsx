@@ -28,9 +28,16 @@ import type { SwitcherListProps } from '../WorkspaceSwitcher';
 import { vnodeToText } from '../../chat/__tests__/vnodeToText';
 import type { WorkspaceStatus } from '../../../api/client/control';
 import type { Loadable } from '../../../store/types';
+import type { RemoteGatewayView } from '../../../utils/remoteWorkspaces';
 
 const MANAGE = '/~/?pick';
 const NOOP = () => {};
+const CLOUD: RemoteGatewayView = {
+  gateway: 'cloud',
+  host: 'cloud.example',
+  workspaces: [{ id: 'notes', name: 'notes', health: 'healthy' }],
+  unreachable: null,
+};
 
 function ws(over: Partial<WorkspaceStatus> & { id: string }): WorkspaceStatus {
   return { name: over.id, port: 5200, health: 'healthy', autostart: false, ...over };
@@ -49,6 +56,10 @@ function listVNode(
     onNavigate: NOOP,
     onContext: NOOP,
     onAlternate: NOOP,
+    remote: [],
+    remoteError: null,
+    order: [],
+    onOpenRemote: NOOP,
     ...over,
   });
 }
@@ -276,13 +287,19 @@ describe('the loading placeholder', () => {
     // and the panel grew by that row at settle, pushing Refresh and Restart
     // down under the user's finger.
     const data = [ws({ id: 'dev' }), ws({ id: 'work' }), ws({ id: 'spike' })];
-    const shape = skeletonShape(data.length, MANAGE);
+    const shape = skeletonShape(data.length, 0, MANAGE);
     expect(shape.rows + (shape.manage ? 1 : 0)).toBe(rowCount(list({ status: 'loaded', data })));
+  });
+
+  it('counts the cached remote rows, which the loaded list draws too', () => {
+    const data = [ws({ id: 'dev' })];
+    const shape = skeletonShape(data.length, CLOUD.workspaces.length, MANAGE);
+    expect(shape.rows + 1).toBe(rowCount(list({ status: 'loaded', data }, { remote: [CLOUD] })));
   });
 
   it('drops the footer wherever the loaded list has none', () => {
     const data = [ws({ id: 'dev' })];
-    const shape = skeletonShape(data.length, null);
+    const shape = skeletonShape(data.length, 0, null);
     expect(shape.manage).toBe(false);
     expect(shape.rows).toBe(
       rowCount(list({ status: 'loaded', data }, { currentId: 'dev', manageHref: null })),
@@ -292,7 +309,73 @@ describe('the loading placeholder', () => {
   it('guesses a short list when this device has never seen one', () => {
     // An unfolded list pushes the rows below it down, so the cheaper guess is
     // the one that moves less when it is wrong.
-    expect(skeletonShape(null, MANAGE)).toEqual({ rows: 2, manage: true });
+    expect(skeletonShape(null, 0, MANAGE)).toEqual({ rows: 2, manage: true });
+  });
+});
+
+describe('remote workspaces in the list', () => {
+  /** Keys of every workspace row, in drawn order. Action rows are skipped. */
+  function rowKeys(node: unknown): string[] {
+    return vnodes(node)
+      .filter((v) => typeof v.key === 'string' && /\bbrand-menu-ws-row\b/.test(String((v.props as { class?: unknown }).class ?? '')))
+      .map((v) => String(v.key))
+      .filter((key) => !key.startsWith('window:'));
+  }
+
+  it('draws local rows first, then remote ones, when no order is stored', () => {
+    const node = listVNode({ status: 'loaded', data: [ws({ id: 'dev' }), ws({ id: 'work' })] }, { remote: [CLOUD] });
+    expect(rowKeys(node)).toEqual(['dev', 'work', 'notes@cloud']);
+  });
+
+  it('follows the stored workspace order across local and remote rows', () => {
+    const node = listVNode(
+      { status: 'loaded', data: [ws({ id: 'dev' }), ws({ id: 'work' })] },
+      { remote: [CLOUD], order: ['notes@cloud', 'work'] },
+    );
+    expect(rowKeys(node)).toEqual(['notes@cloud', 'work', 'dev']);
+  });
+
+  it('wears the local row shape with a quiet gateway tag, and no heading', () => {
+    const node = listVNode({ status: 'loaded', data: [ws({ id: 'dev' })] }, { remote: [CLOUD] });
+    const tag = vnodes(rowNode(node, 'notes@cloud')).find((v) => (v.props as { class?: unknown }).class === 'brand-menu-ws-gateway');
+    expect(vnodeToText(tag)).toContain('@cloud');
+    expect(String(rowNode(node, 'notes@cloud').props.class)).toBe('brand-menu-ws-row');
+    const text = vnodeToText(node);
+    expect(text).not.toContain('remote');
+    expect(text).not.toContain('cloud.example');
+  });
+
+  it('opens through this gateway\'s relay route', () => {
+    const r = rowNode(listVNode({ status: 'loaded', data: [] }, { remote: [CLOUD] }), 'notes@cloud');
+    expect(r.type).toBe('a');
+    expect(r.props.href).toBe('/notes@cloud/');
+  });
+
+  it('marks the remote workspace this page serves, not its local namesake', () => {
+    const node = listVNode(
+      { status: 'loaded', data: [ws({ id: 'notes' })] },
+      { currentId: 'notes@cloud', remote: [CLOUD] },
+    );
+    expect(rowNode(node, 'notes@cloud').props['aria-current']).toBe('page');
+    expect(rowNode(node, 'notes').props['aria-current']).toBeUndefined();
+  });
+
+  it('keeps an unreachable gateway\'s rows greyed and shut, saying why', () => {
+    const silent = { ...CLOUD, unreachable: 'Gateway did not answer' };
+    const r = rowNode(listVNode({ status: 'loaded', data: [] }, { remote: [silent] }), 'notes@cloud');
+    expect(r.type).toBe('div');
+    expect(r.props.class).toContain('is-shut');
+    expect(r.props['data-tooltip']).toContain('Gateway did not answer');
+  });
+
+  it('still draws remote rows beside a failed local listing', () => {
+    const node = listVNode({ status: 'failed', error: 'gateway down' }, { remote: [CLOUD] });
+    expect(rowKeys(node)).toEqual(['notes@cloud']);
+  });
+
+  it('states a remote listing failure under the rows', () => {
+    const text = list({ status: 'loaded', data: [ws({ id: 'dev' })] }, { remoteError: 'relay refused' });
+    expect(text).toContain('relay refused');
   });
 });
 

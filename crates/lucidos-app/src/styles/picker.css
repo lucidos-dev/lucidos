@@ -496,6 +496,7 @@
 }
 
 .ws-picker-row {
+  position: relative;
   border-top: 1px solid rgba(255, 255, 255, 0.12);
 }
 .ws-picker-row:last-child {
@@ -517,6 +518,8 @@
   --ws-picker-surface-shadow: 0 0.5rem 1.5rem rgba(3, 25, 60, 0.55);
   --ws-picker-dot-size: 0.625rem;
   --ws-picker-row-gap: 0.75rem;
+  /* The column left of the dot, where a hovered row shows its drag grip. */
+  --ws-picker-grip-width: 1.5rem;
   /* The name's line-height, named because the dot derives its offset from it:
      the dot sits on the name's FIRST line, and a copy of this number there
      would drift the moment the name is retuned. */
@@ -548,7 +551,8 @@
 .ws-picker-open {
   display: flex;
   flex-direction: column;
-  padding: 0.625rem 0.625rem 0.625rem 0.75rem;
+  /* The left padding is the grip's column (see .ws-picker-grip). */
+  padding: 0.625rem 0.625rem 0.625rem var(--ws-picker-grip-width);
   border-radius: calc(var(--radius-surface) * 5 / 6);
   cursor: pointer;
   transition: background var(--duration-fast) ease;
@@ -618,7 +622,7 @@
   overflow-wrap: anywhere;
 }
 
-/* Workspaces on remote gateways, set apart from the local list by a gap. */
+/* The gateways that did not answer, set apart from the list by a gap. */
 .ws-picker-remote-list {
   margin-top: 1.5rem;
 }
@@ -636,6 +640,70 @@
 .ws-picker-row-unreachable .ws-picker-open {
   opacity: 0.5;
 }
+
+/* The host a remote row lives on reads as a place, not as a path. */
+.ws-picker-address.ws-picker-host {
+  font-family: inherit;
+}
+
+/* The gateway a remote row lives on, after its name and quieter than it. */
+.ws-picker-gateway-tag {
+  font-weight: 400;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+/* What a mouse drags to reorder. It sits in the row's left padding, out of
+   sight until the row is hovered. On touch a hold on the row drags instead. */
+.ws-picker-grip {
+  position: absolute;
+  inset-block: 0;
+  left: 0;
+  width: var(--ws-picker-grip-width);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(255, 255, 255, 0.75);
+  opacity: 0;
+  cursor: grab;
+  touch-action: none;
+  transition: opacity var(--duration-fast) ease;
+}
+@media (hover: hover) {
+  .ws-picker-row:hover .ws-picker-grip {
+    opacity: 1;
+  }
+}
+@media (pointer: coarse) {
+  .ws-picker-grip {
+    display: none;
+  }
+}
+
+/* A row in flight follows the pointer, and the row it would land on shows a
+   white edge. */
+.ws-picker-row-lifted {
+  transform: translateY(var(--ws-picker-drag-dy));
+  z-index: 2;
+  border-radius: calc(var(--radius-surface) * 5 / 6);
+  background: var(--ws-picker-surface);
+  box-shadow: var(--ws-picker-surface-shadow);
+  cursor: grabbing;
+}
+.ws-picker-row-lifted .ws-picker-grip {
+  opacity: 1;
+  cursor: grabbing;
+}
+.ws-picker-row-drop-before::before,
+.ws-picker-row-drop-after::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: #fff;
+}
+.ws-picker-row-drop-before::before { top: -1px; }
+.ws-picker-row-drop-after::after { bottom: -1px; }
 
 @keyframes ws-dot-pulse {
   0%, 100% { opacity: 1; }

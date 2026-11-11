@@ -1,4 +1,5 @@
 import { request } from './_fetch';
+import { people } from './threadPeople';
 
 /** Why a turn end left a coding agent's work unproposed. Mirrors the engine's
  *  `UnproposedReason` wire names. */
@@ -121,4 +122,7 @@ export const threads = {
     return request<{ count: number }>(`/threads/count${buildListQuery(opts)}`)
       .then(r => r.count);
   },
+
+  /** Driver and watchers of a root thread (ADR 0623). */
+  people,
 };

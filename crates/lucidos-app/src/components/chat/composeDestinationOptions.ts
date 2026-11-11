@@ -31,10 +31,12 @@ export type DestinationOptionInputs = {
   reposError: string | null;
   /** Error text when the apps list failed to load (null = no error). */
   appsError: string | null;
+  /** Teammates a new thread can be for. Empty off a team gateway (ADR 0649). */
+  people: readonly { id: string; name: string; has_device: boolean }[];
 };
 
 export function buildDestinationOptions(inputs: DestinationOptionInputs): DropdownOption[] {
-  const { dest, apps, externalRepos, packaged, listsPending, reposError, appsError } = inputs;
+  const { dest, apps, externalRepos, packaged, listsPending, reposError, appsError, people } = inputs;
 
   const options: DropdownOption[] = [
     {
@@ -42,8 +44,18 @@ export function buildDestinationOptions(inputs: DestinationOptionInputs): Dropdo
       label: 'Lucidos Agent',
       description: LUCIDOS_AGENT_BLURB,
     },
-    { value: '__hdr-coding', label: 'Coding agent on…', disabled: true },
   ];
+  if (people.length > 0) {
+    options.push({ value: '__hdr-people', label: 'A teammate…', disabled: true });
+    for (const p of people) {
+      options.push({
+        value: destinationToOptionValue({ kind: 'person', personId: p.id }),
+        label: p.name,
+        description: p.has_device ? 'Starts with the agent paused' : 'No paired device, so no push reaches them',
+      });
+    }
+  }
+  options.push({ value: '__hdr-coding', label: 'Coding agent on…', disabled: true });
   // "Lucidos source" edits the platform's own code — only meaningful on a dev
   // build with a source checkout. A packaged install has none (is_packaged()),
   // so picking it spawns against an unregistered repo and 500s
@@ -99,7 +111,8 @@ export function buildDestinationOptions(inputs: DestinationOptionInputs): Dropdo
   if (!listsPending && !options.some(o => o.value === value)) {
     const codingScope = dest.kind === 'coding' ? dest.scope : null;
     const unavailableName =
-      codingScope?.kind === 'lucidos' ? 'Lucidos source'
+      dest.kind === 'person' ? 'That teammate'
+      : codingScope?.kind === 'lucidos' ? 'Lucidos source'
       : codingScope?.kind === 'app' ? codingScope.appId
       : codingScope?.kind === 'external' ? codingScope.repoId
       : value;

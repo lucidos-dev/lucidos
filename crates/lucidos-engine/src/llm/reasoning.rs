@@ -99,7 +99,12 @@ const GPT_6_ASTRA: &str = "gpt-6-astra";
 /// Models with no way to switch reasoning off, by their first-party id. An
 /// OpenRouter id carries a vendor prefix (`openai/gpt-6.1-sol`), which
 /// [`always_reasons`] strips.
-const ALWAYS_REASONING: &[&str] = &["gpt-6.1-sol", "gemini-3.8-flash"];
+const ALWAYS_REASONING: &[&str] = &[
+    "gpt-6.1-sol",
+    "gemini-3.8-flash",
+    "gemini-4-argon",
+    "gemini-4-carbon",
+];
 
 /// Whether `model` rejects every request that asks for no reasoning.
 pub(crate) fn always_reasons(model: &str) -> bool {
@@ -124,7 +129,7 @@ pub fn supported_efforts(provider: ProviderKind, model: &str) -> &'static [&'sta
                 THROUGH_HIGH
             }
         }
-        ProviderKind::OpenAi => {
+        ProviderKind::OpenAi | ProviderKind::ChatGptPlan => {
             if always_reasons(model) {
                 LOW_THROUGH_MAX
             } else if model.starts_with("gpt-5.6") || model == GPT_6_ASTRA {

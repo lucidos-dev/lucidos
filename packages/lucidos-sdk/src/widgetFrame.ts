@@ -23,6 +23,9 @@ import { hapticTick } from './haptic';
 import { opensContextMenu, selectionCovers, shouldSuppressContextMenu, textAt, type Point } from './contextMenu';
 import { runIsolated } from './_isolate';
 import { WIDGET_SIZES } from './generated/engine-constants';
+import { domGeometry, measureFit, settle, type FitResult } from './widgetFit';
+
+export { FIT_EDGES, FIT_KINDS, MAX_FIT_FINDINGS, SETTLE_CAP_MS, type FitFinding } from './widgetFit';
 
 /** The push channel the host marks a widget frame on. */
 export const WIDGET_CHANNEL = 'widget';
@@ -34,6 +37,9 @@ export const WIDGET_CONTENT_SIZE_MESSAGE_TYPE = 'lucidos:ui:size';
  *  right-click, and on a finger held still on a thread card or a dashboard
  *  tile. */
 export const WIDGET_MENU_MESSAGE_TYPE = 'lucidos:ui:widget-menu';
+
+/** What a frame posts once it has measured for a push's `measure` token. */
+export const WIDGET_FIT_MESSAGE_TYPE = 'lucidos:ui:widget-fit';
 
 /** A {@link WIDGET_MENU_MESSAGE_TYPE} message. `at` is where a pointer pressed,
  *  in the frame's own viewport. A hold or a keyboard-raised menu has none.
@@ -77,18 +83,28 @@ export interface WidgetPush {
   menu?: boolean;
   /** The host clamped the box below its true width and scrolls it sideways. */
   pans?: boolean;
+  /** The *widget fit check* asks this frame to settle and report what its box
+   *  cuts off. Each size it walks carries a new token. */
+  measure?: string;
 }
 
 /** A content-size report. `size` is the widget size the widget laid out
  *  for, so the host can tell a report from before a resize from one after. */
 export interface ContentSize {
+  /** At least the box's width. More means the content spills sideways. */
+  width?: number;
   height: number;
   size?: WidgetSize;
 }
 
-function verticalMargins(doc: Document): number {
+/** A {@link WIDGET_FIT_MESSAGE_TYPE} message: the box the frame measured and
+ *  what it cuts off, or why it could not measure. */
+export type WidgetFitReport = { type: typeof WIDGET_FIT_MESSAGE_TYPE; token: string; size?: WidgetSize }
+  & (({ box: { width: number; height: number } } & FitResult) | { error: string });
+
+function margins(doc: Document, start: 'marginTop' | 'marginLeft', end: 'marginBottom' | 'marginRight'): number {
   const style = doc.defaultView?.getComputedStyle(doc.body);
-  return style ? (parseFloat(style.marginTop) || 0) + (parseFloat(style.marginBottom) || 0) : 0;
+  return style ? (parseFloat(style[start]) || 0) + (parseFloat(style[end]) || 0) : 0;
 }
 
 /** The content's height in CSS pixels, margins included. A body that fills
@@ -96,7 +112,15 @@ function verticalMargins(doc: Document): number {
  *  `100vh` or the frame can never shrink. */
 export function contentHeight(doc: Document): number {
   if (!doc.body) return 0;
-  return Math.ceil(doc.body.scrollHeight + verticalMargins(doc));
+  return Math.ceil(doc.body.scrollHeight + margins(doc, 'marginTop', 'marginBottom'));
+}
+
+/** The content's width in CSS pixels, side margins included. In a box,
+ *  `holdStillInBox` makes the body a scroll container, so its `scrollWidth`
+ *  counts what spills past. */
+export function contentWidth(doc: Document): number {
+  if (!doc.body) return 0;
+  return Math.ceil(doc.body.scrollWidth + margins(doc, 'marginLeft', 'marginRight'));
 }
 
 function sizeOf(data: unknown): WidgetSize | null {
@@ -136,6 +160,8 @@ let place: WidgetPlace | null = null;
 let visible = true;
 let menu = false;
 let pans = false;
+// The fit check's token for the current push, else null.
+let measuring: string | null = null;
 // The press that may raise the next `contextmenu`, taken in its capture phase.
 let menuPress = false;
 let selectionAtPress = false;
@@ -286,6 +312,21 @@ function forwardContextMenu(e: MouseEvent): void {
   postMenuRequest(fromPointer ? point : undefined);
 }
 
+/** Settle, then report for `token` unless a later push replaced it. The size
+ *  is the one the frame laid out for when the token came. */
+async function measureWhenSettled(token: string, laidOutFor: WidgetSize | null): Promise<void> {
+  await settle(document);
+  if (measuring !== token) return;
+  const head = { type: WIDGET_FIT_MESSAGE_TYPE, token, ...(laidOutFor ? { size: laidOutFor } : {}) } as const;
+  let report: WidgetFitReport;
+  try {
+    report = { ...head, box: domGeometry.box(), ...measureFit(document) };
+  } catch (error) {
+    report = { ...head, error: error instanceof Error ? error.message : String(error) };
+  }
+  postToHost(report);
+}
+
 /** Start reporting once the host marks this frame a widget. A later push
  *  updates the place and size and reports again. */
 export function installWidgetFrame(): void {
@@ -293,9 +334,9 @@ export function installWidgetFrame(): void {
   let scheduled = false;
   const report = () => {
     scheduled = false;
-    const content: ContentSize = { height: contentHeight(document) };
+    const content: ContentSize = { width: contentWidth(document), height: contentHeight(document) };
     if (size) content.size = size;
-    const key = `${content.height} ${size}`;
+    const key = `${content.width} ${content.height} ${size}`;
     if (key === last) return;
     last = key;
     postToHost({ type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, ...content });
@@ -312,6 +353,8 @@ export function installWidgetFrame(): void {
     const nextVisible = (data as { visible?: unknown } | null)?.visible !== false;
     menu = (data as { menu?: unknown } | null)?.menu === true;
     pans = (data as { pans?: unknown } | null)?.pans === true;
+    const token = (data as { measure?: unknown } | null)?.measure;
+    const nextMeasuring = typeof token === 'string' && token ? token : null;
     // A new place can relay out the widget even at the same size, and the host
     // waits for a report there.
     last = '';
@@ -332,6 +375,10 @@ export function installWidgetFrame(): void {
     if (nextVisible !== visible) {
       visible = nextVisible;
       notify(visibilityListeners, visible);
+    }
+    if (nextMeasuring !== measuring) {
+      measuring = nextMeasuring;
+      if (measuring) void measureWhenSettled(measuring, size);
     }
     if (!installed) {
       installed = true;
@@ -388,6 +435,7 @@ export function _resetWidgetFrameForTesting(): void {
   size = null;
   place = null;
   visible = true;
+  measuring = null;
   menu = pans = menuPress = selectionAtPress = menuFromPointer = menuOverSelection = false;
   primaryDown = heldOpenedMenu = false;
   releaseNativeLongPress();

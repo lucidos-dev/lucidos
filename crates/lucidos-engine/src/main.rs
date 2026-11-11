@@ -935,6 +935,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // No event bus yet, so no gateway access. The engine rebuilds
         // with one once it has a bus.
         claude_gateway_access: None,
+        chatgpt_plan_access: None,
     };
 
     // Deliberately NO catch-all boot-failure report here. A reported failure is
@@ -1018,6 +1019,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         tap: Default::default(),
                         actor: None,
                         audience: None,
+                        push_group: None,
                     },
                 ),
                 "[Proxy] apis.json NotificationCreated",
@@ -1063,6 +1065,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         tap: Default::default(),
                         actor: None,
                         audience: None,
+                        push_group: None,
                     },
                 ),
                 "[Proxy] insecure transport NotificationCreated",
@@ -1128,6 +1131,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         tap: Default::default(),
                         actor: None,
                         audience: None,
+                        push_group: None,
                     },
                 ),
                 "[Proxy] handshake seed NotificationCreated",

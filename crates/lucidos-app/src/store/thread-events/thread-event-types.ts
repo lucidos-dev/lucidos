@@ -272,19 +272,23 @@ export function isUserStoppedWait(event: { type: string; cause?: string }): bool
  *  continues out of it. Grouping opens an exchange for it and hands the
  *  running turn straight back, and the panel draws its header alone.
  *
- *  Five qualify. The user's Stop waiting (`isUserStoppedWait`). A
+ *  These qualify. The user's Stop waiting (`isUserStoppedWait`). A
  *  `ChildThreadStopped` on a parent (ADR 0252): a user Stop paused one of its
  *  children. A `ChildThreadDetached` on a parent (ADR 0278): one of its
  *  children moved to top level. A `ChildReportFiled`: a child's report its
  *  child said needs no action now. And a `CacheKeepAliveStatusChanged`, the
- *  record of one keep-alive run (ADR 0540). None wakes the parent, so no
- *  response follows. */
+ *  record of one keep-alive run (ADR 0540). A *people-only message* and an
+ *  agent pause or resume (ADR 0649). None wakes the agent, so no response
+ *  follows. */
 export function isTurnlessBoundary(event: { type: string; cause?: string }): boolean {
   return isUserStoppedWait(event)
     || event.type === 'ChildThreadStopped'
     || event.type === 'ChildThreadDetached'
     || event.type === 'ChildReportFiled'
-    || event.type === 'CacheKeepAliveStatusChanged';
+    || event.type === 'CacheKeepAliveStatusChanged'
+    || event.type === 'PeopleMessagePosted'
+    || event.type === 'AgentPaused'
+    || event.type === 'AgentResumed';
 }
 
 /** The wait's `reason` as a bare subject, for a label that already said "wait".

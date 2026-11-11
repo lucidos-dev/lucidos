@@ -25,6 +25,7 @@ import { refreshThemesIfLoaded } from './themes';
 import { isActiveThemePath, refreshActiveTheme } from './preferences';
 import { refreshWorkspaceFontsIfLoaded } from './workspaceFonts';
 import { refreshClaudeGatewayStatusIfLoaded } from './claudeGateway';
+import { refreshChatGptPlanStatusIfLoaded } from './chatgptPlan';
 import { removePinnedAppLocal, loadPinnedApps } from './pinnedApps';
 import { loadCredentials } from './credentials';
 import { loadEnvironmentVariables } from './environmentVariables';
@@ -157,6 +158,7 @@ export const PROVIDER_PREFERENCE_KEYS: ReadonlySet<string> = new Set([
   'provider_enabled_xai',
   'provider_enabled_local',
   'provider_enabled_claude_gateway',
+  'provider_enabled_chatgpt_plan',
   'claude_gateway_url',
 ]);
 
@@ -409,6 +411,21 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     case 'ClaudeGatewaySignedOut':
       refreshLlmConfigured();
       refreshClaudeGatewayStatusIfLoaded();
+      break;
+    // A ChatGPT plan sign-in or sign-out installs or drops the engine's plan
+    // provider, so it takes the same re-probe. Settings also shows the account.
+    case 'ChatGptPlanSignedIn':
+    case 'ChatGptPlanSignedOut':
+      refreshLlmConfigured();
+      refreshChatGptPlanStatusIfLoaded();
+      break;
+    // An attempt starting, stopping or failing, or the usage-limit pause,
+    // changes only what Settings shows.
+    case 'ChatGptPlanSignInStarted':
+    case 'ChatGptPlanSignInCanceled':
+    case 'ChatGptPlanSignInFailed':
+    case 'ChatGptPlanLimitReached':
+      refreshChatGptPlanStatusIfLoaded();
       break;
     // A sign-in starting, stopping or ending without tokens, or a new
     // gateway policy, changes only what Settings shows.

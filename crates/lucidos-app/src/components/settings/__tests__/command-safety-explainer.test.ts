@@ -12,8 +12,8 @@ const settingsView: string = readFileSync(resolve(here, '../SettingsView.tsx'), 
 /** The Command safety section says which agent's commands it reaches, because
  *  nothing else on the page does and the answer is not the obvious one. The
  *  guard covers the Lucidos Agent's own tools. A coding agent's permissions
- *  live in the two lists below it. With the master toggle on, the guard also
- *  judges coding-agent commands, unless the coding-agents child is off.
+ *  live in the two lists below it. The guard never answers their cards:
+ *  coding-agent auto-answer, under Coding agent permissions, does.
  *
  *  Asserted over WHITESPACE-COLLAPSED source, so a reflow of the JSX cannot
  *  fail a claim that is still on the page. What each assertion pins is the
@@ -47,68 +47,71 @@ describe('Settings → Permissions: the Command safety explainer', () => {
     expect(body).toMatch(/side-effect grant it declared/);
   });
 
-  /** `command_guard_coding_agents` defaults on, so turning the guard on also
-   *  answers coding-agent commands. Copy that said "by default it does not"
-   *  promised cards the guard no longer raises. */
-  it('says when a coding agent is covered, and where its permissions are', () => {
-    expect(body).toMatch(/With the guard off, it does not gate a coding agent's tools/);
+  /** `coding_agent_auto_answer` is independent of the guard, so turning the
+   *  guard on answers no coding-agent card. The copy names the switch that does. */
+  it('says the guard answers no coding-agent card, and which switch does', () => {
+    expect(body).toMatch(/The guard does not answer a coding agent's cards/);
     expect(body).toMatch(/Claude Code asks through its own permissions list below/);
-    expect(body).toMatch(/With the guard on, it also judges those commands, unless you turn off Answer coding-agent questions/);
+    expect(body).toMatch(/Auto-answer coding-agent cards, under Coding agent permissions, hands those to Lucidos/);
   });
 
-  /** Two exceptions send a Codex escape through without a card, and only one
-   *  of them is this section's. The static pass in `attended_command_allowed`
-   *  runs ahead of both toggles, so a plain read is answered even with Command
-   *  safety off. Attributing that to the judge would promise a card the guard
-   *  does not raise. */
+  /** The static pass in `attended_command_allowed` runs ahead of both
+   *  toggles, so a plain read is answered even with Command safety off.
+   *  Attributing that to the judge would promise a card the guard does not
+   *  raise. */
   it('separates the always-on static answer from the toggled judge', () => {
     expect(body).toMatch(/Lucidos answers the plain reads for you, whatever these toggles say/);
   });
 
-  /** The one claim a reader could not derive from the rest of the page: the
-   *  judge half of this section decides Codex sandbox escapes too, so turning
-   *  the master off moves those back to a permission card. */
-  it('says the judge reaches Codex, and what turning the guard off does to that', () => {
-    expect(body).toMatch(/reaches past the Lucidos Agent/);
-    expect(body).toMatch(/Codex sandbox escape/);
-    expect(body).toMatch(/Turn the guard off and those ask you instead/);
+  /** Turning the guard on must never read as asking less: the judge answers a
+   *  coding agent only under auto-answer, never under these toggles. */
+  it('says the judge answers a coding agent only under auto-answer', () => {
+    expect(body).toMatch(/It answers a coding agent only under auto-answer/);
+    expect(body).not.toMatch(/Turn the guard off and those ask you instead/);
   });
 
 });
 
-/** The coding-agents row widens what runs without a card, with no undo, so its
+/** The auto-answer row widens what runs without a card, with no undo, so its
  *  own explainer has to say so beside the switch. */
-describe('Settings → Permissions: the Answer coding-agent questions explainer', () => {
-  const row = settingsView.indexOf('data-search-anchor="command-safety:coding-agents"');
+describe('Settings → Permissions: the Auto-answer coding-agent cards explainer', () => {
+  const row = settingsView.indexOf('data-search-anchor="permissions:coding-agent-auto-answer"');
   const body = settingsView.slice(row, row + 2200).replace(/\s+/g, ' ');
 
   it('explains from the row label', () => {
-    expect(body).toMatch(/Answer coding-agent questions <Explainer title="Answer coding-agent questions">/);
+    expect(body).toMatch(/Auto-answer coding-agent cards <Explainer title="Auto-answer coding-agent cards">/);
+  });
+
+  /** The switch sits with the coding-agent list it answers beyond, never
+   *  under the command guard, which it does not depend on. */
+  it('sits in the Coding agent permissions section', () => {
+    expect(settingsView).toMatch(/lead=\{\(\s*<>\s*\{codingAgentAutoAnswerRow\(\)\}/);
+    expect(body).toMatch(/The command guard switch does not change this/);
   });
 
   it('says what the switch widens, and what it costs', () => {
-    expect(body).toMatch(/the guard can answer for you/);
+    expect(body).toMatch(/Lucidos can answer for you/);
     expect(body).toMatch(/so a wrong reversible call has no undo/);
     expect(body).toMatch(/An irreversible or catastrophic one never runs unasked/);
   });
 
   /** The permission mode and the allowlist settle a command before the gate
    *  runs. "Off, every command asks" would promise cards that never come. */
-  it('says the guard only sees what would otherwise ask', () => {
+  it('says auto-answer only sees what would otherwise ask', () => {
     expect(body).toMatch(/It sees only what would otherwise ask you/);
-    expect(body).toMatch(/Off, the guard runs no Claude Code command for you/);
+    expect(body).toMatch(/Off, Lucidos runs no Claude Code command for you/);
   });
 
   /** `prompt_coding_agent_permission` refuses a catastrophic command ahead of
    *  every switch, so "off, the guard stays out" would be false. */
   it('says the catastrophic floor holds whatever the switches say', () => {
-    expect(body).toMatch(/the guard refuses a catastrophic command it recognises/);
+    expect(body).toMatch(/Lucidos refuses a catastrophic command it recognises/);
   });
 
   /** `attended_command_allowed` lets a Safe Codex escape run whatever the
    *  switches say, so the copy pins that on the sandbox, not on this switch. */
   it('says a safe Codex sandbox escape runs regardless of the switches', () => {
     expect(body).toMatch(/Codex is different/);
-    expect(body).toMatch(/the guard lets a safe one run whatever these switches say/);
+    expect(body).toMatch(/Lucidos lets a safe one run whatever these switches say/);
   });
 });

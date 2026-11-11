@@ -2,6 +2,11 @@ Harden the code: review changed code for reuse, quality, and efficiency, then fi
 
 **No postpone option.** Never tell the user you're "postponing", "deferring", or "skipping" `/harden`. There is no such mode, so saying it misleads them. Apply runs hardening synchronously when the marker is `MISSING`, and the user waits at that point. Either Phase 0 reports `ALREADY_HARDENED` or `PLAN_ONLY` (say so and stop) or you run the full skill. The only honest answers are "already hardened, skipping", "plans only, no hardening needed" or "running hardening now".
 
+**Iteration successor entry:** Before running Phase 0, check the successor narrative.
+If it continues a `harden-iteration` handoff, go directly to **Resume at scope selection** under **Iteration boundary**.
+Skip Phase 0 through Phase 0.6, including review-head deletion, the first-entry checkpoint and the merge of main.
+This entry rule also applies when the successor receives "Run /harden now".
+
 ## Phase 0: Check if Already Hardened
 
 `lucidos hardened query` prints `FRESH`, `STALE`, `MISSING` or `NOT_NEEDED`
@@ -35,14 +40,45 @@ flow (`system-knowhow/coding-agent-flows/hardening`), and
 `./scripts/check-default-flows.sh` keeps the two identical:
 
 <!-- default-flow: hardening -->
-#### Handoff checkpoint
+#### Handoff checkpoints
 
-At this flow's first entry, before any review, run
+**First entry.** Before any review, run
 `lucidos successor offer --at pre-harden --default-floor` and follow what it
-prints. Only the first entry runs it: a later pass returns to the review,
-never here. A successor session this checkpoint started skips it too, and
-starts at the review. `--default-floor` makes the surface's default rung the
-floor for this run, so a thread below it hands off onto it.
+prints. Only a new hardening run enters here. A successor this checkpoint
+started skips it and starts at the review. `--default-floor` makes the
+surface's default rung the floor for this run.
+
+**Iteration boundary.** When a completed iteration needs another review,
+record its actual verdict and commit its fixes first. Then run exactly once:
+`lucidos successor offer --at harden-iteration --default-floor`.
+Do not invent a progress total: the engine estimates the next review cycle.
+
+Follow its automatic verdict without asking the user. The engine owns the
+configured context ceiling and handoff estimate; do not compare token counts
+locally or change preferences. A failed or unavailable reading means carry on.
+A passing final iteration goes straight to the marker, with no checkpoint.
+
+**Before an iteration handoff.** Join or explicitly stop every session-owned
+suite runner and reviewer, including a pending suite kickoff. Record stopped
+or interrupted work as incomplete. No process is assumed to survive the turn.
+
+Write the successor narrative with:
+
+- Review head, current HEAD, next iteration number, tier and scope flags.
+- Findings, fix commits, suite state paths and actual verdicts.
+- Outstanding gates, reviewer status and exact next command.
+
+Preserve evidence on disk; the repository's suite validator decides
+whether completed results still count. Missing exit files, stale inputs and a
+passing retry subset never certify a full run.
+
+**Iteration successor entry.** Skip this checkpoint once and resume at the
+next iteration's scope selection, preserving the review head, iteration count
+and tier. Do not repeat first-entry initialization. Missing or unusable review
+state widens the review; missing or invalid suite evidence requires rerunning
+verification. After another completed iteration needs a repeat, evaluate the
+iteration checkpoint again. These rules cover both Claude Code and Codex,
+full and fast tiers, root threads and sub-threads.
 <!-- /default-flow: hardening -->
 
 It is automatic and asks nothing. A handoff is due when it pays, or when this
@@ -50,8 +86,8 @@ thread runs below the default rung. It names one rung above the default for
 security work or a costly one-way door: judge that by its two tests, and say
 why in one line. On "carry on", or when the command fails, continue below. On a
 handoff, end your turn: the successor session runs `/harden` from the start,
-but skips this checkpoint. A later iteration returns to Phase 1, so a handoff
-never lands in the middle of the loop.
+but skips the first-entry checkpoint. An iteration handoff instead uses the
+continuation entry below; it never restarts Phase 0.
 
 Then read the tier this branch runs (ADR 0465):
 
@@ -256,6 +292,39 @@ lucidos events emit HardenRunCompleted --summary "harden iteration <n>: <pass|fa
   (`docs/plans/2026-10-13-auto-compact-trial-and-successor-threads.md`).
 
 An emit that fails never blocks hardening: note it and go on.
+
+## Iteration boundary
+
+Every "return to Phase 1" routes through this boundary, including a failed
+cheap gate, prose gate or suite verdict. Record the iteration's failure before
+acting on it, stop suites before unsafe edits, and commit the fixes. Follow the
+shared **Iteration boundary** checkpoint above exactly once, then continue at
+scope selection below. RERUN and still-running suite results stay inside
+Phase 4.5; they are not new review iterations. A formatting-only commit keeps
+its existing Phase 4.5 path. A final PASS proceeds directly to Phase 5.
+
+Before starting a successor, join the other-model review or abandon it using
+Phase 3's cancellation procedure. Join the early kickoff shell too, so it
+cannot start another runner after `./scripts/harden-suites.sh stop`. Then join
+or stop the suites, and put their real statuses in the narrative. Preserve
+`.lucidos/harden-review-head`, `.lucidos/harden-suites/`,
+`.lucidos/harden-retry` and `.lucidos/harden-carried`; do not manufacture exit
+files or delete a retry record to turn incomplete work into PASS.
+
+**Resume at scope selection**, not Phase 0: restore the narrative's next
+iteration number, tier, scope flags and outstanding gates. Skip the iteration
+checkpoint once on this entry. Run the scope command below against the
+retained review head. If narrative and disk disagree, or the head is missing
+or unusable, widen to a full review without deleting the evidence. Recompute
+scope flags conservatively if they cannot be restored.
+
+Phase 4.5 validates retained suite evidence after the resumed review, using its normal wait and verdict handling.
+Do not route a historical FAIL through the retry boundary again.
+The predecessor already recorded that failure and committed its fixes.
+A missing exit file or interrupted runner requires a new run, and retry-only PASS still owes the full set.
+
+Run the cheap gates again on current HEAD. No marker exists until the resumed review and all
+required verification pass for current HEAD and the expected tier.
 
 ## Later iterations review only the fix
 
@@ -770,7 +839,11 @@ These matter when you read a verdict:
 - **`make lint` is the per-change lint gate, never `cargo check`.** `/harden` is
   the only stage between a change and `main`. Never restate its flags.
 
-**`/harden` finishes in one turn.** Apply sends "Run /harden now", waits for the next idle, and then refuses a branch with no marker. So do NOT hand the suites to `lucidos background-task run` and end your turn here, as the general rule suggests for long work: that idle would read as a finished `/harden`. Claude Code has no blocking wait tool. So `start` runs behind a shell `&`, and each suite writes an exit file under `.lucidos/harden-suites/` when it ends. `wait` joins on those files in the foreground.
+**Keep suite waits in the active session.** Apply sends "Run /harden now", waits for the next idle, and then refuses a branch with no marker. So do NOT hand the suites to `lucidos background-task run` and end your turn here, as the general rule suggests for long work: that idle would read as a finished `/harden`. Only an explicit successor
+handoff at the iteration boundary may end a session with hardening still in
+progress; its narrative carries the remaining work.
+
+Claude Code has no blocking wait tool. So `start` runs behind a shell `&`, and each suite writes an exit file under `.lucidos/harden-suites/` when it ends. `wait` joins on those files in the foreground.
 
 Each exit file holds the suite's real exit code: redirecting is not piping. `wait` and `verdict` print a few lines, so the logs never flood your context. Read the detail from the log a FAIL line names, with `tail -40` or `grep -nE "^error|test result:"`.
 

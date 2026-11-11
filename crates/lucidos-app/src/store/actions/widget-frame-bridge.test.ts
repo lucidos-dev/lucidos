@@ -1,12 +1,19 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { WIDGET_CONTENT_SIZE_MESSAGE_TYPE, WIDGET_MENU_MESSAGE_TYPE } from '@lucidos/widget-frame';
+import {
+  MAX_FIT_FINDINGS,
+  WIDGET_CONTENT_SIZE_MESSAGE_TYPE,
+  WIDGET_FIT_MESSAGE_TYPE,
+  WIDGET_MENU_MESSAGE_TYPE,
+} from '@lucidos/widget-frame';
 import { overlayStack, pushOverlay } from '../overlayStack';
 import { primaryPointerIsDown } from '../../utils/pointerPress';
 
 const appFrameFor = vi.fn();
 vi.mock('../../utils/appFrame', () => ({ appFrameFor }));
 
-const { handleWidgetFrameMessage, APP_FRAME_MENU_EVENT, APP_FRAME_SIZE_EVENT } = await import('./widget-frame-bridge');
+const {
+  handleWidgetFrameMessage, APP_FRAME_FIT_EVENT, APP_FRAME_MENU_EVENT, APP_FRAME_SIZE_EVENT,
+} = await import('./widget-frame-bridge');
 
 const SOURCE = { name: 'the dashboard tile' };
 const message = (data: unknown, source: unknown = SOURCE) => ({ data, source }) as unknown as MessageEvent;
@@ -36,8 +43,13 @@ describe('handleWidgetFrameMessage', () => {
     expect(dispatched().detail).toEqual({ height: 312 });
   });
 
-  it('carries the height alone', () => {
+  it('carries the width, so the box can fade a sideways spill', () => {
     handleWidgetFrameMessage(message({ type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, height: 120, width: 180 }));
+    expect(dispatched().detail).toEqual({ height: 120, width: 180 });
+  });
+
+  it('drops a width that is not a length', () => {
+    handleWidgetFrameMessage(message({ type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, height: 120, width: -4 }));
     expect(dispatched().detail).toEqual({ height: 120 });
   });
 
@@ -112,5 +124,52 @@ describe('handleWidgetFrameMessage', () => {
       handleWidgetFrameMessage(message({ type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, height }));
     }
     expect(appFrameFor).not.toHaveBeenCalled();
+  });
+
+  describe('a fit report', () => {
+    const finding = { kind: 'ellipsis', edge: 'right', px: 42, path: 'div.row > span', text: 'Oslo to Lisbon' };
+    const report = (extra: Record<string, unknown> = {}) => ({
+      type: WIDGET_FIT_MESSAGE_TYPE, token: 't1', size: 'large', box: { width: 320, height: 320 }, findings: [finding], total: 1, ...extra,
+    });
+
+    it('dispatches the box and findings on the frame that measured', () => {
+      handleWidgetFrameMessage(message(report()));
+      expect(dispatched().type).toBe(APP_FRAME_FIT_EVENT);
+      expect(dispatched().bubbles).toBe(true);
+      expect(dispatched().detail).toEqual({ token: 't1', size: 'large', box: { width: 320, height: 320 }, findings: [finding], total: 1 });
+    });
+
+    it('dispatches why a frame could not measure', () => {
+      handleWidgetFrameMessage(message({ type: WIDGET_FIT_MESSAGE_TYPE, token: 't1', error: 'boom' }));
+      expect(dispatched().detail).toEqual({ token: 't1', error: 'boom' });
+    });
+
+    it('keeps at most the findings a frame may send', () => {
+      handleWidgetFrameMessage(message(report({ findings: Array(MAX_FIT_FINDINGS + 3).fill(finding), total: 11 })));
+      expect(dispatched().detail.findings).toHaveLength(MAX_FIT_FINDINGS);
+      expect(dispatched().detail.total).toBe(11);
+    });
+
+    it('drops a report with no token, no box, or a malformed finding', () => {
+      for (const bad of [
+        report({ token: '' }),
+        report({ token: 7 }),
+        report({ box: undefined }),
+        report({ box: { width: -1, height: 2 } }),
+        report({ findings: 'none' }),
+        report({ findings: [{ ...finding, kind: 'odd' }] }),
+        report({ findings: [{ ...finding, edge: 'middle' }] }),
+        report({ findings: [{ ...finding, px: Number.NaN }] }),
+        report({ findings: [{ ...finding, text: 3 }] }),
+        report({ total: -1 }),
+        { type: WIDGET_FIT_MESSAGE_TYPE, token: 't1', error: 5 },
+      ]) handleWidgetFrameMessage(message(bad));
+      expect(frame.dispatchEvent).not.toHaveBeenCalled();
+    });
+
+    it('drops a size that is not a widget size', () => {
+      handleWidgetFrameMessage(message(report({ size: 'huge' })));
+      expect(dispatched().detail.size).toBeUndefined();
+    });
   });
 });

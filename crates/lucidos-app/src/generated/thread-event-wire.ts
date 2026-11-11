@@ -50,6 +50,11 @@ export type AgentParticipant =
       label: string;
     };
 
+/** What flipped a thread's *agent pause* (ADR 0649). */
+export type AgentPauseCause =
+  | 'mention'
+  | 'chip';
+
 /** Where a granted "Always allow" click is remembered.
  *  Full reasoning is on the Rust variant. */
 export type AllowScope =
@@ -752,8 +757,8 @@ export type MessageOrigin =
       kind: 'device';
       device_id: string;
     }
-  /** HTTP request without a `device_id` and without a `caller_workspace`
-   *  body field. Mode is carried explicitly so SDK callers can declare
+  /** HTTP request without a `device_id`, and without a `caller_workspace`
+   *  body field unless a verified origin token outranks it. Mode is carried explicitly so SDK callers can declare
    *  themselves as agent/engine; defaults to Human for back-compat.
    *  Full reasoning is on the Rust variant. */
   | {
@@ -767,6 +772,10 @@ export type MessageOrigin =
        *  external API clients (browsers, real curl, cross-workspace
        *  engines) and for legacy persisted rows that pre-date the field. */
       source_thread_id?: string;
+      /** The trigger whose fire this subprocess is, read off the same
+       *  verified token. A scheduled script has no thread, so the spawn gate
+       *  reads its trigger here. */
+      emitting_trigger_id?: string;
     }
   /** Mode = Human or Agent (carried in `mode`). HTTP request from another
    *  Lucidos workspace, identified by the `caller_workspace` body field. */
@@ -2291,10 +2300,10 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Someone became the *driver* of this work item (ADR 0623), on its
-   *  family root. The actor names them: a device, or a trigger fire whose
+  /** Someone became the *driver* of this thread's family (ADR 0623), on its
+   *  root. The actor names them: a device, or a trigger fire whose
    *  actor email an operator holds. Recorded by Take, Take over, and by
-   *  answering a gate. Projects nothing: `engine::work_item` folds it. */
+   *  answering a gate. Projects nothing: `engine::thread_people` folds it. */
   | {
       type: 'WorkItemDriverTaken';
       /** Links this event back to the request that opened the turn. */
@@ -2304,8 +2313,8 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The work item's driver gave the role up, on its family root. The work
-   *  item has no driver until someone takes it. */
+  /** The root thread's driver gave the role up, on its family root. It has
+   *  no driver until someone takes it. */
   | {
       type: 'WorkItemDriverReleased';
       /** Links this event back to the request that opened the turn. */
@@ -2317,7 +2326,7 @@ export type ThreadEvent =
     }
   /** A gate waited on its driver past `driver_timeout_hours`, so it now
    *  reaches the whole team. Recorded once per gate, on the family root.
-   *  The driver keeps the work item. */
+   *  The driver keeps the root thread. */
   | {
       type: 'WorkItemGateEscalated';
       /** The thread the question card is on: the root or a sub-thread. */
@@ -2330,10 +2339,13 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The actor started watching this work item: its gate pushes reach them
+  /** Someone started watching this root thread: its gate pushes reach them
    *  beside the driver. Recorded on the family root. */
   | {
       type: 'WorkItemWatched';
+      /** The person a *person mention* made a watcher (ADR 0649). Absent
+       *  means the actor's own person, who tapped Watch. */
+      operator_id?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -2341,9 +2353,53 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The actor stopped watching this work item, from any of their devices. */
+  /** The actor stopped watching this root thread, from any of their devices. */
   | {
       type: 'WorkItemUnwatched';
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** A person wrote to the other people in this thread, not to its agent: a
+   *  *people-only message* (ADR 0649). The meta actor names the sender.
+   *  Full reasoning is on the Rust variant. */
+  | {
+      type: 'PeopleMessagePosted';
+      text: string;
+      /** Blob hashes of attached images, as on `MessageReceived`. */
+      user_image_hashes?: string[];
+      /** The device the message came from, by id only. */
+      device_id?: string;
+      /** The operators the message mentions. An operator id, because that is
+       *  the only stable handle for a person. A removed operator's id
+       *  resolves to nobody. */
+      mentioned_operator_ids?: string[];
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** Typed messages in this thread stop waking its agent: the *agent pause*
+   *  (ADR 0649). A running turn carries on. The meta actor names who paused. */
+  | {
+      type: 'AgentPaused';
+      cause: AgentPauseCause;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** Typed messages in this thread wake its agent again. */
+  | {
+      type: 'AgentResumed';
+      cause: AgentPauseCause;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -3018,7 +3074,7 @@ export type ThreadEvent =
       summary: string;
       /** The grant each "Always allow"-style button stores (ADR 0571). `None`
        *  on a card persisted before the engine stamped it, and on an
-       *  unattended auto-deny, which renders already answered. */
+       *  auto-deny, which renders already answered. */
       grant_offer?: GrantOffer;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -3861,6 +3917,25 @@ export type TransientEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
+  /** A *widget fit check*. The chosen page renders the widget at each size,
+   *  on the desk tile and the phone column, at `ui_scale`. It answers with
+   *  `POST /api/v1/widgets/fit-report`. */
+  | {
+      type: 'WidgetFitRequested';
+      app_id: string;
+      request_id: string;
+      sizes: WidgetSize[];
+      ui_scale: number;
+      /** The device that uses `ui_scale`, so the frames' first paint
+       *  carries it. Absent when the workspace-wide scale is the largest. */
+      scale_device_id?: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
   | {
       type: 'NavigationRequested';
       payload: string;
@@ -3969,6 +4044,9 @@ const THREAD_EVENT_TYPE_FLAGS = {
   WorkItemGateEscalated: true,
   WorkItemWatched: true,
   WorkItemUnwatched: true,
+  PeopleMessagePosted: true,
+  AgentPaused: true,
+  AgentResumed: true,
   ThreadStarted: true,
   ThreadDiscarded: true,
   HomeThreadCreated: true,

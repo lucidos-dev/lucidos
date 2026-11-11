@@ -4,6 +4,7 @@ import { COPY_ID_NONCE, WIDGET_EMBED_ATTR, WIDGET_EMBED_ERROR_ATTR, WIDGET_EMBED
 import type { WidgetEmbed } from '../../generated/thread-event-wire';
 import { InlineWidget, UnavailableWidget } from './InlineWidget';
 import { embedRefusal } from '../../utils/widgetEmbed';
+import { useMermaidBlocks } from '../shared/useMermaidBlocks';
 
 const SLOT_MARK = `${WIDGET_EMBED_SLOT_ATTR}="${COPY_ID_NONCE}"`;
 const SLOT_SELECTOR = `[${SLOT_MARK}]`;
@@ -71,5 +72,6 @@ export function ReplyHtml({ html, final, threadId, eventId, class: className, te
 }) {
   const [host, setHost] = useState<HTMLDivElement | null>(null);
   useWidgetEmbedSlots(host, html, final, threadId, eventId);
+  useMermaidBlocks(host, html, final);
   return <div ref={setHost} class={['authored-html', className].filter(Boolean).join(' ')} data-text-seq={textSeq} dangerouslySetInnerHTML={{ __html: html }} />;
 }

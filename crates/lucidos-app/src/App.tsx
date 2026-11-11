@@ -46,6 +46,7 @@ import { engineBuildLogOpen } from './store/engineBuildLog';
 import { viewportIsMobile } from './utils/viewport';
 import { CameraCaptureSlot } from './components/chat/PromptInput';
 import { DashboardRail } from './components/dashboard/DashboardRail';
+import { widgetFitRequests } from './store/widgetFit';
 
 // Re-exported so it ships in the shell chunk, which `main.tsx` runs it from.
 export { startShell } from './shellStartup';
@@ -63,6 +64,7 @@ const SearchEverywhere = lazyComponent(() => import('./components/search/SearchE
 const FilePreviewModal = lazyComponent(() => import('./components/files/FilePreviewModal').then(m => m.FilePreviewModal));
 const ReleaseNoticeModal = lazyComponent(() => import('./components/shared/ReleaseNoticeModal').then(m => m.ReleaseNoticeModal));
 const MemoryChoice = lazyComponent(() => import('./components/settings/MemoryChoice').then(m => m.MemoryChoice));
+const WidgetFitCheck = lazyComponent(() => import('./components/widgets/WidgetFitCheck').then(m => m.WidgetFitCheck));
 const ConfirmAndPromptDialogs = lazyComponent(() => import('./components/shared/ConfirmAndPromptDialogs').then(m => m.ConfirmAndPromptDialogs));
 prefetchWhenIdle(ConfirmAndPromptDialogs);
 registerAskDialogChunk(ConfirmAndPromptDialogs);
@@ -88,6 +90,8 @@ function FilePreviewModalSlot()  { return filePreviewModal.value     ? <FilePrev
 function ReleaseNoticeSlot()     { return releaseNoticeModalOpen()   ? <ReleaseNoticeModal /> : null; }
 // Asked once per workspace, so the same holds for the memory choice.
 function MemoryChoiceSlot()      { return memoryChoiceOpen()         ? <MemoryChoice />      : null; }
+// A fit check renders only when the engine asks, so no first frame loads it.
+function WidgetFitCheckSlot()    { return widgetFitRequests.value.length > 0 ? <WidgetFitCheck /> : null; }
 
 // FileSearchModal and SearchEverywhere render a hidden shell instead of
 // unmounting when closed (avoids will-change:transform ghost pixels on iOS
@@ -191,6 +195,7 @@ export function App() {
         <CameraCaptureSlot />
       </OverlayLayer>
       <DropZone />
+      <WidgetFitCheckSlot />
       <UiBlockingOverlay />
     </>
   );

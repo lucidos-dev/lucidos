@@ -11,62 +11,20 @@
 use super::navigate::{device_presence, recipient, Recipient};
 use crate::core::{ArtifactManager, WriteAnnouncement};
 use crate::engine::event_bus::{BusEvent, EventBus};
+use crate::engine::pending_answers::{await_answer, forget_answer, PendingAnswers};
 use crate::engine::thread_events::{CaptureFormat, EventMeta, ThreadEvent};
 use crate::engine::CaptureResult;
 use crate::llm::tool_names as tn;
 use sqlx::PgPool;
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::Duration;
-use tokio::sync::oneshot;
 use uuid::Uuid;
 
 /// How long the agent waits for an answer. The page gives up after 8 s
 /// (`captureAppUI`), so its own error arrives before this.
 pub(crate) const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A capture waiting for its answer.
-pub struct PendingCapture {
-    /// The device that must answer. `None` when the agent named none and the
-    /// turn has no last used device, and then any page may.
-    target: Option<String>,
-    tx: oneshot::Sender<CaptureResult>,
-}
-
 /// The captures waiting for an answer, by request id.
-pub type PendingCaptures = Mutex<HashMap<String, PendingCapture>>;
-
-/// Why an answer was not taken.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum CaptureRefusal {
-    /// No capture waits under this id: it timed out, or was already answered.
-    Unknown,
-    /// The capture waits for another device. It stays open for that one.
-    OtherDevice,
-}
-
-/// Hand `result` to the capture `request_id` waits on, if `answering` is the
-/// device it waits for.
-pub(crate) fn resolve_capture(
-    pending: &PendingCaptures,
-    request_id: &str,
-    answering: Option<&str>,
-    result: CaptureResult,
-) -> Result<(), CaptureRefusal> {
-    let mut captures = pending.lock().unwrap();
-    let Entry::Occupied(waiting) = captures.entry(request_id.to_string()) else {
-        return Err(CaptureRefusal::Unknown);
-    };
-    let target = waiting.get().target.as_deref();
-    if target.is_some_and(|target| answering != Some(target)) {
-        return Err(CaptureRefusal::OtherDevice);
-    }
-    // A closed receiver means the tool call itself is gone (a canceled turn),
-    // so there is nobody left to tell.
-    let _ = waiting.remove().tx.send(result);
-    Ok(())
-}
+pub type PendingCaptures = PendingAnswers<CaptureResult>;
 
 /// Where a capture is saved, and the format its extension names.
 #[derive(Debug, PartialEq, Eq)]
@@ -225,14 +183,7 @@ pub(crate) async fn app_ui_tool_impl(
     }
 
     let request_id = Uuid::new_v4().to_string();
-    let (tx, rx) = oneshot::channel();
-    pending.lock().unwrap().insert(
-        request_id.clone(),
-        PendingCapture {
-            target: device.map(str::to_string),
-            tx,
-        },
-    );
+    let rx = await_answer(pending, &request_id, device);
     log!("[AppCapture] capture thread={thread_id} app={app_id} device={device:?}");
     let emitted = bus
         .emit(BusEvent::Thread {
@@ -246,7 +197,7 @@ pub(crate) async fn app_ui_tool_impl(
         })
         .await;
     if let Err(e) = emitted {
-        pending.lock().unwrap().remove(&request_id);
+        forget_answer(pending, &request_id);
         return format!("Error: Capture failed: could not send the request: {e}");
     }
 
@@ -283,7 +234,7 @@ pub(crate) async fn app_ui_tool_impl(
         }
         Ok(Err(_)) => "Error: Capture failed: the frontend channel was dropped.".to_string(),
         Err(_) => {
-            pending.lock().unwrap().remove(&request_id);
+            forget_answer(pending, &request_id);
             timed_out(pool, &who, timeout).await
         }
     }

@@ -121,6 +121,7 @@ pub(crate) fn agent_thread_actor(caller: Uuid) -> MessageOrigin {
         user_agent: None,
         mode: ActorMode::Agent,
         source_thread_id: Some(caller),
+        emitting_trigger_id: None,
     }
 }
 

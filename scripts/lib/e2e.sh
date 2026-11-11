@@ -1219,4 +1219,10 @@ reset_e2e_database() {
     # memory-choice-all.spec.ts deletes the answer to see the modal.
     shared_pg_psql "$db" -v ON_ERROR_STOP=1 -q -c \
         "INSERT INTO preferences (key, value) VALUES ('memory_module', 'classic') ON CONFLICT (key, COALESCE(device_id, '')) DO NOTHING;"
+
+    # Dynamic bars default on, but the e2e baseline is pinned bars, which
+    # disableMobileDynamicBars restores. Seeding it keeps every spec on one
+    # baseline whatever order the specs run in.
+    shared_pg_psql "$db" -v ON_ERROR_STOP=1 -q -c \
+        "INSERT INTO preferences (key, value) VALUES ('mobile_dynamic_bars', 'false') ON CONFLICT (key, COALESCE(device_id, '')) DO NOTHING;"
 }

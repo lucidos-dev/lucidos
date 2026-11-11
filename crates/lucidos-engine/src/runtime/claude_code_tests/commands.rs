@@ -611,3 +611,17 @@ fn the_served_picker_names_the_model_each_row_runs() {
     assert_eq!(served[2]["value"], "opus");
     assert_eq!(served[2]["resolved_model"], "claude-opus-5-5[1m]");
 }
+
+#[test]
+fn fable_52_keeps_the_fable_overlay_only_policy() {
+    assert!(!offered_cc_model_options(None)
+        .iter()
+        .any(|r| r.value == "claude-fable-5-2"));
+    assert_eq!(
+        crate::runtime::coding_agent_context_window(
+            crate::runtime::CodingAgent::ClaudeCode,
+            "claude-fable-5-2"
+        ),
+        Some(1_000_000)
+    );
+}

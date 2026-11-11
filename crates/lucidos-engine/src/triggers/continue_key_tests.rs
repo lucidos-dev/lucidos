@@ -235,7 +235,7 @@ mod routing {
     }
 
     /// An unattended run lands in Archive when it finishes, with no
-    /// `ThreadArchived`. Its work item is still open, so the key stays.
+    /// `ThreadArchived`. Its root thread is still open, so the key stays.
     #[tokio::test]
     async fn a_finished_unattended_run_keeps_the_key() {
         let (pool, db) = setup_test_db().await;

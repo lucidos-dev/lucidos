@@ -342,6 +342,7 @@ fn system_notification_created_matches_server_event_shape() {
             tap: crate::scheduler::notifications::Tap::Modal,
             actor: None,
             audience: None,
+            push_group: None,
         }),
         aggregate: None,
         depth: 0,
@@ -687,6 +688,7 @@ fn reserved_type_names_match_event_type() {
             tap: crate::scheduler::notifications::Tap::Modal,
             actor: None,
             audience: None,
+            push_group: None,
         },
         NotificationRead {
             id: "x".into(),

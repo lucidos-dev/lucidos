@@ -7,7 +7,7 @@ vi.mock('../../utils/basePath', async () => ({
 }));
 vi.mock('../../api/client/control', async () => ({
   ...await vi.importActual('../../api/client/control'),
-  listWorkspaces: vi.fn().mockResolvedValue([{ id: 'local', name: 'Local workspace', health: 'healthy', port: 5000, autostart: false }]),
+  listWorkspacesWithOrder: vi.fn().mockResolvedValue({ workspaces: [{ id: 'local', name: 'Local workspace', health: 'healthy', port: 5000, autostart: false }], order: [] }),
   listRemoteWorkspaces: vi.fn(() => new Promise(() => {})),
 }));
 vi.mock('../shared/Disclosure', () => import('../shared/__tests__/disclosureStub'));

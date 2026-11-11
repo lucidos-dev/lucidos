@@ -5,6 +5,11 @@ import { mountedAppFrames } from '../../utils/appFrame';
 import { appearanceVersion } from './preferences';
 import { motionPreference } from '../../utils/motion';
 import { themeEffectsPreference } from '../../utils/themeEffects';
+import { PREF_UI_SCALE } from '@lucidos/preference-catalog';
+
+/** Marks a *widget fit check* surface. Its value is the UI scale the frames
+ *  inside it render at, whatever scale the shell paints. */
+export const WIDGET_FIT_SCALE_ATTRIBUTE = 'data-widget-fit-scale';
 
 /** What the shell painted, read from the mirrors each paint writes. The SDK's
  *  `watchPreferences()` repaints the app from it, with no request, so the app
@@ -16,10 +21,16 @@ function paintedAppearance(): Record<string, string> {
   );
 }
 
+/** `painted`, with the scale of the fit check surface `frame` sits on, if any. */
+function appearanceFor(frame: HTMLIFrameElement, painted: Record<string, string>): Record<string, string> {
+  const scale = frame.closest(`[${WIDGET_FIT_SCALE_ATTRIBUTE}]`)?.getAttribute(WIDGET_FIT_SCALE_ATTRIBUTE);
+  return scale ? { ...painted, [PREF_UI_SCALE.key]: scale } : painted;
+}
+
 /** Hand one app frame the current appearance. Called as the frame loads, since
  *  a push to a document that has not run the SDK yet reaches nobody. */
 export function pushAppearanceToFrame(frame: HTMLIFrameElement): void {
-  postToAppFrame(frame, APPEARANCE_CHANNEL, paintedAppearance());
+  postToAppFrame(frame, APPEARANCE_CHANNEL, appearanceFor(frame, paintedAppearance()));
 }
 
 let pushQueued = false;
@@ -28,7 +39,7 @@ function pushToEveryFrame(): void {
   pushQueued = false;
   const appearance = paintedAppearance();
   for (const frame of mountedAppFrames()) {
-    postToAppFrame(frame, APPEARANCE_CHANNEL, appearance);
+    postToAppFrame(frame, APPEARANCE_CHANNEL, appearanceFor(frame, appearance));
   }
 }
 

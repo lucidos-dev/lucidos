@@ -75,6 +75,13 @@ export interface ChatRequestBody {
    *  Follow-ups and compose first-sends omit it: a compose thread already has
    *  its row (`sendCompose` awaits `POST /threads` before the chat POST). */
   new_thread?: boolean;
+  /** *Person mentions*, by person id (ADR 0649). A message that mentions only
+   *  people pauses the agent and stays between people. Sent only on a team
+   *  gateway: any other refuses a non-empty list. */
+  mentions?: string[];
+  /** The *agent mention*: the message wakes the agent, and resumes it when
+   *  paused. */
+  agent_mentioned?: boolean;
   /** Required when `mode !== 'human'`: the thread that spawned this one. */
   parent_thread_id?: string;
   /** Required when `mode !== 'human'`: the parent event that triggered the spawn. */
@@ -250,7 +257,7 @@ export interface CodingAgentLadder extends IntelligenceLadder {
  *  whichever provider the workspace has credentials for. */
 export interface RouteInfo {
   /** 'vertex' | 'anthropic' | 'openai' | 'openrouter' | 'xai' |
-   *  'opencode-free' | 'local' | 'claude-gateway'. */
+   *  'opencode-free' | 'local' | 'claude-gateway' | 'chatgpt-plan'. */
   provider: string;
   /** The id this route puts on the wire. The engine always spells it out, even
    *  where the stored route leaves it to default to the row's own id. */
@@ -506,6 +513,8 @@ export type TreeBackfill =
 export interface RecallLine {
   id: string;
   text: string;
+  /** The sending device for a human prompt leaf. */
+  sender_device_id?: string;
 }
 
 /** `GET /api/v1/memory/tree`. Mirrors the Rust `TreeTop` (`summary_tree/recall.rs`). */
@@ -612,6 +621,9 @@ export interface BackgroundModel {
   /** Whether the task asks no model at all: it runs only on measured models,
    *  and none is reachable. The wake decision then wakes every parent. */
   asks_no_model: boolean;
+  /** Why the task has no model, so the engine refuses what needs it. Only
+   *  the command judge sets it. */
+  unresolved: string | null;
   /** The models the picker lists first, best first. */
   recommended: RecommendedSelection[];
 }

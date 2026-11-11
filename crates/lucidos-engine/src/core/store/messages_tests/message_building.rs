@@ -994,3 +994,115 @@ fn side_questions_never_enter_session_history() {
     let text = with.to_string();
     assert!(!text.contains("what is x?") && !text.contains("x is 3"));
 }
+
+/// A people-only message reads as a user turn in order, with its sender's
+/// device, and leaves the woken turn's request and reply alone (ADR 0649).
+#[test]
+fn a_people_only_message_is_a_user_turn_that_opens_no_request() {
+    let device = |id: &str| json!({"kind": "device", "device_id": id});
+    let events = vec![
+        make_event(
+            "MessageReceived",
+            json!({"text": "draft the plan", "origin": device("dev-sam")}),
+            0,
+        ),
+        make_event("ResponseGenerated", json!({"text": "Here it is."}), 1),
+        make_event(
+            "PeopleMessagePosted",
+            json!({"text": "looks thin to me", "actor": device("dev-alex")}),
+            2,
+        ),
+        make_event(
+            "PeopleMessagePosted",
+            json!({"text": "agreed, add risks", "actor": device("dev-sam")}),
+            3,
+        ),
+        make_event(
+            "MessageReceived",
+            json!({"text": "add the risks", "origin": device("dev-sam")}),
+            4,
+        ),
+        make_event("ResponseGenerated", json!({"text": "Added."}), 5),
+    ];
+    let msgs = build_session_messages(&events);
+    let turns: Vec<(&str, &str, Option<&str>)> = msgs
+        .iter()
+        .map(|m| {
+            (
+                m.role.as_str(),
+                m.content.as_str(),
+                m.sender_device_id.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        turns,
+        vec![
+            ("user", "draft the plan", Some("dev-sam")),
+            ("assistant", "Here it is.", None),
+            ("user", "looks thin to me", Some("dev-alex")),
+            ("user", "agreed, add risks", Some("dev-sam")),
+            ("user", "add the risks", Some("dev-sam")),
+            ("assistant", "Added.", None),
+        ]
+    );
+    assert_eq!(
+        msgs[5].request_event_id, msgs[4].event_id,
+        "the reply answers the woken message, not a people-only one"
+    );
+}
+
+/// A message no device typed (a trigger, a parent thread) has no sender.
+#[test]
+fn only_a_device_origin_names_a_sender() {
+    let events = vec![make_event(
+        "MessageReceived",
+        json!({"text": "run the report", "origin": {"kind": "engine", "reason": {"kind": "orphan_recovery"}}}),
+        0,
+    )];
+    assert_eq!(build_session_messages(&events)[0].sender_device_id, None);
+}
+
+/// A people-only message posted while a reply streams follows that reply,
+/// which never saw it. While the turn still runs, its in-progress reply stays
+/// last and keeps the running steps on the message that woke it.
+#[test]
+fn a_people_only_message_during_a_turn_follows_its_reply() {
+    let device = |id: &str| json!({"kind": "device", "device_id": id});
+    let asked = make_event(
+        "MessageReceived",
+        json!({"text": "draft the plan", "origin": device("dev-sam")}),
+        0,
+    );
+    let streamed = make_event("TextStreamed", json!({"text": "Working on"}), 1);
+    let aside = make_event(
+        "PeopleMessagePosted",
+        json!({"text": "keep it short", "actor": device("dev-alex")}),
+        2,
+    );
+    let done = make_event("ResponseGenerated", json!({"text": "Here it is."}), 3);
+    let roles = |events: &[EventRow]| -> Vec<(String, String)> {
+        build_session_messages(events)
+            .into_iter()
+            .map(|m| (m.role, m.content))
+            .collect()
+    };
+    let pair = |role: &str, content: &str| (role.to_string(), content.to_string());
+
+    assert_eq!(
+        roles(&[asked.clone(), streamed.clone(), aside.clone(), done]),
+        vec![
+            pair("user", "draft the plan"),
+            pair("assistant", "Working on\n\nHere it is."),
+            pair("user", "keep it short"),
+        ]
+    );
+    assert_eq!(
+        roles(&[asked, streamed, aside]),
+        vec![
+            pair("user", "draft the plan"),
+            pair("user", "keep it short"),
+            pair("assistant", "Working on"),
+        ]
+    );
+}

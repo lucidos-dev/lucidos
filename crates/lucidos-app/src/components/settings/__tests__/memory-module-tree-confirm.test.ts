@@ -108,6 +108,7 @@ describe('choosing Tree', () => {
         not_served: [],
         needs_vision: false,
         asks_no_model: false,
+        unresolved: null,
         vision: true,
         recommended: [
           { model: 'gpt-6.1-sol', effort: 'low' },

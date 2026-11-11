@@ -560,3 +560,107 @@ async fn a_task_tier_binds_only_its_recommended_models() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+/// With the guard and its judge on, an install no judge model reaches refuses
+/// the turn and names the fix. Anthropic alone reaches Haiku 5.5 (I5).
+#[tokio::test]
+async fn a_guarded_turn_refuses_only_without_a_judge_model() {
+    let (pool, db_name) = setup_test_db().await;
+    let registry: ModelRegistry = Arc::new(RwLock::new(load_from_db(&pool).await));
+    let xai = StubRouter::defaulting_to(&[ProviderKind::XAi], "grok-4.6");
+    let refusal = guarded_turn_refusal(&pool, &registry, xai.as_ref(), true)
+        .await
+        .expect("no judge model reaches xAI");
+    assert!(
+        refusal.contains("Settings → Models → Command judge"),
+        "{refusal}"
+    );
+    assert!(!refusal.contains("grok-4.6"), "{refusal}");
+    let anthropic = StubRouter::holding(&[ProviderKind::Anthropic]);
+    assert_eq!(
+        guarded_turn_refusal(&pool, &registry, anthropic.as_ref(), true).await,
+        None
+    );
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A System One judge the owner picked resolves the judge where no chat judge
+/// model does. It then runs alone, never on the chat model (I4).
+#[tokio::test]
+async fn a_picked_system_one_judge_resolves_without_a_chat_judge_model() {
+    use crate::core::AuthType;
+    use crate::llm::judgment::endpoint::TYPESAFE_CREDENTIAL_SERVICE;
+    use crate::llm::judgment::JudgmentSite;
+    use crate::test_support::{seed_credential, seed_preference};
+    let (pool, db_name) = setup_test_db().await;
+    let registry: ModelRegistry = Arc::new(RwLock::new(load_from_db(&pool).await));
+    let xai = StubRouter::defaulting_to(&[ProviderKind::XAi], "grok-4.6");
+    seed_credential(
+        &pool,
+        TYPESAFE_CREDENTIAL_SERVICE,
+        "https://api.typesafe.ai/v1",
+        AuthType::Bearer,
+        "test-key",
+    )
+    .await;
+    let site = JudgmentSite::CommandGuard.preference_key().key();
+    seed_preference(&pool, site, "jev").await.unwrap();
+    assert_eq!(
+        guarded_turn_refusal(&pool, &registry, xai.as_ref(), true).await,
+        None
+    );
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The judge switched off is an explicit choice: the static lists decide, and
+/// no turn is refused for the judge model (I6).
+#[tokio::test]
+async fn a_turn_with_the_judge_off_never_refuses() {
+    let (pool, db_name) = setup_test_db().await;
+    let registry: ModelRegistry = Arc::new(RwLock::new(load_from_db(&pool).await));
+    let xai = StubRouter::defaulting_to(&[ProviderKind::XAi], "grok-4.6");
+    assert_eq!(
+        guarded_turn_refusal(&pool, &registry, xai.as_ref(), false).await,
+        None
+    );
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A stored judge model no configured provider serves refuses by name. It is
+/// never moved to a measured default.
+#[tokio::test]
+async fn an_unserved_judge_pick_refuses_by_name() {
+    let (pool, db_name) = setup_test_db().await;
+    let registry: ModelRegistry = Arc::new(RwLock::new(load_from_db(&pool).await));
+    crate::core::PreferenceStore::set_row_for_test(
+        &pool,
+        prefs::MODEL_COMMAND_JUDGE.key(),
+        "gemini-3.1-flash-lite",
+    )
+    .await
+    .unwrap();
+    let anthropic = StubRouter::holding(&[ProviderKind::Anthropic]);
+    let refusal = guarded_turn_refusal(&pool, &registry, anthropic.as_ref(), true)
+        .await
+        .expect("Anthropic does not serve the pick");
+    assert!(refusal.contains("'gemini-3.1-flash-lite'"), "{refusal}");
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// An e2e engine on the mock judges on the mock, so it never refuses.
+#[tokio::test]
+async fn a_mock_engine_never_refuses_a_guarded_turn() {
+    let (pool, db_name) = setup_test_db().await;
+    let registry: ModelRegistry = Arc::new(RwLock::new(load_from_db(&pool).await));
+    let mock = crate::llm::mock::MockProvider::new(crate::llm::MOCK_MODEL.to_string());
+    assert_eq!(
+        guarded_turn_refusal(&pool, &registry, &mock, true).await,
+        None
+    );
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

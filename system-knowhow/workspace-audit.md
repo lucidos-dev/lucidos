@@ -17,7 +17,7 @@ report. Each section carries its own scan, checks and fixes.
 
 | id | load | covers |
 |---|---|---|
-| `triggers` | `system-knowhow/workspace-audit/triggers` | intent vs knowhow split, retired event subscriptions, slugs, notification taps |
+| `triggers` | `system-knowhow/workspace-audit/triggers` | intent vs knowhow split, retired event subscriptions, slugs, notification taps, coding-agent grants |
 | `apps` | `system-knowhow/workspace-audit/apps` | SDK boilerplate, the isolated app frame, escaping, theme names, dashboard names, hand-drawn controls, the ready signal, widgets |
 | `knowhow` | `system-knowhow/workspace-audit/knowhow` | frontmatter, naming, placement, unreachable references, orphans |
 | `intents` | `system-knowhow/workspace-audit/intents` | frontmatter, knowhow ids, tone |
@@ -65,6 +65,9 @@ It differs from a full pass in four ways:
 - **Go straight to the section's § Remediation.** The user asking to migrate has already
   answered "do the fixes", so do not ask again, and do not stop at a report.
 - **Claim only what you ran.** The report carries the one check.
+
+One break can span checks in two sections, as when a release notice names
+them. Run each named check the same way, and report them together.
 
 A targeted run is NOT a lighter audit. An unqualified "audit my workspace" is
 always the full pass.
@@ -163,6 +166,7 @@ calling a category clean.
 | `cred-env` | a credential read from the environment | `cross-cutting` |
 | `auth-header` | an auth header built in app UI code | `cross-cutting` |
 | `retired-tools` | LLM tools that were retired | `cross-cutting` |
+| `retired-work-items` | the retired work-item SDK namespace and routes | `cross-cutting` |
 | `machine-path` | a hardcoded home or machine path | `scripts` |
 | `db-defaults` | database access that may lean on libpq defaults the engine no longer sets | `scripts` |
 | `plugin-manifests` | authored plugin-root `manifest.toml` files and whether each declares `engine` | `plugins` |

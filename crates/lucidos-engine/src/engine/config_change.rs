@@ -80,6 +80,33 @@ pub(crate) enum ConfigUndo {
     },
 }
 
+impl ConfigUndo {
+    /// Whether only the owner may apply this undo: it would widen a trigger's
+    /// grants, or rewrite the work of a granted one.
+    pub(crate) fn needs_the_owner(&self, current: Option<&crate::triggers::TriggerConfig>) -> bool {
+        let ConfigUndo::WriteTrigger { write, payload, .. } = self else {
+            return false;
+        };
+        if !matches!(write, TriggerWrite::Created | TriggerWrite::Updated) {
+            return false;
+        }
+        match current {
+            None => {
+                payload.get("coding_agent_grant").and_then(Value::as_bool) == Some(true)
+                    || !crate::triggers::config::parse_side_effect_grant(
+                        payload.get("side_effect_grant"),
+                    )
+                    .is_empty()
+            }
+            Some(current) => {
+                let mut next = current.clone();
+                next.apply_update(payload);
+                current.widens_a_grant(&next) || current.unowned_edit_clears_grants(&next)
+            }
+        }
+    }
+}
+
 /// One config change, read from its stored event.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ConfigChange {
@@ -433,6 +460,7 @@ async fn announce(engine: &LucidosEngine, frame: &EmittedEvent) -> Result<(), Bo
             tap: notice.tap,
             actor: None,
             audience: notice.audience,
+            push_group: None,
         }))
         .await?;
     Ok(())

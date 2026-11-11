@@ -820,8 +820,8 @@ fn the_bands_follow_the_reference_intelligence_rung() {
     assert_eq!(at_high.reference, Some(opus_at("high")));
 }
 
-/// On the general profile only: the Coding Agent Index scores some higher
-/// efforts lower, and the coding ladders show that (ADR 0527).
+/// General-profile samples retain their estimated gains. Both profiles also
+/// obey the nondecreasing effort envelope checked across the full data below.
 #[test]
 fn a_models_higher_efforts_read_as_more_intelligent() {
     let ladder = served(LadderSurface::Chat, None, "medium", 0.0);
@@ -833,14 +833,15 @@ fn a_models_higher_efforts_read_as_more_intelligent() {
     }
 }
 
-/// The fill never rewrites a pair the coding index measured.
+/// Index coverage survives smoothing; a coding estimate stays on its own
+/// profile rather than being replaced by the general profile.
 #[test]
-fn a_measured_coding_score_is_never_filled_over() {
+fn covered_coding_scores_keep_their_profile_after_smoothing() {
     let max = estimate_of("claude-haiku-5-5", "max").expect("Haiku max is estimated");
     assert!(!max.coding_estimated, "the index measured Haiku at max");
     assert!(
         max.coding_band < max.general_band,
-        "the measured coding dip stays: {max:?}"
+        "coding stays distinct from general after smoothing: {max:?}"
     );
 }
 
@@ -1371,7 +1372,7 @@ fn a_chat_refusal_names_the_lucidos_agent_ladder_and_its_surface_flag() {
     );
     assert!(err.contains("--surface chat"), "{err}");
     assert!(ladder
-        .check_pick(&IntelligenceRung::new("claude-opus-5-5[1m]", "max"))
+        .check_pick(&IntelligenceRung::new("claude-opus-5-5[1m]", "xhigh"))
         .is_ok());
 }
 
@@ -1395,7 +1396,7 @@ async fn an_agents_chat_pick_is_bound_to_the_chat_ladder() {
     };
     assert_eq!(check(None, None).await, Ok(()), "no pick is the default");
     assert_eq!(
-        check(Some("claude-opus-5-5[1m]"), Some("max")).await,
+        check(Some("claude-opus-5-5[1m]"), Some("xhigh")).await,
         Ok(())
     );
     let err = check(Some("claude-sonnet-5-5"), Some("low"))
@@ -1405,7 +1406,7 @@ async fn an_agents_chat_pick_is_bound_to_the_chat_ladder() {
         err.contains("claude-sonnet-5-5=low is not a rung on the Lucidos Agent"),
         "{err}"
     );
-    assert!(err.contains("claude-opus-5-5=max"), "{err}");
+    assert!(err.contains("claude-fable-5-2=max"), "{err}");
     let err = check(Some("claude-sonnet-5-5"), None).await.unwrap_err();
     assert!(
         err.contains("claude-sonnet-5-5=high"),
@@ -1434,4 +1435,32 @@ async fn the_chat_ladder_loads_with_the_account_default_marked() {
         && r.effort == default.effort));
     assert!(!ladder.pairs().is_empty());
     crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// An operational ladder must never demote a model when its effort increases.
+/// Check the shipped data independently of the generator that writes it.
+#[test]
+fn every_models_effort_bands_are_nondecreasing() {
+    let efforts = ["none", "low", "medium", "high", "xhigh", "max"];
+    for model in rung_estimates().pairs.iter().map(|pair| &pair.model) {
+        let mut previous: Option<&EstimatedPair> = None;
+        for effort in efforts {
+            let Some(pair) = estimate_of(model, effort) else {
+                continue;
+            };
+            if let Some(prev) = previous {
+                assert!(
+                    pair.general_band >= prev.general_band,
+                    "{model}: {} to {effort} lowers general capability",
+                    prev.effort
+                );
+                assert!(
+                    pair.coding_band >= prev.coding_band,
+                    "{model}: {} to {effort} lowers coding capability",
+                    prev.effort
+                );
+            }
+            previous = Some(pair);
+        }
+    }
 }

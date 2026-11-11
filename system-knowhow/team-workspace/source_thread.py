@@ -1,14 +1,14 @@
-"""Find the source address of a work item, for the outbound script triggers.
+"""Find the source address of a root thread, for the outbound script triggers.
 
 Copy to data/scripts/team-workspace/source_thread.py. The intake trigger's
 continue key starts with the source name the translation script wrote, so
-the key alone says which source a work item came from and where to reply.
+the key alone says which source a root thread came from and where to reply.
 See system-knowhow/team-workspace.md.
 """
 import json
 import subprocess
 
-# A family deeper than this is a loop in the data, not a real work item.
+# A family deeper than this is a loop in the data, not a real family.
 MAX_DEPTH = 20
 
 
@@ -23,7 +23,7 @@ def events(event_type, thread_id):
 
 
 def family_root(thread_id):
-    """The work item root: follow each thread's first message up to its parent."""
+    """The root thread: follow each thread's first message up to its parent."""
     for _ in range(MAX_DEPTH):
         received = events("MessageReceived", thread_id)
         parent = received[-1]["payload"].get("parent_thread_id") if received else None
@@ -43,7 +43,7 @@ def continue_key(root):
 
 
 def keyed_by(thread_id, source):
-    """(root, address) when `source` started this thread's work item, else None.
+    """(root, address) when `source` started this thread's root thread, else None.
 
     The address is the rest of the continue key after the source name.
     """

@@ -18,3 +18,8 @@ widgets\(action="(?:un)?pin"\)	widgets(action="add_to_dashboard"), or widgets(ac
 \bthread\s+widgets\b	the thread's inline widgets, drawn from its replies	docs/adr/0621-widgets-one-box-no-pin.md
 \bpush\s+audience\b	notification audience	docs/adr/0623-team-workspace-factory.md
 \b(?-i:Models)(?:\s+(?:→|->|>)\s+Providers\b|,\s+Providers\b|\s+\(Providers\))	Settings → Providers (Providers is its own Settings page)	docs/adr/0637-providers-settings-page.md
+\battend(?:ed)?\s+modes?\b	nothing: every coding-agent session takes the workspace grants, and a trigger needs its coding-agent grant	docs/adr/0641-coding-agents-trust-by-provenance.md
+\bpermission\s+waits?\b	nothing: a card waits for a human, and a trigger needs its coding-agent grant to start a coding agent	docs/adr/0641-coding-agents-trust-by-provenance.md
+\bcommand_guard_coding_agents\b	coding_agent_auto_answer (coding-agent auto-answer), independent of command_guard	docs/adr/0644-command-guard-on-by-default.md
+\bwork[\s-]+items?\b	root thread (a root thread and its sub-threads); WorkItem* event types are legacy spellings	docs/adr/0649-people-only-messages.md
+\bworkItems\b	lucidos.threads.people	docs/adr/0649-people-only-messages.md

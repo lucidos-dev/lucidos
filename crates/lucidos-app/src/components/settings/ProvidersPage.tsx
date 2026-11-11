@@ -1,5 +1,6 @@
 import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
+import { loadChatGptPlanStatus } from '../../store/actions/chatgptPlan';
 import { loadClaudeGatewayStatus } from '../../store/actions/claudeGateway';
 import { loadCredentials } from '../../store/actions/credentials';
 import { currentVertexRegion, loadPreferences, setVertexRegion } from '../../store/actions/preferences';
@@ -7,6 +8,7 @@ import { preferences } from '../../store/store';
 import { providerAnchor } from '../../store/modelProviders';
 import { Dropdown } from '../shared/Dropdown';
 import { AnthropicProviderSettings } from './AnthropicProviderSettings';
+import { ChatGptPlanSettings } from './ChatGptPlanSettings';
 import { ClaudeGatewaySettings } from './ClaudeGatewaySettings';
 import { CloudflareWorkersAiSettings } from './CloudflareWorkersAiSettings';
 import { CustomSystemOneSettings } from './CustomSystemOneSettings';
@@ -86,6 +88,7 @@ export function ProvidersPage() {
     loadPreferences(),
     loadCredentials(),
     loadClaudeGatewayStatus(),
+    loadChatGptPlanStatus(),
   ]));
 
   return (
@@ -100,6 +103,7 @@ export function ProvidersPage() {
         <OpenCodeFreeSettings />
         <LocalProviderSettings />
         <ClaudeGatewaySettings />
+        <ChatGptPlanSettings />
       </div>
       <div class="settings-section">
         <div class="settings-section-title">System One</div>

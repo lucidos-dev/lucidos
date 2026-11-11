@@ -25,7 +25,7 @@ export interface PresenceCheckPayload {
   deadline_ms: number;
   /** Engine wall-clock at emit time. Drives the freshness gate. */
   sent_at_ms: number;
-  /** The devices this push is for (a work item's driver and watchers).
+  /** The devices this push is for (a root thread's driver and watchers).
    *  Absent means every device. */
   audience?: string[] | null;
 }

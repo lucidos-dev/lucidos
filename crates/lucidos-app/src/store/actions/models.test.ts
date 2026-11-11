@@ -180,6 +180,19 @@ describe('chatModelOptions', () => {
     expect(chatModelOptions()).toEqual([]);
   });
 
+  // Mirrors the engine's `resolve_route`: the plan route leads a GPT row only so
+  // a signed-in plan wins. A user who set up nothing never chose it.
+  it('names the API route of an unconfigured GPT model, not the plan', () => {
+    const gpt = dualRouted('gpt-x', 'GPT X', ['chatgpt-plan', 'openai']);
+    chatModels.value = { status: 'loaded', data: [gpt] };
+
+    configuredProviders.value = [];
+    expect(resolvedRoute('gpt-x')?.provider).toBe('openai');
+
+    configuredProviders.value = ['chatgpt-plan', 'openai'];
+    expect(resolvedRoute('gpt-x')?.provider).toBe('chatgpt-plan');
+  });
+
   // Honoured or refused, never substituted. A model whose PICKED backend is
   // parked stays listed, because the provider step is the only place the user
   // can fix it. Hiding the model would be a dead end.
@@ -256,8 +269,10 @@ describe('chatModelOptions', () => {
   });
 
   // The newest Anthropic builtin heads the list.
-  it('offers Fable 5.1 first and not the retired Fable 5', () => {
-    expect(MODELS[0]).toEqual({ value: 'claude-fable-5-1', label: 'Fable 5.1' });
+  it('offers Fable 5.2 first and not the retired Fable 5', () => {
+    expect(MODELS[0]).toEqual({ value: 'claude-fable-5-2', label: 'Fable 5.2' });
+    expect(MODELS).toContainEqual({ value: 'gemini-4-argon', label: 'Gemini 4 Argon' });
+    expect(MODELS).toContainEqual({ value: 'gemini-4-carbon', label: 'Gemini 4 Carbon' });
     expect(MODELS.some((m) => m.value.startsWith('claude-fable-5['))).toBe(false);
     expect(MODELS.some((m) => m.value === 'claude-fable-5')).toBe(false);
   });

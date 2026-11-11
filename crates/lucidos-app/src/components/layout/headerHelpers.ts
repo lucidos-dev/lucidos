@@ -43,12 +43,12 @@ function getHostname(url: string): string {
   try { return new URL(url).hostname; } catch { return url; }
 }
 
-/** An app's title in the Canvas header. A widget says so, and its full form
- *  names the thread it came from (ADR 0402). */
+/** An app's name in the Canvas header. Widget details and the origin thread
+ *  belong in the full tooltip and history title (ADR 0402). */
 function appTitle(app: App, short: boolean): string {
-  if (app.kind !== 'widget') return app.name;
+  if (short || app.kind !== 'widget') return app.name;
   const origin = app.origin_thread_id ? threadMap.value.get(app.origin_thread_id)?.meta.title : undefined;
-  if (short || !origin || origin === PENDING_TITLE_PLACEHOLDER) return `${app.name} (widget)`;
+  if (!origin || origin === PENDING_TITLE_PLACEHOLDER) return `${app.name} (widget)`;
   return `${app.name} (widget from ${origin})`;
 }
 

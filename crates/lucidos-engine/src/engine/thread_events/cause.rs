@@ -356,6 +356,16 @@ impl From<ProposalHold> for UnproposedReason {
     }
 }
 
+/// What flipped a thread's *agent pause* (ADR 0649).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPauseCause {
+    /// A message mentioned only people, or mentioned the agent.
+    Mention,
+    /// Someone tapped the pause chip above the composer.
+    Chip,
+}
+
 /// Why a change left the landing lane without landing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

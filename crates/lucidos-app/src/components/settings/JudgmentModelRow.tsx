@@ -48,8 +48,6 @@ export function JudgmentModelRow(props: {
   /** Indent under the rows this one qualifies. */
   nested?: boolean;
   explainer?: ComponentChildren;
-  /** A reason from the surrounding feature, such as the guard being off. */
-  disabled?: boolean;
 }) {
   // Both signals the row is derived from, read during render so it tracks
   // them. It waits on credentials too, because which System One rows are
@@ -103,7 +101,6 @@ export function JudgmentModelRow(props: {
       model={judgmentSelectedModel(picked, chatModel)}
       effort={judgmentSelectedEffort(picked, stored.effort ?? resolved?.effort ?? null)}
       unsetEffortLabel={PROVIDER_DEFAULT_EFFORT_LABEL}
-      disabled={props.disabled}
       onChange={(patch) => void apply(patch)}
     />
   );

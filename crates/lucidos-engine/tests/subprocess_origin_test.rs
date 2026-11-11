@@ -81,6 +81,7 @@ fn subprocess_curl_into_different_thread_stamps_agent_api_actor() {
             user_agent,
             mode,
             source_thread_id,
+            ..
         }) => {
             assert_eq!(user_agent.as_deref(), Some("curl/8.7.1"));
             assert_eq!(
@@ -213,6 +214,7 @@ fn api_origin_with_source_thread_id_round_trips_as_json() {
         user_agent: Some("curl/8.7.1".into()),
         mode: ActorMode::Agent,
         source_thread_id: Some(source),
+        emitting_trigger_id: None,
     };
     let json = serde_json::to_value(&origin).unwrap();
     assert_eq!(json["kind"], "api");
@@ -248,6 +250,7 @@ fn api_origin_legacy_rows_deserialize_without_source_thread_id() {
         user_agent: None,
         mode: ActorMode::Human,
         source_thread_id: None,
+        emitting_trigger_id: None,
     };
     let json = serde_json::to_value(&origin).unwrap();
     assert!(

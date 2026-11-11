@@ -19,7 +19,6 @@ use crate::engine::thread_events::{ActorMode, EngineReason, MessageOrigin, Trigg
 use crate::engine::types::*;
 use crate::engine::LucidosEngine;
 use crate::triggers::continue_key::FireTarget;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::process_helpers::TriggerContext;
@@ -154,9 +153,6 @@ impl LucidosEngine {
     /// `invocation` records which path fired this run (cron schedule or matched event).
     /// `target` says whether the fire starts a thread or continues the open
     /// thread holding its continue key (ADR 0623).
-    /// `external_cancel`, when set, is forwarded into the per-thread cancellation
-    /// token so the scheduler can stop an in-flight trigger cleanly (UI delete,
-    /// disable, update) without aborting the agentic loop mid-tool.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn process_trigger(
         &self,
@@ -174,7 +170,6 @@ impl LucidosEngine {
         // preferred provider decide. A pin naming an unconfigured backend
         // refuses the fire rather than running it somewhere else.
         provider: Option<&str>,
-        external_cancel: Option<CancellationToken>,
         // See `TriggerContext::queue_entry_id`.
         queue_entry_id: Uuid,
         retry_of: Option<crate::engine::thread_events::RetryOf>,
@@ -247,7 +242,6 @@ impl LucidosEngine {
                 None,
                 origin,
                 None,
-                external_cancel,
                 crate::engine::FollowUpUrgency::Normal,
                 None,
             )
@@ -335,7 +329,6 @@ impl LucidosEngine {
             title,
             origin,
             voice_session_id,
-            None,
             urgency,
             input_turn,
         )

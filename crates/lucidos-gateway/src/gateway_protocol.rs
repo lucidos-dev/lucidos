@@ -509,6 +509,10 @@ pub struct ListedWorkspace {
     /// workspace from a failed one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// B's unread-notification count for the workspace, absent when B has none
+    /// to report (a stopped engine, or an older B that never sent one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_count: Option<u64>,
 }
 
 /// B's workspaces, for A's Workspaces list.
@@ -523,6 +527,7 @@ async fn list_workspaces(State(state): State<GatewayState>) -> Json<Vec<ListedWo
                 name: w.name,
                 health: w.health,
                 last_error: w.last_error,
+                unread_count: w.unread_count,
             })
             .collect(),
     )

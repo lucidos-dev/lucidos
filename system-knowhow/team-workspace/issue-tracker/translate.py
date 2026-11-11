@@ -33,7 +33,7 @@ def email_of(login):
 
 
 def activity(headers, body):
-    """(kind, issue, text, login) for a delivery worth a work item, else None."""
+    """(kind, issue, text, login) for a delivery worth a thread, else None."""
     kind = headers.get("X-GitHub-Event")
     issue = body.get("issue") or {}
     if kind == "issues" and body.get("action") == "opened":

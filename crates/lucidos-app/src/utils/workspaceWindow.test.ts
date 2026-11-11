@@ -358,6 +358,15 @@ describe('the landing', () => {
     ]);
   });
 
+  // The same rule one level up. A row that passes a literal mode has decided
+  // the window for itself, so a desktop click can repoint the window the user
+  // clicked from.
+  it('takes its mode from the gesture, never from a literal at the call site', () => {
+    const literal = /openWorkspaceIn\(\s*['"`]/;
+    const callers = sources().filter(([, code]) => literal.test(code));
+    expect(callers.map(([path]) => path)).toEqual([]);
+  });
+
   it('is absent from every mechanism when no row asked for one', async () => {
     await openWorkspaceIn('in-place', 'work');
     expect(openWorkspace).toHaveBeenCalledWith('work', undefined);

@@ -3,8 +3,8 @@
 
 Copy to data/triggers/chat-translate/scripts/run.py and run it every minute.
 The worked example reads Slack's Web API. It polls rather than takes a
-webhook, so it needs no public address. A new message that mentions the bot starts a work
-item. Every later reply in its chat thread continues it.
+webhook, so it needs no public address. A new message that mentions the bot starts a
+root thread. Every later reply in its chat thread continues it.
 See system-knowhow/team-workspace/chat-tool.md.
 """
 import json

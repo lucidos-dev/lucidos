@@ -27,4 +27,13 @@ describe('the mark speaks the state badge', () => {
     expect(mark.getAttribute('data-tooltip-rows')).toContain('Building new version');
     expect(host.querySelector('.brand-badge')?.getAttribute('data-tooltip')).toBeNull();
   });
+
+  it('puts the job between the menu name and the connection state', () => {
+    engineBuilding.value = true;
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    render(<BrandMenuButton placement="brand" />, host);
+    const label = host.querySelector('[data-role="brand-menu-toggle"]')!.getAttribute('aria-label')!;
+    expect(label.startsWith(`${MENU_NAME} · Building new version · `)).toBe(true);
+  });
 });

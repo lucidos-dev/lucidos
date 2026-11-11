@@ -124,11 +124,18 @@ export function openProviderBlock(provider: string): void {
   openSettingsSubview('providers');
 }
 
-/** Deep-link to Settings → Permissions → Command safety → Answer coding-agent questions, the
- *  row a coding-agent permission card points at. */
-export function openCommandGuardCodingAgentsSettings(): void {
-  settingsScrollTarget.value = 'command-safety:coding-agents';
+/** Deep-link to Settings → Permissions → Coding agent permissions → Auto-answer
+ *  coding-agent cards, the row a coding-agent permission card points at. */
+export function openCodingAgentAutoAnswerSettings(): void {
+  settingsScrollTarget.value = 'permissions:coding-agent-auto-answer';
   openSettingsSubview('permissions');
+}
+
+/** Deep-link to Settings → Models → Command judge. Command safety and the
+ *  coding-agent auto-answer switch both run on that model, so both link here. */
+export function openCommandJudgeModelSettings(): void {
+  settingsScrollTarget.value = 'models:command-judge';
+  openSettingsSubview('models');
 }
 
 /** Deep-link to the OpenCode Free switch on the Providers page. It is where

@@ -124,11 +124,32 @@ async fn a_delivered_callback_reaches_its_flow_and_closes_the_slot() {
     };
     assert!(ok);
     assert!(page.contains("Authorization complete"), "{page}");
-    assert_eq!(pending.received().await.unwrap(), "the-code");
+    assert_eq!(pending.received().await.unwrap().code, "the-code");
 
     assert!(
         matches!(deliver_callback(&query), CallbackDelivery::Unclaimed { .. }),
         "a replay finds no slot"
+    );
+}
+
+#[tokio::test]
+async fn a_delivered_callback_hands_its_flow_the_issued_client_id() {
+    let state = unique_state("/dev/");
+    let pending = PendingCallback::open(&state, "ChatGPT");
+    let query = format!(
+        "code=the-code&state={}&client_id=app_issued",
+        urlencoding::encode(&state)
+    );
+    assert!(matches!(
+        deliver_callback(&query),
+        CallbackDelivery::Accepted { ok: true, .. }
+    ));
+    assert_eq!(
+        pending.received().await.unwrap(),
+        AuthorizationGrant {
+            code: "the-code".into(),
+            client_id: Some("app_issued".into()),
+        }
     );
 }
 

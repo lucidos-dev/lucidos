@@ -1,6 +1,7 @@
 # 0125: The coding-agent gate enforces the workspace allowlist, bounded by derive_allow_pattern
 
-- **Status**: Accepted
+- **Status**: Accepted; its placement below the unattended fast path is
+  superseded by [ADR 0641](0641-coding-agents-trust-by-provenance.md): every coding-agent session takes the workspace grants
 - **Date**: 2026-08-25
 
 ## Context

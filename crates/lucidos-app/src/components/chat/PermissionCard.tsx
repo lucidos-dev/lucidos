@@ -1,8 +1,10 @@
 import type { ComponentChildren } from 'preact';
 import { useEffect, useRef } from 'preact/hooks';
 import { showToast } from '../../store/store';
-import { openCommandGuardCodingAgentsSettings } from '../../store/actions/menu';
-import { currentCommandGuard, currentCommandGuardCodingAgents } from '../../store/actions/preferences';
+import { openCodingAgentAutoAnswerSettings, openCommandJudgeModelSettings } from '../../store/actions/menu';
+import { useBackgroundModels } from '../settings/useBackgroundModels';
+import { PREF_MODEL_COMMAND_JUDGE } from '@lucidos/preference-catalog';
+import { currentCodingAgentAutoAnswer } from '../../store/actions/preferences';
 import { SettingsIcon } from '../shared/icons';
 import { resolveCodingAgentPermission, resolveCommandPermission, resolveMcpPermission } from '../../store/actions/permissions';
 import { changeKindName, type AllowScope } from '../../store/thread-events';
@@ -307,12 +309,17 @@ export const PLAIN_RESOLUTION_NOTES: [string, string][] = [
   ['Coding agent terminated before answering', 'Closed because the agent stopped before anyone answered.'],
   ['Auto-allowed: file write inside', 'Allowed by Lucidos: the agent was writing a file in its own working copy.'],
   ['Auto-allowed: the command guard', 'Allowed by Lucidos: its command check judged this safe to run.'],
+];
+
+/** Reasons only the retired unattended lane wrote (ADR 0641). Older cards in a
+ *  thread's history still carry them, so the card keeps translating them. */
+export const LEGACY_RESOLUTION_NOTES: [string, string][] = [
   ['Auto-allowed: benign in-workspace operation', 'Allowed by Lucidos: a harmless step in a trigger run with nobody to ask.'],
   ['Auto-allowed: covered by the trigger', 'Allowed by Lucidos: the trigger was given permission for this kind of action.'],
   ['Auto-denied: catastrophic operation', 'Refused by Lucidos: this is never allowed in a run with nobody to ask.'],
   ['Auto-denied: this coding-agent session runs unattended, and the command guard', 'Refused by Lucidos: its command check could not confirm this was safe, and nobody was there to ask.'],
   ['Auto-denied: this unattended coding-agent session has no side-effect grant', 'Refused by Lucidos: this unattended run has no permission for this kind of action.'],
-  ['Auto-denied: nobody answered this permission card', 'Refused by Lucidos: nobody answered this card within its permission wait.'],
+  ['Auto-denied: nobody answered this permission card', 'Refused by Lucidos: nobody answered this card in time.'],
 ];
 
 /** What a card the ENGINE resolved says under its buttons, in plain words.
@@ -323,7 +330,8 @@ export function engineResolutionNote(
 ): string | null {
   const reason = resolved?.reason?.trim();
   if (!reason || reason === USER_DENIAL_REASON) return null;
-  const plain = PLAIN_RESOLUTION_NOTES.find(([opening]) => reason.startsWith(opening));
+  const plain = [...PLAIN_RESOLUTION_NOTES, ...LEGACY_RESOLUTION_NOTES]
+    .find(([opening]) => reason.startsWith(opening));
   if (plain) return plain[1];
   const end = reason.search(/\.\s/);
   return end === -1 ? reason : reason.slice(0, end + 1);
@@ -400,6 +408,27 @@ function renderPermissionButton(
   );
 }
 
+/** Auto-answer is on, but no judge model resolves, so the engine carded this
+ *  command. Says so, in the engine's words, and links to the picker. Draws
+ *  nothing while the judge has a model. */
+function JudgeModelLink() {
+  const background = useBackgroundModels();
+  const why = background.row(PREF_MODEL_COMMAND_JUDGE.key)?.unresolved;
+  if (!why) return null;
+  return (
+    <button
+      type="button"
+      class="permission-settings-link"
+      data-not-choice="true"
+      data-tooltip={why}
+      onClick={openCommandJudgeModelSettings}
+    >
+      <SettingsIcon />
+      Pick a judge model so Lucidos can answer
+    </button>
+  );
+}
+
 /** The shared card chrome: a question and one wrapping row of buttons. Each
  *  permission card (coding-agent, command-guard, MCP) builds its own `buttons`
  *  and feeds them here. */
@@ -412,7 +441,7 @@ function PermissionBodyShell({
   mark,
   terminated,
   note,
-  commandGuardLink = false,
+  settingsLink = null,
 }: {
   requestId: string;
   question: ComponentChildren;
@@ -422,9 +451,9 @@ function PermissionBodyShell({
   mark: PickMark;
   terminated: boolean;
   note: string | null;
-  /** A pending command card links to the Command guard's coding-agents row
-   *  while that switch is off. */
-  commandGuardLink?: boolean;
+  /** Where a pending command card points: the auto-answer switch while it
+   *  is off, else the judge model, shown only when no judge model resolves. */
+  settingsLink?: 'auto-answer' | 'judge-model' | null;
 }) {
   const bodyStateClass = answered ? ' permission-body-answered'
     : terminated ? ' permission-body-terminated'
@@ -453,17 +482,18 @@ function PermissionBodyShell({
     >
       <div class="permission-text">{question}</div>
       <div class="permission-actions">
-        {commandGuardLink && live && (
+        {settingsLink === 'auto-answer' && live && (
           <button
             type="button"
             class="permission-settings-link"
             data-not-choice="true"
-            onClick={openCommandGuardCodingAgentsSettings}
+            onClick={openCodingAgentAutoAnswerSettings}
           >
             <SettingsIcon />
-            Let the guard answer these
+            Let Lucidos answer these
           </button>
         )}
+        {settingsLink === 'judge-model' && live && <JudgeModelLink />}
         {buttons.map(spec => renderPermissionButton(spec, state))}
       </div>
       {note && <div class="permission-resolution-note">{note}</div>}
@@ -590,8 +620,10 @@ export function PermissionBody({ event, resolved, terminated }: PermissionBodyPr
       mark={mark}
       terminated={!!terminated}
       note={engineResolutionNote(resolved)}
-      commandGuardLink={
-        isCommandTool(event.tool_name) && !(currentCommandGuard() && currentCommandGuardCodingAgents())
+      settingsLink={
+        !isCommandTool(event.tool_name) ? null
+          : currentCodingAgentAutoAnswer() ? 'judge-model'
+          : 'auto-answer'
       }
     />
   );

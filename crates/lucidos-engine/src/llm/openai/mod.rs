@@ -12,12 +12,15 @@
 
 use crate::core::AuthType;
 use crate::llm::api_usage::ApiUsage;
+use crate::llm::chatgpt_plan::served_models::ServedModels;
+use crate::llm::chatgpt_plan::{ChatGptPlanAccess, ChatGptPlanError, ChatGptPlanTokens};
 use crate::llm::model_registry::{gpt_major_version, gpt_version};
 use crate::llm::provider::{
     LlmProvider, LlmResponse, Message, ModelSelection, TokenCallback, ToolCall, ToolDefinition,
 };
 use crate::llm::usage_wire;
 use async_trait::async_trait;
+use std::sync::Arc;
 use std::time::Duration;
 
 mod chat;
@@ -185,8 +188,22 @@ pub(crate) fn takes_cache_breakpoints(model: &str) -> bool {
     gpt_version(model).is_some_and(|version| version >= (5, 6))
 }
 
+/// Who an [`OpenAiProvider`] speaks for. That sets how it authenticates and
+/// which request profile it sends.
+#[derive(Clone)]
+pub(crate) enum OpenAiEndpoint {
+    /// An API key, or an empty one for a keyless local server.
+    Platform { api_key: String },
+    /// A ChatGPT plan sign-in (ADR 0636). Its token goes only to OpenAI, and
+    /// only for a model the plan lists.
+    ChatGptPlan {
+        access: ChatGptPlanAccess,
+        served: Arc<ServedModels>,
+    },
+}
+
 pub struct OpenAiProvider {
-    api_key: String,
+    endpoint: OpenAiEndpoint,
     model: String,
     /// Full Chat Completions endpoint (`{base}/chat/completions`). Configurable
     /// so the same struct serves direct OpenAI, OpenRouter, and a local
@@ -241,7 +258,7 @@ impl OpenAiProvider {
             .pool_idle_timeout(Duration::from_secs(30))
             .build()?;
         Ok(Self {
-            api_key,
+            endpoint: OpenAiEndpoint::Platform { api_key },
             model,
             chat_url,
             responses_url,
@@ -251,39 +268,116 @@ impl OpenAiProvider {
         })
     }
 
-    /// Whether this request should take the Responses API path. OpenRouter /
-    /// local backends pin Chat Completions via `force_chat_completions`;
-    /// direct OpenAI keeps the GPT-5/codex → Responses split.
-    fn should_use_responses(&self, model: &str) -> bool {
-        !self.force_chat_completions && uses_responses_api(model)
+    /// Build the ChatGPT plan provider. `base_url` is
+    /// [`OPENAI_DEFAULT_BASE_URL`] outside tests: a plan token goes to OpenAI
+    /// or to a loopback mock, and anywhere else is refused here.
+    pub fn new_chatgpt_plan(
+        access: ChatGptPlanAccess,
+        model: String,
+        base_url: &str,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        if !plan_base_url_allowed(base_url) {
+            return Err(format!(
+                "a ChatGPT plan token goes only to {OPENAI_DEFAULT_BASE_URL}, not {base_url}"
+            )
+            .into());
+        }
+        let mut provider =
+            Self::new_with_base_url(String::new(), model, base_url, Vec::new(), false)?;
+        let models_url = format!("{}/models", base_url.trim_end_matches('/'));
+        provider.endpoint = OpenAiEndpoint::ChatGptPlan {
+            access,
+            served: Arc::new(ServedModels::new(models_url)),
+        };
+        Ok(provider)
     }
 
-    /// The header pairs sent on every request: auth (omitted when keyless) +
-    /// `extra_headers` + content-type. Pure so it's unit-testable; the
-    /// `Authorization: Bearer` header is omitted when `api_key` is empty so a
-    /// keyless local server (Ollama / llama.cpp) isn't sent a bogus `Bearer `.
-    fn request_headers(&self) -> Vec<(String, String)> {
-        let mut headers = self.caller_headers();
+    /// The plan's token source, or `None` on the platform endpoint.
+    fn plan_tokens(&self) -> Option<&Arc<dyn ChatGptPlanTokens>> {
+        self.plan_access().map(|access| &access.tokens)
+    }
+
+    /// What the plan endpoint shares across builds, or `None` on the platform.
+    fn plan_access(&self) -> Option<&ChatGptPlanAccess> {
+        match &self.endpoint {
+            OpenAiEndpoint::ChatGptPlan { access, .. } => Some(access),
+            OpenAiEndpoint::Platform { .. } => None,
+        }
+    }
+
+    /// Ready a plan request on `model`: refused while the limit pause runs,
+    /// or when the plan does not list `model`. Returns the bearer to send.
+    /// `None` on the platform endpoint, whose bearer [`Self::bearer`] gives.
+    async fn plan_bearer(
+        &self,
+        model: &str,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let OpenAiEndpoint::ChatGptPlan { access, served } = &self.endpoint else {
+            return Ok(None);
+        };
+        if let Some(refusal) = access.pause.refusal() {
+            return Err(Box::new(refusal));
+        }
+        let mut bearer = access.tokens.access_token().await?;
+        if let Err(e) = served
+            .check(model, access.tokens.as_ref(), &mut bearer)
+            .await
+        {
+            if let Some(plan_error) = e.downcast_ref::<ChatGptPlanError>() {
+                access.pause.observe(plan_error).await;
+            }
+            return Err(e);
+        }
+        Ok(Some(bearer))
+    }
+
+    /// Whether this request should take the Responses API path. OpenRouter /
+    /// local backends pin Chat Completions via `force_chat_completions`;
+    /// direct OpenAI keeps the GPT-5/codex → Responses split. The plan route
+    /// serves the Responses API only.
+    fn should_use_responses(&self, model: &str) -> bool {
+        self.plan_tokens().is_some() || (!self.force_chat_completions && uses_responses_api(model))
+    }
+
+    /// The bearer for the next request: the API key, or the plan's current
+    /// access token. `None` for a keyless local server, which must not be
+    /// sent a bogus `Bearer `.
+    async fn bearer(&self) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        match &self.endpoint {
+            OpenAiEndpoint::Platform { api_key } => {
+                Ok((!api_key.is_empty()).then(|| api_key.clone()))
+            }
+            OpenAiEndpoint::ChatGptPlan { access, .. } => {
+                access.tokens.access_token().await.map(Some)
+            }
+        }
+    }
+
+    /// The header pairs sent on every request: auth, `extra_headers` and
+    /// content-type.
+    fn request_headers(&self, bearer: Option<&str>) -> Vec<(String, String)> {
+        let mut headers = self.caller_headers(bearer);
         headers.push(("Content-Type".to_string(), "application/json".to_string()));
         headers
     }
 
     /// Auth and `extra_headers`: who calls, without the body's type.
-    fn caller_headers(&self) -> Vec<(String, String)> {
+    fn caller_headers(&self, bearer: Option<&str>) -> Vec<(String, String)> {
         let mut headers = Vec::new();
-        if !self.api_key.is_empty() {
-            headers.push((
-                "Authorization".to_string(),
-                format!("Bearer {}", self.api_key),
-            ));
+        if let Some(bearer) = bearer {
+            headers.push(("Authorization".to_string(), format!("Bearer {bearer}")));
         }
         headers.extend(self.extra_headers.iter().cloned());
         headers
     }
 
     /// Apply [`request_headers`](Self::request_headers) to a request builder.
-    fn apply_headers(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        Self::with_headers(req, self.request_headers())
+    fn apply_headers(
+        &self,
+        req: reqwest::RequestBuilder,
+        bearer: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        Self::with_headers(req, self.request_headers(bearer))
     }
 
     fn with_headers(
@@ -488,12 +582,20 @@ impl LlmProvider for OpenAiProvider {
         body: &crate::llm::prefill::PrefillBody,
         _call: crate::llm::metered::CallToken,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        // A beat spends the user's weekly plan limit (ADR 0636).
+        if self.plan_tokens().is_some() {
+            return Err(crate::llm::prefill::cannot_prefill(body.provider));
+        }
         let url = if self.should_use_responses(&body.wire_model) {
             &self.responses_url
         } else {
             &self.chat_url
         };
-        let builder = Self::with_headers(self.streaming_client.post(url), self.caller_headers());
+        let bearer = self.bearer().await?;
+        let builder = Self::with_headers(
+            self.streaming_client.post(url),
+            self.caller_headers(bearer.as_deref()),
+        );
         let label = body
             .provider
             .as_ref()
@@ -504,6 +606,15 @@ impl LlmProvider for OpenAiProvider {
     fn default_model(&self) -> &str {
         &self.model
     }
+}
+
+/// Whether a plan token may go to `base_url`: OpenAI's own API, or a loopback
+/// mock for tests.
+fn plan_base_url_allowed(base_url: &str) -> bool {
+    if base_url.trim_end_matches('/') == OPENAI_DEFAULT_BASE_URL {
+        return true;
+    }
+    reqwest::Url::parse(base_url).is_ok_and(|url| crate::llm::chatgpt_plan::is_loopback_mock(&url))
 }
 
 /// The bodies a [`serve_recording`] server received, in order.
@@ -720,6 +831,66 @@ mod tests {
         assert_eq!(local.chat_url, "http://localhost:11434/v1/chat/completions");
     }
 
+    /// A plan token goes to OpenAI's API or to a loopback mock, and every
+    /// other base is refused before a provider exists.
+    #[test]
+    fn a_plan_provider_takes_only_openai_or_a_loopback_mock() {
+        for allowed in [
+            OPENAI_DEFAULT_BASE_URL,
+            "https://api.openai.com/v1/",
+            "http://127.0.0.1:4010/v1",
+        ] {
+            assert!(plan_base_url_allowed(allowed), "{allowed}");
+        }
+        for refused in [
+            "https://openrouter.ai/api/v1",
+            "http://api.openai.com/v1",
+            "https://api.openai.com.evil.example/v1",
+            "http://192.168.1.10:4010/v1",
+            "https://127.0.0.1:4010/v1",
+            "not a url",
+        ] {
+            assert!(!plan_base_url_allowed(refused), "{refused}");
+        }
+    }
+
+    /// The plan route serves the Responses API only, whatever the model id.
+    #[test]
+    fn a_plan_provider_always_takes_the_responses_path() {
+        struct NoTokens;
+        #[async_trait]
+        impl ChatGptPlanTokens for NoTokens {
+            async fn access_token(
+                &self,
+            ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+                Err("unused".into())
+            }
+            async fn after_rejection(
+                &self,
+                _: &str,
+            ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+                Err("unused".into())
+            }
+        }
+        let access = || ChatGptPlanAccess {
+            tokens: Arc::new(NoTokens),
+            pause: Arc::new(crate::llm::chatgpt_plan::LimitPause::unannounced()),
+        };
+        let plan = OpenAiProvider::new_chatgpt_plan(
+            access(),
+            "gpt-4o".to_string(),
+            OPENAI_DEFAULT_BASE_URL,
+        )
+        .unwrap();
+        assert!(plan.should_use_responses("gpt-4o"));
+        assert!(OpenAiProvider::new_chatgpt_plan(
+            access(),
+            "gpt-4o".to_string(),
+            "https://openrouter.ai/api/v1",
+        )
+        .is_err());
+    }
+
     /// `force_chat_completions` pins the Chat Completions path even for a
     /// `gpt-5`-shaped id (OpenRouter / local don't implement the Responses API);
     /// direct OpenAI keeps the GPT-5/codex → Responses split.
@@ -777,8 +948,8 @@ mod tests {
     /// The `Authorization` header is omitted on an empty key (keyless local
     /// server) and present otherwise; `extra_headers` (OpenRouter attribution)
     /// always ride along.
-    #[test]
-    fn request_headers_omit_auth_when_keyless_and_include_extras() {
+    #[tokio::test]
+    async fn request_headers_omit_auth_when_keyless_and_include_extras() {
         let keyless = OpenAiProvider::new_with_base_url(
             String::new(),
             "llama3.1".to_string(),
@@ -787,7 +958,7 @@ mod tests {
             true,
         )
         .unwrap();
-        let headers = keyless.request_headers();
+        let headers = keyless.request_headers(keyless.bearer().await.unwrap().as_deref());
         assert!(
             !headers.iter().any(|(n, _)| n == "Authorization"),
             "keyless local server must not be sent an Authorization header"
@@ -807,7 +978,7 @@ mod tests {
             true,
         )
         .unwrap();
-        let headers = openrouter.request_headers();
+        let headers = openrouter.request_headers(openrouter.bearer().await.unwrap().as_deref());
         assert!(headers
             .iter()
             .any(|(n, v)| n == "Authorization" && v == "Bearer sk-or"));

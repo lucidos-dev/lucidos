@@ -9,6 +9,7 @@ export const PROVIDERS = [
   { value: 'opencode-free', label: 'OpenCode Free (keyless)' },
   { value: 'local', label: 'Local (OpenAI-compatible)' },
   { value: 'claude-gateway', label: 'Claude gateway' },
+  { value: 'chatgpt-plan', label: 'ChatGPT plan' },
 ];
 
 /** The Providers page as copy names it. */

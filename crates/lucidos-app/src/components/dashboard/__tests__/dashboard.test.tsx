@@ -63,6 +63,7 @@ import {
   dashboardContentWidth,
   widgetBoxCss,
   widgetCellCss,
+  widgetCellPx,
 } from '../../../utils/dashboardGeometry';
 import { SIZE_SPANS } from '../DashboardTile';
 import { SPINNER_DELAY_MS } from '../../../hooks/useDelayedLoading';
@@ -134,6 +135,20 @@ describe('dashboard geometry', () => {
       const edge = Math.min(cell, (content - (columns - 1) * gap) / columns);
       expect(evaluate(widgetCellCss(width)), `at ${width}px`).toBeCloseTo(edge);
     }
+  });
+
+  /** Invariant: the fit check's px cell is the cell the CSS draws, at any scale. */
+  it('gives the same cell edge in px as the CSS draws', () => {
+    for (const rem of [12, 16, 18, 20, 32]) {
+      const evaluate = (css: string): number => Number(new Function(`return ${css
+        .replace(/min\(/g, 'Math.min(')
+        .replace(/([\d.]+)rem/g, `($1*${rem})`)
+        .replace(/([\d.]+)px/g, '$1')};`)());
+      for (const width of [200, 320, 360, 390, 600, 1280]) {
+        expect(widgetCellPx(width, rem), `at ${width}px, rem ${rem}`).toBeCloseTo(evaluate(widgetCellCss(width)));
+      }
+    }
+    expect(widgetCellPx(360, 20)).toBeCloseTo(152.5);
   });
 
   it('scales with the UI scale, since cells are in rem', () => {

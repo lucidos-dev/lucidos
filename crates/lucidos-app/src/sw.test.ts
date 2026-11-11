@@ -876,6 +876,20 @@ describe('Service Worker push handler — normal show-notification path', () => 
     const [title, opts] = mockRegistration.showNotification.mock.calls[0];
     expect(title).toBe('Hi');
     expect(opts.tag).toBe('notif-show');
+    expect(opts.actions).toEqual([]);
+  });
+
+  it('carries the engine\'s action buttons onto the notification', async () => {
+    const actions = [{ action: 'unwatch', title: 'Unwatch' }];
+    const event = makePushEvent({
+      web_push: 8030,
+      notification: { title: 'Sam', body: 'Kim, can you look?', tag: 'people-tid-1', actions },
+    });
+    handlers.push(event);
+    await Promise.all(event.waiting);
+
+    const [, opts] = mockRegistration.showNotification.mock.calls[0];
+    expect(opts.actions).toEqual(actions);
   });
 });
 
@@ -1275,6 +1289,28 @@ describe('Service Worker notificationclick handler — deep-link routing', () =>
     // idle when the tab was already focused.
     expect(client.navigate).not.toHaveBeenCalled();
     // No duplicate window is opened when a tab already exists.
+    expect(openWindow).not.toHaveBeenCalled();
+  });
+
+  it('Unwatch leaves the thread and marks the notification read, opening nothing', async () => {
+    const { handlers, matchAll, mockFetch, openWindow } = loadSw();
+    mockFetch.mockResolvedValue(new Response('ok'));
+    const client = topLevelClient();
+    matchAll.mockResolvedValue([client]);
+
+    const ev = { ...makeClickEvent({ ...threadData, unwatch_thread_id: 'tid-1' }), action: 'unwatch' };
+    handlers.notificationclick(ev);
+    await Promise.all(ev._waited);
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      'https://example.com/api/v1/threads/tid-1/people/unwatch',
+      expect.objectContaining({ method: 'POST' }),
+    );
+    expect(mockFetch).toHaveBeenCalledWith(
+      'https://example.com/api/v1/notification/read?id=nid-thread',
+      expect.objectContaining({ method: 'POST' }),
+    );
+    expect(client.postMessage).not.toHaveBeenCalled();
     expect(openWindow).not.toHaveBeenCalled();
   });
 

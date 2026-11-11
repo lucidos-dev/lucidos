@@ -16,6 +16,9 @@ export const DEFAULT_CHAT_MODEL: string = PREFERENCE_CATALOG.chat_model.fallback
  *  migration retired with `retire_model` (ADR 0418). An engine test fails
  *  while this list still offers a retired id. */
 export const MODELS = [
+  { value: 'claude-fable-5-2', label: 'Fable 5.2' },
+  { value: 'gemini-4-carbon', label: 'Gemini 4 Carbon' },
+  { value: 'gemini-4-argon', label: 'Gemini 4 Argon' },
   { value: 'claude-fable-5-1', label: 'Fable 5.1' },
   { value: 'claude-opus-5-5', label: 'Opus 5.5' },
   { value: 'claude-sonnet-5-5', label: 'Sonnet 5.5' },

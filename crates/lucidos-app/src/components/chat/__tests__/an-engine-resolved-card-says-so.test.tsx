@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { render } from 'preact';
 import {
   CommandPermissionBody,
+  LEGACY_RESOLUTION_NOTES,
   PLAIN_RESOLUTION_NOTES,
   PermissionBody,
   engineResolutionNote,
@@ -55,8 +56,9 @@ describe('engineResolutionNote', () => {
 
   // The first matching opening wins, so a prefix would shadow a longer one.
   it('has no opening that is a prefix of another', () => {
-    for (const [a] of PLAIN_RESOLUTION_NOTES) {
-      for (const [b] of PLAIN_RESOLUTION_NOTES) {
+    const notes = [...PLAIN_RESOLUTION_NOTES, ...LEGACY_RESOLUTION_NOTES];
+    for (const [a] of notes) {
+      for (const [b] of notes) {
         if (a !== b) expect(b.startsWith(a), `"${a}" shadows "${b}"`).toBe(false);
       }
     }
@@ -86,10 +88,10 @@ describe('the coding-agent card', () => {
 
   // A parked card that ran out its wait was shown to someone, so it never
   // claims nobody was there to ask.
-  it('says a parked card ran out its permission wait', () => {
-    const expired = 'Auto-denied: nobody answered this permission card within its permission wait';
+  it('says nobody answered a parked card in time', () => {
+    const expired = 'Auto-denied: nobody answered this permission card within its permission wait'; // a legacy stored reason
     render(<PermissionBody event={event} resolved={{ allowed: false, reason: expired }} />, host);
-    expect(note()).toBe('Refused by Lucidos: nobody answered this card within its permission wait.');
+    expect(note()).toBe('Refused by Lucidos: nobody answered this card in time.');
     expect(note()).not.toContain('nobody was there to ask');
     expect(host.querySelector('.permission-btn-picked')).toBeNull();
   });

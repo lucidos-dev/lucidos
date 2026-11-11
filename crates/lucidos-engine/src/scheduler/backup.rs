@@ -413,6 +413,7 @@ async fn emit_backup_notification(
             tap,
             actor: None,
             audience: None,
+            push_group: None,
         }))
         .await
     {

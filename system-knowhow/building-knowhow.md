@@ -154,7 +154,7 @@ A recipe that calls an external HTTP API the workspace holds a credential for us
 
 Configure the backend once in `data/config/apis.json` (schema in `system-knowhow/best-practices.md` § `config/`). Knowhow then names it instead of restating credentials.
 
-**A model provider needs no entry at all.** Every model provider the engine holds auth for is a *builtin provider proxy*: `anthropic`, `claude-gateway`, `local`, `openai`, `openrouter`, `typesafe`, `vertex` and `xai`. They are not in `apis.json`, and a recipe never asks for their key. Each default base already includes `/v1`, so a recipe writes `lucidos proxy openai /models`, never `/v1/models`. See `system-knowhow/lucidos-cli.md` § `lucidos proxy`.
+**A model provider needs no entry at all.** Every model provider the engine holds auth for is a *builtin provider proxy*: `anthropic`, `claude-gateway`, `local`, `openai`, `openrouter`, `typesafe`, `vertex` and `xai`. The ChatGPT plan has none. They are not in `apis.json`, and a recipe never asks for their key. Each default base already includes `/v1`, so a recipe writes `lucidos proxy openai /models`, never `/v1/models`. See `system-knowhow/lucidos-cli.md` § `lucidos proxy`.
 
 ## Writing knowhow during execution
 

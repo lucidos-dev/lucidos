@@ -559,6 +559,28 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_workspace_opens_beside_the_local_window_it_was_clicked_from() {
+        // `dev@cloud` is not the local `dev`, so the window on `dev` is neither
+        // focused nor repointed. The click opens a window of its own.
+        let open = windows(&[("main", "http://localhost:3210/dev/")]);
+        assert_eq!(
+            choose_workspace_target(&open, "main", "dev@cloud", ORIGIN, None),
+            Some(WorkspaceTarget::NewWindow {
+                url: "http://localhost:3210/dev@cloud/".to_string(),
+            })
+        );
+        // A second click finds that window rather than stacking another.
+        let open = windows(&[
+            ("main", "http://localhost:3210/dev/"),
+            ("window-1", "http://localhost:3210/dev@cloud/"),
+        ]);
+        assert_eq!(
+            choose_workspace_target(&open, "main", "dev@cloud", ORIGIN, None),
+            Some(WorkspaceTarget::Focus("window-1".to_string()))
+        );
+    }
+
+    #[test]
     fn an_unnavigated_window_is_never_the_target() {
         // `desktop::launch` is waiting on the gateway and will navigate `main`
         // itself, so anything pointed there is clobbered. The tap path spends a

@@ -47,7 +47,7 @@ export interface NativePushRequestedPayload {
  *  touching the OS:
  *   - not Tauri → no-op (browser / PWA get the real web push instead);
  *   - stale frame → no-op (late SSE-queue flush);
- *   - another device's banner → no-op (a work item's audience, ADR 0623).
+ *   - another device's banner → no-op (a root thread's audience, ADR 0623).
  *
  *  Then it always surfaces the notification. The page answered the check while
  *  its window was not in front, but the reader may have brought it forward

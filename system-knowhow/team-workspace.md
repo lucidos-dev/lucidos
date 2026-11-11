@@ -1,11 +1,11 @@
 ---
 name: Team workspace setup
-description: Setting up one shared workspace as a team's factory. "team workspace", "set up Lucidos for my team", "offboard someone". Hosting, people, bots, team keys, gate policy, the Factory app, ticket and chat intake.
+description: A team's shared factory workspace. "team workspace", "set up Lucidos for my team", "offboard someone". Hosting, people, bots, team keys, gate policy, Factory app, ticket and chat intake, @mentions, agent pause.
 ---
 
 # Team workspace setup
 
-A *team workspace* is one Lucidos workspace that a whole team pairs devices to. It holds the credentials and does the work. Tickets and chat messages start *work items* on their own, some finish as a pull request, and some stop at a *gate* for a person. The design is ADR 0623. The terms are in the glossary: *operator*, *work item*, *driver*, *continue key*, *actor*.
+A *team workspace* is one Lucidos workspace that a whole team pairs devices to. It holds the credentials and does the work. Tickets and chat messages start *root threads* on their own, some finish as a pull request, and some stop at a *gate* for a person. The design is ADR 0623. The terms are in the glossary: *operator*, *root thread*, *driver*, *continue key*, *actor*.
 
 Walk the user through the steps below in order. Ask before each step that creates an account, a credential or a public address.
 
@@ -47,12 +47,12 @@ Each credential records who saved it. Nothing enforces this rule, so state it to
 
 ## 4. The gate policy
 
-A gate is a question card on a work item. Which steps stop for a person is the team's policy, and it lives in knowhow, never in the engine. Write it with the team to `data/knowhow/team/gate-policy.md`. A starting point:
+A gate is a question card in a root thread or one of its sub-threads. Which steps stop for a person is the team's policy, and it lives in knowhow, never in the engine. Write it with the team to `data/knowhow/team/gate-policy.md`. A starting point:
 
 ```markdown
 ---
 name: Team gate policy
-description: When the factory must stop and ask a person before going on. Use for every work item from the issue tracker or the team chat.
+description: When the factory must stop and ask a person before going on. Use for every root thread from the issue tracker or the team chat.
 ---
 
 Ask with a question card, and wait, before you:
@@ -72,7 +72,7 @@ lucidos preferences set --key driver_timeout_hours --value 24
 
 ## 5. The Factory app
 
-The Factory app lists the open work items with their driver, their watchers and their gates. **Mine** is what you drive or watch, **Team** is gates nobody owns, and **All** is everything open. **Take**, **Take over**, **Release**, **Watch** and **Unwatch** act as the person holding the device. It reads `lucidos.workItems` (`js-sdk.md` § "lucidos.workItems").
+The Factory app lists the open root threads with their driver, their watchers and their gates. **Mine** is what you drive or watch, **Team** is gates nobody owns, and **All** is everything open. **Take**, **Take over**, **Release**, **Watch** and **Unwatch** act as the person holding the device. It reads `lucidos.threads.people` (`js-sdk.md` § "lucidos.threads.people").
 
 Copy these three files into `data/apps/factory/`, keeping their paths, with `lucidos data write`:
 
@@ -81,6 +81,8 @@ Copy these three files into `data/apps/factory/`, keeping their paths, with `luc
 - `system-knowhow/team-workspace/factory-app/assets/icon.svg`
 
 Then run `lucidos apps list` and check that **Factory** is there.
+
+A Factory app copied before the rename calls the retired `lucidos.workItems` and shows an error. Copy the three files again after you upgrade.
 
 ## 6. Sources of work
 
@@ -96,19 +98,32 @@ The templates:
 - `system-knowhow/team-workspace/issue-tracker`: issues and comments, through a signed webhook. GitHub is the worked example.
 - `system-knowhow/team-workspace/chat-tool`: messages that mention the bot, polled. Slack is the worked example.
 
-Both share `system-knowhow/team-workspace/source_thread.py`, which finds the source address of a work item from its continue key.
+Both share `system-knowhow/team-workspace/source_thread.py`, which finds the source address of a root thread from its continue key.
 
 The engine knows nothing about either source. To add another, copy a template and change its marked functions.
 
-## How a work item runs
+## How a root thread runs
 
 - **Started by a person** in Lucidos: they are its first driver.
 - **Started by a ticket or a message**: no driver yet. Its gates reach the Team view and push the whole team.
 - **Answering a gate**, in Lucidos or from the source, makes the answerer the driver. An answer from a source counts only when its email is on a person.
-- **A gate its driver leaves** past `driver_timeout_hours` escalates once and pushes everyone. The driver keeps the work item.
-- **Archive the root thread** to finish a work item. Only Archive releases its continue key, so the next comment on that ticket starts a fresh one.
+- **A gate its driver leaves** past `driver_timeout_hours` escalates once and pushes everyone. The driver keeps the root thread.
+- **Archive the root thread** to finish its work. Only Archive releases its continue key, so the next comment on that ticket starts a fresh one.
 
 Anyone can still answer any gate, whoever drives.
+
+## How people talk in a thread
+
+Teammates can talk inside a thread without its agent answering, so the talk about the work stays beside the work (ADR 0649). The terms are in the glossary: *person mention*, *agent mention*, *agent pause*, *people-only message*.
+
+- **`@Name` writes to a person.** The composer suggests teammates as you type `@`. **Tab** takes the first suggestion, and Enter still sends.
+- **Mention only people, and the agent pauses.** The message reaches them as a push and stays out of the agent's way. Untagged messages stay between people until someone resumes it. A reply typed to an open question card still answers it.
+- **`@agent` wakes the agent**, and ends the pause. So does **Resume** on the hint line above the composer.
+- **The agent still reads everything.** Its next woken turn sees the people-only messages, each under its writer's name.
+- **The People row** under the thread's title shows the driver and the watchers as initials. **Watch**, **Unwatch**, **Take** and **Release** sit there too. A mention makes someone a watcher, so they leave with one tap.
+- **To start a thread with a teammate**, pick them under "A teammate…" in the compose destination. The first message then mentions them.
+
+A trigger fire, a sub-thread's report and a question answer always wake the agent, paused or not. A gateway with one person shows none of this.
 
 ## Config changes
 
@@ -119,5 +134,5 @@ A change to a trigger, a repository, an MCP server or a credential tells the res
 1. In **Settings → Devices**, under People, use **Remove** on their person. That revokes every device they hold.
 2. Rotate each credential they saved or saw, from **Settings → Accounts** or with the provider.
 3. Remove them from the bot accounts' organisation and from the chat tool's app collaborators.
-4. Their work items lose their driver, so their open gates show in the Factory app's **Team** view. Take each one there.
+4. Their root threads lose their driver, so their open gates show in the Factory app's **Team** view. Take each one there.
 5. Remove them from each translation script's `people.json`, the list of who may start work.

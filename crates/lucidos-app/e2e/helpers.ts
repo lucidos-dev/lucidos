@@ -1031,7 +1031,7 @@ export async function getHeaderTop(page: Page): Promise<number> {
   });
 }
 
-/** Turn on the default-OFF "Dynamic bars" mobile preference, so the header's
+/** Turn on the "Dynamic bars" mobile preference, so the header's
  *  and prompt's hide-on-scroll, and the header's hide-on-keyboard-open, are
  *  exercisable. With the bars pinned, nothing slides off and the hide
  *  assertions time out. Set the GLOBAL pref to 'true' BEFORE navigating so the
@@ -1058,12 +1058,11 @@ export async function enableMobileDynamicBars(page: Page): Promise<void> {
   expect(res.ok()).toBeTruthy();
 }
 
-/** Force the default pinned bars ("Dynamic bars" off). `mobile_dynamic_bars` is
- *  a GLOBAL preference, and the e2e DB is reset only between projects. So a test
- *  that called `enableMobileDynamicBars` leaks the on state into later tests
- *  assuming the pinned default. A test depending on the pinned bars calls this
- *  in its beforeEach BEFORE navigating, so it boots pinned whatever the order.
- *  Pairs with `enableMobileDynamicBars`. */
+/** Force pinned bars ("Dynamic bars" off), the e2e baseline. The product
+ *  default is on, but `reset_e2e_database` (`scripts/lib/e2e.sh`) seeds the
+ *  GLOBAL pref off for every project. A test depending on the pinned bars calls
+ *  this in its beforeEach BEFORE navigating, so it boots pinned whatever the
+ *  order. Pairs with `enableMobileDynamicBars`. */
 export async function disableMobileDynamicBars(page: Page): Promise<void> {
   const res = await apiRequest(page).put('/api/v1/preferences?key=mobile_dynamic_bars', {
     data: { value: 'false' },

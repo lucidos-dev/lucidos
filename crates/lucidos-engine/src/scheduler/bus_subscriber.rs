@@ -50,12 +50,7 @@ pub(super) type TriggerGroups = Arc<std::sync::RwLock<HashMap<String, TriggerGro
 #[async_trait]
 pub(super) trait SchedulerEffects: Send + Sync {
     /// Apply a trigger lifecycle event to the cron runners.
-    async fn apply_trigger_lifecycle(
-        &self,
-        event_type: &str,
-        trigger_id: &str,
-        payload: &serde_json::Value,
-    );
+    async fn apply_trigger_lifecycle(&self, event_type: &str, trigger_id: &str);
     /// Re-arm cron runners from the registry after a lag.
     async fn rearm_cron_after_lag(&self);
     /// Re-arm the backup loop from the stored preferences.
@@ -81,16 +76,10 @@ pub(super) struct EngineEffects {
 
 #[async_trait]
 impl SchedulerEffects for EngineEffects {
-    async fn apply_trigger_lifecycle(
-        &self,
-        event_type: &str,
-        trigger_id: &str,
-        payload: &serde_json::Value,
-    ) {
+    async fn apply_trigger_lifecycle(&self, event_type: &str, trigger_id: &str) {
         handle_trigger_event(
             event_type,
             trigger_id,
-            payload,
             &self.trigger_configs,
             &self.tracked_tasks,
             &self.engine,
@@ -185,37 +174,14 @@ impl<E: SchedulerEffects> BusSubscriber<E> {
         let first_sight = self.lag_replay.live(emitted);
         if let BusEvent::System(se) = &emitted.typed {
             match se {
-                SystemEvent::TriggerCreated {
-                    trigger_id,
-                    payload,
-                    ..
-                }
-                | SystemEvent::TriggerUpdated {
-                    trigger_id,
-                    payload,
-                    ..
-                }
-                | SystemEvent::TriggerDeleted {
-                    trigger_id,
-                    payload,
-                    ..
-                }
-                | SystemEvent::TriggerEnabled {
-                    trigger_id,
-                    payload,
-                    ..
-                }
-                | SystemEvent::TriggerDisabled {
-                    trigger_id,
-                    payload,
-                    ..
-                }
-                | SystemEvent::TriggerExecuted {
-                    trigger_id,
-                    payload,
-                } => {
+                SystemEvent::TriggerCreated { trigger_id, .. }
+                | SystemEvent::TriggerUpdated { trigger_id, .. }
+                | SystemEvent::TriggerDeleted { trigger_id, .. }
+                | SystemEvent::TriggerEnabled { trigger_id, .. }
+                | SystemEvent::TriggerDisabled { trigger_id, .. }
+                | SystemEvent::TriggerExecuted { trigger_id, .. } => {
                     self.effects
-                        .apply_trigger_lifecycle(se.event_type(), trigger_id, payload)
+                        .apply_trigger_lifecycle(se.event_type(), trigger_id)
                         .await;
                 }
                 SystemEvent::TriggerGroupCreated {

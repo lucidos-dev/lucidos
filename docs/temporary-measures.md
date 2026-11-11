@@ -1769,6 +1769,36 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Status:** active
 - **Investigation:** n/a (the cause is upstream; nothing is being chased)
 
+### Blind visual viewport
+
+- **Added:** 2026-11-09
+- **Lives in:** `trackAppHeight` and the stored `keyboardBandMemory` in
+  `crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx`, tested by
+  `components/layout/__tests__/keyboard-blind-viewport.test.ts`.
+- **Impermanent because:** an installed iOS PWA can launch with a dead visual
+  viewport. It reads height 0, then the full screen, and never shrinks for the
+  keyboard until a relaunch. The shell keeps the full height and the composer
+  sits under the keys. This is an upstream bug.
+
+  The gateway log showed it once in 121 iPhone launches, after a notification
+  tap. That launch was the only one whose keyboard readings never shrank. So a
+  zero reading before the first real one marks the viewport blind, until it
+  next measures a keyboard. A later zero is a wake's transient one and is
+  ignored. While blind, a focused keyboard field shrinks the shell by the last
+  measured keyboard. That band is kept per orientation in the
+  `lucidos-keyboard-band` storage key.
+
+  Who it misses: a blind launch with a hardware keyboard attached gets a
+  needless band on each focus until a relaunch. A blind state that starts with
+  no zero reading is not detected.
+- **Removal / resolution condition:** when no iPhone launch logs a zero
+  `visualViewport` in its `[Client/safe-area]` lines across a month of use on
+  the oldest iOS we support. Then delete `viewportBlind`, the `blindBandPx`
+  field and its test, and drop the storage argument from `keyboardBandMemory`.
+  The stored key can stay behind, since nothing else reads it.
+- **Status:** active
+- **Investigation:** n/a (the cause is upstream; nothing is being chased)
+
 ### CC byte-idle deadline raised past the engine watchdog
 
 - **Added:** 2026-08-02
@@ -2541,6 +2571,11 @@ condition; fix the condition rather than acting on it.
   prefix, never a loose substring, so an incidental mid-sentence mention isn't
   mis-flagged). We would not need this if CC never emitted `is_error: true` on a
   turn it declared successful.
+  The prefix is not the only failure signal. A turn whose last top-level
+  assistant message carries `is_api_error_message: true` fails with that
+  banner's text, whatever the `result` says. A gateway's own body (a spend cap)
+  has no prefix to match. That flag is structured, so it is not part of this
+  measure (`turn_ending_on_api_error_banner_fails_with_its_text`).
 - **Removal / resolution condition:** When Claude Code stops emitting
   `is_error: true` alongside `subtype: "success"`/absent with an empty `errors[]`
   (its terminal signal becomes self-consistent) — sample a batch of recent CC

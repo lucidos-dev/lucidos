@@ -461,6 +461,28 @@ pub const TABLES: &[TableRule] = &[
         },
     },
     TableRule {
+        table: "chatgpt_plan_accounts",
+        owners: &["llm/chatgpt_plan/account.rs"],
+        announcement: Announcement::Announced {
+            events: &["ChatGptPlanSignedIn", "ChatGptPlanSignedOut"],
+            exempt: &[
+                ExemptWriter {
+                    function: "registration",
+                    why: "Mints the opaque host id the first time a sign-in \
+                          begins. Nothing user-visible changed: the sign-in that \
+                          follows announces, and an abandoned one leaves only an \
+                          id that names no user.",
+                },
+                ExemptWriter {
+                    function: "update_tokens",
+                    why: "A token refresh renews the same sign-in in place. \
+                          Nothing user-visible changed, and announcing it would \
+                          put an events row on the timeline every hour.",
+                },
+            ],
+        },
+    },
+    TableRule {
         table: "claude_gateway_telemetry_cursor",
         owners: &["llm/claude_gateway/telemetry/exporter.rs"],
         announcement: Announcement::Silent {

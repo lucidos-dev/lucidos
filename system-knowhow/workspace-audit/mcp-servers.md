@@ -39,10 +39,11 @@ For each finding, capture: **location** (the server id), **what's wrong**,
 - **Static check `may perform …`.** The command looks like an irreversible
   side effect, such as a mutating request or a cloud change. Severity:
   **smell**. Fix: ask the user to read the line and confirm they meant it.
-- **`not approved`.** Nobody approved this exact line. With the guard on, its
-  next start asks. With the guard off, the catastrophic floor and secret-read gate still apply. Severity:
-  **nit**. Fix: ask the user to read the line, then approve it by clicking
-  Start under **Settings → MCP Servers**.
+- **`not approved`.** Nobody approved this exact line. With the guard on, the
+  default, the server does not start until someone approves it. With the guard
+  off, the catastrophic floor and secret-read gate still apply. Severity:
+  **smell** with the guard on, **nit** with it off. Fix: ask the user to read
+  the line, then approve it by clicking Start under **Settings → MCP Servers**.
 - **Static check `needs a judgment at start`** on an approved line is not a
   finding. The user already said yes to it.
 - **`Launch: unknown`.** Report "could not check `<id>`'s launch line", never

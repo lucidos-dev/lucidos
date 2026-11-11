@@ -5,14 +5,14 @@ use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::seed;
-use crate::engine::event_bus::EventBus;
+use super::{event, seed};
+use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::summary_tree::recall::{self, RecallLine};
 use crate::engine::summary_tree::shape::complete_addresses;
 use crate::engine::summary_tree::store::{self, StoredNode};
 use crate::engine::summary_tree::view::NodeId;
 use crate::engine::summary_tree::{NodeAddr, SummaryScope};
-use crate::engine::thread_events::EventChannel;
+use crate::engine::thread_events::{EventChannel, EventMeta, MessageOrigin};
 use crate::test_support::{setup_test_db, teardown_test_db};
 
 fn addr(start: u64, span: u64) -> NodeAddr {
@@ -148,6 +148,51 @@ async fn a_thread_top_reads_its_unbuilt_entries_from_events() {
         ]
     );
     assert!(top.lines[0].text.contains("the door is blue"));
+
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn a_thread_leaf_carries_its_sending_device_through_top_and_zoom() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id: thread,
+        event: event(json!({"type": "MessageReceived", "text": "hello", "mode": "human"})),
+        meta: EventMeta {
+            channel: Some(EventChannel::Chat),
+            actor: Some(MessageOrigin::Device {
+                device_id: "sending-device".to_string(),
+            }),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .expect("seed emit")
+    .expect("seed is persisted");
+    seed(
+        &bus,
+        thread,
+        EventChannel::Chat,
+        vec![json!({"type": "ResponseGenerated", "text": "Hello."})],
+    )
+    .await;
+
+    let top = recall::top(&pool, SummaryScope::Thread(thread))
+        .await
+        .unwrap();
+    assert_eq!(
+        top.lines[0].sender_device_id.as_deref(),
+        Some("sending-device")
+    );
+    assert_eq!(top.lines[1].sender_device_id, None);
+    let opened = zoom(&pool, &format!("{thread}/0+1"), 1).await;
+    assert_eq!(
+        opened[0].sender_device_id.as_deref(),
+        Some("sending-device")
+    );
+    assert_eq!(opened[0].text, "prompt (human): hello");
 
     teardown_test_db(&db_name).await;
 }

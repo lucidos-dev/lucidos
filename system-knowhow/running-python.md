@@ -213,7 +213,7 @@ may report cleanup candidates. A protected workspace deletion needs a paired
 device and its exact typed name. A harness may delete only an ephemeral entry
 whose registration minted its owner token.
 
-When a workspace turns on the command guard, every `run_bash` / `run_bash_background` / `run_python` / `run_python_background` call is checked before it runs. A fast static pass settles the obvious cases (catastrophic vs. obviously-safe). A cheap LLM **judge** classifies everything in between. The lanes:
+While the command guard is on, which is the default, every `run_bash` / `run_bash_background` / `run_python` / `run_python_background` call is checked before it runs. A fast static pass settles the obvious cases (catastrophic vs. obviously-safe). A cheap LLM **judge** classifies everything in between. The lanes:
 
 - **Catastrophic → refused.** These are **refused without running**, with a failed tool result explaining why:
   - recursive deletion of the filesystem root or home directory (`rm -rf /`, `rm -rf ~`);
@@ -238,7 +238,7 @@ Each yes is remembered for that exact line, so the same server never asks twice.
 
 The guard is deliberately narrow. These all run with no prompt: reads anywhere on the machine (outside the workspace too, by design), a plain `curl https://…` GET, writes under `data/`, and redirects to `/dev/null`. Pure-compute Python that installs no packages runs unprompted too. An in-workspace *deletion* also runs unprompted, with the Undo above. The judge asks only when it can't tell a command is safe.
 
-The additional checks are off by default. The catastrophic floor and secret-read gate remain on.
+A workspace can turn the guard off. Its other checks then stop, but the catastrophic floor and secret-read gate remain on.
 
 **With the judge turned off, the static pass decides alone, and it asks more often.** A command it cannot see through asks the user, and on a trigger it needs the `other` grant. That covers a command substitution (`$(…)`), a path-qualified head (`data/bin/tool`) and a code-injecting `VAR=` preamble. It also covers Python that installs packages, shells out, or uses a network or mail library. A head it simply does not know (`cargo build`) still runs. An in-workspace deletion keeps the Undo lane, unless the same command holds one of those shapes.
 

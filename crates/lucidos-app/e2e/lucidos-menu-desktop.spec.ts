@@ -48,9 +48,11 @@ test.describe('Lucidos menu from the desktop mark', () => {
     const menu = page.locator('.brand-menu');
 
     // The mark is the connection light as well as the opener, and it says so in
-    // more than colour: the state is in the accessible name.
+    // more than colour: the state is in the accessible name. A job in flight
+    // sits between the menu name and the connection. A fresh engine downloads
+    // its embedding model at boot, so those segments are optional.
     await expect(toggle).toHaveAttribute('data-conn', /connected|connecting|disconnected/);
-    await expect(toggle).toHaveAttribute('aria-label', /^Lucidos menu · connect/);
+    await expect(toggle).toHaveAttribute('aria-label', /^Lucidos menu · (.+ · )*connect/);
 
     // The actions the menu drops are here in the row, which is the whole
     // premise of dropping them.
@@ -74,13 +76,12 @@ test.describe('Lucidos menu from the desktop mark', () => {
     }
 
     // Workspaces names the workspace you are in, in all three shapes that row
-    // can take. THIS harness is the middle one: `scripts/lib/e2e.sh` runs the
-    // engine standalone and serves `dist/` at `/`, so the page is a direct
-    // engine port. A real gateway lists that engine (`e2e_gateway.sh`), so its
-    // shell carries the gateway-port meta. With base `/`, the picker is
-    // addressable absolutely while `/~/api/v1/control/*` would resolve to the
-    // engine and 404. The row therefore links out here, becoming the
-    // in-app switcher only under `/<slug>/`, which this suite cannot reach.
+    // can take. `scripts/lib/e2e.sh` serves `dist/` at `/` from the engine, so
+    // the page is a direct engine port. It is never the in-app switcher, which
+    // needs `/<slug>/`. The harness picks one of the other two shapes. When a
+    // gateway lists the engine (`e2e_gateway.sh`), the shell carries the
+    // gateway-port meta and the row links out to the picker. When none does,
+    // as in a local slot no gateway lists, the row is a static label.
     // `computeGatewayPickerHref`'s unit tests own the three-way derivation; this
     // pins what must hold in EVERY shape.
     const workspaces = menu.locator('.brand-menu-item', { hasText: 'Workspaces' });
@@ -116,11 +117,17 @@ test.describe('Lucidos menu from the desktop mark', () => {
 
     // The control plane is NOT reachable from this origin, so the row must not
     // offer the switcher: an expander here answers a tap with a 404 against
-    // routes the engine does not serve. It links to the picker instead, which
-    // makes it the menu's one anchor and the one row a user agent would
-    // underline.
-    await expect(workspaces).toHaveJSProperty('tagName', 'A');
-    await expect(workspaces).toHaveAttribute('href', /\/~\/\?pick$/);
+    // routes the engine does not serve. With a gateway it links to the picker
+    // instead, which makes it the menu's one anchor and the one row a user
+    // agent would underline. Without one it has nowhere to go.
+    const hasGateway = await page.locator('meta[name="lucidos-gateway-port"]').count() > 0;
+    if (hasGateway) {
+      await expect(workspaces).toHaveJSProperty('tagName', 'A');
+      await expect(workspaces).toHaveAttribute('href', /\/~\/\?pick$/);
+    } else {
+      await expect(workspaces).not.toHaveJSProperty('tagName', 'A');
+      await expect(workspaces).not.toHaveAttribute('href');
+    }
     await expect(workspaces.locator('.brand-menu-value-chevron')).toHaveCount(0);
     await expect(workspaces.locator('.brand-menu-value-check')).toHaveCount(1);
     await expect(workspaces).toHaveCSS('text-decoration-line', 'none');

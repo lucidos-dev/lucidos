@@ -91,7 +91,7 @@ hs_resolve_tier() { # <engine-answer> <HARDEN_TIER>
 # parent runs them all once.
 hs_fast_tier_suite() { # <suite>
     case "$1" in
-        codegen | knowhow-generated | lint | shell-lint | ts | vite | vitest | harden-suites | harden-scope | harden-other-model-review) echo "$1" ;;
+        codegen | knowhow-generated | lint | shell-lint | ts | vite | vitest | rung-estimates | harden-suites | harden-scope | harden-other-model-review) echo "$1" ;;
     esac
     return 0
 }
@@ -626,7 +626,7 @@ hs_select_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-fi
 # The full tier's selection, which hs_select_suites narrows for the fast tier.
 # The cargo suites come first, in the order their lane runs them.
 hs_select_full_tier_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-file] [drift-file] [touched-specs-file] [test-inputs-file] [crate-graph-file] [compile-owners-file]
-    local inputs=${1:-/dev/null} cli_inputs=${2:-/dev/null} vitest_inputs=${3:-/dev/null} drift=${4:-/dev/null} touched=${5:-/dev/null} test_inputs=${6:-/dev/null} graph=${7:-/dev/null} owners=${8:-/dev/null} p s reach shell="" app="" cli="" gateway="" ts="" css="" vitest="" install="" release="" firstpaint="" self="" scope="" other_model="" codegen="" ort_download="" paths=""
+    local inputs=${1:-/dev/null} cli_inputs=${2:-/dev/null} vitest_inputs=${3:-/dev/null} drift=${4:-/dev/null} touched=${5:-/dev/null} test_inputs=${6:-/dev/null} graph=${7:-/dev/null} owners=${8:-/dev/null} p s reach shell="" app="" cli="" gateway="" ts="" css="" vitest="" install="" release="" firstpaint="" self="" scope="" other_model="" codegen="" ort_download="" rung_estimates="" paths=""
     while IFS= read -r p; do
         [ -n "$p" ] || continue
         paths="$paths$p
@@ -657,6 +657,7 @@ hs_select_full_tier_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest
         esac
         if hs_is_listed "$p" "$HS_GATEWAY_PINNED"; then gateway=1; fi
         case "$p" in
+            .claude/skills/update-lucidos-models/* | docs/plans/rung-estimate-inputs/* | crates/lucidos-engine/src/llm/rung_estimates.json) rung_estimates=1 ;;
             scripts/codegen.sh | scripts/lib/codegen*.sh | scripts/lib/codegen_blocks.py | crates/lucidos-engine/build.rs) codegen=1 ;;
             install.sh | uninstall.sh | scripts/lib/service.sh | scripts/lib/stage_runtime*.sh | \
                 scripts/lib/stage_runtime*.py | scripts/lib/linux_dev_install_test.py | scripts/build-headless.sh | scripts/lib/install_test.sh | \
@@ -718,6 +719,7 @@ hs_select_full_tier_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest
     [ -n "$other_model" ] && echo harden-other-model-review
     [ -n "$ort_download" ] && echo ort-download
     [ -n "$codegen" ] && echo codegen
+    [ -n "$rung_estimates" ] && echo rung-estimates
     return 0
 }
 
@@ -938,6 +940,7 @@ hs_suite_command() { # <suite> <early|normal> <state-dir>
         harden-suites) echo "bash scripts/lib/harden_suites_test.sh && bash scripts/lib/touched_specs_test.sh" ;;
         harden-scope) echo "bash scripts/lib/harden_scope_test.sh" ;;
         harden-other-model-review) echo "bash scripts/lib/harden_other_model_review_test.sh" ;;
+        rung-estimates) echo "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .claude/skills/update-lucidos-models -p test_estimate_rungs.py" ;;
         codegen) echo "bash scripts/lib/codegen_test.sh && bash scripts/lib/codegen_blocks_test.sh" ;;
         *)
             echo "unknown suite: $suite" >&2

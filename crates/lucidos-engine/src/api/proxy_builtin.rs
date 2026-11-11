@@ -142,10 +142,16 @@ pub(crate) const BUILTIN_PROXIES: [BuiltinProxy; 8] = [
 ///
 /// `opencode-free` is out by ADR 0104: nothing may build on an anonymous
 /// endpoint that can vanish without notice.
-pub(crate) const PROVIDERS_WITHOUT_PROXY: [(&str, &str); 1] = [(
-    "opencode-free",
-    "the keyless free tier serves chat only (ADR 0104)",
-)];
+pub(crate) const PROVIDERS_WITHOUT_PROXY: [(&str, &str); 2] = [
+    (
+        "opencode-free",
+        "the keyless free tier serves chat only (ADR 0104)",
+    ),
+    (
+        "chatgpt-plan",
+        "apps and scripts never spend the user's ChatGPT plan (ADR 0636)",
+    ),
+];
 
 /// A service name with case and separators removed, so `Open-AI`, `open_ai`
 /// and `openai` compare equal.
@@ -193,7 +199,8 @@ pub(crate) fn model_proxy_info(provider: &str, wire_id: &str) -> Option<super::M
             ModelProxyProtocol::VertexAnthropic
         }
         ProviderKind::Vertex => ModelProxyProtocol::VertexGoogle,
-        ProviderKind::OpenCodeFree => return None,
+        // Apps never spend the user's ChatGPT plan (ADR 0636).
+        ProviderKind::OpenCodeFree | ProviderKind::ChatGptPlan => return None,
     };
     Some(super::ModelProxyInfo {
         name: proxy.name.to_string(),

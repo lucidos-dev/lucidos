@@ -60,6 +60,7 @@ function resolvedTo(row: Partial<BackgroundModel>): BackgroundRows {
       not_served: [],
       needs_vision: false,
       asks_no_model: false,
+      unresolved: null,
       vision: true,
       default_effort: null,
       recommended: [],
@@ -106,15 +107,14 @@ describe('JudgmentModelRow', () => {
     act(() => { match.click(); });
   }
 
-  function mount(disabled = false, background: BackgroundRows = UNRESOLVED) {
+  function mount(background: BackgroundRows = UNRESOLVED) {
     act(() => {
       render(
         <JudgmentModelRow
           site="command-guard"
-          label="Judge model"
-          anchor="command-safety:judge-model"
+          label="Command judge"
+          anchor="models:command-judge"
           background={background}
-          disabled={disabled}
         />,
         host,
       );
@@ -273,15 +273,18 @@ describe('JudgmentModelRow', () => {
     expect(saveModelSelection).not.toHaveBeenCalled();
   });
 
-  it('honours a disabled prop from the surrounding feature', () => {
-    mount(true);
-    expect(trigger()?.disabled).toBe(true);
+  /** No judge model resolves: the row says why, in the engine's words, since
+   *  a guarded turn then refuses to start. */
+  it('shows why no judge model resolves', () => {
+    const why = 'No configured provider serves a command judge model (gemini-3.1-flash-lite).';
+    mount(resolvedTo({ source: 'chat-model', asks_no_model: true, unresolved: why }));
+    expect(host.textContent).toContain(why);
   });
 
   /** While unset, the trigger reads what the engine resolved, not a catalog
    *  default no configured provider may serve. */
   it('reads the resolved model while unset', () => {
-    mount(false, resolvedTo({ model: 'claude-haiku-4-5-20251001', effort: 'none' }));
+    mount(resolvedTo({ model: 'claude-haiku-4-5-20251001', effort: 'none' }));
     expect(triggerLabel()).toBe('Haiku 4.5 · Off');
   });
 
@@ -289,7 +292,7 @@ describe('JudgmentModelRow', () => {
    *  System One rows get one too. */
   it('lists the recommended models first, each section under a heading', () => {
     credentials.value = { status: 'loaded', data: [typeSafeCred()] };
-    mount(false, resolvedTo({ recommended: [{ model: 'gemini-3.8-flash', effort: null }] }));
+    mount(resolvedTo({ recommended: [{ model: 'gemini-3.8-flash', effort: null }] }));
     open();
     expect(optionValues()).toEqual(['gemini-3.8-flash', 'claude-haiku-4-5-20251001', 'typesafe-jev']);
     const headings = [...document.body.querySelectorAll('.control-section-label')].map((h) => h.textContent);
@@ -299,7 +302,7 @@ describe('JudgmentModelRow', () => {
   /** A stored pick nobody serves is refused, never moved, so the row says so. */
   it('says when no configured provider serves the stored pick', () => {
     preferences.value = { status: 'loaded', data: { model_command_judge: 'gemini-3.8-flash' } };
-    mount(false, resolvedTo({ source: 'preference', reachable: false }));
+    mount(resolvedTo({ source: 'preference', reachable: false }));
     expect(detail()).toBe('No configured provider serves this model');
   });
 });

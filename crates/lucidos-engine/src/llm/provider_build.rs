@@ -10,6 +10,7 @@
 
 use crate::core::prefs::{self, parse_flag, Flag, Pref};
 use crate::core::{AuthType, CredentialStore};
+use crate::llm::chatgpt_plan::{ChatGptPlanAccess, ChatGptPlanAccountStore};
 use crate::llm::claude_gateway::account::ClaudeGatewayAccountStore;
 use crate::llm::claude_gateway::{GatewayAccessFactory, GatewayOrigin};
 use crate::llm::web_search::{
@@ -33,12 +34,12 @@ use std::sync::Arc;
 pub const PROVIDER_CREDENTIAL_SERVICES: [&str; 5] =
     ["openai", "anthropic", "openrouter", "xai", "local"];
 
-/// The seven per-provider enable switches, in the order [`ProviderSwitches`]
+/// The eight per-provider enable switches, in the order [`ProviderSwitches`]
 /// declares them.
 ///
 /// [`PROVIDER_PREFERENCE_KEYS`] is built from this list, so the config
 /// subscriber cannot end up watching a subset of it.
-pub(crate) const PROVIDER_ENABLED_SWITCHES: [&Pref<Flag>; 7] = [
+pub(crate) const PROVIDER_ENABLED_SWITCHES: [&Pref<Flag>; 8] = [
     &prefs::PROVIDER_ENABLED_VERTEX,
     &prefs::PROVIDER_ENABLED_ANTHROPIC,
     &prefs::PROVIDER_ENABLED_OPENAI,
@@ -46,6 +47,7 @@ pub(crate) const PROVIDER_ENABLED_SWITCHES: [&Pref<Flag>; 7] = [
     &prefs::PROVIDER_ENABLED_XAI,
     &prefs::PROVIDER_ENABLED_LOCAL,
     &prefs::PROVIDER_ENABLED_CLAUDE_GATEWAY,
+    &prefs::PROVIDER_ENABLED_CHATGPT_PLAN,
 ];
 
 /// Preference keys that, when changed, change which LLM provider is installed.
@@ -55,7 +57,7 @@ pub(crate) const PROVIDER_ENABLED_SWITCHES: [&Pref<Flag>; 7] = [
 /// local base URL used to need a restart. The Claude gateway URL decides which
 /// sign-in counts. The per-provider switches are here for the same reason: a
 /// switch that needed a restart is a switch the user reads as broken.
-pub const PROVIDER_PREFERENCE_KEYS: [&str; 10] = [
+pub const PROVIDER_PREFERENCE_KEYS: [&str; 11] = [
     prefs::OPENCODE_FREE_ENABLED.key(),
     prefs::LOCAL_BASE_URL.key(),
     prefs::CLAUDE_GATEWAY_URL.key(),
@@ -66,6 +68,7 @@ pub const PROVIDER_PREFERENCE_KEYS: [&str; 10] = [
     PROVIDER_ENABLED_SWITCHES[4].key(),
     PROVIDER_ENABLED_SWITCHES[5].key(),
     PROVIDER_ENABLED_SWITCHES[6].key(),
+    PROVIDER_ENABLED_SWITCHES[7].key(),
 ];
 
 /// The per-provider enable switches, resolved from the `provider_enabled_*`
@@ -87,6 +90,7 @@ pub struct ProviderSwitches {
     pub xai: bool,
     pub local: bool,
     pub claude_gateway: bool,
+    pub chatgpt_plan: bool,
 }
 
 impl Default for ProviderSwitches {
@@ -99,11 +103,12 @@ impl Default for ProviderSwitches {
             xai: prefs::PROVIDER_ENABLED_XAI.default_flag(),
             local: prefs::PROVIDER_ENABLED_LOCAL.default_flag(),
             claude_gateway: prefs::PROVIDER_ENABLED_CLAUDE_GATEWAY.default_flag(),
+            chatgpt_plan: prefs::PROVIDER_ENABLED_CHATGPT_PLAN.default_flag(),
         }
     }
 }
 
-/// Read the seven switches, defaulting any unreadable one to its default (on).
+/// Read the eight switches, defaulting any unreadable one to its default (on).
 /// The handle read logs a failed read. Losing a provider over a transient query
 /// error is worse than honouring the veto one build late.
 pub(crate) async fn read_provider_switches(pool: &PgPool) -> ProviderSwitches {
@@ -115,6 +120,7 @@ pub(crate) async fn read_provider_switches(pool: &PgPool) -> ProviderSwitches {
         xai: prefs::PROVIDER_ENABLED_XAI.read(pool).await,
         local: prefs::PROVIDER_ENABLED_LOCAL.read(pool).await,
         claude_gateway: prefs::PROVIDER_ENABLED_CLAUDE_GATEWAY.read(pool).await,
+        chatgpt_plan: prefs::PROVIDER_ENABLED_CHATGPT_PLAN.read(pool).await,
     }
 }
 
@@ -143,6 +149,9 @@ pub struct ProviderBuildContext {
     /// event bus exists: a signed-in gateway then counts as configured but is
     /// left out, and the engine rebuilds once it can supply one.
     pub claude_gateway_access: Option<GatewayAccessFactory>,
+    /// The ChatGPT plan's token source and limit pause. `None` at boot, as
+    /// [`Self::claude_gateway_access`] is, for the same reason.
+    pub chatgpt_plan_access: Option<ChatGptPlanAccess>,
 }
 
 /// Providers installed together at boot and on runtime configuration changes.
@@ -171,6 +180,12 @@ struct DirectProviders {
     claude_gateway: Option<AnthropicProvider>,
     /// A signed-in gateway is configured, whether or not it could be built yet.
     claude_gateway_signed_in: bool,
+    /// The ChatGPT plan. It serves no web search: the docs leave search on
+    /// the plan to OpenAI's policy, and the search backend takes a platform
+    /// key only.
+    chatgpt_plan: Option<OpenAiProvider>,
+    /// A ChatGPT plan sign-in is stored, whether or not it could be built yet.
+    chatgpt_plan_signed_in: bool,
     /// Search backends in chain order — Anthropic before OpenAI. Vertex is
     /// prepended by the caller, which owns the Vertex config.
     search_backends: Vec<Arc<dyn WebSearchProvider>>,
@@ -241,6 +256,7 @@ struct StoredInputs {
     claude_gateway_url: Option<String>,
     /// The gateway origin the stored sign-in came from.
     claude_gateway_issuer: Option<String>,
+    chatgpt_plan_signed_in: bool,
     switches: ProviderSwitches,
 }
 
@@ -329,6 +345,15 @@ async fn read_stored_inputs(pool: &PgPool, mut switches: ProviderSwitches) -> St
         ),
     }
 
+    // The ChatGPT plan: whether a sign-in is stored, never its tokens.
+    match ChatGptPlanAccountStore::is_signed_in(pool).await {
+        Ok(signed_in) => stored.chatgpt_plan_signed_in = signed_in,
+        Err(e) => crate::log!(
+            "[Startup] Failed to read the ChatGPT plan sign-in, omitting the ChatGPT plan: {}",
+            e
+        ),
+    }
+
     stored.switches = switches;
     stored
 }
@@ -382,6 +407,7 @@ async fn resolve_direct_providers(
     env: EnvFallbacks,
     switches: ProviderSwitches,
     claude_gateway_access: Option<&GatewayAccessFactory>,
+    chatgpt_plan_access: Option<&ChatGptPlanAccess>,
 ) -> DirectProviders {
     let EnvFallbacks {
         openai: openai_env_key,
@@ -398,6 +424,7 @@ async fn resolve_direct_providers(
         local_key,
         claude_gateway_url,
         claude_gateway_issuer,
+        chatgpt_plan_signed_in,
         switches,
     } = match pool {
         Some(pool) => read_stored_inputs(pool, switches).await,
@@ -460,6 +487,11 @@ async fn resolve_direct_providers(
         build_claude_gateway_provider(origin, claude_gateway_access, default_model)
     });
 
+    let chatgpt_plan_signed_in = chatgpt_plan_signed_in && switches.chatgpt_plan;
+    let chatgpt_plan = if_enabled(chatgpt_plan_signed_in, || {
+        build_chatgpt_plan_provider(chatgpt_plan_access, default_model)
+    });
+
     // Chain order: Anthropic before OpenAI, because Anthropic's server tool has
     // no per-call fee while OpenAI's Responses web search bills per call on top
     // of the tokens the results consume.
@@ -478,6 +510,8 @@ async fn resolve_direct_providers(
         local,
         claude_gateway,
         claude_gateway_signed_in,
+        chatgpt_plan,
+        chatgpt_plan_signed_in,
         search_backends,
     }
 }
@@ -670,6 +704,8 @@ pub async fn build_active_provider(
         local,
         claude_gateway,
         claude_gateway_signed_in,
+        chatgpt_plan,
+        chatgpt_plan_signed_in,
         search_backends,
     } = resolve_direct_providers(
         pool,
@@ -678,6 +714,7 @@ pub async fn build_active_provider(
         env,
         switches,
         ctx.claude_gateway_access.as_ref(),
+        ctx.chatgpt_plan_access.as_ref(),
     )
     .await;
 
@@ -691,6 +728,7 @@ pub async fn build_active_provider(
         has_opencode_free: opencode_free.is_some(),
         has_local: local.is_some(),
         has_claude_gateway: claude_gateway_signed_in,
+        has_chatgpt_plan: chatgpt_plan_signed_in,
     });
 
     // Vertex leads the chain so an existing Vertex workspace keeps the exact
@@ -761,6 +799,7 @@ pub async fn build_active_provider(
                     opencode_free,
                     local,
                     claude_gateway,
+                    chatgpt_plan,
                 },
                 ctx.model_registry.clone(),
                 ctx.default_model.clone(),
@@ -866,6 +905,32 @@ fn build_claude_gateway_provider(
                 "[Startup] Failed to build the Claude gateway provider: {}",
                 e
             );
+            None
+        }
+    }
+}
+
+/// Build the ChatGPT plan provider for a stored sign-in. `None` while no
+/// plan access can be made yet (the boot build), or if the client fails.
+fn build_chatgpt_plan_provider(
+    access: Option<&ChatGptPlanAccess>,
+    default_model: &str,
+) -> Option<OpenAiProvider> {
+    let Some(access) = access else {
+        crate::log!("[Startup] The ChatGPT plan joins once the engine's event bus exists");
+        return None;
+    };
+    match OpenAiProvider::new_chatgpt_plan(
+        access.clone(),
+        default_model.to_string(),
+        OPENAI_DEFAULT_BASE_URL,
+    ) {
+        Ok(p) => {
+            crate::log!("[Startup] ChatGPT plan provider configured");
+            Some(p)
+        }
+        Err(e) => {
+            crate::log!("[Startup] Failed to build the ChatGPT plan provider: {}", e);
             None
         }
     }
@@ -1164,8 +1229,8 @@ fn local_key_in_scope(
 mod tests {
     use super::*;
     use crate::test_support::{
-        delete_credential, seed_claude_gateway_sign_in, seed_credential, seed_preference,
-        setup_test_db, teardown_test_db,
+        delete_credential, seed_chatgpt_plan_sign_in, seed_claude_gateway_sign_in, seed_credential,
+        seed_preference, setup_test_db, teardown_test_db,
     };
 
     /// Build a non-mock context with no Vertex. `model_is_mock: false` is the load-
@@ -1180,6 +1245,7 @@ mod tests {
             model_registry: crate::llm::model_registry::empty(),
             not_served: Default::default(),
             claude_gateway_access: None,
+            chatgpt_plan_access: None,
         }
     }
 
@@ -1399,6 +1465,7 @@ mod tests {
             },
             ProviderSwitches::default(),
             None,
+            None,
         )
         .await;
         assert!(
@@ -1431,6 +1498,7 @@ mod tests {
             EnvFallbacks::default(),
             ProviderSwitches::default(),
             None,
+            None,
         )
         .await;
         assert!(
@@ -1448,6 +1516,7 @@ mod tests {
                 ..EnvFallbacks::default()
             },
             ProviderSwitches::default(),
+            None,
             None,
         )
         .await;
@@ -1813,6 +1882,7 @@ mod tests {
             },
             ProviderSwitches::default(),
             None,
+            None,
         )
         .await;
         assert!(
@@ -1835,6 +1905,7 @@ mod tests {
                 ..EnvFallbacks::default()
             },
             ProviderSwitches::default(),
+            None,
             None,
         )
         .await;
@@ -2090,6 +2161,99 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
+    /// Hands out a fixed plan token.
+    struct FixedPlanTokens;
+
+    #[async_trait::async_trait]
+    impl crate::llm::chatgpt_plan::ChatGptPlanTokens for FixedPlanTokens {
+        async fn access_token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            Ok("plan-token".into())
+        }
+
+        async fn after_rejection(
+            &self,
+            _rejected: &str,
+        ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            Ok("plan-token".into())
+        }
+    }
+
+    /// A context that can make the plan access, as the engine's is.
+    fn plan_ctx() -> ProviderBuildContext {
+        ProviderBuildContext {
+            chatgpt_plan_access: Some(ChatGptPlanAccess {
+                tokens: Arc::new(FixedPlanTokens),
+                pause: Arc::new(crate::llm::chatgpt_plan::LimitPause::unannounced()),
+            }),
+            ..unconfigured_ctx()
+        }
+    }
+
+    /// A stored ChatGPT sign-in configures the plan backend. It adds no web
+    /// search backend and no OpenAI platform backend.
+    #[tokio::test]
+    async fn a_chatgpt_plan_sign_in_configures_only_its_backend() {
+        let (pool, db) = setup_test_db().await;
+        seed_chatgpt_plan_sign_in(&pool, "plan-token").await;
+        let ProviderBuildOutcome {
+            llm,
+            web_search,
+            selection,
+        } = build_active_provider(Some(&pool), &plan_ctx())
+            .await
+            .unwrap();
+        assert_eq!(selection, ProviderSelection::Real);
+        let providers = llm.configured_providers().expect("a provider set");
+        assert!(providers.contains(&crate::llm::ProviderKind::ChatGptPlan));
+        if !ambient_provider_env() {
+            assert_eq!(providers, vec![crate::llm::ProviderKind::ChatGptPlan]);
+            assert!(web_search.backend_ids().is_empty());
+        }
+        teardown_test_db(&db).await;
+    }
+
+    /// No sign-in, or the switch off, leaves the plan out. A workspace that
+    /// never signed in builds exactly as before.
+    #[tokio::test]
+    async fn a_chatgpt_plan_without_a_sign_in_or_switched_off_is_left_out() {
+        let (pool, db) = setup_test_db().await;
+        let ctx = plan_ctx();
+        let plan = crate::llm::ProviderKind::ChatGptPlan;
+        assert!(
+            !configured(&pool, &ctx).await.contains(&plan),
+            "not signed in"
+        );
+        seed_chatgpt_plan_sign_in(&pool, "plan-token").await;
+        assert!(configured(&pool, &ctx).await.contains(&plan));
+        seed_preference(&pool, prefs::PROVIDER_ENABLED_CHATGPT_PLAN.key(), "false")
+            .await
+            .unwrap();
+        assert!(
+            !configured(&pool, &ctx).await.contains(&plan),
+            "switched off"
+        );
+        teardown_test_db(&db).await;
+    }
+
+    /// The boot build has no plan access yet. A stored sign-in still counts,
+    /// so a plan-only workspace boots, and the engine rebuilds with it in.
+    #[tokio::test]
+    async fn a_chatgpt_plan_sign_in_counts_at_boot_before_it_can_be_built() {
+        if ambient_provider_env() {
+            return;
+        }
+        let (pool, db) = setup_test_db().await;
+        seed_chatgpt_plan_sign_in(&pool, "plan-token").await;
+        let (provider, selection) = install(
+            build_active_provider(Some(&pool), &unconfigured_ctx())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(selection, ProviderSelection::Real);
+        assert_eq!(provider.configured_providers(), Some(Vec::new()));
+        teardown_test_db(&db).await;
+    }
+
     // ---- Per-provider enable switches -------------------------------------
 
     /// Absent means enabled, and only an explicit off turns a switch off. This
@@ -2146,6 +2310,7 @@ mod tests {
             EnvFallbacks::default(),
             ProviderSwitches::default(),
             None,
+            None,
         )
         .await;
         assert!(
@@ -2163,6 +2328,7 @@ mod tests {
                 anthropic: false,
                 ..ProviderSwitches::default()
             },
+            None,
             None,
         )
         .await;
@@ -2199,6 +2365,7 @@ mod tests {
             EnvFallbacks::default(),
             read_provider_switches(&pool).await,
             None,
+            None,
         )
         .await;
         assert!(
@@ -2225,6 +2392,7 @@ mod tests {
                     xai: true,
                     local: true,
                     claude_gateway: true,
+                    chatgpt_plan: true,
                 }
             ),
             "a workspace with no rows must resolve every switch on"
@@ -2241,7 +2409,8 @@ mod tests {
                 && !s.openrouter
                 && !s.xai
                 && !s.local
-                && !s.claude_gateway,
+                && !s.claude_gateway
+                && !s.chatgpt_plan,
             "every key must reach its own field: {s:?}"
         );
         teardown_test_db(&db).await;

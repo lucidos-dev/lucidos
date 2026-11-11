@@ -39,6 +39,8 @@ pub struct RoutingBackends {
     /// A Claude gateway, an [`AnthropicProvider`] on the gateway's origin with
     /// its signed-in bearer.
     pub claude_gateway: Option<AnthropicProvider>,
+    /// The ChatGPT plan, an [`OpenAiProvider`] on its plan endpoint.
+    pub chatgpt_plan: Option<OpenAiProvider>,
 }
 
 /// Routes LLM requests to the correct provider for the requested model. The
@@ -54,6 +56,7 @@ pub struct RoutingProvider {
     opencode_free: Option<Arc<OpenAiProvider>>,
     local: Option<Arc<OpenAiProvider>>,
     claude_gateway: Option<Arc<AnthropicProvider>>,
+    chatgpt_plan: Option<Arc<OpenAiProvider>>,
     registry: ModelRegistry,
     default_model: String,
     not_served: NotServedLedger,
@@ -70,6 +73,7 @@ impl RoutingProvider {
             opencode_free,
             local,
             claude_gateway,
+            chatgpt_plan,
         } = backends;
         Self {
             vertex: vertex.map(Arc::new),
@@ -80,6 +84,7 @@ impl RoutingProvider {
             opencode_free: opencode_free.map(Arc::new),
             local: local.map(Arc::new),
             claude_gateway: claude_gateway.map(Arc::new),
+            chatgpt_plan: chatgpt_plan.map(Arc::new),
             registry,
             default_model,
             not_served: NotServedLedger::default(),
@@ -113,6 +118,9 @@ impl RoutingProvider {
                 .claude_gateway
                 .as_deref()
                 .map(|p| p as &dyn LlmProvider),
+            ProviderKind::ChatGptPlan => {
+                self.chatgpt_plan.as_deref().map(|p| p as &dyn LlmProvider)
+            }
         }
     }
 
@@ -339,6 +347,7 @@ fn unconfigured_message(kind: ProviderKind) -> &'static str {
         ProviderKind::OpenCodeFree => concat!("Free model requested but the keyless OpenCode Free tier is turned off (", providers_settings!(), ")"),
         ProviderKind::Local => concat!("Local model requested but the local OpenAI-compatible provider is not configured (", providers_settings!(), ")"),
         ProviderKind::ClaudeGateway => concat!("Claude gateway model requested but Lucidos is not signed in to a Claude gateway (", providers_settings!(), ")"),
+        ProviderKind::ChatGptPlan => concat!("ChatGPT plan model requested but Lucidos is not signed in with ChatGPT (", providers_settings!(), ")"),
     }
 }
 
@@ -1613,3 +1622,7 @@ pub(crate) mod lineage_stub {
         ])))
     }
 }
+
+#[cfg(test)]
+#[path = "routing_plan_tests.rs"]
+mod plan_tests;

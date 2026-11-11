@@ -19,10 +19,8 @@
 //! URL on future starts so the old cluster can be explicitly decommissioned.
 
 use serde::{Deserialize, Serialize};
-use std::io::Write as _;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -244,42 +242,10 @@ impl Registry {
         Some(changed)
     }
 
-    /// Persist the registry to `path` atomically (write a sibling temp file,
-    /// then rename) so a crash mid-write can't truncate the registry and strand
-    /// every workspace. The temp file is created exclusively under a name no
-    /// other write uses, so two writers never share one.
+    /// Persist the registry to `path` atomically, so a crash mid-write can't
+    /// truncate the registry and strand every workspace.
     pub fn save(&self, path: &Path) -> Result<(), BoxError> {
-        static SAVES: AtomicU64 = AtomicU64::new(0);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let json = serde_json::to_string_pretty(self)?;
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| format!("{} has no file name", path.display()))?;
-        // The clock as well as the pid and counter: a re-exec keeps the pid and
-        // restarts the counter.
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let tmp = path.with_file_name(format!(
-            ".{name}.{}.{nanos}.{}.tmp",
-            std::process::id(),
-            SAVES.fetch_add(1, Ordering::Relaxed)
-        ));
-        // Synced before the rename, so a crash cannot leave a blank registry.
-        let written = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .and_then(|mut f| f.write_all(json.as_bytes()).and_then(|()| f.sync_all()))
-            .and_then(|()| std::fs::rename(&tmp, path));
-        if let Err(e) = written {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(format!("save {}: {e}", path.display()).into());
-        }
-        Ok(())
+        crate::atomic_file::write(path, serde_json::to_string_pretty(self)?.as_bytes())
     }
 
     pub fn get(&self, id: &str) -> Option<&Workspace> {

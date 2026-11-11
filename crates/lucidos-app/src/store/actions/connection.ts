@@ -14,6 +14,7 @@ import { resyncPluginCatalog } from './plugin-marketplaces';
 import { loadPreferences } from './preferences';
 import { loadReleaseNotices } from './releaseNotices';
 import { loadReaderDevices } from './reader-devices';
+import { loadPeople } from './people';
 import { reloadChangelogIfRead } from './whatsNew';
 import { releaseNoticeDismissed } from '../releaseNotices';
 import { flushUndeliveredComposeDrafts } from './compose';
@@ -236,6 +237,7 @@ function runResumeSync(): void {
   void loadReleaseNotices();
   // No frame says the operators changed while the stream was down.
   void loadReaderDevices();
+  void loadPeople();
   // The changelog the engine serves follows its release too, and What's New
   // opened during the restart holds a failed read.
   void reloadChangelogIfRead();

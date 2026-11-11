@@ -1066,6 +1066,12 @@ pub async fn seed_claude_gateway_sign_in(pool: &PgPool, issuer: &str) {
         .expect("store the sign-in");
 }
 
+/// Store a ChatGPT plan sign-in holding `access_token`, through its store.
+pub async fn seed_chatgpt_plan_sign_in(pool: &PgPool, access_token: &str) {
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    crate::llm::chatgpt_plan::ChatGptPlanAccountStore::seed_sign_in(pool, &bus, access_token).await;
+}
+
 /// [`seed_preference`], scoped to one device.
 pub async fn seed_preference_for_device(
     pool: &PgPool,

@@ -115,7 +115,8 @@ pub struct EstimatedPair {
     pub general_band: i32,
     /// The *coding* profile, which the coding agents rank on.
     pub coding_band: i32,
-    /// No coding score was published, so `coding_band` is `general_band`.
+    /// No coding score was published; the model gap estimates its coding band.
+    /// Covered scores may also be smoothed by the monotone effort envelope.
     pub coding_estimated: bool,
     /// Billed tokens per task in output-token equivalents. Times the model's
     /// output price, it is the cost per task.

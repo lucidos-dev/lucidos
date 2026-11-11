@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
-import { PLAIN_RESOLUTION_NOTES } from '../PermissionCard';
+import { LEGACY_RESOLUTION_NOTES, PLAIN_RESOLUTION_NOTES } from '../PermissionCard';
 import { TOOL_CALL_CAP_OPENING } from '../ChatExchange';
 import { LEGACY_REENTRY_OPENINGS } from '../../../store/thread-events';
 
@@ -31,6 +31,11 @@ const engineText = [
 describe('the engine still writes the words the UI matches on', () => {
   it.each(PLAIN_RESOLUTION_NOTES.map(([opening]) => opening))('a permission reason opening "%s"', (opening) => {
     expect(engineText).toContain(opening);
+  });
+
+  // A retired row the engine still wrote would belong in the current table.
+  it.each(LEGACY_RESOLUTION_NOTES.map(([opening]) => opening))('no longer a reason opening "%s"', (opening) => {
+    expect(engineText).not.toContain(opening);
   });
 
   it.each(LEGACY_REENTRY_OPENINGS.map(([opening]) => opening))('a re-entry opening "%s"', (opening) => {

@@ -1,5 +1,6 @@
 use super::actor::build_message_origin;
 use super::*;
+use crate::engine::agent_pause::MessageAudience;
 use crate::engine::thread_events::{
     ActorMode, EventChannel, EventMeta, MessageOrigin, ThreadEvent, WakeMode,
 };
@@ -1086,8 +1087,11 @@ pub(super) async fn chat_submit(
     let model = request.model.clone();
     let reasoning_effort = request.reasoning_effort.clone();
     let provider = request.provider.clone();
-    let device_id =
-        super::actor::claimed_device_id(request.device_id.as_deref(), &headers).map(str::to_string);
+    let device_id = match crate::gateway_operators::current().person_count() >= 2 {
+        true => super::actor::authenticated_device_id(request.device_id.as_deref(), &headers),
+        false => super::actor::claimed_device_id(request.device_id.as_deref(), &headers),
+    }
+    .map(str::to_string);
 
     // Parent title is best-effort display metadata stamped onto the new thread's
     // origin — a transient DB error shouldn't fail the user's send.
@@ -1473,6 +1477,20 @@ pub(super) async fn chat_submit(
         .await?;
     }
 
+    // Checked before the dispatch, so a refused mention records nothing.
+    let people_addressing = super::people_messages::addressing_of_send(
+        &state.pool,
+        thread_id,
+        request.mentions,
+        request.agent_mentioned,
+        mode,
+    )
+    .await?;
+    super::people_messages::refuse_people_only_start(
+        people_addressing.as_ref(),
+        use_coding_agent == Some(true) && !has_started,
+    )?;
+
     let request_title = request.title;
     let request_integrated = request.integrated;
     // A script fire's spawn names its fire, but only on a verified token.
@@ -1580,10 +1598,7 @@ pub(super) async fn chat_submit(
                 integrated: request_integrated,
                 spawning_trigger_id,
             };
-            let outcome = engine
-                .thread_queue
-                .submit(queue_request, origin, None)
-                .await;
+            let outcome = engine.thread_queue.submit(queue_request, origin).await;
             if !outcome.admitted {
                 log!(
                     "[Chat] Agent-mode spawn queued at position {} (thread {})",
@@ -1625,6 +1640,66 @@ pub(super) async fn chat_submit(
             }
             _ => None,
         };
+
+        // On a team gateway a person's message may stay between people. It
+        // then records `PeopleMessagePosted`, which starts no turn (ADR 0649).
+        let thread_id = match (&people_addressing, thread_id) {
+            (Some(_), None) => Some(Uuid::new_v4()),
+            (_, tid) => tid,
+        };
+        if let (Some(addressing), Some(tid)) = (&people_addressing, thread_id) {
+            // The route reads the pause, which an input admitted before this
+            // one may still flip. Waiting keeps both in admission order.
+            if let Some(turn) = input_turn.as_mut() {
+                turn.wait_for_predecessor().await;
+            }
+            let routed = super::people_messages::route_people_message(
+                engine.pool(),
+                &engine.event_bus,
+                tid,
+                addressing,
+                origin.clone(),
+            )
+            .await;
+            let posted = match routed {
+                Ok(MessageAudience::Agent) => None,
+                Ok(MessageAudience::PeopleOnly) => Some(
+                    super::people_messages::post_people_message(
+                        &engine.event_bus,
+                        tid,
+                        super::people_messages::PeopleMessage {
+                            text: message.clone(),
+                            image_hashes: supplied_image_hashes.clone().unwrap_or_default(),
+                            device_id: device_id.clone(),
+                            mentions: addressing.mentions.clone(),
+                            event_id: event_uuid,
+                        },
+                        origin.clone(),
+                    )
+                    .await,
+                ),
+                Err(e) => Some(Err(e)),
+            };
+            match posted {
+                None => {}
+                Some(Ok(())) => {
+                    drop(input_turn.take());
+                    super::people_messages::spawn_people_notice(
+                        &engine, tid, event_uuid, &message, addressing, true, &origin,
+                    );
+                    return Ok(Json(ChatSubmitResponse {
+                        event_id: event_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+                        compose,
+                    }));
+                }
+                Some(Err(e)) => {
+                    if let Some(id) = accepted_event_id {
+                        engine.accepted_messages.forget(id);
+                    }
+                    return Err(e);
+                }
+            }
+        }
 
         // Stash the app spawn AFTER every early-return gate above. An entry
         // stamped earlier would leak in the in-memory map when a gate rejects:
@@ -1687,6 +1762,14 @@ pub(super) async fn chat_submit(
         // client's raw new send does, so the Thread Queue gate's reservation
         // belongs to the thread it starts (ADR 0443).
         let thread_id = thread_id.unwrap_or_else(Uuid::new_v4);
+        if let Some(addressing) = people_addressing
+            .as_ref()
+            .filter(|a| !a.mentions.is_empty())
+        {
+            super::people_messages::spawn_people_notice(
+                &engine, thread_id, event_uuid, &message, addressing, false, &origin,
+            );
+        }
         let engine_for_panic = engine.clone();
         let thread_id_for_panic = thread_id;
         let actor_for_apply = origin.clone();

@@ -115,6 +115,11 @@ pub struct SessionMessage {
     /// writer knew which one wrote.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentParticipant>,
+    /// The device a person typed a user turn on, read from the event's own
+    /// origin. `history.rs` resolves it to an operator name on a team gateway.
+    /// `None` on every other turn.
+    #[serde(skip)]
+    pub sender_device_id: Option<String>,
 }
 
 /// A message in a conversation snapshot (for time-travel view)

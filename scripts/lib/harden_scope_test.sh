@@ -272,6 +272,24 @@ g checkout -q parent && g merge -q --ff-only child
 expect_eq "nothing is the branch's own" "MERGE_ONLY
 fork-point $FORK" "$(HARDEN_REVIEWED_HEADS="$CH" scope "")"
 
+echo "an iteration successor retains its review head"
+new_repo successor
+mkdir -p .lucidos
+printf '%s\n' "$H" > .lucidos/harden-review-head
+commit_file fix.txt fix "feature: post-review fix"
+C=$(git rev-parse HEAD)
+# A fresh shell stands in for successor entry: no in-memory review state.
+OUT=$(bash -c '"$1" "$(cat .lucidos/harden-review-head 2>/dev/null)"' _ "$CLI")
+expect_eq "successor reviews only the committed fix" "INCREMENTAL
+commit $C
+other-model-base $H" "$OUT"
+expect_lacks "reviewed work is excluded" "commit $H" "$OUT"
+expect_has "missing continuation widens review" "FULL no harden marker" \
+    "$(bash -c '"$1" "$(cat .lucidos/missing-review-head 2>/dev/null)"' _ "$CLI")"
+printf '%s\n' 0123456789abcdef0123456789abcdef01234567 > .lucidos/harden-review-head
+expect_has "invalid continuation widens review" "FULL hardened commit not found" \
+    "$(bash -c '"$1" "$(cat .lucidos/harden-review-head 2>/dev/null)"' _ "$CLI")"
+
 echo
 echo "harden_scope: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

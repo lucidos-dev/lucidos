@@ -30,7 +30,8 @@ workspaces on one machine could not connect accounts at the same time.
    checks the nonce exactly as before.
 3. **The gateway forwards server-side.** It answers `/oauth/callback` only on its
    loopback listener, and forwards only `code`, `state`, `error` and
-   `error_description`.
+   `error_description`. ADR 0636 adds `client_id`, which Sign in with ChatGPT
+   returns beside the code.
    - An own workspace gets them on `GET /api/v1/internal/oauth/callback` over
      the engine socket (ADR 0445). The engine accepts that route only from its
      gateway, and renders the browser page.

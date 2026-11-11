@@ -33,6 +33,7 @@ macro_rules! log {
     };
 }
 
+mod atomic_file;
 mod auth;
 mod auth_api;
 mod boot_failure;
@@ -80,6 +81,7 @@ mod trash;
 mod update_relay;
 #[cfg(test)]
 mod value_pins_tests;
+mod workspace_order;
 
 /// Lucidos umbrella release version (e.g. "0.7"), sourced from the repo-root
 /// `RELEASE` file at compile time. Mirrors `lucidos_engine::LUCIDOS_RELEASE`

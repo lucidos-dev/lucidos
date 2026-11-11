@@ -7,13 +7,9 @@ use crate::llm::{ContentBlock, Message, MessageContent};
 use crate::memory::{EmbeddingProvider, MemoryEntry, QueryClassification};
 use uuid::Uuid;
 
-/// Tokens reserved out of the model's context window when sizing the input
-/// char budget — a heuristic margin so a long reply doesn't push the request
-/// total past the window. The engine never enforces this on the output side
-/// (the model is free to keep generating); the reserve just shrinks how
-/// much input we'll pack in. 8k covers a long assistant turn plus tool
-/// calls; smaller reserves stop being safe past ~32k responses, which we
-/// don't ship today.
+/// Default input-packing margin for models with no explicit shared-window
+/// output cap. Gemini 4 instead reserves its whole wire cap through
+/// `agent_context_char_budget_for`.
 pub(super) const RESPONSE_TOKEN_RESERVE: usize = 8_000;
 
 /// Per-request char budget for `(system_prompt + tools + messages)`, derived
@@ -40,6 +36,15 @@ pub(crate) fn agent_context_char_budget(context_window: usize) -> usize {
     let usable_tokens = context_window.saturating_sub(RESPONSE_TOKEN_RESERVE);
     // 3/2 = 1.5 chars/token (integer math).
     usable_tokens.saturating_mul(3) / 2
+}
+
+/// Model-aware request budget: reserve the full output cap for models with
+/// a unified input/output window. Existing models retain the 8k margin.
+pub(crate) fn agent_context_char_budget_for(model: &str, context_window: usize) -> usize {
+    match crate::llm::model_registry::unified_output_limit(model) {
+        Some(reserve) => context_window.saturating_sub(reserve).saturating_mul(3) / 2,
+        None => agent_context_char_budget(context_window),
+    }
 }
 
 /// Exact inverse of [`agent_context_char_budget`]: how many tokens the
@@ -1483,7 +1488,10 @@ mod tool_definition_sizing_tests {
 
 #[cfg(test)]
 mod chars_per_token_ratio_tests {
-    use super::{agent_context_char_budget, budget_tokens_from_chars, estimate_tokens_from_chars};
+    use super::{
+        agent_context_char_budget, agent_context_char_budget_for, budget_tokens_from_chars,
+        estimate_tokens_from_chars,
+    };
 
     /// Pin the measured display ratio at 2.5 chars/token. The number the user
     /// reads is the one this produces, and it was 1.5 (the budget's safety
@@ -1530,6 +1538,27 @@ mod chars_per_token_ratio_tests {
 
     /// The budget itself is untouched by the split: it is still expressed in
     /// chars at 1.5 chars/token, and the display ratio must not leak into it.
+    #[test]
+    fn gemini_four_reserves_its_wire_output_cap() {
+        for model in ["gemini-4-argon", "gemini-4-carbon"] {
+            let window = 1_048_576;
+            let budget = agent_context_char_budget_for(model, window);
+            assert_eq!(budget_tokens_from_chars(budget), window - 32_768);
+            assert_eq!(
+                crate::mcp::mcp_tool_char_ceiling_for(model, window),
+                budget / 4
+            );
+        }
+        assert_eq!(
+            agent_context_char_budget_for("gemini-3.8-flash", 1_048_576),
+            agent_context_char_budget(1_048_576)
+        );
+        assert_eq!(
+            agent_context_char_budget_for("claude-fable-5-2", 1_000_000),
+            agent_context_char_budget(1_000_000)
+        );
+    }
+
     #[test]
     fn the_split_did_not_move_the_budget() {
         assert_eq!(agent_context_char_budget(200_000), 288_000);

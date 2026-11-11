@@ -217,6 +217,7 @@ export function appUrl(
   threadId?: string,
   fragment?: string,
   widgetParams?: WidgetParams,
+  device: string | null = readDeviceId(),
 ): string {
   const base = `${API_BASE}/app/${encodeURIComponent(appId)}/`;
   const params = new URLSearchParams();
@@ -227,9 +228,9 @@ export function appUrl(
   // `device` is whose appearance the app's first paint should carry. The engine
   // stamps it onto the app's own `sdk-prefs.js` reference, and that script then
   // resolves this device's theme, font and scale. An isolated app frame cannot
-  // read them out of the shell's storage the way a same-origin one could.
-  const deviceId = readDeviceId();
-  if (deviceId) params.set('device', deviceId);
+  // read them out of the shell's storage the way a same-origin one could. A
+  // widget fit check names another device, to render at that device's scale.
+  if (device) params.set('device', device);
   // A widget's params ride one key the SDK owns, so they never meet a host
   // name (ADR 0415). Canonical, so one instance always has one URL.
   if (hasWidgetParams(widgetParams)) params.set(WIDGET_PARAMS_QUERY, canonicalWidgetParams(widgetParams));

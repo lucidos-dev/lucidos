@@ -269,6 +269,7 @@ pub(crate) async fn notify_outage(service_name: &str, failure: Option<&str>) {
             tap: Default::default(),
             actor: None,
             audience: None,
+            push_group: None,
         }),
         "[SecretReference] NotificationCreated",
     )

@@ -419,6 +419,56 @@ impl SettingsPage {
     }
 }
 
+/// The OS push action that stops watching a root thread. `sw.js` carries a
+/// copy, pinned by a test because a service worker served raw cannot import it.
+pub const UNWATCH_PUSH_ACTION: &str = "unwatch";
+
+/// Notifications whose OS pushes share one tag, so a burst replaces one banner
+/// rather than stacking (ADR 0649). Stored on the notification row, because
+/// the wake push rebuilds from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PushGroup {
+    /// People-only messages in one thread. The push offers Unwatch, except to
+    /// the thread's driver, who cannot unwatch it.
+    PeopleMessages {
+        thread_id: Uuid,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        to_driver: bool,
+    },
+}
+
+impl PushGroup {
+    /// The push tag every notification in the group carries.
+    pub fn tag(&self) -> String {
+        match self {
+            Self::PeopleMessages { thread_id, .. } => format!("people-{thread_id}"),
+        }
+    }
+
+    /// Stamp the group onto a push envelope: its tag, and for people-only
+    /// messages to a watcher an Unwatch action with the thread it leaves.
+    pub fn apply(&self, payload: &mut serde_json::Value) {
+        let notification = &mut payload["notification"];
+        notification["tag"] = serde_json::Value::String(self.tag());
+        match self {
+            Self::PeopleMessages {
+                to_driver: true, ..
+            } => {}
+            Self::PeopleMessages {
+                thread_id,
+                to_driver: false,
+            } => {
+                notification["actions"] = serde_json::json!([
+                    { "action": UNWATCH_PUSH_ACTION, "title": "Unwatch" }
+                ]);
+                notification["data"]["unwatch_thread_id"] =
+                    serde_json::Value::String(thread_id.to_string());
+            }
+        }
+    }
+}
+
 /// A notification sent to the user
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Notification {
@@ -699,6 +749,21 @@ impl NotificationStore {
                 .await?
                 .flatten(),
         )
+    }
+
+    /// The push group a notification belongs to. `None` for an ordinary one,
+    /// and for one that no longer exists.
+    pub async fn push_group(
+        pool: &PgPool,
+        notification_id: Uuid,
+    ) -> Result<Option<PushGroup>, sqlx::Error> {
+        let group: Option<sqlx::types::Json<PushGroup>> =
+            sqlx::query_scalar("SELECT push_group FROM notifications WHERE id = $1")
+                .bind(notification_id)
+                .fetch_optional(pool)
+                .await?
+                .flatten();
+        Ok(group.map(|g| g.0))
     }
 }
 
@@ -1208,6 +1273,49 @@ mod tests {
                 .await
                 .unwrap(),
             0
+        );
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// The projection stores the push group, so the wake push can rebuild it.
+    #[tokio::test]
+    async fn a_notification_keeps_its_push_group() {
+        use crate::engine::event_bus::{BusEvent, SystemEvent};
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let group = PushGroup::PeopleMessages {
+            thread_id: Uuid::new_v4(),
+            to_driver: false,
+        };
+        let grouped = Uuid::new_v4();
+        bus.emit(BusEvent::System(SystemEvent::NotificationCreated {
+            id: grouped.to_string(),
+            title: "Sam".into(),
+            message: "Kim, can you look?".into(),
+            task_id: None,
+            app_id: None,
+            thread_id: None,
+            event_id: None,
+            tap: Tap::Modal,
+            actor: None,
+            audience: Some(vec!["kim-phone".into()]),
+            push_group: Some(group.clone()),
+        }))
+        .await
+        .unwrap();
+        let ordinary = insert_for(&pool, None).await;
+
+        assert_eq!(
+            NotificationStore::push_group(&pool, grouped).await.unwrap(),
+            Some(group)
+        );
+        assert_eq!(
+            NotificationStore::push_group(&pool, ordinary)
+                .await
+                .unwrap(),
+            None
         );
 
         pool.close().await;

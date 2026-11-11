@@ -169,6 +169,41 @@ fn a_tool_change_inverts_only_when_one_tool_moved() {
     assert_eq!(one_toggled(&[a()], &[a()]), None);
 }
 
+/// Undoing a revoke, or restoring a deleted granted trigger, grants coding
+/// agents again. The undo route holds that to the grant's own rule.
+#[test]
+fn an_undo_that_restores_a_coding_agent_grant_is_named() {
+    let config = |granted: bool| {
+        TriggerConfig::from_created_payload(&serde_json::json!({
+            "trigger_id": "t1", "name": "T", "schedule": ["0 0 8 * * *"],
+            "run": { "type": "intent", "intent": "x" },
+            "coding_agent_grant": granted,
+        }))
+        .unwrap()
+    };
+    let undo = |write, granted: bool| ConfigUndo::WriteTrigger {
+        write,
+        trigger_id: "t1".to_string(),
+        payload: config(granted).to_created_payload(),
+    };
+    let revoked = config(false);
+    let granted = config(true);
+
+    assert!(undo(TriggerWrite::Updated, true).needs_the_owner(Some(&revoked)));
+    assert!(undo(TriggerWrite::Created, true).needs_the_owner(None));
+    assert!(!undo(TriggerWrite::Updated, true).needs_the_owner(Some(&granted)));
+    assert!(!undo(TriggerWrite::Updated, false).needs_the_owner(Some(&granted)));
+    assert!(!undo(TriggerWrite::Deleted, true).needs_the_owner(Some(&revoked)));
+    // Rewriting a granted trigger's work back to an older version.
+    let mut rewritten = granted.clone();
+    rewritten.apply_update(&serde_json::json!({ "mcp_servers": ["slack"] }));
+    assert!(undo(TriggerWrite::Updated, true).needs_the_owner(Some(&rewritten)));
+    assert!(!ConfigUndo::RemoveMcpServer {
+        server_id: "s".to_string()
+    }
+    .needs_the_owner(None));
+}
+
 #[tokio::test]
 async fn a_repository_add_and_remove_each_undo() {
     let bench = Bench::new().await;

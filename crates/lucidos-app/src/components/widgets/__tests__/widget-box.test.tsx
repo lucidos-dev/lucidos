@@ -44,7 +44,7 @@ const box = (size: WidgetSize) => (
   <WidgetBox appId="fare-grid" reveal="on-load" place="inline" size={size} />
 );
 const covered = () => host.querySelector('.widget-box-cover')!.classList.contains('is-covering');
-const report = (detail: { height: number; size?: WidgetSize }) => act(() => {
+const report = (detail: { height: number; width?: number; size?: WidgetSize }) => act(() => {
   host.querySelector('iframe')!.dispatchEvent(new CustomEvent(APP_FRAME_SIZE_EVENT, { detail, bubbles: true }));
 });
 
@@ -98,5 +98,46 @@ describe('WidgetBox resize cover', () => {
     expect(covered()).toBe(true);
     report({ height: 400, size: 'large' });
     expect(covered()).toBe(false);
+  });
+});
+
+/** Invariant: the right-edge fade shows exactly when the content is wider than
+ *  the canvas it draws on, and never on a transparent box (plan
+ *  2026-11-10-widget-fit-check). */
+describe('WidgetBox right-edge fade', () => {
+  const rightFade = () => host.querySelector('.widget-box-fade[data-edge="right"]');
+  const canvasWidth = (px: number) => {
+    Object.defineProperty(host.querySelector('.widget-box-canvas')!, 'clientWidth', { configurable: true, value: px });
+  };
+
+  it('fades the right edge when the content spills sideways', () => {
+    shownAt('large');
+    canvasWidth(320);
+    report({ height: 100, width: 410, size: 'large' });
+    expect(rightFade()).not.toBeNull();
+  });
+
+  it('shows no right fade for content that fits, or a report with no width', () => {
+    shownAt('large');
+    canvasWidth(320);
+    report({ height: 100, width: 320.6, size: 'large' });
+    expect(rightFade()).toBeNull();
+    report({ height: 100, size: 'large' });
+    expect(rightFade()).toBeNull();
+  });
+
+  it('never calls an XL box that pans cut: its canvas keeps the true width', () => {
+    shownAt('xl');
+    canvasWidth(680);
+    report({ height: 100, width: 680, size: 'xl' });
+    expect(rightFade()).toBeNull();
+  });
+
+  it('never fades a transparent box, on either edge', () => {
+    act(() => { render(<WidgetBox appId="fare-grid" reveal="on-load" place="inline" size="large" transparent />, host); });
+    act(() => { reportOnScreen?.(true); });
+    canvasWidth(320);
+    report({ height: 2000, width: 900, size: 'large' });
+    expect(host.querySelector('.widget-box-fade')).toBeNull();
   });
 });

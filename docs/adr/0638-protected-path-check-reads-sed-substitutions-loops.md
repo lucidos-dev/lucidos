@@ -1,6 +1,7 @@
 # 0638: The protected-path write check reads a printing sed, a read-only substitution, and loop keywords
 
-- **Status**: Accepted
+- **Status**: Accepted; amended by [ADR 0641](0641-coding-agents-trust-by-provenance.md): the walk decides only whether a
+  narrow grant covers a command
 - **Date**: 2026-11-09
 
 ## Context

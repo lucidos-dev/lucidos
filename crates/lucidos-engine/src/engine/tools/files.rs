@@ -1244,6 +1244,7 @@ impl LucidosEngine {
         name: &str,
         args: &serde_json::Value,
         thread_id: uuid::Uuid,
+        device_id: Option<&str>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         match name {
             "read_file" => {
@@ -1420,12 +1421,17 @@ impl LucidosEngine {
 
                 let result_action = if file_exists { "UPDATED" } else { "CREATED" };
                 let sha_short = &commit_sha[..commit_sha.floor_char_boundary(7)];
+                // The check waits on a window for seconds. No other write may
+                // wait on it too, and the widget's own data writes need the lock.
+                drop(held);
+                let fit = self.widget_fit_notes([path], thread_id, device_id).await;
                 Ok(format!(
-                    "[ACTION COMPLETED] {}: {} (commit: {}){}",
+                    "[ACTION COMPLETED] {}: {} (commit: {}){}{}",
                     result_action,
                     path,
                     sha_short,
-                    app_lint_note(path, content).unwrap_or_default()
+                    app_lint_note(path, content).unwrap_or_default(),
+                    fit
                 ))
             }
             "edit_file" => {
@@ -1459,6 +1465,11 @@ impl LucidosEngine {
                             let data_dir = self.workspace_path().join(crate::core::DATA_DIR);
                             message.push_str(
                                 &app_lint_note_on_disk(&data_dir, &r.path).unwrap_or_default(),
+                            );
+                            message.push_str(
+                                &self
+                                    .widget_fit_notes([r.path.as_str()], thread_id, device_id)
+                                    .await,
                             );
                         }
                         Ok(message)

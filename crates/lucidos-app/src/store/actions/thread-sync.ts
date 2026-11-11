@@ -54,9 +54,11 @@ import { loadPreferences, refreshActiveTheme } from './preferences';
 import { loadChatModels } from './models';
 import { loadReleaseNotices } from './releaseNotices';
 import { loadOperators } from './operators';
+import { agentPauseVersion, loadPeople, threadPeopleVersion } from './people';
 import { loadReaderDevices, readIsMine } from './reader-devices';
 import { loadArtifacts, refreshArtifacts } from './artifacts';
 import { refreshAppUI, captureAppUI } from './apps';
+import { requestWidgetFit } from '../widgetFit';
 import { clearWipIfMatches } from './wipPreview';
 import { closeResolvedFormRequest, openFormRequest, syncPendingFormRequests } from './form-requests';
 import { setDevicePushEnabled } from './push';
@@ -665,8 +667,14 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
 
   // The draft is not touched here: the send consumed the compose slot at
   // accept, and the engine reported what that left (ADR 0450).
-  if (event.type === 'MessageReceived') {
+  // A people-only message can open a thread too: one started with a teammate.
+  if (event.type === 'MessageReceived' || event.type === 'PeopleMessagePosted') {
     if (thread.meta.state !== 'active') { thread.meta.state = 'active'; metaChanged = true; }
+  }
+  if (event.type === 'AgentPaused' || event.type === 'AgentResumed') agentPauseVersion.value++;
+  if (event.type === 'WorkItemDriverTaken' || event.type === 'WorkItemDriverReleased'
+      || event.type === 'WorkItemWatched' || event.type === 'WorkItemUnwatched') {
+    threadPeopleVersion.value++;
   }
   if (event.type === 'ThreadDiscarded') {
     if (thread.meta.state !== 'discarded') { thread.meta.state = 'discarded'; metaChanged = true; }
@@ -1017,6 +1025,7 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // and every people list on screen is stale.
       void loadReaderDevices();
       void loadOperators();
+      void loadPeople();
       break;
 
     case 'ReleaseNoticeResolved':
@@ -1552,6 +1561,20 @@ function handleTransientSideEffects(
         (window) => window.appId !== null,
         () => true,
       )) void captureAppUI(event.app_id, event.request_id, event.save_format);
+      break;
+
+    // The engine names one device with a visible window. On it the window
+    // showing the thread renders the check, else the one touched last.
+    case 'WidgetFitRequested':
+      if (isForThisDevice(event.actor) && isChosenForThread(sourceThreadId)) {
+        requestWidgetFit({
+          requestId: event.request_id,
+          appId: event.app_id,
+          sizes: event.sizes,
+          scale: event.ui_scale,
+          scaleDevice: event.scale_device_id,
+        });
+      }
       break;
 
     case 'NavigationRequested': {

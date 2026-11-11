@@ -248,6 +248,7 @@ impl GatewayState {
                 updated.save(&self.inner.registry_path)?;
                 *registry = updated;
             }
+            self.forget_workspace_order(&ws.id);
         }
         entry.phase = crate::trash::Phase::Completed;
         entry.save(journal_root)?;
@@ -1076,6 +1077,16 @@ mod tests {
                 registry.workspaces.push(workspace.clone());
                 registry.save(&state.inner.registry_path).unwrap();
             }
+            state
+                .workspace_order()
+                .replace(
+                    crate::workspace_order::WorkspaceOrder::new(vec![
+                        "scratch".into(),
+                        "scratch@cloud".into(),
+                    ])
+                    .unwrap(),
+                )
+                .unwrap();
             let audit = crate::cleanup_audit::Audit::begin(
                 state.app_data(),
                 "scratch",
@@ -1113,6 +1124,15 @@ mod tests {
             assert_eq!(
                 state.inner.registry.lock().unwrap().contains("scratch"),
                 observation != Some(false)
+            );
+            // The deleted workspace's key goes with it; a remote namesake stays.
+            assert_eq!(
+                state.workspace_order().keys(),
+                if observation == Some(false) {
+                    vec!["scratch@cloud"]
+                } else {
+                    vec!["scratch", "scratch@cloud"]
+                }
             );
             assert!(!source.exists());
             assert_eq!(

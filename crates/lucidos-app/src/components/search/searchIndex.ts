@@ -188,6 +188,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'models:query-classification', label: 'Query classification', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:query-classification', keywords: 'query classification retrieval memory typesafe jev clef system one judgment' },
   { id: 'models:conversation-summary', label: 'Conversation summary', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:conversation-summary' },
   { id: 'models:read-decision', label: 'Read decision', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:read-decision', keywords: 'read decision review worth reading typesafe jev openai decisions openrouter system one judgment' },
+  { id: 'models:command-judge', label: 'Command judge', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:command-judge', keywords: 'command guard judge model safety flash lite luna haiku typesafe jev clef system one judgment backend auto answer coding agent' },
   { id: 'models:wake-decision', label: 'Wake decision', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:wake-decision', keywords: 'wake decision sub-thread child parent filed report typesafe jev openai decisions openrouter system one judgment' },
   { id: 'models:expected-wake-decision', label: 'Expected wake', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:expected-wake-decision', keywords: 'expected wake decision cache keep-alive waiting estimate when the thread wakes typesafe jev openai decisions openrouter system one judgment' },
   { id: 'models:voice', label: 'Voice', subview: 'models', path: 'Settings → Models', anchor: 'models:voice', keywords: 'voice call talk speak speech audio microphone realtime talker transcriber experimental' },
@@ -223,6 +224,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: providerAnchor('xai'), label: 'xAI', subview: 'providers', path: PROVIDERS_SETTINGS_PATH, anchor: providerAnchor('xai'), keywords: 'xai grok api key' },
   { id: providerAnchor('local'), label: 'Local (OpenAI-compatible)', subview: 'providers', path: PROVIDERS_SETTINGS_PATH, anchor: providerAnchor('local'), keywords: 'local ollama lm studio llama vllm openai compatible base url self-hosted' },
   { id: providerAnchor('claude-gateway'), label: 'Claude gateway', subview: 'providers', path: PROVIDERS_SETTINGS_PATH, anchor: providerAnchor('claude-gateway'), keywords: 'claude gateway organisation organization company sign in device code anthropic' },
+  { id: providerAnchor('chatgpt-plan'), label: 'ChatGPT plan', subview: 'providers', path: PROVIDERS_SETTINGS_PATH, anchor: providerAnchor('chatgpt-plan'), keywords: 'chatgpt plan subscription plus pro sign in with chatgpt openai gpt usage limit' },
   // A provider's "In use by" row sits in its folded body, so it lands on the
   // provider's header, which always renders. A chat provider's header has its
   // own entry above.
@@ -276,10 +278,9 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'command-safety', label: 'Command safety', subview: 'permissions', path: 'Settings → Permissions', anchor: 'command-safety', keywords: 'command guard safety bash python shell judge' },
   { id: 'command-safety:guard', label: 'Command guard', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:guard', keywords: 'command guard safety bash python shell' },
   { id: 'command-safety:judge', label: 'LLM judge', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:judge', keywords: 'command guard llm judge' },
-  { id: 'command-safety:coding-agents', label: 'Answer coding-agent questions', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:coding-agents', keywords: 'command guard enabled for coding agents codex claude code bash permission card questions auto allow' },
-  { id: 'command-safety:judge-model', label: 'Judge model', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:judge-model', keywords: 'command guard judge model haiku typesafe jev clef system one judgment backend' },
   { id: 'permissions:lucidos', label: 'Lucidos Agent permissions', subview: 'permissions', path: 'Settings → Permissions', anchor: 'permissions:lucidos', keywords: 'lucidos agent command allowlist bash python always allow auto allow' },
   { id: 'permissions:coding-agent', label: 'Coding agent permissions', subview: 'permissions', path: 'Settings → Permissions', anchor: 'permissions:coding-agent', keywords: 'claude code permissions codex permissions tool permissions allowed tools allowlist always allow' },
+  { id: 'permissions:coding-agent-auto-answer', label: 'Auto-answer coding-agent cards', subview: 'permissions', path: 'Settings → Permissions → Coding agent permissions', anchor: 'permissions:coding-agent-auto-answer', keywords: 'auto answer coding agents codex claude code bash permission card questions auto allow command guard judge' },
   { id: 'permissions:mcp', label: 'MCP tool permissions', subview: 'permissions', path: 'Settings → Permissions', anchor: 'permissions:mcp', keywords: 'mcp model context protocol server tool permissions allowlist always allow' },
 
   // MCP Servers subview

@@ -1084,6 +1084,7 @@ fn the_setup_seed_names_the_confirming_device_and_only_a_device() {
         user_agent: Some("curl/8".to_string()),
         mode: crate::engine::thread_events::ActorMode::Human,
         source_thread_id: None,
+        emitting_trigger_id: None,
     };
     assert_eq!(reason_device(Some(&api)), None);
     assert_eq!(reason_device(None), None);

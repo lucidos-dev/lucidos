@@ -417,9 +417,14 @@ impl LucidosEngine {
                             .as_ref()
                             .map(|field| format!("  Actor: {}\n", field.0))
                             .unwrap_or_default();
+                        let coding_agents = if config.coding_agent_grant {
+                            "allowed"
+                        } else {
+                            "not allowed (only the owner can grant)"
+                        };
                         result.push_str(&format!(
-                            "- **{}** (ID: {}) [{}]\n{}{}{}{}{}  Status: {}\n  Last run: {}\n  Run: {}\n\n",
-                            config.name, config.id, trigger_type, schedule_display, event_display, mcp_display, key_display, actor_display, status, last_run, run_info
+                            "- **{}** (ID: {}) [{}]\n{}{}{}{}{}  Status: {}\n  Coding agents: {}\n  Last run: {}\n  Run: {}\n\n",
+                            config.name, config.id, trigger_type, schedule_display, event_display, mcp_display, key_display, actor_display, status, coding_agents, last_run, run_info
                         ));
                     }
                     Ok(result)
@@ -674,9 +679,18 @@ impl LucidosEngine {
                 {
                     return Ok(format!("Error: {e}"));
                 }
+                // This tool is always an agent's, never the owner's.
+                let grant_notice = existing.unowned_edit_clears_grants(&next).then(|| {
+                    crate::triggers::TriggerConfig::clear_grants_in(&mut update_payload);
+                    format!("\n\n{}", existing.grants_cleared_notice())
+                });
 
                 self.emit_trigger_write(TriggerWrite::Updated, &trigger_id, update_payload, actor)
                     .await?;
+                if let (Some(_), Some(engine)) = (&grant_notice, self.try_clone_arc()) {
+                    crate::scheduler::user_tasks::notify_trigger_grants_cleared(&engine, &existing)
+                        .await;
+                }
 
                 let display_name = new_name.unwrap_or(&existing.name);
                 let display_schedule = new_cron
@@ -691,9 +705,10 @@ impl LucidosEngine {
                     .unwrap_or_default();
 
                 Ok(format!(
-                    "[ACTION COMPLETED] Updated trigger '{}' (ID: {}). Changed: {}. Schedule: {} ({}){}{}",
+                    "[ACTION COMPLETED] Updated trigger '{}' (ID: {}). Changed: {}. Schedule: {} ({}){}{}{}",
                     display_name, trigger_id, updated_fields.join(", "), display_schedule, existing.timezone, advice,
-                    warning_suffix(&event_warnings)
+                    warning_suffix(&event_warnings),
+                    grant_notice.unwrap_or_default()
                 ))
             }
             "delete_trigger" => {

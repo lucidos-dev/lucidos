@@ -704,12 +704,16 @@ impl OpenAiProvider {
             )
         });
 
+        let bearer = self.bearer().await?;
         let mut attempt = 0u32;
         loop {
             attempt += 1;
 
             let builder = self
-                .apply_headers(self.streaming_client.post(&self.chat_url))
+                .apply_headers(
+                    self.streaming_client.post(&self.chat_url),
+                    bearer.as_deref(),
+                )
                 .json(&body);
             let resp = match crate::llm::send_streaming_request(
                 builder,

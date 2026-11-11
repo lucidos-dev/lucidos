@@ -14,6 +14,7 @@ fn notification_created_is_persisted() {
         tap: crate::scheduler::notifications::Tap::Modal,
         actor: None,
         audience: None,
+        push_group: None,
     };
     assert!(event.is_persisted());
     assert_eq!(event.aggregate(), "notification");
@@ -37,6 +38,7 @@ fn notification_created_skips_none_fields_in_sse() {
             tap: crate::scheduler::notifications::Tap::Modal,
             actor: None,
             audience: None,
+            push_group: None,
         }),
         aggregate: None,
         depth: 0,
@@ -74,6 +76,7 @@ fn notification_created_carries_thread_id_in_sse() {
             tap: crate::scheduler::notifications::Tap::Modal,
             actor: None,
             audience: None,
+            push_group: None,
         }),
         aggregate: None,
         depth: 0,

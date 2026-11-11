@@ -1002,7 +1002,7 @@ fn web_redirect_uris(client_config: &serde_json::Value) -> Vec<String> {
 ///
 /// The verifier is a one-time secret: it is the only thing standing between an
 /// intercepted authorization code and a token, so it must never be logged.
-struct Pkce {
+pub(crate) struct Pkce {
     verifier: String,
     challenge: String,
 }
@@ -1019,7 +1019,7 @@ impl std::fmt::Debug for Pkce {
 }
 
 impl Pkce {
-    fn generate() -> Self {
+    pub(crate) fn generate() -> Self {
         let verifier = random_url_token();
         let challenge = Self::challenge_for(&verifier);
         Self {
@@ -1029,9 +1029,17 @@ impl Pkce {
     }
 
     /// `BASE64URL-NOPAD(SHA256(ASCII(verifier)))`, the `S256` method.
-    fn challenge_for(verifier: &str) -> String {
+    pub(crate) fn challenge_for(verifier: &str) -> String {
         use sha2::{Digest, Sha256};
         base64_url_nopad(&Sha256::digest(verifier.as_bytes()))
+    }
+
+    pub(crate) fn verifier(&self) -> &str {
+        &self.verifier
+    }
+
+    pub(crate) fn challenge(&self) -> &str {
+        &self.challenge
     }
 }
 
@@ -1044,7 +1052,7 @@ fn base64_url_nopad(bytes: &[u8]) -> String {
 /// a URL. Shared by both unguessable values an authorization request carries:
 /// the PKCE verifier (RFC 7636 wants 43..=128 unreserved characters, and 32
 /// bytes is its recommended entropy) and the `state` nonce.
-fn random_url_token() -> String {
+pub(crate) fn random_url_token() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -1892,15 +1900,25 @@ fn callback_state_matches(query: &str, expected: &str) -> bool {
     query_param(query, "state", false).is_some_and(|got| got == expected)
 }
 
-/// Turn a callback query string into the authorization code, or into the
-/// provider's own reason for refusing.
+/// What a callback that granted access carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizationGrant {
+    pub code: String,
+    /// The client id the provider issued, which Sign in with ChatGPT returns
+    /// beside the code. Other providers send none.
+    pub client_id: Option<String>,
+}
+
+/// Turn a callback query string into the grant, or into the provider's own
+/// reason for refusing.
 ///
 /// A denial arrives as `?error=…&error_description=…` with no `code`. Reporting
 /// that as "no authorization code" hides the one piece of information the user
 /// needs (OAuth 2.0 §4.1.2.1).
-fn parse_callback_query(query: &str) -> Result<String, BoxError> {
+fn parse_callback_query(query: &str) -> Result<AuthorizationGrant, BoxError> {
     if let Some(code) = query_param(query, "code", false).filter(|c| !c.is_empty()) {
-        return Ok(code);
+        let client_id = query_param(query, "client_id", false).filter(|c| !c.is_empty());
+        return Ok(AuthorizationGrant { code, client_id });
     }
     if let Some(error) = query_param(query, "error", true).filter(|e| !e.is_empty()) {
         let description = query_param(query, "error_description", true).filter(|d| !d.is_empty());
@@ -2098,19 +2116,19 @@ async fn wait_for_oauth_callback(
         }
 
         let received = callback_received(provider, query);
-        let status = if received.code.is_ok() {
+        let status = if received.grant.is_ok() {
             "200 OK"
         } else {
             "400 Bad Request"
         };
         respond_to_browser(&mut stream, status, &received.page).await;
-        return received.code;
+        return received.grant.map(|grant| grant.code);
     }
 }
 
-/// A callback that carried this flow's `state`: the code, and the browser page.
+/// A callback that carried this flow's `state`: the grant, and the browser page.
 pub(crate) struct ReceivedCallback {
-    pub code: Result<String, BoxError>,
+    pub grant: Result<AuthorizationGrant, BoxError>,
     pub page: String,
 }
 
@@ -2119,9 +2137,9 @@ pub(crate) struct ReceivedCallback {
 /// The provider's own reason goes to the engine, never into the page. See
 /// [`callback_page`] for why nothing from `query` is rendered.
 pub(crate) fn callback_received(provider: &str, query: &str) -> ReceivedCallback {
-    let code = parse_callback_query(query);
-    let page = callback_page(provider, code.is_ok());
-    ReceivedCallback { code, page }
+    let grant = parse_callback_query(query);
+    let page = callback_page(provider, grant.is_ok());
+    ReceivedCallback { grant, page }
 }
 
 /// What a flow waits on for its callback.
@@ -2136,7 +2154,7 @@ impl CallbackWait {
     async fn code(self, provider: &str, state: &str) -> Result<String, BoxError> {
         match self {
             Self::Listener(listener) => wait_for_oauth_callback(listener, provider, state).await,
-            Self::Gateway(pending) => pending.received().await,
+            Self::Gateway(pending) => pending.received().await.map(|grant| grant.code),
         }
     }
 }

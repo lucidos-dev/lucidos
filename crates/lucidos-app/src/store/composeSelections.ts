@@ -69,6 +69,9 @@ export interface ComposeSelectionOverride {
   /** The composer is in side-question mode. Turned off as an explicit `false`,
    *  since the compose PUT omits an empty selection and the engine keeps it. */
   sideQuestionMode?: boolean;
+  /** A teammate the new thread is for, by person id (ADR 0649). `null` clears
+   *  it, since the compose PUT omits an absent field and the engine keeps it. */
+  person?: string | null;
 }
 
 export const composeSelections = signal<Map<string, ComposeSelectionOverride>>(new Map());
@@ -179,6 +182,11 @@ export function resolveScope(threadId: string | null | undefined): Scope {
   // at creation, so a real id resolves its own stored scope or the fixed default.
   // Only the no-draft compose view (null/undefined) reads the last-used seed.
   return threadId ? { kind: 'lucidos' } : selectedScope.value;
+}
+
+/** The teammate this draft is addressed to, or `null` for an agent. */
+export function resolvePerson(threadId: string | null | undefined): string | null {
+  return getComposeSelectionOverride(threadId).person ?? null;
 }
 
 export function resolveCodingAgent(threadId: string | null | undefined): CodingAgent {

@@ -31,7 +31,7 @@ pub const SOURCE_USER: &str = "user";
 pub struct Route {
     /// Backend that serves the model on this route:
     /// "vertex" | "anthropic" | "openai" | "openrouter" | "xai" |
-    /// "opencode-free" | "local" | "claude-gateway".
+    /// "opencode-free" | "local" | "claude-gateway" | "chatgpt-plan".
     pub provider: String,
     /// The id sent on the wire. `None` means the row's own id, which is the
     /// common case: a first-party Claude id is byte-identical on Vertex and on
@@ -416,6 +416,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn november_models_are_additive_native_window_builtins() {
+        let (pool, db_name) = setup_test_db().await;
+        for (id, window, effort, providers) in [
+            (
+                "claude-fable-5-2",
+                1_000_000,
+                "high",
+                vec!["anthropic", "claude-gateway"],
+            ),
+            ("gemini-4-argon", 1_048_576, "medium", vec!["vertex"]),
+            ("gemini-4-carbon", 1_048_576, "medium", vec!["vertex"]),
+        ] {
+            let m = ModelStore::get(&pool, id).await.unwrap().expect(id);
+            assert!(m.is_builtin() && m.vision && m.successor.is_none());
+            assert_eq!(m.default_effort.as_deref(), Some(effort));
+            assert_eq!(
+                m.routes
+                    .iter()
+                    .map(|r| r.provider.as_str())
+                    .collect::<Vec<_>>(),
+                providers
+            );
+            assert!(m
+                .routes
+                .iter()
+                .all(|r| r.context_window == Some(window) && r.id.is_none()));
+            assert!(ModelStore::get(&pool, &format!("{id}[1m]"))
+                .await
+                .unwrap()
+                .is_none());
+        }
+        // A user-created collision must survive migration replay byte for byte.
+        sqlx::query("DELETE FROM models WHERE id = 'gemini-4-argon'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let custom = fields("My endpoint", "local", 77, Some(64_000));
+        let before = ModelStore::insert_row(&pool, "gemini-4-argon", &custom)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20261110213512_add_fable_5_2_and_gemini_4_models.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let after = ModelStore::get(&pool, "gemini-4-argon")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(before).unwrap(),
+            serde_json::to_value(after).unwrap()
+        );
+        let mut alias = fields("Custom Gemini", "vertex", 78, Some(1_048_576));
+        alias.routes[0].id = Some("gemini-4-carbon".to_string());
+        ModelStore::insert_row(&pool, "custom-gemini", &alias)
+            .await
+            .unwrap();
+        let registry = crate::llm::model_registry::empty();
+        crate::llm::model_registry::reload(&registry, &pool).await;
+        let route =
+            crate::llm::model_registry::resolve_route(&registry, "custom-gemini", None, |_| true)
+                .unwrap();
+        let defaults = crate::llm::vertex::sdk_request_defaults(&route.wire_id, Some("medium"));
+        let cap = defaults["body"]["generationConfig"]["maxOutputTokens"]
+            .as_u64()
+            .unwrap() as usize;
+        let window = route.context_window.unwrap();
+        assert_eq!(
+            crate::engine::context::agent_context_char_budget_for(&route.wire_id, window),
+            (window - cap) * 3 / 2
+        );
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
     async fn migration_seeds_builtins_including_fable_5() {
         let (pool, db_name) = setup_test_db().await;
         let models = ModelStore::list(&pool).await.unwrap();
@@ -580,6 +658,38 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
+    /// Every builtin GPT row the API key serves is served by the ChatGPT plan
+    /// too: a copy of its `openai` route, placed right before it. A row with
+    /// no `openai` route gets none.
+    #[tokio::test]
+    async fn migration_routes_every_gpt_builtin_to_the_chatgpt_plan_first() {
+        let (pool, db_name) = setup_test_db().await;
+        let models = ModelStore::list(&pool).await.unwrap();
+        let mut routed = 0;
+        for m in models.iter().filter(|m| m.is_builtin()) {
+            let at = |provider: &str| m.routes.iter().position(|r| r.provider == provider);
+            match (at("openai"), at("chatgpt-plan")) {
+                (Some(openai), Some(plan)) => {
+                    assert!(m.id.starts_with("gpt-"), "{}", m.id);
+                    assert_eq!(plan + 1, openai, "{}: right before openai", m.id);
+                    let (o, p) = (&m.routes[openai], &m.routes[plan]);
+                    assert_eq!(
+                        (&o.id, o.context_window),
+                        (&p.id, p.context_window),
+                        "{}",
+                        m.id
+                    );
+                    routed += 1;
+                }
+                (None, None) => {}
+                (Some(_), None) if !m.id.starts_with("gpt-") => {}
+                (openai, plan) => panic!("{}: openai {openai:?}, plan {plan:?}", m.id),
+            }
+        }
+        assert!(routed > 0, "the current GPT builtins route to the plan");
+        teardown_test_db(&db_name).await;
+    }
+
     /// GPT-6 Luna and Gemini 3.1 Flash-Lite head the background fallbacks, so
     /// each routes first party first, then through OpenRouter.
     #[tokio::test]
@@ -608,15 +718,21 @@ mod tests {
             assert!(m.is_builtin() && m.vision, "{id}");
             assert_eq!(m.successor, None, "{id}");
             assert_eq!(m.default_effort.as_deref(), Some(effort), "{id}");
+            // A GPT row leads with the ChatGPT plan's copy of its route.
+            let plan = (first_party == "openai").then_some(("chatgpt-plan", None, Some(window)));
+            let expected: Vec<_> = plan
+                .into_iter()
+                .chain([
+                    (first_party, None, Some(window)),
+                    ("openrouter", Some(openrouter_id), Some(window)),
+                ])
+                .collect();
             assert_eq!(
                 m.routes
                     .iter()
                     .map(|r| (r.provider.as_str(), r.id.as_deref(), r.context_window))
                     .collect::<Vec<_>>(),
-                [
-                    (first_party, None, Some(window)),
-                    ("openrouter", Some(openrouter_id), Some(window)),
-                ],
+                expected,
                 "{id}"
             );
         }
@@ -1388,13 +1504,19 @@ mod tests {
         assert!(m.is_builtin(), "the promotion to builtin must survive");
         assert_eq!(m.label, "GPT-6 Astra");
         assert_eq!(m.sort_order, 36);
+        let folded = Route {
+            provider: "openai".to_string(),
+            id: None,
+            context_window: Some(1_050_000),
+        };
+        // The ChatGPT plan's copy comes later, ahead of the folded route.
+        let plan = Route {
+            provider: "chatgpt-plan".to_string(),
+            ..folded.clone()
+        };
         assert_eq!(
             m.routes,
-            vec![Route {
-                provider: "openai".to_string(),
-                id: None,
-                context_window: Some(1_050_000),
-            }],
+            vec![plan, folded],
             "the retired columns must fold into exactly one route"
         );
         pool.close().await;

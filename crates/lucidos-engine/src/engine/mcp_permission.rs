@@ -825,6 +825,7 @@ mod tests {
             tap: notice.tap,
             actor: None,
             audience: None,
+            push_group: None,
         }))
         .await
         .unwrap();

@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.58.0 — 2026-11-11
+
+### Added
+
+- Sign in with ChatGPT. The ChatGPT plan is its own provider: sign in under Settings > Providers or with `lucidos chatgpt-plan`, and chat on your plan's models. Apps and scripts never spend it.
+- Mermaid diagrams render inline in chat and previews, with a toggle to the source.
+- People-only messages in team workspaces. A message for people only does not reach the agent, and the agent pause holds the agent while people talk. The agent later reads them under each person's name.
+- Mention a person to make them a watcher and notify them. Each thread has one push tag, and Unwatch stops its notices.
+- A teammate's message shows their name and sits on the left, and its origin popover names them.
+- The notifications menu lists unread counts for workspaces on a paired remote gateway.
+- The `widgets` fit action reports what each size's box cuts off, and a widget write carries a fit note.
+- Claude Fable 5.2 and Gemini 4 in the model list.
+
+### Changed
+
+- The command guard is on by default. Workspaces it affects get a notice that links each choice.
+- Coding-agent auto-answer is its own setting, apart from the command guard. The command judge runs on a measured model or refuses the turn.
+- Every coding-agent session uses the workspace grants. A run starts only with its cause's consent, and only the owner sets or widens a trigger's coding-agent grant. An agent's edit to a granted trigger clears its grant.
+- The workspace picker and the switcher draw local and remote workspaces as one ordered list. Drag to reorder.
+- Work items are retired. A thread's drivers and watchers are its people.
+- Dynamic bars are on by default on every phone.
+- Reasoning effort estimates never rank a lower effort above a higher one.
+- The command guard says plainly why it refuses a workspace deletion.
+
+### Fixed
+
+- Saving a trigger never stops a run already in progress. Only a queued scheduled fire is dropped.
+- A Claude Code turn that ends on its API-error banner fails instead of passing as done.
+- On iPhone, the composer stays above the keyboard when the app launches with a blind viewport.
+- A relayed page names its own device, so notices and reads land on the right one.
+- A middle click on a remote workspace row does nothing where no separate view exists, and the desktop app opens it in a new window.
+- The header drops the remote gateway suffix before the workspace name.
+- Compact headers give app titles the room they need.
+- Onboarding describes push notifications in full, not as scheduled-task alerts only.
 ## v0.57.1 — 2026-11-09
 
 ### Added

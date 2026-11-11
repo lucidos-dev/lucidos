@@ -43,7 +43,8 @@ impl ModelSource {
 /// `BACKGROUND_MODEL` before them.
 pub(crate) const AUX_FALLBACKS: &[&str] = &["gpt-6-luna", "gemini-3.1-flash-lite"];
 
-/// The operator's override of every purpose's first choice but the judge's.
+/// The operator's override of every purpose's first choice but a measured-only
+/// purpose's.
 const EXTRACTION_MODEL_ENV: &str = "LUCIDOS_EXTRACTION_MODEL";
 
 /// The first of `candidates` that `reach` serves as a default: itself or a
@@ -77,12 +78,29 @@ fn purpose_lead(purpose: ContextPurpose) -> Vec<&'static str> {
     }
 }
 
+/// What a [`measured_only`] purpose's eval cleared after its catalog default,
+/// in place of [`AUX_FALLBACKS`].
+fn measured_tail(purpose: ContextPurpose) -> &'static [&'static str] {
+    match purpose {
+        // `lucidos-eval command-judge`: 0 of 28 irreversible commands called
+        // safe at `none`, recorded in ADR 0406's addendum. One per provider
+        // family: Vertex and OpenRouter, OpenAI and the ChatGPT plan, Anthropic
+        // and the Claude gateway.
+        ContextPurpose::CommandJudge => &["gpt-6-luna", "claude-haiku-5-5"],
+        _ => &[],
+    }
+}
+
 /// Whether every model `purpose` runs on unpinned must have cleared its eval.
-/// Such a purpose recommends only its measured lead and catalog default. With
-/// neither reachable it resolves to the chat model, which its caller never
-/// asks (ADR 0448).
+/// Such a purpose recommends only its measured lead, catalog default and
+/// [`measured_tail`]. With none reachable it resolves to the chat model, which
+/// its caller never asks: the wake decision wakes the parent (ADR 0448), and
+/// the command judge refuses the turn.
 fn measured_only(purpose: ContextPurpose) -> bool {
-    purpose == ContextPurpose::WakeDecision
+    matches!(
+        purpose,
+        ContextPurpose::WakeDecision | ContextPurpose::CommandJudge
+    )
 }
 
 /// Whether `purpose` asks no model at all, its selection having come from
@@ -94,10 +112,9 @@ pub(crate) fn asks_no_model(purpose: ContextPurpose, source: ModelSource) -> boo
 /// The models `purpose` recommends, best first, each once. Settings shows
 /// them first, and the first a configured provider serves is the default.
 ///
-/// `LUCIDOS_EXTRACTION_MODEL` leads when set, except for the command judge,
-/// which it never reached, and a [`measured_only`] purpose. Then the purpose's
-/// measured lead, its catalog default, and [`AUX_FALLBACKS`] unless it is
-/// measured only. The compactor recommends its own measured list (ADR 0373).
+/// `LUCIDOS_EXTRACTION_MODEL` leads when set, except for a [`measured_only`]
+/// purpose. Then the purpose's measured lead, its catalog default, and
+/// [`AUX_FALLBACKS`], or [`measured_tail`] when it is measured only. The compactor recommends its own measured list (ADR 0373).
 /// A purpose with no preference pair recommends nothing.
 ///
 /// A purpose that needs vision recommends only models that read images, so
@@ -151,9 +168,12 @@ fn recommended_with(purpose: ContextPurpose, extraction_override: Option<&str>) 
         }
     };
     let measured = measured_only(purpose);
-    let env_override =
-        extraction_override.filter(|_| purpose != ContextPurpose::CommandJudge && !measured);
-    let fallbacks: &[&str] = if measured { &[] } else { AUX_FALLBACKS };
+    let env_override = extraction_override.filter(|_| !measured);
+    let fallbacks = if measured {
+        measured_tail(purpose)
+    } else {
+        AUX_FALLBACKS
+    };
     let mut list: Vec<String> = Vec::new();
     for model in env_override
         .into_iter()
@@ -172,7 +192,8 @@ fn recommended_with(purpose: ContextPurpose, extraction_override: Option<&str>) 
 ///
 /// A stored pick wins whether or not anything serves it: it is honoured or
 /// refused, never moved to another vendor. Unset, the first reachable
-/// recommended model wins, else the chat model.
+/// recommended model wins, else the chat model. A [`measured_only`] purpose
+/// never asks that chat model ([`asks_no_model`]).
 pub(crate) fn select(
     stored: Option<String>,
     recommended: &[String],

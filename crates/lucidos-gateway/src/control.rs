@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 pub fn router() -> Router<GatewayState> {
     Router::new()
         .route("/workspaces", get(list).post(create))
+        .route("/workspace-order", put(set_workspace_order))
         .route("/cleanup", get(cleanup_review))
         .route("/cleanup/batches", post(freeze_cleanup))
         .route("/cleanup/batches/:id/confirm", post(confirm_cleanup))
@@ -463,7 +464,30 @@ struct DeleteBody {
 }
 
 async fn list(State(state): State<GatewayState>) -> Json<Value> {
-    Json(json!({ "workspaces": state.list_status().await }))
+    Json(json!({
+        "workspaces": state.list_status().await,
+        "order": state.workspace_order().keys(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct WorkspaceOrderBody {
+    order: Vec<String>,
+}
+
+/// PUT /~/api/v1/control/workspace-order: replace the workspace order. Keys
+/// for workspaces that no longer exist are kept: the list skips them.
+async fn set_workspace_order(
+    State(state): State<GatewayState>,
+    Json(body): Json<WorkspaceOrderBody>,
+) -> Result<StatusCode, ApiError> {
+    let order =
+        crate::workspace_order::WorkspaceOrder::new(body.order).map_err(ApiError::bad_request)?;
+    state
+        .workspace_order()
+        .replace(order)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Fresh aggregate unread total across running workspaces (see
@@ -1397,6 +1421,8 @@ mod authz_tests {
         ("POST", "/~/api/v1/control/workspaces/dev/restart"),
         ("POST", "/~/api/v1/control/workspaces/dev/rename"),
         ("DELETE", "/~/api/v1/control/workspaces/dev"),
+        // Rewrites the list every paired device draws.
+        ("PUT", "/~/api/v1/control/workspace-order"),
         ("POST", "/~/api/v1/control/gateway/reload"),
         ("GET", "/~/api/v1/control/network-config"),
         ("PUT", "/~/api/v1/control/network-config"),
@@ -1508,6 +1534,74 @@ mod authz_tests {
                 "token {token:?} must not authenticate"
             );
         }
+    }
+
+    async fn put_workspace_order(state: &crate::server::GatewayState, body: Value) -> StatusCode {
+        use tower::ServiceExt as _;
+        crate::server::gateway_router(state.clone())
+            .oneshot(
+                axum::extract::Request::builder()
+                    .method("PUT")
+                    .uri("/~/api/v1/control/workspace-order")
+                    .header(auth::HEADER_LOCAL_TOKEN, "test-local-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// A gateway with its own order file: bare fixtures share one scratch dir.
+    fn state_with_own_order() -> (tempfile::TempDir, crate::server::GatewayState) {
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::server::GatewayState::for_tests_with_static_dir(Some(dir.path().to_owned()));
+        (dir, state)
+    }
+
+    #[tokio::test]
+    async fn the_list_carries_an_empty_order_until_one_is_stored() {
+        let (_dir, state) = state_with_own_order();
+        let body = get_json(&state, "/~/api/v1/control/workspaces", true).await;
+        assert_eq!(body["order"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_stored_order_rides_the_list() {
+        let (_dir, state) = state_with_own_order();
+        let order = json!(["notes", "home@cloud", "dev"]);
+        assert_eq!(
+            put_workspace_order(&state, json!({ "order": order })).await,
+            StatusCode::NO_CONTENT
+        );
+        let body = get_json(&state, "/~/api/v1/control/workspaces", true).await;
+        assert_eq!(body["order"], order);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_order_is_refused_and_the_stored_one_kept() {
+        let (_dir, state) = state_with_own_order();
+        put_workspace_order(&state, json!({ "order": ["dev"] })).await;
+        let too_many: Vec<String> = (0..=crate::workspace_order::MAX_KEYS)
+            .map(|i| format!("w{i}"))
+            .collect();
+        for (bad, status) in [
+            (json!({ "order": ["../etc"] }), StatusCode::BAD_REQUEST),
+            (json!({ "order": ["dev", "dev"] }), StatusCode::BAD_REQUEST),
+            (json!({ "order": too_many }), StatusCode::BAD_REQUEST),
+            (json!({ "order": [1, 2] }), StatusCode::UNPROCESSABLE_ENTITY),
+            (json!({}), StatusCode::UNPROCESSABLE_ENTITY),
+        ] {
+            assert_eq!(
+                put_workspace_order(&state, bad.clone()).await,
+                status,
+                "{bad}"
+            );
+        }
+        let body = get_json(&state, "/~/api/v1/control/workspaces", true).await;
+        assert_eq!(body["order"], json!(["dev"]));
     }
 
     #[tokio::test]

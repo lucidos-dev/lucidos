@@ -8,7 +8,7 @@ use crate::engine::summary_tree::log::{
     cap, project, EntryKind, StoredEvent, ThreadKind, ENTRY_EVENT_TYPES, LOADED_KNOWHOW_POINTER,
     TURN_END_EVENT_TYPES,
 };
-use crate::engine::thread_events::ActorMode;
+use crate::engine::thread_events::{ActorMode, EventMeta};
 use crate::llm::tool_names::LOAD_KNOWHOW;
 
 fn stored(values: Vec<serde_json::Value>) -> Vec<StoredEvent> {
@@ -16,6 +16,7 @@ fn stored(values: Vec<serde_json::Value>) -> Vec<StoredEvent> {
         .into_iter()
         .map(|v| StoredEvent {
             id: Uuid::new_v4(),
+            actor: EventMeta::from_payload(&v).actor,
             event: event(v),
         })
         .collect()
@@ -27,6 +28,28 @@ fn kinds_and_texts(kind: ThreadKind, values: Vec<serde_json::Value>) -> Vec<(Ent
         .into_iter()
         .map(|e| (e.kind, e.text))
         .collect()
+}
+
+#[test]
+fn a_device_actor_names_only_the_human_prompt() {
+    let events = stored(vec![
+        json!({"type": "MessageReceived", "text": "find the plan", "mode": "human",
+            "actor": {"kind": "device", "device_id": "sending-device"}}),
+        json!({"type": "ResponseGenerated", "text": "Here it is.",
+            "actor": {"kind": "device", "device_id": "sending-device"}}),
+        json!({"type": "MessageReceived", "text": "engine prompt", "mode": "engine",
+            "actor": {"kind": "device", "device_id": "sending-device"}}),
+        json!({"type": "MessageReceived", "text": "old message", "mode": "human"}),
+    ]);
+    let log = project(ThreadKind::LucidosAgent, &events);
+    assert_eq!(
+        log.entries[0].sender_device_id.as_deref(),
+        Some("sending-device")
+    );
+    assert_eq!(log.entries[0].message(), "prompt (human): find the plan");
+    assert!(log.entries[1..]
+        .iter()
+        .all(|entry| entry.sender_device_id.is_none()));
 }
 
 /// A Lucidos Agent thread logs everything: the user, the tool call, its

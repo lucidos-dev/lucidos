@@ -719,6 +719,9 @@ impl LucidosEngine {
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
         let cc_start = std::time::Instant::now();
         let thread_id = claim.thread_id;
+        // Every run passes here, a resume and a follow-up included. Inside the
+        // lane's answer, so a refused lane run still reports its end.
+        self.gate_coding_agent_spawn(thread_id, origin_id).await?;
         // A retry's first run cancelled the token to kill its process.
         if claim.entry.agent_cancel.is_cancelled() {
             claim.entry.agent_cancel = tokio_util::sync::CancellationToken::new();
@@ -1060,8 +1063,26 @@ impl LucidosEngine {
         // A successor session starts clean: its opening carries the context.
         if pending_handoff.is_none() {
             let thread_messages = self.event_store.get_thread_messages(&thread_id_str).await?;
+            // The first prompt's turn-gap note carries the people-only messages
+            // since the previous turn, so the history leaves them out.
+            let in_first_prompt: Vec<String> =
+                crate::engine::agent_session::turn_gap::compute_turn_gap_note(
+                    &self.pool, thread_id, origin_id, None,
+                )
+                .await
+                .map(|note| note.people_event_ids.iter().map(Uuid::to_string).collect())
+                .unwrap_or_default();
+            let operators = crate::gateway_operators::current();
             let (prior, current_at) = before_current_message(
-                thread_messages.iter().map(HistoryLine::of).collect(),
+                thread_messages
+                    .iter()
+                    .filter(|m| {
+                        m.event_id
+                            .as_ref()
+                            .is_none_or(|id| !in_first_prompt.contains(id))
+                    })
+                    .map(|m| HistoryLine::of(m, &operators))
+                    .collect(),
                 user_message,
             );
             let redelivered: Vec<String> =
@@ -2868,11 +2889,8 @@ impl LucidosEngine {
                             let pool = self.pool.clone();
                             let bus = self.event_bus.clone();
                             let pending = self.pending_cc_permission.clone();
-                            // An unattended session resolves the request from
-                            // the inherited side-effect grant, or parks a card
-                            // bounded by its permission wait. That decision
-                            // needs the trigger registry and the workspace root.
-                            let trigger_configs = self.trigger_configs.clone();
+                            // The grant file and the command guard read the
+                            // workspace root.
                             let workspace_path = self.workspace_path.clone();
                             // A file write inside this session's own worktree
                             // skips the card entirely. This local IS what seeded
@@ -2880,9 +2898,8 @@ impl LucidosEngine {
                             // the MCP path resolves, and reading it here keeps
                             // the arm lock-free.
                             let session_worktree = worktree_path.clone();
-                            // The attended command gate's LLM half and the
-                            // unattended park's push run off the engine, inside
-                            // the spawned task below. Taken as an Arc for the
+                            // The command gate's LLM half runs off the
+                            // engine, inside the spawned task below. Taken as an Arc for the
                             // same reason the title task does, and the select
                             // arm stays free of the classification. `try_` so a
                             // bare test engine gets the static half rather than
@@ -2901,7 +2918,6 @@ impl LucidosEngine {
                                         &pool,
                                         &bus,
                                         &pending,
-                                        &trigger_configs,
                                         &workspace_path,
                                         session_worktree.as_deref(),
                                         engine.as_ref(),
@@ -3800,16 +3816,23 @@ struct HistoryLine<'a> {
     content: &'a str,
     image_hashes: &'a [String],
     event_id: Option<&'a str>,
+    /// Who typed a user message: the operator's name on a team gateway,
+    /// else "User". The same name chat history gives it.
+    speaker: String,
 }
 
 impl<'a> HistoryLine<'a> {
-    fn of(message: &'a crate::core::store::SessionMessage) -> Self {
+    fn of(
+        message: &'a crate::core::store::SessionMessage,
+        operators: &crate::gateway_operators::OperatorSnapshot,
+    ) -> Self {
         Self {
             role: &message.role,
             channel: message.channel.as_deref(),
             content: &message.content,
             image_hashes: &message.user_image_hashes,
             event_id: message.event_id.as_deref(),
+            speaker: operators.speaker_of_device(message.sender_device_id.as_deref()),
         }
     }
 
@@ -3892,7 +3915,7 @@ fn thread_history_block(messages: &[HistoryLine<'_>], attached: &[&str]) -> Stri
                 return None;
             }
             let label = match line.role {
-                "user" => "User",
+                "user" => line.speaker.as_str(),
                 "assistant" if line.channel == Some("claude_code") => "Coding agent",
                 "assistant" => "Assistant",
                 other => other,
@@ -3962,6 +3985,7 @@ mod thread_history_block_tests {
             content,
             image_hashes: &[],
             event_id: None,
+            speaker: "User".into(),
         }
     }
 
@@ -4010,6 +4034,17 @@ mod thread_history_block_tests {
         assert!(block.contains("**Coding agent:** hi there"));
         assert!(!block.contains("omitted"));
         assert_eq!(thread_history_block(&[line("user", None, "  ")], &[]), "");
+    }
+
+    /// On a team gateway each person's message reads under their name.
+    #[test]
+    fn a_team_message_reads_under_its_speaker() {
+        let kim = HistoryLine {
+            speaker: "Kim".into(),
+            ..line("user", None, "try the staging build")
+        };
+        let block = thread_history_block(&[kim], &[]);
+        assert!(block.contains("**Kim:** try the staging build"), "{block}");
     }
 
     /// The message being sent follows the session context, so the history

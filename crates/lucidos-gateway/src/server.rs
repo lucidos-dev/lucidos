@@ -217,6 +217,8 @@ struct GatewayInner {
     /// The remote gateways this one has paired with, holding their credentials
     /// (ADR 0590).
     remote_gateways: crate::remote_gateways::RemoteGatewayStore,
+    /// The user's order for the workspace list.
+    workspace_order: crate::workspace_order::WorkspaceOrderStore,
     /// The transport every outbound peer request uses, with pooled
     /// connections and one credential boundary (ADR 0591).
     peer_connection: crate::peer_connection::PeerConnection,
@@ -427,6 +429,9 @@ impl GatewayState {
                     crate::remote_gateways::remote_gateways_path(&scratch),
                 )
                 .unwrap(),
+                workspace_order: crate::workspace_order::WorkspaceOrderStore::load(
+                    crate::workspace_order::workspace_order_path(&scratch),
+                ),
                 peer_connection: crate::peer_connection::PeerConnection::new().unwrap(),
                 refusal_log: Mutex::new(auth::LogThrottle::default()),
                 certs: Arc::default(),
@@ -814,6 +819,18 @@ impl GatewayState {
     /// The remote gateways this one has paired with (ADR 0590).
     pub fn remote_gateways(&self) -> &crate::remote_gateways::RemoteGatewayStore {
         &self.inner.remote_gateways
+    }
+
+    pub fn workspace_order(&self) -> &crate::workspace_order::WorkspaceOrderStore {
+        &self.inner.workspace_order
+    }
+
+    /// Drop a deleted local workspace's key. A failure leaves a stale key,
+    /// which the list ignores, so it is logged rather than failing the delete.
+    fn forget_workspace_order(&self, id: &str) {
+        if let Err(e) = self.inner.workspace_order.forget(id) {
+            crate::log!("[Gateway] could not drop {id} from the workspace order: {e}");
+        }
     }
 
     pub fn peer_connection(&self) -> &crate::peer_connection::PeerConnection {
@@ -3245,6 +3262,7 @@ impl GatewayState {
             updated.save(&self.inner.registry_path)?;
             *reg = updated;
         }
+        self.forget_workspace_order(id);
         entry.phase = crate::trash::Phase::Completed;
         entry.save(&root)?;
         self.clear_runtime_state(id);
@@ -4043,6 +4061,9 @@ pub async fn run(inherited_lock_fd: Option<String>) -> Result<RunOutcome, BoxErr
     let remote_gateways = crate::remote_gateways::RemoteGatewayStore::load(
         crate::remote_gateways::remote_gateways_path(&app_data),
     )?;
+    let workspace_order = crate::workspace_order::WorkspaceOrderStore::load(
+        crate::workspace_order::workspace_order_path(&app_data),
+    );
     crate::log!(
         "[Gateway] inbound auth ready: {} paired device(s), local token at {}",
         directory.devices.devices.len(),
@@ -4073,6 +4094,7 @@ pub async fn run(inherited_lock_fd: Option<String>) -> Result<RunOutcome, BoxErr
                 )),
                 paired_gateways,
                 remote_gateways,
+                workspace_order,
                 peer_connection: crate::peer_connection::PeerConnection::new()?,
                 refusal_log: Mutex::new(auth::LogThrottle::default()),
                 certs: Arc::default(),

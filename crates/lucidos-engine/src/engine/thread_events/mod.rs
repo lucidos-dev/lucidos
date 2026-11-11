@@ -33,7 +33,9 @@ pub use actor::{
 pub use agent_exit::{CodingAgentExit, CodingAgentExitStage};
 pub use apply_now::ApplyNowOutcome;
 pub use capture::CaptureFormat;
-pub use cause::{AbortCause, CancelCause, EventWaitCancelCause, UnproposedReason, UnqueueReason};
+pub use cause::{
+    AbortCause, AgentPauseCause, CancelCause, EventWaitCancelCause, UnproposedReason, UnqueueReason,
+};
 pub use channel::{EventChannel, FireRetry, RetryOf, RetrySkipReason, TriggerInvocation};
 pub use dashboard::{ArrangedTile, Dashboard, LegacyArrangedTile};
 pub use event::{RecoveredCompose, ThreadEvent};

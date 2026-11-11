@@ -26,7 +26,6 @@ import { FormSkeleton } from '../shared/FormSkeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 import { Explainer, FieldLabel } from '../shared/Explainer';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
-import { permissionWaitFromValue, permissionWaitOptions, permissionWaitValue } from './permissionWaitChoices';
 
 const NEW_GROUP_SENTINEL = '__new_group__';
 
@@ -224,8 +223,8 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
   const [sideEffectGrant, setSideEffectGrant] = useServerBackedField<SideEffectCategory[]>(
     existingTrigger?.side_effect_grant ?? [], sameSet,
   );
-  const [permissionWait, setPermissionWait] = useServerBackedField(
-    permissionWaitValue(existingTrigger?.permission_wait),
+  const [codingAgentGrant, setCodingAgentGrant] = useServerBackedField(
+    existingTrigger?.coding_agent_grant ?? false,
   );
   const toggleSideEffect = (cat: SideEffectCategory, on: boolean) => {
     setSideEffectGrant(
@@ -360,8 +359,8 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
       on = built;
     }
 
-    // go_to_review / side_effect_grant / permission_wait / model /
-    // reasoning_effort / provider apply only to the intent path. `submitTrigger` gates them all on
+    // go_to_review / side_effect_grant / model / reasoning_effort / provider
+    // apply only to the intent path. `submitTrigger` gates them all on
     // `run.type`, so a script trigger can't persist state left over from an
     // intent → script switch.
     savingRef.current = true;
@@ -372,8 +371,8 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
         on, showEvent, goToReview,
         groupId: groupId || null,
         sideEffectGrant,
+        codingAgentGrant,
         // '' is the Default option; null is how it reaches the engine.
-        permissionWait: permissionWaitFromValue(permissionWait),
         model: model || null,
         reasoningEffort: triggerEffort || null,
         provider: triggerProvider || null,
@@ -743,9 +742,9 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
           )}
 
           {/* Both controls are consumed only on the intent (LLM) trigger path;
-              the script path never reads go_to_review, side_effect_grant or
-              permission_wait. Hide
-              them in script mode so they can't imply behavior that never runs. */}
+              the script path never reads go_to_review or side_effect_grant.
+              Hide them in script mode so they can't imply behavior that never
+              runs. */}
           {runType === 'intent' && (
             <>
               <div class="form-group">
@@ -825,28 +824,34 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
                   ))}
                 </div>
               </div>
-
-              <div class="form-group">
-                <FieldLabel title="Permission wait">
-                    <p>
-                      When a coding agent this trigger started runs a command Lucidos
-                      cannot check, and one of your devices takes notifications,
-                      Lucidos parks a card and notifies you.
-                    </p>
-                    <p>
-                      This sets how long the card waits before it is denied. Deny at
-                      once skips the card. Workspace default follows the
-                      unattended_permission_wait preference.
-                    </p>
-                </FieldLabel>
-                <Dropdown
-                  value={permissionWait}
-                  onChange={setPermissionWait}
-                  options={permissionWaitOptions(permissionWait)}
-                />
-              </div>
             </>
           )}
+
+          {/* Shown for both run types: a script can start a thread through
+              the CLI as well. */}
+          <div class="form-group">
+            <label class="form-checkbox-row">
+              <input
+                type="checkbox"
+                data-role="allow-coding-agents"
+                checked={codingAgentGrant}
+                onChange={(e) => setCodingAgentGrant((e.target as HTMLInputElement).checked)}
+              />
+              <span>Allow coding agents</span>
+              <Explainer title="Allow coding agents">
+                <p>
+                  Off by default: a run that tries to start a coding agent fails, and
+                  you get a notification.
+                </p>
+                <p>
+                  Turn it on only if you trust what steers this trigger. Its coding
+                  agents hold every grant you gave coding agents, so content the
+                  trigger reads (messages, web pages, email) can steer them.
+                </p>
+                <p>Only you can turn this on. An agent or an app cannot.</p>
+              </Explainer>
+            </label>
+          </div>
 
           <div class="form-actions">
             <button

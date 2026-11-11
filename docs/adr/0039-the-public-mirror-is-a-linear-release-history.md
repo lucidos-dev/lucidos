@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-08-04
+- **Amended by**: [0642](0642-mirror-main-moves-last.md): `main` now moves last, after the Release is published, and the in-flight state is a tag leading `main`
 - **Relates to**: [0024: The release candidate IS the published artifact](0024-the-release-candidate-is-the-published-artifact.md), [0029: A release tag names the main-line commit](0029-a-release-tag-names-the-main-line-commit.md)
 
 ## Context

@@ -636,8 +636,9 @@ impl LucidosEngine {
             );
             Vec::new()
         });
-        let (_, window) = self.chat_model_and_window().await;
-        let mcp_budget = self.mcp_manager.budget(window).await?;
+        let (model, window) = self.chat_model_and_window().await;
+        let budget_model = self.request_budget_model_for(&model, None);
+        let mcp_budget = self.mcp_manager.budget(&budget_model, window).await?;
         let mcp_threads =
             crate::engine::prompt_footprint::mcp_thread_use(&self.pool, unused_days).await?;
         let mcp_schemas = self

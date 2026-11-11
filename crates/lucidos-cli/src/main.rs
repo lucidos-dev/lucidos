@@ -27,6 +27,7 @@ mod cc_plan_gate;
 mod cc_read_coerce;
 mod cc_stop_reminder;
 mod changes;
+mod chatgpt_plan;
 mod claude_gateway;
 mod coding_agent_diff_hook;
 mod credentials;
@@ -503,6 +504,13 @@ enum Command {
     /// code to enter on the gateway's page.
     #[command(name = "claude-gateway")]
     ClaudeGateway(ClaudeGatewayCliArgs),
+    /// Sign Lucidos in with ChatGPT, sign it out, or show where it stands.
+    ///
+    /// The ChatGPT plan provider runs GPT models on the user's ChatGPT
+    /// subscription. The engine keeps the tokens; this shows only the ChatGPT
+    /// page to open, in a browser on the computer running Lucidos.
+    #[command(name = "chatgpt-plan")]
+    ChatGptPlan(ChatGptPlanCliArgs),
     /// Send a push notification via the parent workspace. Persists to the
     /// inbox AND pushes to subscribed devices, identical to the
     /// `send_notification` LLM tool. Use from scripts that need to nudge the
@@ -636,9 +644,9 @@ enum Command {
         action: generated::EnvVarsCmd,
     },
     /// Reusable widgets, a thread's widget card sizes and the dashboards:
-    /// `list`, `size`, `make-reusable`, `stop-reusing` and the dashboard verbs.
-    /// `size --thread-id` defaults to `$LUCIDOS_THREAD_ID`, the session's own
-    /// thread.
+    /// `list`, `size`, `fit`, `make-reusable`, `stop-reusing` and the
+    /// dashboard verbs. `size` and `fit` default `--thread-id` to
+    /// `$LUCIDOS_THREAD_ID`, the session's own thread.
     Widgets {
         #[command(subcommand)]
         action: generated::WidgetsCmd,
@@ -1179,6 +1187,33 @@ pub(crate) enum ClaudeGatewayAction {
 }
 
 #[derive(Args)]
+pub(crate) struct ChatGptPlanCliArgs {
+    #[command(subcommand)]
+    pub(crate) action: ChatGptPlanAction,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ChatGptPlanAction {
+    /// Who is signed in, any sign-in in progress, and the usage-limit pause.
+    Status {
+        /// Print the engine's own JSON instead of sentences.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start a sign-in, show the ChatGPT page to open, and wait for it.
+    #[command(name = "sign-in")]
+    SignIn,
+    /// Forget the sign-in, and stop one in progress.
+    #[command(name = "sign-out")]
+    SignOut {
+        /// Also forget the ChatGPT account, so the next sign-in may use
+        /// another one. That registers Lucidos with OpenAI afresh.
+        #[arg(long)]
+        forget_account: bool,
+    },
+}
+
+#[derive(Args)]
 pub(crate) struct CredentialsCliArgs {
     #[command(subcommand)]
     pub(crate) action: CredentialsAction,
@@ -1426,7 +1461,8 @@ pub(crate) struct SpawnThreadArgs {
     /// default is suppressed so the request never carries both a repo and a folder.
     #[arg(long, conflicts_with = "repo")]
     pub(crate) folder: Option<String>,
-    /// Override the upstream actor mode. Defaults to "agent".
+    /// Override actor attribution. Agents must keep the default
+    /// "agent" mode; "human" is refused from agent subprocesses.
     #[arg(long, value_enum, default_value_t = CliMode::Agent)]
     pub(crate) mode: CliMode,
     /// Relationship of the spawned thread to the calling thread.
@@ -1991,6 +2027,17 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             }
             Ok(0)
         }
+        Command::ChatGptPlan(args) => {
+            let ws = resolve_from_env()?;
+            match args.action {
+                ChatGptPlanAction::Status { json } => chatgpt_plan::cmd_status(&ws, json)?,
+                ChatGptPlanAction::SignIn => chatgpt_plan::cmd_sign_in(&ws)?,
+                ChatGptPlanAction::SignOut { forget_account } => {
+                    chatgpt_plan::cmd_sign_out(&ws, forget_account)?
+                }
+            }
+            Ok(0)
+        }
         Command::Credentials(args) => {
             let ws = resolve_from_env()?;
             match args.action {
@@ -2335,7 +2382,9 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
         }
         Command::Widgets { mut action } => {
             let ws = resolve_from_env()?;
-            if let generated::WidgetsCmd::Size { thread_id, .. } = &mut action {
+            if let generated::WidgetsCmd::Size { thread_id, .. }
+            | generated::WidgetsCmd::Fit { thread_id, .. } = &mut action
+            {
                 if thread_id.is_none() {
                     *thread_id = threads::source_thread_id_from_env();
                 }
@@ -2410,6 +2459,20 @@ mod tests {
     #[test]
     fn the_command_tree_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn chatgpt_plan_takes_status_sign_in_and_sign_out_only() {
+        for argv in [
+            &["lucidos", "chatgpt-plan", "status"][..],
+            &["lucidos", "chatgpt-plan", "status", "--json"],
+            &["lucidos", "chatgpt-plan", "sign-in"],
+            &["lucidos", "chatgpt-plan", "sign-out"],
+            &["lucidos", "chatgpt-plan", "sign-out", "--forget-account"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_ok(), "{argv:?}");
+        }
+        assert!(Cli::try_parse_from(["lucidos", "chatgpt-plan", "sign-in", "--url", "x"]).is_err());
     }
 
     #[test]
@@ -2577,6 +2640,35 @@ mod tests {
                 "the refusal must name both flags: {rendered}"
             );
         }
+    }
+
+    /// `widgets fit` names the widget, and the thread is optional: a coding
+    /// agent's session fills in its own.
+    #[test]
+    fn widgets_fit_takes_the_widget_and_an_optional_thread() {
+        let fit = |argv: &[&str]| match Cli::try_parse_from(argv).map(|cli| cli.command) {
+            Ok(Command::Widgets {
+                action: generated::WidgetsCmd::Fit { app_id, thread_id },
+            }) => Some((app_id, thread_id)),
+            _ => None,
+        };
+        assert_eq!(
+            fit(&["lucidos", "widgets", "fit", "--app-id", "trip"]),
+            Some(("trip".to_string(), None))
+        );
+        assert_eq!(
+            fit(&[
+                "lucidos",
+                "widgets",
+                "fit",
+                "--app-id",
+                "trip",
+                "--thread-id",
+                "t"
+            ]),
+            Some(("trip".to_string(), Some("t".to_string())))
+        );
+        assert_eq!(fit(&["lucidos", "widgets", "fit"]), None);
     }
 
     /// A repo flow keeps working: `offer` and `start` keep their flags.

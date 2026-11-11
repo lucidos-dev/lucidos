@@ -545,6 +545,8 @@ fn base_req(mode: ActorMode) -> ChatRequest {
         caller_thread_id: None,
         caller_event_id: None,
         integrated: false,
+        mentions: vec![],
+        agent_mentioned: false,
     }
 }
 
@@ -1518,6 +1520,24 @@ fn the_body_device_id_wins_and_a_blank_one_falls_through_to_the_header() {
     );
 }
 
+/// A team send names its speaker by device, so the device the gateway
+/// authenticated wins over a body naming someone else's.
+#[test]
+fn a_team_send_takes_the_authenticated_device_over_the_body() {
+    use crate::api::actor::authenticated_device_id;
+    let h = headers_with(&[(super::super::actor::HEADER_DEVICE_ID, "kim-phone")]);
+    assert_eq!(
+        authenticated_device_id(Some("sam-phone"), &h),
+        Some("kim-phone")
+    );
+    let none = headers_with(&[]);
+    assert_eq!(
+        authenticated_device_id(Some("sam-phone"), &none),
+        Some("sam-phone")
+    );
+    assert_eq!(authenticated_device_id(Some(" "), &none), None);
+}
+
 /// The gateway sends its own token beside the device header. A device id in
 /// the header alone is recorded as that device, not as the engine's own
 /// machinery. Its mode agrees with the request.
@@ -1551,6 +1571,7 @@ fn a_mode_the_credential_contradicts_is_a_400_not_a_panic() {
         user_agent: None,
         mode: ActorMode::Agent,
         source_thread_id: Some(Uuid::new_v4()),
+        emitting_trigger_id: None,
     };
     let refusal = origin_agrees_with_mode(Some(&agent), ActorMode::Engine)
         .expect_err("an agent's credential cannot claim engine mode");

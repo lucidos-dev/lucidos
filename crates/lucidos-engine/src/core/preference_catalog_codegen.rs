@@ -31,7 +31,6 @@ fn type_name(value: PrefValue) -> &'static str {
         | PrefValue::ModelEfforts
         | PrefValue::IntelligenceLadder(_)
         | PrefValue::FontFamily
-        | PrefValue::PermissionWait
         | PrefValue::ContextCeiling => "text",
     }
 }

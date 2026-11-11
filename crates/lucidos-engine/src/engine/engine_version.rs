@@ -2845,6 +2845,7 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
             user_agent: None,
             mode: crate::engine::thread_events::ActorMode::Human,
             source_thread_id: None,
+            emitting_trigger_id: None,
         };
         for (actor, hands_over) in [
             (device("the-click"), true),
@@ -2870,6 +2871,7 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
             user_agent: Some("curl".to_string()),
             mode: crate::engine::thread_events::ActorMode::Human,
             source_thread_id: None,
+            emitting_trigger_id: None,
         });
         assert!(stash_first_restart_actor(&mut slot, api));
         assert!(slot.is_some());

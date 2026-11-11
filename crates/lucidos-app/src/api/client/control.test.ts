@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   listWorkspaces,
+  listWorkspacesWithOrder,
+  setWorkspaceOrder,
   locateWorkspace,
   createWorkspace,
   restartWorkspace,
@@ -98,6 +100,21 @@ describe('control client', () => {
     await listWorkspaces();
     expect(mock).toHaveBeenCalledTimes(1);
     expect(String(mock.mock.calls[0][0])).toBe('/~/api/v1/control/workspaces');
+  });
+
+  it('reads the workspace order beside the list, empty when the gateway sends none', async () => {
+    withFetch(() => Promise.resolve(new Response('{"workspaces":[],"order":["b","a@cloud"]}', { status: 200 })));
+    expect(await listWorkspacesWithOrder()).toEqual({ workspaces: [], order: ['b', 'a@cloud'] });
+    withFetch(() => Promise.resolve(new Response('{"workspaces":[]}', { status: 200 })));
+    expect(await listWorkspacesWithOrder()).toEqual({ workspaces: [], order: [] });
+  });
+
+  it('replaces the workspace order with a PUT to the sigil control route', async () => {
+    const mock = withFetch(() => Promise.resolve(new Response(null, { status: 204 })));
+    await setWorkspaceOrder(['b', 'a@cloud']);
+    expect(String(mock.mock.calls[0][0])).toBe('/~/api/v1/control/workspace-order');
+    expect(mock.mock.calls[0][1]?.method).toBe('PUT');
+    expect(JSON.parse(mock.mock.calls[0][1].body)).toEqual({ order: ['b', 'a@cloud'] });
   });
 
   it('creates a workspace via POST to the sigil control route', async () => {

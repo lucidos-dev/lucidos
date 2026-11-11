@@ -7,7 +7,7 @@ description: The chat tool template of the team workspace setup. A polling trans
 
 # Chat tool template
 
-Read `system-knowhow/team-workspace` first. This page is one source of work for it. The worked example is Slack. A message that mentions the factory's bot starts a work item. Replies in that chat thread continue it, and answer its questions.
+Read `system-knowhow/team-workspace` first. This page is one source of work for it. The worked example is Slack. A message that mentions the factory's bot starts a root thread. Replies in that chat thread continue it, and answer its questions.
 
 ## Why it polls
 
@@ -18,7 +18,7 @@ To take Slack's Events API instead, publish the hook socket and use the issue tr
 | Step | Piece | Does |
 |---|---|---|
 | 1 | Script trigger `chat-translate`, every minute | Reads new messages, resolves user ids to emails, emits `ChatMessageReceived` |
-| 2 | Intent trigger `chat-intake` | Starts or continues the work item, keyed by channel and chat thread |
+| 2 | Intent trigger `chat-intake` | Starts or continues the root thread, keyed by channel and chat thread |
 | 3 | Script trigger `chat-questions` | Posts each gate question into the chat thread |
 | 4 | Script trigger `chat-outcomes` | Posts the root thread's answer into the chat thread, short, with a link back |
 
@@ -63,7 +63,9 @@ lucidos triggers create --name "Chat intake" --slug chat-intake \
   --run '{"type":"intent","intent":"Work on this request from the team chat, and follow the team gate policy."}'
 ```
 
-The key starts with `source`, the literal `chat` the script wrote. Ask the user to tick the side-effect grant the work needs (`triggers.md` § "Side-effect grant").
+The key starts with `source`, the literal `chat` the script wrote.
+
+Its runs start coding agents, so ask the user to tick *Allow coding agents* on it (`triggers.md` § "Coding-agent grant"). Those coding agents hold every grant the user gave coding agents. Only the listed teammates steer them, since the translate script drops strangers. Ask too for any side-effect grant the trigger's own run needs (`triggers.md` § "Side-effect grant").
 
 ## 4. The outbound script triggers
 
@@ -85,4 +87,4 @@ The bot's own posts come back in the history, and the translation script skips t
 1. Mention the bot in a channel it serves. Within a minute a thread starts.
 2. Ask the agent to ask a question. The question appears in the chat thread.
 3. Reply in the chat thread. The question card shows answered, and you are the driver.
-4. Archive the thread. The next reply in that chat thread starts a fresh work item.
+4. Archive the thread. The next reply in that chat thread starts a fresh root thread.

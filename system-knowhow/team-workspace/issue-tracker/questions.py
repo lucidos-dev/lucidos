@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Mirror a gate question to the issue its work item came from.
+"""Mirror a gate question to the issue its root thread came from.
 
 Copy to data/triggers/issue-tracker-questions/scripts/run.py. Fires on
-UserQuestionAsked. A thread whose work item no issue started is skipped.
+UserQuestionAsked. A thread whose root thread no issue started is skipped.
 See system-knowhow/team-workspace/issue-tracker.md.
 """
 import json

@@ -25,6 +25,7 @@ import { loadPreferences, flushPendingPreferenceWrites } from './actions/prefere
 import { loadPinnedApps } from './actions/pinnedApps';
 import { loadReleaseNotices } from './actions/releaseNotices';
 import { loadReaderDevices } from './actions/reader-devices';
+import { loadPeople } from './actions/people';
 import { loadWebhookIngress } from './actions/webhookIngress';
 import { loadWebhookRefusals } from './actions/webhookRefusals';
 import { loadWorkspaceDisplayName } from './actions/workspace-label';
@@ -203,6 +204,8 @@ export function startClient(): () => void {
   void loadUnreadNotifications();
   // ...and this page's person, which decides its Review group.
   void loadReaderDevices();
+  // ...and the people a message can mention.
+  void loadPeople();
   // ...and the other workspaces' counts, which the bell never shows but the
   // app ICON does: behind the gateway one installed icon covers every
   // workspace on the origin. A no-op on a direct engine port. See

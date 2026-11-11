@@ -523,14 +523,14 @@ const TRIGGER_SIDE_EFFECT_GRANT_ARG: Arg = Arg {
     description:
         "Irreversible side-effect categories this trigger may perform unattended, e.g. [\"email\"].",
 };
-const TRIGGER_PERMISSION_WAIT_ARG: Arg = Arg {
-    name: "permission_wait",
-    ty: ArgType::Str,
+const TRIGGER_CODING_AGENT_GRANT_ARG: Arg = Arg {
+    name: "coding_agent_grant",
+    ty: ArgType::Bool,
     enum_values: &[],
     required: false,
     loc: ArgIn::Body,
-    description: "How long an unattended fire's parked permission card waits: \"deny\", minutes \
-                  (1-1440) or \"indefinite\". Omitted = the workspace preference.",
+    description: "Whether this trigger's runs may start coding-agent threads. Only the owner may \
+                  set true: an agent or app caller is refused. Default false.",
 };
 const TRIGGER_MCP_SERVERS_ARG: Arg = Arg {
     name: "mcp_servers",
@@ -605,11 +605,11 @@ pub const TRIGGER_CREATE_LLM_SCHEMA: &str = r#"{
   "go_to_review": {"type":"boolean","description":"Threads this trigger spawns land in REVIEW, not ARCHIVE. Default false."},
   "group_id": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Trigger-group id, organizational only. Null for ungrouped."},
   "mcp_servers": {"anyOf":[{"type":"null"},{"type":"array","items":{"type":"string"}}],"description":"MCP server ids its fires call; any other is refused."},
-  "continue_key": {"anyOf":[{"type":"null"},{"type":"array","items":{"anyOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}]}}],"description":"Intent triggers: payload paths naming one work item; a part may list alternatives. A fire with the same values continues its open thread. Null clears."},
+  "continue_key": {"anyOf":[{"type":"null"},{"type":"array","items":{"anyOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}]}}],"description":"Intent triggers: payload paths naming one thread; a part may list alternatives. A fire with the same values continues its open thread. Null clears."},
   "actor": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Intent triggers: payload path of the email of the person behind a fire. The thread credits that operator. Null clears."},
   "model": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Model id, a Lucidos Agent rung, else REFUSED. Null = account default (on update, clears a pin). Set only if asked."},
   "reasoning_effort": {"anyOf":[{"type":"null"},{"type":"string","enum":["none","low","medium","high","xhigh","max"]}],"description":"Thinking budget for the intent. Null = account default (on update, clears a pin)."},
-  "provider": {"anyOf":[{"type":"null"},{"type":"string","enum":["vertex","anthropic","openai","openrouter","xai","opencode-free","local","claude-gateway"]}],"description":"Backend for the pinned model, one of its routes; needs model. Null = its preferred provider. Set only if asked."}
+  "provider": {"anyOf":[{"type":"null"},{"type":"string","enum":["vertex","anthropic","openai","openrouter","xai","opencode-free","local","claude-gateway","chatgpt-plan"]}],"description":"Backend for the pinned model, one of its routes; needs model. Null = its preferred provider. Set only if asked."}
 }"#;
 // `model` / `reasoning_effort` / `provider` are deliberately NOT repeated here.
 // Properties are unioned across a domain's operations first-wins (see
@@ -636,7 +636,7 @@ const TRIGGERS_OPS: &[Operation] = &[
             TRIGGER_GO_TO_REVIEW_ARG,
             TRIGGER_GROUP_ID_ARG,
             TRIGGER_SIDE_EFFECT_GRANT_ARG,
-            TRIGGER_PERMISSION_WAIT_ARG,
+            TRIGGER_CODING_AGENT_GRANT_ARG,
             TRIGGER_MCP_SERVERS_ARG,
             TRIGGER_CONTINUE_KEY_ARG,
             TRIGGER_ACTOR_ARG,
@@ -685,7 +685,7 @@ const TRIGGERS_OPS: &[Operation] = &[
             TRIGGER_GO_TO_REVIEW_ARG,
             TRIGGER_GROUP_ID_ARG,
             TRIGGER_SIDE_EFFECT_GRANT_ARG,
-            TRIGGER_PERMISSION_WAIT_ARG,
+            TRIGGER_CODING_AGENT_GRANT_ARG,
             TRIGGER_MCP_SERVERS_ARG,
             TRIGGER_CONTINUE_KEY_ARG,
             TRIGGER_ACTOR_ARG,
@@ -1309,6 +1309,7 @@ pub const MODEL_PROVIDER_ENUM: &[&str] = &[
     "opencode-free",
     "local",
     "claude-gateway",
+    "chatgpt-plan",
 ];
 
 const MODEL_ID_BODY_ARG: Arg = Arg {
@@ -1400,7 +1401,7 @@ const MODEL_VISION_ARG: Arg = Arg {
 pub const MODELS_ADD_LLM_SCHEMA: &str = r#"{
   "id": {"type":"string","description":"Model id, the API string unless a route overrides it. All but list need it."},
   "label": {"type":"string","description":"Display name; defaults to the id."},
-  "provider": {"type":"string","enum":["vertex","anthropic","openai","openrouter","xai","opencode-free","local","claude-gateway"],"description":"Single-route shorthand for the first route. Add needs it or routes."},
+  "provider": {"type":"string","enum":["vertex","anthropic","openai","openrouter","xai","opencode-free","local","claude-gateway","chatgpt-plan"],"description":"Single-route shorthand for the first route. Add needs it or routes."},
   "sort_order": {"type":"integer","description":"Lower sorts first."},
   "context_window": {"anyOf":[{"type":"null"},{"type":"integer"}],"description":"First route's window in tokens; omitted, most non-Claude ids get 200k. Null clears."},
   "routes": {"type":"array","description":"Backends in priority order. Replaces the whole list.","items":{"type":"object","properties":{"provider":{"type":"string"},"id":{"type":"string","description":"This backend's id if different, e.g. 'anthropic/claude-opus-5-5'."},"context_window":{"type":"integer"}},"required":["provider"]}},
@@ -1889,6 +1890,14 @@ const WIDGETS_OPS: &[Operation] = &[
         "/widgets/size",
         WIDGET_CARD_SIZE_ARGS,
         "size",
+    ),
+    widget_op(
+        "fit",
+        "What each size's box cuts off.",
+        Method::Post,
+        "/widgets/fit",
+        &[WIDGET_APP_ID_ARG, WIDGET_THREAD_BODY_ARG],
+        "fit",
     ),
     widget_op(
         "make_reusable",

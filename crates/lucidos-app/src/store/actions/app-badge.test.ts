@@ -6,6 +6,7 @@ import type { WorkspaceStatus } from '../../api/client/control';
 
 const mocks = vi.hoisted(() => ({
   listWorkspaces: vi.fn(),
+  listRemoteWorkspaces: vi.fn(),
   // Stand-ins for basePath's load-time consts: `workspaceId` non-null = served
   // behind the gateway under `/<slug>/` (one installed icon covers the whole
   // origin, so the badge is an aggregate); null + not picker = a legacy root /
@@ -20,7 +21,10 @@ vi.mock('../../utils/platform', async (importActual) => ({
   ...(await importActual<typeof import('../../utils/platform')>()),
   isTauri: vi.fn(() => false),
 }));
-vi.mock('../../api/client/control', () => ({ listWorkspaces: mocks.listWorkspaces }));
+vi.mock('../../api/client/control', () => ({
+  listWorkspaces: mocks.listWorkspaces,
+  listRemoteWorkspaces: mocks.listRemoteWorkspaces,
+}));
 // Keep the rest of basePath real: the store pulls in the API client, which
 // reads BASE_PATH at import time.
 vi.mock('../../utils/basePath', async (importActual) => {
@@ -42,6 +46,7 @@ const {
   refreshOtherWorkspacesUnread,
   crossWorkspaceUnreadTotal,
   peerWorkspaces,
+  remotePeerWorkspaces,
 } = await import('./app-badge');
 const { isTauri } = await import('../../utils/platform');
 
@@ -95,6 +100,8 @@ beforeEach(() => {
   // Module-level, so a listing left by one case would otherwise be the starting
   // total of the next.
   peerWorkspaces.value = [];
+  remotePeerWorkspaces.value = [];
+  mocks.listRemoteWorkspaces.mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -255,10 +262,52 @@ describe('behind the gateway the icon badges EVERY workspace', () => {
     expect(crossWorkspaceUnreadTotal.value).toBe(4);
   });
 
+  it('reads the remote gateways beside the local ones, without moving the badge total', async () => {
+    mocks.listWorkspaces.mockResolvedValue([workspace('other', 2)]);
+    mocks.listRemoteWorkspaces.mockResolvedValue([
+      { gateway: 'lab', state: 'reachable', workspaces: [workspace('notes', 7)] },
+    ]);
+    servedUnreadNotifications.value = { status: 'loaded', data: [] };
+    await refreshOtherWorkspacesUnread();
+    expect(remotePeerWorkspaces.value).toEqual([
+      { gateway: 'lab', workspaces: [workspace('notes', 7)], unreachable: null },
+    ]);
+    expect(crossWorkspaceUnreadTotal.value).toBe(2);
+  });
+
+  it('keeps a silent gateway\'s last rows, marked unreachable', async () => {
+    mocks.listRemoteWorkspaces.mockResolvedValueOnce([
+      { gateway: 'lab', state: 'reachable', workspaces: [workspace('notes', 7)] },
+    ]);
+    await refreshOtherWorkspacesUnread();
+    mocks.listRemoteWorkspaces.mockResolvedValueOnce([
+      { gateway: 'lab', state: 'unreachable', reason: 'timed out' },
+    ]);
+    await refreshOtherWorkspacesUnread();
+    expect(remotePeerWorkspaces.value).toMatchObject([
+      { gateway: 'lab', workspaces: [workspace('notes', 7)], unreachable: 'timed out' },
+    ]);
+  });
+
+  it('a failed remote listing keeps the last rows and never blocks the local counts', async () => {
+    mocks.listRemoteWorkspaces.mockResolvedValueOnce([
+      { gateway: 'lab', state: 'reachable', workspaces: [workspace('notes', 7)] },
+    ]);
+    await refreshOtherWorkspacesUnread();
+    mocks.listRemoteWorkspaces.mockRejectedValueOnce(new Error('gateway unreachable'));
+    mocks.listWorkspaces.mockResolvedValue([workspace('other', 4)]);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await expect(refreshOtherWorkspacesUnread()).resolves.toBeUndefined();
+    warn.mockRestore();
+    expect(remotePeerWorkspaces.value[0].workspaces).toEqual([workspace('notes', 7)]);
+    expect(crossWorkspaceUnreadTotal.value).toBe(4);
+  });
+
   it('does not reach for the control plane in the picker (it sums its own listing)', async () => {
     mocks.isPicker = true;
     await refreshOtherWorkspacesUnread();
     expect(mocks.listWorkspaces).not.toHaveBeenCalled();
+    expect(mocks.listRemoteWorkspaces).not.toHaveBeenCalled();
     expect(setAppBadge).not.toHaveBeenCalled();
   });
 });

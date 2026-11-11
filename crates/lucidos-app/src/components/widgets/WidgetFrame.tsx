@@ -3,7 +3,9 @@ import { WIDGET_CHANNEL, type ContentSize, type WidgetPlace, type WidgetPush, ty
 import { AppFrame } from '../apps/AppFrame';
 import { appUrl } from '../../api/client';
 import { postToAppFrame } from '../../store/actions/app-bridge';
-import { APP_FRAME_MENU_EVENT, APP_FRAME_SIZE_EVENT } from '../../store/actions/widget-frame-bridge';
+import {
+  APP_FRAME_FIT_EVENT, APP_FRAME_MENU_EVENT, APP_FRAME_SIZE_EVENT, type WidgetFit,
+} from '../../store/actions/widget-frame-bridge';
 import type { ViewportPoint } from '../../hooks/useAnchoredPopover';
 import { watchOnScreen } from '../../hooks/useOnScreenInTranscript';
 import { holdAcrossRelayout } from '../chat/scrollState';
@@ -35,6 +37,18 @@ export type { WidgetPlace };
 export type WidgetFramePlacement =
   | { place: 'inline' | 'dashboard'; size: WidgetSize }
   | { place: Exclude<WidgetPlace, 'inline' | 'dashboard'>; size?: undefined };
+
+/** Makes a frame a *widget fit check* probe. It loads at once and stays
+ *  loaded, outside the shared frame budget, so it never evicts a frame the
+ *  user sees. Each new `measure` token asks the widget to settle and report
+ *  what its box cuts off, and `onFit` hears that report. `device` names whose
+ *  appearance the frame's first paint carries, instead of this window's.
+ *  `null` carries the workspace-wide appearance. */
+export interface WidgetFitProbe {
+  measure: string;
+  device: string | null;
+  onFit: (fit: WidgetFit) => void;
+}
 
 /** A frame's height before its widget reports one. */
 export function defaultWidgetHeight(place: WidgetPlace): number {
@@ -100,7 +114,8 @@ function watchInViewport(el: HTMLElement, onChange: (inView: boolean) => void): 
   return () => observer.disconnect();
 }
 
-/** A widget's app frame (ADRs 0402, 0432).
+/** A widget's app frame (ADRs 0402, 0432). `probe` makes it a fit check's
+ *  frame (`WidgetFitProbe`).
  *
  *  An `inline` or `dashboard` frame given a `size` fills its *widget box*,
  *  a thread card's or a dashboard tile's (`WidgetBox`). A report never sizes
@@ -131,12 +146,15 @@ function watchInViewport(el: HTMLElement, onChange: (inView: boolean) => void): 
  *
  *  `pans` says the box around the frame scrolls sideways, so the frame leaves
  *  a sideways drag to it rather than swiping the panes. */
-export function WidgetFrame({ appId, params, reveal, place, size, visible = true, pans = false, onHeight, onSize, onFrameState, onMenu }: WidgetFramePlacement & {
+export function WidgetFrame({
+  appId, params, reveal, place, size, visible = true, pans = false, probe, onHeight, onSize, onFrameState, onMenu,
+}: WidgetFramePlacement & {
   appId: string;
   params?: WidgetParams;
   reveal: AppReveal;
   visible?: boolean;
   pans?: boolean;
+  probe?: WidgetFitProbe;
   onHeight?: (px: number) => void;
   onSize?: (size: ContentSize, fromReport: boolean) => void;
   onFrameState?: (state: FrameState) => void;
@@ -147,6 +165,8 @@ export function WidgetFrame({ appId, params, reveal, place, size, visible = true
   const boxed = size !== undefined;
   // Set on screen, cleared by the off-screen hold or by eviction.
   const [held, setHeld] = useState(false);
+  const probing = probe !== undefined;
+  const loaded = held || probing;
   const instanceKey = widgetInstanceKey(appId, params);
   const [height, setHeight] = useState(() => lastSizes.get(instanceKey)?.height ?? defaultWidgetHeight(place));
   // Only `onReport` changes the height, and it sets this first.
@@ -179,6 +199,9 @@ export function WidgetFrame({ appId, params, reveal, place, size, visible = true
   const onMenuRef = useRef(onMenu);
   onMenuRef.current = onMenu;
   const hasMenu = onMenu !== undefined;
+  const probeRef = useRef(probe);
+  probeRef.current = probe;
+  const measure = probe?.measure;
   const [revealed, setRevealed] = useState(false);
   const frameState = widgetFrameState(inView, showing, revealed);
   const onFrameStateRef = useRef(onFrameState);
@@ -193,6 +216,16 @@ export function WidgetFrame({ appId, params, reveal, place, size, visible = true
   }, [host]);
 
   useEffect(() => {
+    if (!host) return undefined;
+    const answer = (e: Event) => {
+      const fit = (e as CustomEvent<WidgetFit>).detail;
+      if (fit.token === probeRef.current?.measure) probeRef.current.onFit(fit);
+    };
+    host.addEventListener(APP_FRAME_FIT_EVENT, answer);
+    return () => host.removeEventListener(APP_FRAME_FIT_EVENT, answer);
+  }, [host]);
+
+  useEffect(() => {
     if (!host) return;
     let pending: ContentSize | null = null;
     let frameRequest = 0;
@@ -202,7 +235,8 @@ export function WidgetFrame({ appId, params, reveal, place, size, visible = true
       const reported = pending;
       pending = null;
       if (boxed) {
-        lastSizes.set(instanceKey, reported);
+        // A probe lays out at another scale, so its size is no card's.
+        if (!probeRef.current) lastSizes.set(instanceKey, reported);
         onSizeRef.current?.(reported, true);
         return;
       }
@@ -249,32 +283,34 @@ export function WidgetFrame({ appId, params, reveal, place, size, visible = true
     if (size) push.size = size;
     if (hasMenu) push.menu = true;
     if (pans) push.pans = true;
+    if (measure) push.measure = measure;
     return postToAppFrame(el, WIDGET_CHANNEL, push);
   };
   useEffect(() => {
     if (frame.current) mark(frame.current);
-  }, [place, size, visible, hasMenu, pans]);
+  }, [place, size, visible, hasMenu, pans, measure]);
 
   // Evicted by the shared cap: drawn again when it next comes on screen.
   useEffect(() => {
-    if (!held || !host) return undefined;
+    if (!held || !host || probing) return undefined;
     return claimWidgetFrame(host, () => setHeld(false));
-  }, [held, host]);
+  }, [held, host, probing]);
   // A change to the widget's files bumps this, which remounts the frame on a
-  // fresh URL, as the Canvas pane's refresh key does.
-  const refreshKey = widgetRefreshKey(appId);
+  // fresh URL, as the Canvas pane's refresh key does. A probe mounts after the
+  // write it checks, and a reload mid-check could answer from the old page.
+  const refreshKey = probing ? 0 : widgetRefreshKey(appId);
   // Each fresh document gets a fresh guard: a reload or a redraw after
   // eviction may be a fixed widget, so an old lock must not hold it. It is
   // covered anew too.
   useEffect(() => {
     setRevealed(false);
-    if (held) guard.current = initialHeightGuard(height);
-  }, [held, refreshKey]);
-  const url = appUrl(appId, undefined, undefined, params);
+    if (loaded) guard.current = initialHeightGuard(height);
+  }, [loaded, refreshKey]);
+  const url = appUrl(appId, undefined, undefined, params, probe ? probe.device : undefined);
   const src = refreshKey > 0 ? cacheBust(url, refreshKey) : url;
   return (
     <div ref={setHost} class={`widget-frame widget-frame-${place}`} style={boxed ? undefined : { height: `${height}px` }}>
-      {held && (
+      {loaded && (
         <AppFrame
           key={refreshKey}
           src={src}

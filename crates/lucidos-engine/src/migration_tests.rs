@@ -1021,3 +1021,69 @@ async fn rename_user_prompt_injected_reaches_rows_and_every_subscription() {
 
     teardown_test_db(&db_name).await;
 }
+
+const RENAME_COMMAND_GUARD_CODING_AGENTS_SQL: &str = include_str!(
+    // The file name carries the retired key.
+    "../migrations/20261110090530_rename_command_guard_coding_agents_to_coding_agent_auto_answer.sql"
+);
+
+/// Each workspace keeps what it ran: the guard on AND the old value, whose
+/// default was `true`. A stored `true` under an off or unset guard did nothing,
+/// so it carries over as `false`. Nothing else gets a row.
+#[tokio::test]
+async fn coding_agent_auto_answer_keeps_what_each_workspace_ran() {
+    let (pool, db_name) = setup_test_db().await;
+    use crate::core::prefs::{CODING_AGENT_AUTO_ANSWER, COMMAND_GUARD};
+    let old = "command_guard_coding_agents"; // Wire contract: the retired key, as stored.
+    let (new, guard) = (CODING_AGENT_AUTO_ANSWER.key(), COMMAND_GUARD.key());
+    let cases = [
+        (Some("true"), Some("true"), Some("true")),
+        (Some("true"), Some("false"), Some("false")),
+        (Some("true"), None, Some("true")),
+        (Some("false"), Some("true"), Some("false")),
+        (Some("false"), Some("false"), Some("false")),
+        (Some("false"), None, None),
+        (None, Some("true"), Some("false")),
+        (None, Some("false"), Some("false")),
+        (None, None, None),
+    ];
+    for (guard_row, old_row, expected) in cases {
+        sqlx::query("DELETE FROM preferences WHERE key = ANY($1)")
+            .bind(vec![old, new, guard])
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (key, value) in [(guard, guard_row), (old, old_row)] {
+            if let Some(value) = value {
+                sqlx::query("INSERT INTO preferences (key, value) VALUES ($1, $2)")
+                    .bind(key)
+                    .bind(value)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        sqlx::raw_sql(RENAME_COMMAND_GUARD_CODING_AGENTS_SQL)
+            .execute(&pool)
+            .await
+            .expect("the migration runs");
+
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT value FROM preferences WHERE key = $1")
+                .bind(new)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        let case = format!("guard {guard_row:?}, old row {old_row:?}");
+        assert_eq!(stored.as_deref(), expected, "{case}");
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM preferences WHERE key = $1")
+            .bind(old)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0, "{case}: no old row survives");
+    }
+
+    teardown_test_db(&db_name).await;
+}

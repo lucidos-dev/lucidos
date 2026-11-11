@@ -27,10 +27,6 @@ export type SideEffectCategory =
   | 'out_of_workspace_destruction'
   | 'other';
 
-/** How long an unattended fire's parked permission card waits for an answer:
- *  `'deny'` (never park), whole minutes from 1 to 1440, or `'indefinite'`. */
-export type PermissionWait = 'deny' | number | 'indefinite';
-
 export interface Trigger {
   id: string;
   name: string;
@@ -50,9 +46,9 @@ export interface Trigger {
   /** Side-effect grant — irreversible categories this trigger may perform
    *  unattended. Omitted when empty (= no grant). */
   side_effect_grant?: SideEffectCategory[];
-  /** Permission wait for this trigger's unattended fires. Omitted when the
-   *  trigger uses the workspace preference `unattended_permission_wait`. */
-  permission_wait?: PermissionWait;
+  /** Coding-agent grant: whether this trigger's runs may start coding-agent
+   *  threads. Always present. */
+  coding_agent_grant: boolean;
   /** MCP server ids this trigger's fires use. Only these servers' tools run
    *  unattended in its threads. Omitted when empty. */
   mcp_servers?: string[];
@@ -91,9 +87,9 @@ export interface CreateTrigger {
   /** Side-effect grant — irreversible categories this trigger may perform
    *  unattended. Omit / `[]` = none granted (the safe default). */
   side_effect_grant?: SideEffectCategory[];
-  /** Permission wait for this trigger's unattended fires. Omit / null = the
-   *  workspace preference. Any other value outside the wire form is refused. */
-  permission_wait?: PermissionWait | null;
+  /** Let this trigger's runs start coding-agent threads. Only the owner may
+   *  set it: a call from an app frame is refused. Omit = false. */
+  coding_agent_grant?: boolean;
   /** MCP server ids this trigger's fires use. A fire refuses a call to any
    *  other server. Omit / `[]` = none. */
   mcp_servers?: string[];
@@ -131,9 +127,9 @@ export interface UpdateTrigger {
   /** Full replacement for the side-effect grant. Send the complete new set;
    *  pass `[]` to clear all grants. */
   side_effect_grant?: SideEffectCategory[];
-  /** Set the permission wait, or clear it back to the workspace preference
-   *  (null). Absent leaves it unchanged. */
-  permission_wait?: PermissionWait | null;
+  /** Grant (true) or revoke (false) coding agents. Only the owner may grant:
+   *  an app frame may revoke but never set it. Absent leaves it unchanged. */
+  coding_agent_grant?: boolean;
   /** Full replacement for the MCP server ids; pass `[]` to clear them. */
   mcp_servers?: string[];
   /** Pin the trigger's intent to a chat model (string) or clear it back to the

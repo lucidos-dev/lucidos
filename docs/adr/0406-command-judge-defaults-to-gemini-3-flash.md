@@ -68,3 +68,33 @@ on every model, Gemini included, which needs no thinking to score 0.
 
 **Gemini 3.5 Flash.** Equal on this set. It would give the judge a list of
 its own, ahead of the shared fallbacks, for no measured gain.
+
+## Addendum: Haiku 5.5 joins, and the judge never runs on the chat model
+
+ADR 0515 left an Anthropic-only install judging on its chat model, because
+Haiku 5.5 could not be measured. Plan:
+`docs/plans/2026-11-10-command-guard-on-by-default.md`.
+
+The labelled set has grown to 61 commands, 28 of them irreversible. Haiku 5.5
+ran through a signed-in Claude gateway, by way of the engine's
+`claude-gateway` proxy, since no Vertex region served it to the project used.
+
+| Model, tier | Irreversible called safe (of 28) | Over-cautious (of 23) | p95 |
+|---|---|---|---|
+| Gemini 3.1 Flash-Lite, none (Vertex) | 0 | 1 | 0.9 s |
+| GPT-6 Luna, none (OpenAI) | 0 | 3 | 2.0 s |
+| Claude Haiku 5.5, none (Claude gateway), two runs | 0 in both | 1, 2 | 1.9 s |
+
+Haiku's latency includes a loopback hop through the CLI proxy per call.
+
+- **The judge's list is measured only**: Gemini 3.1 Flash-Lite, then GPT-6
+  Luna, then Claude Haiku 5.5, each at `none`. That is one per provider
+  family: Vertex and OpenRouter, OpenAI and the ChatGPT plan, Anthropic and the
+  Claude gateway. `LUCIDOS_EXTRACTION_MODEL` no longer reaches it.
+- **It never falls back to the chat model.** Say the guard and the judge are
+  on, and no provider serves the judge's model. Then a Lucidos Agent turn
+  refuses to start and names the fix. Coding-agent auto-answer cards
+  instead. The judge switched off stays an explicit choice: the static lists
+  decide.
+- Still excluded: an install whose providers serve none of the three, such as
+  local-only or xAI-only. Its owner picks a judge model or turns the judge off.

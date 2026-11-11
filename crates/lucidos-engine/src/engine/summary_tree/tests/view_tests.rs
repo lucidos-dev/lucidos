@@ -417,6 +417,7 @@ fn built_thread(
             kind: EntryKind::Prompt(crate::engine::thread_events::ActorMode::Human),
             text: format!("entry {i}"),
             event_id: Uuid::new_v4(),
+            sender_device_id: None,
         })
         .collect();
     let nodes = complete_addresses(len)

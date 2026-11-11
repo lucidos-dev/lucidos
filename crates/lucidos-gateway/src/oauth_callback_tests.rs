@@ -98,10 +98,11 @@ async fn fake_peer(
 }
 
 #[test]
-fn only_the_four_callback_fields_are_forwarded() {
+fn only_the_callback_fields_are_forwarded() {
     let query = forwarded_query(
         "code=4%2F0Ab&state=%2Fdev%2F~n0nce&scope=email&error=&\
-         error_description=a+b&code_verifier=leak&session=cookie&code=second",
+         error_description=a+b&code_verifier=leak&session=cookie&code=second&\
+         client_id=app_issued&client_id=second",
     );
     let url = reqwest::Url::parse(&format!("http://x/?{query}")).unwrap();
     let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -112,6 +113,7 @@ fn only_the_four_callback_fields_are_forwarded() {
             ("state".into(), "/dev/~n0nce".into()),
             ("error".into(), String::new()),
             ("error_description".into(), "a b".into()),
+            ("client_id".into(), "app_issued".into()),
         ]
     );
 }
@@ -231,13 +233,13 @@ async fn the_callback_port_answers_nothing_else() {
 }
 
 #[tokio::test]
-async fn a_local_callback_reaches_its_engine_with_the_four_fields_only() {
+async fn a_local_callback_reaches_its_engine_with_the_callback_fields_only() {
     let state = GatewayState::for_tests();
     let (_dir, engine) = engine(StatusCode::OK, "<p>done</p>");
     state.set_route_for_test("dev", engine.address);
 
     let mut req = callback_request(
-        "/oauth/callback?code=c0de&state=%2Fdev%2F~n0nce&code_verifier=leak",
+        "/oauth/callback?code=c0de&client_id=app_1&state=%2Fdev%2F~n0nce&code_verifier=leak",
         Some(peer(LOOPBACK_PEER)),
     );
     req.headers_mut()
@@ -254,7 +256,7 @@ async fn a_local_callback_reaches_its_engine_with_the_four_fields_only() {
 
     let seen = engine.seen.lock().unwrap();
     let (query, headers) = &seen[0];
-    assert_eq!(query, "code=c0de&state=%2Fdev%2F~n0nce");
+    assert_eq!(query, "code=c0de&state=%2Fdev%2F~n0nce&client_id=app_1");
     assert!(headers.get("cookie").is_none());
     assert!(headers.get("x-forwarded-prefix").is_none());
     assert_eq!(
@@ -372,10 +374,10 @@ async fn a_handoff_is_loopback_only_and_never_handed_on() {
 // ── A remote workspace: the callback crosses the relay ─────────────────────
 
 #[tokio::test]
-async fn a_remote_callback_crosses_the_relay_device_less_with_the_four_fields_only() {
+async fn a_remote_callback_crosses_the_relay_device_less_with_the_callback_fields_only() {
     let p = crate::relay::tests::paired().await;
     let mut req = callback_request(
-        "/oauth/callback?code=c0de&state=%2Fdev%40cloud%2F~n0nce&code_verifier=leak",
+        "/oauth/callback?code=c0de&state=%2Fdev%40cloud%2F~n0nce&code_verifier=leak&client_id=app_1",
         Some(peer(LOOPBACK_PEER)),
     );
     req.headers_mut()
@@ -388,7 +390,7 @@ async fn a_remote_callback_crosses_the_relay_device_less_with_the_four_fields_on
     let (target, headers) = seen.split_once('\n').unwrap();
     assert_eq!(
         target,
-        "get /api/v1/internal/oauth/callback?code=c0de&state=%2fdev%40cloud%2f~n0nce"
+        "get /api/v1/internal/oauth/callback?code=c0de&state=%2fdev%40cloud%2f~n0nce&client_id=app_1"
     );
     let token = crate::auth::HEADER_LOCAL_TOKEN.to_lowercase();
     assert!(headers.contains(&format!("{token}: test-local-token")));

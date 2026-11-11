@@ -50,7 +50,7 @@
 //! Any subprocess could claim any source thread id, which made every gate that
 //! reads `source_thread_id` (`api::chat::subprocess_chat_legitimate`,
 //! `api::internal::coding_agent_diff_refresh`,
-//! `engine::cc_permission::resolve_attend_mode`) an accounting boundary rather
+//! `engine::agent_session::spawn_gate::spawn_provenance`) an accounting boundary rather
 //! than an authorization one.
 //!
 //! Now each spawn gets its own **thread-bound origin token**, minted by
@@ -478,20 +478,21 @@ pub fn build_message_origin(
     caller: Option<CallerOrigin>,
 ) -> Option<MessageOrigin> {
     let user_agent = header_str(headers, "user-agent");
-    // Subprocess origin overrides device/api resolution so an agent action
-    // never stamps as Human. Cross-workspace `caller` still wins (different
-    // channel, different actor model).
-    if caller.is_none() {
-        if let SubprocessOrigin::Subprocess {
-            source_thread_id, ..
-        } = subprocess_origin(headers)
-        {
-            return Some(MessageOrigin::Api {
-                user_agent,
-                mode: ActorMode::Agent,
-                source_thread_id,
-            });
-        }
+    // A verified token outranks every claim, so an agent action never stamps
+    // as Human. Only this engine's subprocesses hold one, so a `caller` beside
+    // it names this workspace, and its thread is a claim the token replaces.
+    if let SubprocessOrigin::Subprocess {
+        source_thread_id,
+        emitting_trigger_id,
+        ..
+    } = subprocess_origin(headers)
+    {
+        return Some(MessageOrigin::Api {
+            user_agent,
+            mode: ActorMode::Agent,
+            source_thread_id,
+            emitting_trigger_id,
+        });
     }
     if let Some(c) = caller {
         return Some(MessageOrigin::Workspace {
@@ -519,6 +520,7 @@ pub fn build_message_origin(
                     user_agent,
                     mode: ActorMode::Engine,
                     source_thread_id: None,
+                    emitting_trigger_id: None,
                 })
             } else {
                 // Nobody. Not the user: a caller presenting no credential has
@@ -613,16 +615,31 @@ pub(crate) fn claimed_device_id<'a>(
     body: Option<&'a str>,
     headers: &'a axum::http::HeaderMap,
 ) -> Option<&'a str> {
-    fn blank_filtered(s: &str) -> Option<&str> {
-        let t = s.trim();
-        (!t.is_empty()).then_some(t)
-    }
-    body.and_then(blank_filtered).or_else(|| {
-        headers
-            .get(HEADER_DEVICE_ID)
-            .and_then(|v| v.to_str().ok())
-            .and_then(blank_filtered)
-    })
+    body.and_then(blank_filtered)
+        .or_else(|| header_device_id(headers))
+}
+
+/// [`claimed_device_id`] with the header first. Through the gateway that is
+/// the device it authenticated, so a body cannot name another person's device.
+/// A send on a team gateway reads it: its device names the speaker that
+/// teammates and the agent read (ADR 0649).
+pub(crate) fn authenticated_device_id<'a>(
+    body: Option<&'a str>,
+    headers: &'a axum::http::HeaderMap,
+) -> Option<&'a str> {
+    header_device_id(headers).or_else(|| body.and_then(blank_filtered))
+}
+
+fn header_device_id(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(HEADER_DEVICE_ID)
+        .and_then(|v| v.to_str().ok())
+        .and_then(blank_filtered)
+}
+
+fn blank_filtered(s: &str) -> Option<&str> {
+    let t = s.trim();
+    (!t.is_empty()).then_some(t)
 }
 
 /// [`user_actor`], refusing rather than returning nobody.

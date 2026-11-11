@@ -294,11 +294,11 @@ Background tasks also shows the compactor's model, `model_summary_compaction`.
 | `opencode_free_enabled` | global | `true` \| `false` | `false` | `true` makes the keyless OpenCode Free models available in the picker. No account and no API key: requests go anonymously to a third-party relay, and several of those models may train on what they receive. Turn it on only if the user asked for free models and accepts that. |
 | `proxy_timeout_secs` | global | number 1–600 | `30` | Seconds the engine proxy waits on one upstream request before it answers 504. Covers every proxied call: `lucidos proxy`, `lucidos.proxy` in an app, the `proxy_request` tool, and the builtin model routes such as `vertex` and `openai`. A streamed reply counts in full, because the proxy reads the whole body first. Raise it when a long model call through the proxy times out. An `apis.json` entry's own `timeout_secs` wins for that entry. Every write path refuses a value outside the range. |
 | `follow_main_interval_minutes` | global | number 1–60 | `3` | Minutes between checks for a newer `main` on the `origin` remote. Only a source checkout with an `origin` remote follows. A newer `main` fast-forwards local `main` and builds in the background; "Switch to new version" still waits for a tap. A paired gateway that lands a change nudges the gateways it opens, so they check at once. Lower it to pick up other landings sooner. |
-| `driver_timeout_hours` | global | number 0–720 | `0` | In a *team workspace*, hours a gate may wait on its work item's *driver* before it escalates. An escalated gate pushes the whole team once, and the driver keeps the work item. `0` never escalates, which is right for a personal workspace. The team setup sets it, typically to `24`. |
+| `driver_timeout_hours` | global | number 0–720 | `0` | In a *team workspace*, hours a gate may wait on its root thread's *driver* before it escalates. An escalated gate pushes the whole team once, and the driver keeps the root thread. `0` never escalates, which is right for a personal workspace. The team setup sets it, typically to `24`. |
 | `notifications_filter` | global | `all` \| `unread` | `all` | Which notifications the bell shows. |
 | `notification_toasts` | global | `true` \| `false` | `true` | Whether a notification pops an in-app toast on a device the user is looking at. `false` silences the pop-up only: the notification still counts on the bell badge and waits in the Notifications panel. No OS push replaces it, because a present device never gets one. Unlike `push_notifications`, one write covers every device. |
 | `composer_enter_key` | global | `send` \| `newline` | `send` | What Enter does in the chat composer on a desktop layout. `send`: Enter sends and Shift+Enter adds a new line. `newline`: Enter adds a new line and Shift+Enter sends. Cmd+Enter or Ctrl+Enter sends in both. On a phone, Enter always adds a new line and the Send button sends. Offer `newline` to a user who keeps sending half-written prompts. Found under **Settings → Keyboard Shortcuts → Composer**. |
-| `mobile_dynamic_bars` | global | `true` \| `false` | `false` | *Dynamic bars* on a phone. `true` glides the header, the thread title and the prompt away while scrolling down a thread, and the header while scrolling down an app that loads the SDK. They return on scroll up or a pane swipe. `false` keeps them always visible. The installed iOS app ignores it and always glides them. |
+| `mobile_dynamic_bars` | global | `true` \| `false` | `true` | *Dynamic bars* on a phone. `true` glides the header, the thread title and the prompt away while scrolling down a thread, and the header while scrolling down an app that loads the SDK. They return on scroll up or a pane swipe. `false` keeps them always visible. The installed iOS app ignores it and always glides them. |
 | `automatic_widgets` | global | `true` \| `false` | `true` | Whether you may choose a *widget* on your own: a small interactive answer shown inline in the thread as an *inline widget* (`create_app` with `kind="widget"`, then an embed). `false` stops only your own choice, and a widget the user asks for is still made. Set it to `false` when the user tells you to stop making widgets. |
 | `external_link_target` | global | `safari` \| `ask` \| `in-app` | `safari` | Where an external http(s) link goes when tapped in an **installed iOS PWA**. Desktop, Android and a normal Safari tab always open a new tab. `safari` hands it to the Safari app. `ask` opens the OS share sheet, so iOS offers every installed browser, including the user's real default. `in-app` keeps it in the PWA's in-app web view (no address bar, no shared Safari session). |
 | `welcome_suggestions_dismissed` | global | `true` \| `false` | `false` | Hide the new-workspace welcome message. Set `false` to SHOW it again. |
@@ -315,7 +315,6 @@ Background tasks also shows the compactor's model, `model_summary_compaction`.
 | `cache_keep_alive_mode` | global | `off` \| `on` | `off` | Whether the cache keep-alive pings a waiting Claude Code session or Lucidos Agent thread. `off` sends no pings, so every wait past the cache lifetime pays a full reread. `on` pings an event wait or working children toward the thread's *expected wake*, only when those pings cost at most 80% of one reread, and never past the pings that cost one reread (the *reread cap*). With no expected wake it pings to the reread cap. A thread parked on a question card or permission prompt gets a cap learned from this workspace's cards asked near the same local hour. With too few of them it gets half the reread cap. Codex, and a model whose cache a ping cannot keep warm, ignore it. |
 | `coding_agent_context_ceiling` | global | `off` \| `<N>k` \| `<P>%` | `300k` | The *context ceiling* of every coding-agent thread that sets none of its own (ADR 0629): the context size at which its session hands off to a *successor session*. No ceiling goes above 75% of the session's window or below 100k. Human only: a higher ceiling spends more, so only the user changes it, in Settings → Coding Agents. An agent lowers its own thread's with `lucidos threads context-ceiling`. |
 | `coding_agent_claude_permission_mode` | global | `accept-edits` \| `auto` | `accept-edits` | Which of Claude Code's own permission modes coding-agent threads run in. `accept-edits` cards anything outside the session's working directories. `auto` lets Claude Code's safety classifier approve routine actions, reaching shapes no allowlist can (a `cd` combined with a redirect, a write, or git). Four costs: it ignores a bare `Bash` entry in `cc-allowed-tools`, it denies rather than cards when the classifier is unreachable, a denial streak falls back to prompting, and each gated call pays a classifier round-trip. Claude Code only; Codex ignores it. Applies to new sessions. |
-| `unattended_permission_wait` | global | `deny` \| whole minutes 1–1440 \| `indefinite` | `30` | The *permission wait* of a coding-agent session nobody is watching, when its root is not a trigger: the main check's fix thread, a webhook, an agent. A command the guard refused to settle then parks a card instead of being denied, but only when an enabled trigger announces the card, such as "When agent needs me". The engine sends no push itself. `deny` never parks; a number of minutes parks, then denies when nobody answers; `indefinite` waits like an attended card. A trigger's own `permission_wait` wins for its runs and their sub-threads. |
 | `backup_schedule` | global | 6-field cron (in the user's timezone) or `off` | `off` | Automatic backup schedule. E.g. `0 0 3 * * *` = daily 03:00, `0 0 3 * * 0` = weekly Sun 03:00, `0 0 */12 * * *` = every 12h. Fires in the user's `timezone`. Requires `backup_provider` set AND its account connected (see that key). |
 | `backup_provider` | global | `google_drive` \| `dropbox` | (unset) | Cloud destination, independent of `backup_schedule`: it stays set with the schedule `off`. The Backup page's provider dropdown opens on it and writes it. Setting this connects NOTHING. Connect the account with `connect_oauth_account`, or the user does it in **Settings → Accounts** (the Backup page has no account UI). Until then backups run and the upload fails. `get_backup_status` reports whether the account is connected. |
 | `backup_retention` | global | number 1–1000 | `5` | How many recent backups to keep; older ones are pruned after each successful backup. |
@@ -337,22 +336,31 @@ Background tasks also shows the compactor's model, `model_summary_compaction`.
 `preferences(action="get")` also lists the settings among these so you can explain them,
 and `preferences(action="set")` refuses every one with a hint naming the right surface:
 
-- `command_guard`, `command_guard_judge`, `command_guard_coding_agents`,
-  `model_command_judge`, `reasoning_command_judge`: the command guard (safety
-  gate over the agent's own bash/python), the model its LLM judge runs on, and
-  whether it also answers coding-agent command cards. Settings → Permissions
-  only. You must not disable or weaken your own safety gate.
+- `command_guard`, `command_guard_judge`: the command guard (safety gate over
+  the agent's own bash/python) and its LLM judge. Both default on: a workspace
+  with no row runs guarded. Settings → Permissions only. You must not disable
+  or weaken your own safety gate.
+- `model_command_judge`, `reasoning_command_judge`: the model the judge runs
+  on, for the guard and for coding-agent auto-answer. Settings → Models
+  (Command judge) only. Unset, it runs the first measured model a provider
+  serves (`gemini-3.1-flash-lite`, `gpt-6-luna`, `claude-haiku-5-5`), never
+  the chat model. With none served and no System One judge picked, a turn
+  under the guard and its judge refuses to start and names the fix.
+- `coding_agent_auto_answer`: whether Lucidos answers coding-agent command
+  cards with the guard's checks and judge. Off by default, and independent of
+  `command_guard`. Only it lets the judge answer a coding agent. Settings → Permissions → Coding agent permissions only.
 - `judgment_command_guard`, `judgment_query_classification`: which backend
   answers each judgment: `chat`, or a System One model (`jev`, `openrouter`,
   `clef`, `clef-flash`, `openai`, `custom`). Both ask typed questions and decide the outcome in
   code. `chat`, the default, asks the surface's own chat model. A System One
   model answers faster and sends what it judges to that vendor, and the chat
-  model takes over if its call fails. Neither key has its own control: **the
+  model takes over if its call fails. The command judge's fallback is its
+  judge model, and with none served the System One model answers alone.
+  Neither key has its own control: **the
   System One models are rows** in that surface's model dropdown. Choosing one
   writes its id; choosing any other model writes `chat`.
-  - The first dropdown is the Judge model row in Settings → Permissions (Command
-    safety). The second is the Query classification row in Settings → Models
-    (Background tasks).
+  - The first dropdown is the Command judge row in Settings → Models
+    (Background tasks). The second is the Query classification row there.
   - A System One row appears only once its provider is set up in Settings →
     Providers, and each sits under that provider's switch below.
   - `openrouter` and `openai` reuse the OpenRouter and OpenAI chat providers'
@@ -455,6 +463,10 @@ and `preferences(action="set")` refuses every one with a hint naming the right s
   toast). Workspace-global (`device_id IS NULL`): a dismiss on one device defers
   the toast everywhere, until a newer build (a different id) re-surfaces it.
   The version-update toasts manage them, never `preferences(action="set")`.
+- `chatgpt_plan_welcome_shown`: internal UI state. True once the one-time
+  "You're using your ChatGPT plan" dialog has shown after the first Sign in
+  with ChatGPT. Workspace-global, so it shows once per workspace. The Settings
+  card writes it, never `preferences(action="set")`.
 - `release_notice_cursor`: internal UI state. It holds the id of the last
   *release notice* this workspace answered; everything after it in the authored
   order is still owed. Workspace-global (`device_id IS NULL`), so answering on
@@ -471,8 +483,8 @@ and `preferences(action="set")` refuses every one with a hint naming the right s
 - `provider_enabled_vertex`, `provider_enabled_anthropic`,
   `provider_enabled_openai`, `provider_enabled_openrouter`,
   `provider_enabled_xai`, `provider_enabled_local`,
-  `provider_enabled_claude_gateway`: the per-provider switches on
-  Settings → Providers. Absent means **on**; only an explicit `false`
+  `provider_enabled_claude_gateway`, `provider_enabled_chatgpt_plan`: the
+  per-provider switches on Settings → Providers. Absent means **on**; only an explicit `false`
   switches a provider off. Off drops it from the model picker and from web
   search, with no restart, and leaves the stored key untouched for later. Never
   via `preferences(action="set")`: the provider you switch off may be answering this turn.

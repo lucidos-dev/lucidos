@@ -60,6 +60,17 @@ pub struct OperatorRef {
     pub name: String,
 }
 
+/// One person this gateway knows, for a picker such as the composer's mention
+/// list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Person {
+    pub id: String,
+    /// "Sam", or "Sam via A" for a relayed person.
+    pub name: String,
+    /// False for a person known only by email. No push reaches them.
+    pub has_device: bool,
+}
+
 /// The gateway's answer to `GET /~/api/v1/auth/operators`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperatorSnapshot {
@@ -135,6 +146,22 @@ impl OperatorSnapshot {
             })
     }
 
+    /// The person an operator id names, local or relayed, as a device of
+    /// theirs would name them. A removed operator's id names nobody.
+    pub fn operator_of_id(&self, operator_id: &str) -> Option<OperatorRef> {
+        if let Some(operator) = self.operators.iter().find(|o| o.id == operator_id) {
+            return Some(OperatorRef {
+                id: operator.id.clone(),
+                name: operator.name.clone(),
+            });
+        }
+        let relayed = self
+            .relayed
+            .iter()
+            .find(|r| self.relayed_person_id(r) == operator_id)?;
+        self.operator_of_device(&relayed.device_id)
+    }
+
     /// The person behind an event origin: a device's holder, or the operator
     /// holding a trigger fire's actor email. Every other origin is nobody.
     pub fn operator_of_origin(
@@ -159,6 +186,31 @@ impl OperatorSnapshot {
     /// people means something only from two.
     pub fn person_count(&self) -> usize {
         self.person_ids().len()
+    }
+
+    /// The name an agent reads a person's typed message under: the device's
+    /// holder on a team gateway. A personal gateway, and a sender no operator
+    /// holds, keep "User".
+    pub fn speaker_of_device(&self, device_id: Option<&str>) -> String {
+        device_id
+            .filter(|_| self.person_count() >= 2)
+            .and_then(|id| self.operator_of_device(id))
+            .map_or_else(|| "User".to_string(), |o| o.name)
+    }
+
+    /// Every person this gateway knows, local and relayed, each once.
+    pub fn people(&self) -> Vec<Person> {
+        self.person_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let who = self.operator_of_id(id)?;
+                Some(Person {
+                    has_device: !self.devices_of(id).is_empty(),
+                    id: who.id,
+                    name: who.name,
+                })
+            })
+            .collect()
     }
 
     /// The devices an operator holds, local and relayed. Empty for an unknown
@@ -238,6 +290,15 @@ pub fn current() -> Arc<OperatorSnapshot> {
         .read()
         .map(|s| Arc::clone(&s))
         .unwrap_or_default()
+}
+
+/// The operator list, or `None` while the gateway has not answered yet. Until
+/// then a team reads as one person, so a decision that differs between the
+/// two must wait. An engine with no gateway knows its list: it is empty.
+pub fn known() -> Option<Arc<OperatorSnapshot>> {
+    let waiting =
+        GATEWAY_PORT.get().is_some() && !ANSWERED.load(std::sync::atomic::Ordering::SeqCst);
+    (!waiting).then(current)
 }
 
 fn install(snapshot: OperatorSnapshot) {
@@ -374,6 +435,17 @@ mod tests {
     }
 
     #[test]
+    fn an_operator_id_names_its_person_local_relayed_or_nobody() {
+        let snapshot = snapshot();
+        assert_eq!(snapshot.operator_of_id("op-2").unwrap().name, "Alex");
+        assert_eq!(
+            snapshot.operator_of_id("pair:op-7").unwrap().name,
+            "Robin via laptop"
+        );
+        assert_eq!(snapshot.operator_of_id("op-removed"), None);
+    }
+
+    #[test]
     fn an_email_matches_its_person_whatever_the_case() {
         let snapshot = snapshot();
         assert_eq!(
@@ -419,6 +491,28 @@ mod tests {
         assert!(snapshot.devices_of("op-2").is_empty());
         assert!(snapshot.devices_of("unknown").is_empty());
         assert_eq!(snapshot.devices_of("op-1").len(), 2);
+    }
+
+    #[test]
+    fn the_people_list_names_everyone_once_and_marks_who_has_no_device() {
+        let person = |id: &str, name: &str, has_device: bool| Person {
+            id: id.into(),
+            name: name.into(),
+            has_device,
+        };
+        assert_eq!(
+            snapshot().people(),
+            vec![
+                person("op-1", "Sam", true),
+                person("op-2", "Alex", false),
+                person("pair:op-7", "Robin via laptop", true),
+            ]
+        );
+
+        let mut solo = snapshot();
+        solo.operators.truncate(1);
+        solo.relayed[0].emails = vec!["sam@example.com".into()];
+        assert_eq!(solo.people(), vec![person("op-1", "Sam", true)]);
     }
 
     #[test]

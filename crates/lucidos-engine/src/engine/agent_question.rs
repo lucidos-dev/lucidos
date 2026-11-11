@@ -1518,7 +1518,7 @@ pub async fn answer_pending_question_with_event_id(
 
     // The answer stands either way, so a failed driver take only logs.
     if let (Some(answerer), true) = (actor.as_ref(), answer.is_a_reply()) {
-        use crate::engine::work_item::{notify, take_on_answer, WorkItemNotice};
+        use crate::engine::thread_people::{notify, take_on_answer, PeopleNotice};
         let snapshot = crate::gateway_operators::current();
         let taken = match take_on_answer(
             engine.pool(),
@@ -1547,7 +1547,7 @@ pub async fn answer_pending_question_with_event_id(
                         notify(
                             engine,
                             root,
-                            WorkItemNotice::GateAnswered(takeover),
+                            PeopleNotice::GateAnswered(takeover),
                             &snapshot,
                         )
                         .await

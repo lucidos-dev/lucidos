@@ -1,5 +1,4 @@
 use crate::core::event_subscription::EventSubscription;
-use crate::core::permission_wait::PermissionWait;
 use crate::engine::command_guard::SideEffectCategory;
 use crate::engine::context_ceiling::ContextCeiling;
 use crate::triggers::actor::{ActorField, ACTOR_FIELD_KEY};
@@ -134,10 +133,11 @@ pub struct TriggerConfig {
     /// irreversible side-effect — the command guard fails the trigger if its
     /// intent tries to. Only consulted when the `command_guard` preference is on.
     pub side_effect_grant: Vec<SideEffectCategory>,
-    /// The trigger's **permission wait**: how long a coding-agent card its runs
-    /// park waits for an answer. Its sub-threads inherit it. `None` reads the
-    /// workspace preference `unattended_permission_wait`.
-    pub permission_wait: Option<PermissionWait>,
+    /// The trigger's **coding-agent grant**: whether a run it fires may start a
+    /// coding-agent thread. False (the default) refuses that spawn at the
+    /// spawn gate (`agent_session::spawn_gate`) and fails the run loudly. It classifies spawns,
+    /// so it sits beside `side_effect_grant`, which classifies commands.
+    pub coding_agent_grant: bool,
     /// The trigger's **context ceiling** (ADR 0629), copied onto each thread it
     /// fires. `None` leaves those threads on the workspace preference.
     pub context_ceiling: Option<ContextCeiling>,
@@ -420,27 +420,9 @@ pub(crate) fn parse_side_effect_grant(field: Option<&Value>) -> Vec<SideEffectCa
     out
 }
 
-/// Read a stored `permission_wait`. Absent or null reads as `None`. So does a
+/// Read a stored `context_ceiling`. Absent or null reads as `None`. So does a
 /// value the parser refuses, so one bad row can never wedge the in-memory
 /// config: the API refuses it at the boundary.
-pub(crate) fn parse_permission_wait(
-    field: Option<&Value>,
-    trigger_id: &str,
-) -> Option<PermissionWait> {
-    let value = field.filter(|v| !v.is_null())?;
-    PermissionWait::from_json(value)
-        .map_err(|e| {
-            log!(
-                "[Triggers] Ignored permission_wait on {}: {}",
-                trigger_id,
-                e
-            )
-        })
-        .ok()
-}
-
-/// Read a stored `context_ceiling`, like [`parse_permission_wait`]: absent,
-/// null or refused reads as `None`.
 pub(crate) fn parse_context_ceiling(
     field: Option<&Value>,
     trigger_id: &str,
@@ -484,6 +466,52 @@ pub(crate) fn parse_mcp_servers(field: Option<&Value>) -> Vec<String> {
 }
 
 impl TriggerConfig {
+    /// Whether the owner gave this trigger a coding-agent grant or any
+    /// side-effect category.
+    pub fn holds_a_grant(&self) -> bool {
+        self.coding_agent_grant || !self.side_effect_grant.is_empty()
+    }
+
+    /// Whether `next` holds a grant this trigger lacks: the coding-agent grant,
+    /// or a side-effect category outside the current set. Only the owner may
+    /// widen a grant (ADR 0641).
+    pub fn widens_a_grant(&self, next: &TriggerConfig) -> bool {
+        (next.coding_agent_grant && !self.coding_agent_grant)
+            || next
+                .side_effect_grant
+                .iter()
+                .any(|c| !self.side_effect_grant.contains(c))
+    }
+
+    /// Whether an agent's or app frame's edit to `next` must drop both grants.
+    /// The owner granted this trigger's work, so a change to its run, its
+    /// events or its MCP servers needs the owner again.
+    pub fn unowned_edit_clears_grants(&self, next: &TriggerConfig) -> bool {
+        fn servers(c: &TriggerConfig) -> std::collections::BTreeSet<&str> {
+            c.mcp_servers.iter().map(String::as_str).collect()
+        }
+        self.holds_a_grant()
+            && (next.run != self.run || next.on != self.on || servers(next) != servers(self))
+    }
+
+    /// Stamp an update payload so it drops both grants.
+    pub fn clear_grants_in(payload: &mut Value) {
+        payload["coding_agent_grant"] = Value::Bool(false);
+        payload["side_effect_grant"] = Value::Array(Vec::new());
+    }
+
+    /// What an agent must tell the user after its edit cleared the grants.
+    pub fn grants_cleared_notice(&self) -> String {
+        format!(
+            "IMPORTANT, tell the user now: this edit changed what the trigger \"{}\" runs, so \
+             Lucidos removed its grants (coding agents and allowed side-effects). Until the \
+             user grants them again, a run that needs one fails with a notification. Ask the \
+             user to open the trigger and tick them again if they trust the new version. You \
+             cannot tick them for them.",
+            self.name
+        )
+    }
+
     /// Build a TriggerConfig from a TriggerCreated event payload.
     pub fn from_created_payload(payload: &Value) -> Result<Self, String> {
         let id = payload["trigger_id"]
@@ -552,7 +580,10 @@ impl TriggerConfig {
             .map(String::from)
             .unwrap_or_else(|| slugify_trigger_name_with_fallback(&name, &id));
         let side_effect_grant = parse_side_effect_grant(payload.get("side_effect_grant"));
-        let permission_wait = parse_permission_wait(payload.get("permission_wait"), &id);
+        let coding_agent_grant = payload
+            .get("coding_agent_grant")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let context_ceiling = parse_context_ceiling(payload.get("context_ceiling"), &id);
         let mcp_servers = parse_mcp_servers(payload.get("mcp_servers"));
         // Plugin provenance (ADR 0019) — present only on plugin-auto-registered
@@ -589,7 +620,7 @@ impl TriggerConfig {
             go_to_review,
             group_id,
             side_effect_grant,
-            permission_wait,
+            coding_agent_grant,
             context_ceiling,
             mcp_servers,
             plugin_id,
@@ -740,7 +771,7 @@ impl TriggerConfig {
             "go_to_review": self.go_to_review,
             "group_id": self.group_id,
             "side_effect_grant": self.side_effect_grant,
-            "permission_wait": self.permission_wait,
+            "coding_agent_grant": self.coding_agent_grant,
             "context_ceiling": self.context_ceiling,
             "mcp_servers": self.mcp_servers,
             "plugin_id": self.plugin_id,
@@ -825,12 +856,11 @@ impl TriggerConfig {
         if payload.get("side_effect_grant").is_some() {
             self.side_effect_grant = parse_side_effect_grant(payload.get("side_effect_grant"));
         }
-        // permission_wait: a value replaces it, null clears it back to the
-        // workspace preference, and absent leaves it as-is.
-        if payload.get("permission_wait").is_some() {
-            self.permission_wait = parse_permission_wait(payload.get("permission_wait"), &self.id);
+        if let Some(v) = payload.get("coding_agent_grant").and_then(|v| v.as_bool()) {
+            self.coding_agent_grant = v;
         }
-        // context_ceiling: the same three cases as permission_wait.
+        // context_ceiling: a value replaces it, null clears it back to the
+        // workspace preference, and absent leaves it as-is.
         if payload.get("context_ceiling").is_some() {
             self.context_ceiling = parse_context_ceiling(payload.get("context_ceiling"), &self.id);
         }

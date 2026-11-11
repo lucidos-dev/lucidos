@@ -8,8 +8,8 @@ use serde::Serialize;
 
 use super::AppState;
 use crate::engine::aux_purpose::{
-    asks_no_model, model_key, recommended, recommended_effort, GenerationStep, ModelSource,
-    BACKGROUND_ROWS,
+    asks_no_model, model_key, recommended, recommended_effort, unresolved_judge, GenerationStep,
+    ModelSource, BACKGROUND_ROWS,
 };
 use crate::engine::ContextPurpose;
 use crate::llm::model_registry::ModelRegistry;
@@ -40,6 +40,10 @@ pub(crate) struct BackgroundModel {
     /// Whether the task asks no model at all: it runs only on measured models,
     /// and none is reachable. The wake decision then wakes every parent.
     pub(crate) asks_no_model: bool,
+    /// Why the task has no model to run on, so the engine refuses what needs
+    /// it. Only the command judge sets it: a Lucidos Agent turn under the
+    /// guard and the judge then refuses to start.
+    pub(crate) unresolved: Option<String>,
     /// The models Settings lists first, best first. The first a configured
     /// provider serves is the default.
     pub(crate) recommended: Vec<RecommendedSelection>,
@@ -71,6 +75,7 @@ fn recommended_selections(
 async fn get_background_models(
     State(state): State<AppState>,
 ) -> Json<BTreeMap<&'static str, BackgroundModel>> {
+    let registry = state.engine.model_registry();
     let mut rows = BTreeMap::new();
     for purpose in BACKGROUND_ROWS {
         let Some(key) = model_key(*purpose) else {
@@ -90,7 +95,13 @@ async fn get_background_models(
                 needs_vision: selection.needs_vision,
                 vision: selection.vision,
                 asks_no_model: asks_no_model(*purpose, selection.source),
-                recommended: recommended_selections(*purpose, state.engine.model_registry()),
+                unresolved: match purpose {
+                    ContextPurpose::CommandJudge => {
+                        unresolved_judge(&state.pool, selection, registry).await
+                    }
+                    _ => None,
+                },
+                recommended: recommended_selections(*purpose, registry),
             },
         );
     }

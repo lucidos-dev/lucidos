@@ -17,7 +17,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::permission_wait::PermissionWait;
 use crate::core::DATA_DIR;
 use crate::engine::command_guard::SideEffectCategory;
 use crate::engine::context_ceiling::ContextCeiling;
@@ -57,12 +56,14 @@ pub struct TriggerDefinition {
     /// this unset; install stamps it from the plugin id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_id: Option<String>,
+    /// Projected so the file shows it. A shipped value is never registered:
+    /// only the owner grants a trigger side-effects.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub side_effect_grant: Vec<SideEffectCategory>,
-    /// How long a parked permission card waits on an unattended fire. Omitted
-    /// (None) = the workspace preference. A scalar, so it stays above the tables.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub permission_wait: Option<PermissionWait>,
+    /// Projected so the file shows it. A shipped value is never registered:
+    /// only the owner grants a trigger coding agents.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub coding_agent_grant: bool,
     /// The context ceiling copied onto each fired thread (ADR 0629). Omitted
     /// (None) = the workspace preference. A scalar, so it stays above the tables.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -110,7 +111,7 @@ impl TriggerDefinition {
             go_to_review: c.go_to_review,
             plugin_id: c.plugin_id.clone(),
             side_effect_grant: c.side_effect_grant.clone(),
-            permission_wait: c.permission_wait,
+            coding_agent_grant: c.coding_agent_grant,
             context_ceiling: c.context_ceiling,
             mcp_servers: c.mcp_servers.clone(),
             model: c.model.clone(),
@@ -126,7 +127,9 @@ impl TriggerDefinition {
     /// Build a `TriggerCreated`/`TriggerUpdated` event payload from this
     /// definition, stamping `trigger_id` + plugin provenance. `schedule` is
     /// forced empty because plugin triggers are event-driven only. Used by
-    /// plugin install to auto-register a shipped `trigger.toml`.
+    /// plugin install to auto-register a shipped `trigger.toml`. It omits both
+    /// grants, so install creates the trigger ungranted and an update keeps the
+    /// owner's answer. Only the owner grants a trigger (ADR 0641).
     pub fn to_trigger_payload(&self, trigger_id: &str, plugin_id: &str) -> serde_json::Value {
         serde_json::json!({
             "trigger_id": trigger_id,
@@ -139,8 +142,6 @@ impl TriggerDefinition {
             "app_id": self.app_id,
             "go_to_review": self.go_to_review,
             "group_id": self.group_id,
-            "side_effect_grant": self.side_effect_grant,
-            "permission_wait": self.permission_wait,
             "context_ceiling": self.context_ceiling,
             "mcp_servers": self.mcp_servers,
             "plugin_id": plugin_id,

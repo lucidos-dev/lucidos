@@ -10,8 +10,13 @@ use crate::core::webhook_refusal::{RefusalCause, Resolution};
 use crate::core::{AppKind, AuthType};
 use crate::engine::thread_events::{ArrangedTile, Dashboard, MessageOrigin};
 use crate::engine::widgets::WidgetParams;
+use crate::llm::chatgpt_plan::ChatGptPlanSignOutReason;
 use crate::llm::claude_gateway::account::ClaudeGatewaySignOutReason;
 use crate::scheduler::notifications::Tap;
+
+/// The `aggregate_id` of every ChatGPT plan event: a workspace has at most one
+/// sign-in, and its tokens have no shareable name.
+const CHATGPT_PLAN_AGGREGATE_ID: &str = "chatgpt-plan";
 
 /// System events — broadcast to SSE, selectively persisted.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,10 +53,14 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
         /// The devices this notification is for, when its producer names
-        /// them: a work item's role change tells one person (ADR 0623).
+        /// them: a root thread's role change tells one person (ADR 0623).
         /// `None` lets the projection work it out from the thread it opens.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         audience: Option<Vec<String>>,
+        /// The OS pushes this notification shares a tag with: the people-only
+        /// messages of one thread (ADR 0649). `None` is an ordinary one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        push_group: Option<crate::scheduler::notifications::PushGroup>,
     },
     NotificationRead {
         id: String,
@@ -771,7 +780,7 @@ pub enum SystemEvent {
         tap: Tap,
         deadline_ms: u32,
         sent_at_ms: i64,
-        /// The devices the push is for, when it is about a work item with a
+        /// The devices the push is for, when it is about a root thread with a
         /// driver (ADR 0623). A page outside it shows nothing and answers
         /// `not_shown`. Absent means every device.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1452,6 +1461,49 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         available_models: Option<Vec<String>>,
     },
+    /// The workspace signed in with ChatGPT for the *ChatGPT plan provider*.
+    /// `email` names the account. Carries no token.
+    ChatGptPlanSignedIn {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        email: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// The ChatGPT plan sign-in ended, for `reason`. The registration stays,
+    /// so the next sign-in reuses the issued client id, unless `reason` is
+    /// `forgotten`.
+    ChatGptPlanSignedOut {
+        reason: ChatGptPlanSignOutReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A Sign in with ChatGPT attempt began, waiting for the browser to come
+    /// back. Carries no URL, `state` or token.
+    ChatGptPlanSignInStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A Sign in with ChatGPT attempt was stopped before it finished. `actor`
+    /// is who stopped it.
+    ChatGptPlanSignInCanceled {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A Sign in with ChatGPT attempt ended without a sign-in: it timed out,
+    /// the user declined, or OpenAI refused. `error` says which, and `actor`
+    /// is who started it.
+    ChatGptPlanSignInFailed {
+        error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// The ChatGPT plan answered that its usage limit for Lucidos is spent.
+    /// Plan requests fail fast, with no request sent, until `paused_until`.
+    /// Emitted once per pause. `paused_until` is Lucidos's own pause, never
+    /// OpenAI's reset time.
+    ChatGptPlanLimitReached {
+        paused_until: chrono::DateTime<chrono::Utc>,
+    },
     /// A `PUT /api/v1/data/*path` write committed (file created or replaced).
     /// `commit` is the resulting git sha when the path lives under `artifacts/`
     /// (manager-committed); empty for non-artifact paths that bypass the
@@ -2009,6 +2061,12 @@ impl SystemEvent {
         "ClaudeGatewaySignInCanceled",
         "ClaudeGatewaySignInFailed",
         "ClaudeGatewayManagedSettingsChanged",
+        "ChatGptPlanSignedIn",
+        "ChatGptPlanSignedOut",
+        "ChatGptPlanSignInStarted",
+        "ChatGptPlanSignInCanceled",
+        "ChatGptPlanSignInFailed",
+        "ChatGptPlanLimitReached",
         "DataFileWritten",
         "DataFileDeleted",
         "DataFileEdited",
@@ -2219,6 +2277,12 @@ impl SystemEvent {
             Self::ClaudeGatewayManagedSettingsChanged { .. } => {
                 "ClaudeGatewayManagedSettingsChanged"
             }
+            Self::ChatGptPlanSignedIn { .. } => "ChatGptPlanSignedIn",
+            Self::ChatGptPlanSignedOut { .. } => "ChatGptPlanSignedOut",
+            Self::ChatGptPlanSignInStarted { .. } => "ChatGptPlanSignInStarted",
+            Self::ChatGptPlanSignInCanceled { .. } => "ChatGptPlanSignInCanceled",
+            Self::ChatGptPlanSignInFailed { .. } => "ChatGptPlanSignInFailed",
+            Self::ChatGptPlanLimitReached { .. } => "ChatGptPlanLimitReached",
             Self::DataFileWritten { .. } => "DataFileWritten",
             Self::DataFileDeleted { .. } => "DataFileDeleted",
             Self::DataFileEdited { .. } => "DataFileEdited",
@@ -2409,6 +2473,12 @@ impl SystemEvent {
         "ClaudeGatewaySignInCanceled",
         "ClaudeGatewaySignInFailed",
         "ClaudeGatewayManagedSettingsChanged",
+        "ChatGptPlanSignedIn",
+        "ChatGptPlanSignedOut",
+        "ChatGptPlanSignInStarted",
+        "ChatGptPlanSignInCanceled",
+        "ChatGptPlanSignInFailed",
+        "ChatGptPlanLimitReached",
         "DataFileWritten",
         "DataFileDeleted",
         "DataFileEdited",
@@ -2582,6 +2652,12 @@ impl SystemEvent {
             | Self::ClaudeGatewaySignInCanceled { .. }
             | Self::ClaudeGatewaySignInFailed { .. }
             | Self::ClaudeGatewayManagedSettingsChanged { .. } => "claude_gateway",
+            Self::ChatGptPlanSignedIn { .. }
+            | Self::ChatGptPlanSignedOut { .. }
+            | Self::ChatGptPlanSignInStarted { .. }
+            | Self::ChatGptPlanSignInCanceled { .. }
+            | Self::ChatGptPlanSignInFailed { .. }
+            | Self::ChatGptPlanLimitReached { .. } => "chatgpt_plan",
             Self::DataFileWritten { .. }
             | Self::DataFileDeleted { .. }
             | Self::DataFileEdited { .. } => "data_file",
@@ -2745,6 +2821,12 @@ impl SystemEvent {
             | Self::ClaudeGatewaySignInCanceled { issuer, .. }
             | Self::ClaudeGatewaySignInFailed { issuer, .. }
             | Self::ClaudeGatewayManagedSettingsChanged { issuer, .. } => issuer.clone(),
+            Self::ChatGptPlanSignedIn { .. }
+            | Self::ChatGptPlanSignedOut { .. }
+            | Self::ChatGptPlanSignInStarted { .. }
+            | Self::ChatGptPlanSignInCanceled { .. }
+            | Self::ChatGptPlanSignInFailed { .. }
+            | Self::ChatGptPlanLimitReached { .. } => CHATGPT_PLAN_AGGREGATE_ID.to_string(),
             Self::DataFileWritten { path, .. }
             | Self::DataFileDeleted { path, .. }
             | Self::DataFileEdited { path, .. }

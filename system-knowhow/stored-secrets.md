@@ -19,6 +19,7 @@ These columns hold only encrypted values:
 | `credentials` | `auth_value` | every *credential* value: API keys, tokens, passwords, OAuth client secrets |
 | `oauth_accounts` | `access_token`, `refresh_token` | connected account tokens |
 | `claude_gateway_accounts` | `access_token`, `refresh_token` | Claude gateway sign-in tokens |
+| `chatgpt_plan_accounts` | `id_token`, `access_token`, `refresh_token` | Sign in with ChatGPT tokens |
 | `mcp_servers` | `env` | each MCP server environment value |
 | `vapid_keys` | `private_key_pem` | the Web Push signing key |
 | `push_subscriptions` | `auth` | each device's push secret |

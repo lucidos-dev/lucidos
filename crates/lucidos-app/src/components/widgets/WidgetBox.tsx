@@ -5,7 +5,7 @@ import type { ContentSize } from '@lucidos/widget-frame';
 import type { AppReveal, WidgetSize } from '../../store/types';
 import { widgetBoxCss } from '../../utils/dashboardGeometry';
 import type { WidgetParams } from '../../utils/widgetParams';
-import { WidgetFrame, type WidgetPlace } from './WidgetFrame';
+import { WidgetFrame, type WidgetFitProbe, type WidgetPlace } from './WidgetFrame';
 import type { FrameState } from './widgetFrameState';
 
 /** How long a resize cover waits for the widget's report before it clears
@@ -28,13 +28,17 @@ type BoxAttributes = Omit<JSX.HTMLAttributes<HTMLDivElement>, 'ref' | 'class' | 
  *  The frame sits in a sideways scroller. A box the host clamps below its true
  *  width, which only an XL box can be, scrolls sideways, and the widget still
  *  sees `xl`. The frame hears that it pans, so a sideways drag scrolls the box.
+ *  Content wider than that canvas is clipped under a right-edge fade. A
+ *  transparent box draws no fade on either edge.
+ *
+ *  `probe` makes the frame a *widget fit check*'s (`WidgetFitProbe`).
  *
  *  `boxRef` hands the box element to its owner, and `hideFade` keeps the fade
  *  off while something else covers the box, such as edit mode's shield. The
  *  rest of the attributes land on the box, so a tile's grid place and handlers
  *  sit on the box itself. */
 export function WidgetBox({
-  appId, params, reveal, place, size, transparent = false, visible, onFrameState, onMenu,
+  appId, params, reveal, place, size, transparent = false, visible, probe, onFrameState, onMenu,
   class: className, boxRef, hideFade = false, children, ...attributes
 }: BoxAttributes & {
   appId: string;
@@ -44,6 +48,7 @@ export function WidgetBox({
   size: WidgetSize;
   transparent?: boolean;
   visible?: boolean;
+  probe?: WidgetFitProbe;
   onFrameState?: (state: FrameState) => void;
   onMenu?: (at?: ViewportPoint) => void;
   class?: string;
@@ -54,8 +59,10 @@ export function WidgetBox({
   const [box, setBox] = useState<HTMLDivElement | null>(null);
   const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
   const [pans, setPans] = useState(false);
-  const [contentHeight, setContentHeight] = useState(0);
+  const [canvas, setCanvas] = useState<HTMLDivElement | null>(null);
+  const [content, setContent] = useState<ContentSize>({ height: 0 });
   const [clipped, setClipped] = useState(false);
+  const [cutRight, setCutRight] = useState(false);
   // The size the box waits on the widget to lay out for, else null.
   const [coveredFor, setCoveredFor] = useState<WidgetSize | null>(null);
   const shownSize = useRef(size);
@@ -70,13 +77,24 @@ export function WidgetBox({
   useLayoutEffect(() => {
     if (!box) return undefined;
     // One pixel of slack absorbs `clientHeight` rounding a fractional report.
-    const measure = () => setClipped(contentHeight - box.clientHeight > 1);
+    const measure = () => setClipped(content.height - box.clientHeight > 1);
     measure();
     if (typeof ResizeObserver !== 'function') return undefined;
     const observer = new ResizeObserver(measure);
     observer.observe(box);
     return () => observer.disconnect();
-  }, [box, contentHeight]);
+  }, [box, content.height]);
+
+  useLayoutEffect(() => {
+    if (!canvas) return undefined;
+    // Against the canvas, not the box: an XL box that pans is not cut.
+    const measure = () => setCutRight(content.width !== undefined && content.width - canvas.clientWidth > 1);
+    measure();
+    if (typeof ResizeObserver !== 'function') return undefined;
+    const observer = new ResizeObserver(measure);
+    observer.observe(canvas);
+    return () => observer.disconnect();
+  }, [canvas, content.width]);
 
   // A layout effect, so the cover is up in the same paint as the new box.
   useLayoutEffect(() => {
@@ -88,7 +106,7 @@ export function WidgetBox({
   }, [size]);
 
   const onSize = (s: ContentSize) => {
-    setContentHeight(s.height);
+    setContent(s);
     if (s.size !== undefined) setCoveredFor((waiting) => (waiting === s.size ? null : waiting));
   };
 
@@ -112,7 +130,7 @@ export function WidgetBox({
       data-size={size}
     >
       <div ref={setScroller} class="widget-box-scroll">
-        <div class="widget-box-canvas" style={{ '--widget-box-true-width': widgetBoxCss(size).width }}>
+        <div ref={setCanvas} class="widget-box-canvas" style={{ '--widget-box-true-width': widgetBoxCss(size).width }}>
           <WidgetFrame
             appId={appId}
             params={params}
@@ -121,13 +139,15 @@ export function WidgetBox({
             size={size}
             visible={visible}
             pans={pans}
+            probe={probe}
             onSize={onSize}
             onFrameState={onFrameState}
             onMenu={onMenu}
           />
         </div>
       </div>
-      {clipped && !hideFade && <div class="widget-box-fade" />}
+      {!transparent && !hideFade && clipped && <div class="widget-box-fade" data-edge="bottom" />}
+      {!transparent && !hideFade && cutRight && <div class="widget-box-fade" data-edge="right" />}
       <div class={`widget-box-cover${coveredFor ? ' is-covering' : ''}`} aria-hidden="true" />
       {children}
     </div>

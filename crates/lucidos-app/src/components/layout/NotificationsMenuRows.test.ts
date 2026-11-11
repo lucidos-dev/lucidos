@@ -14,6 +14,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { VNode } from 'preact';
 import type { WorkspaceStatus } from '../../api/client/control';
+import type { RemoteGatewayView } from '../../utils/remoteWorkspaces';
 import { vnodeToText } from '../chat/__tests__/vnodeToText';
 vi.mock('../shared/GlyphBadge', () => import('../shared/__tests__/glyphBadgeStub'));
 
@@ -39,9 +40,14 @@ function ws(id: string, unread?: number, health: WorkspaceStatus['health'] = 'he
   return { id, name: id, port: 5173, health, autostart: false, unread_count: unread };
 }
 
+function remote(gateway: string, workspaces: WorkspaceStatus[], unreachable: string | null = null): RemoteGatewayView {
+  return { gateway, workspaces, unreachable };
+}
+
 function props(over: Partial<NotificationsGroupProps> = {}): NotificationsGroupProps {
   return {
     peers: [],
+    remotePeers: [],
     ownUnread: 0,
     ownId: 'dev',
     ownName: 'dev',
@@ -124,6 +130,41 @@ describe('which workspaces become rows', () => {
       peers: [ws('demo', 0), ws('stopped', undefined, 'unhealthy'), ws('notes', 5)],
     }));
     expect(rows.map((r) => r.name)).toEqual(['notes']);
+  });
+
+  it('lists a remote gateway\'s unread workspaces last, named <name> @<gateway>', () => {
+    const rows = notifyRows(props({
+      ownUnread: 1,
+      peers: [ws('demo', 2)],
+      remotePeers: [
+        remote('lab', [ws('notes', 3), ws('quiet', 0), ws('stopped', undefined, 'unhealthy')]),
+      ],
+    }));
+    expect(rows.map((r) => [r.id, r.name, r.count, r.isSelf]))
+      .toEqual([
+        ['dev', 'dev', 1, true],
+        ['demo', 'demo', 2, false],
+        ['notes@lab', 'notes @lab', 3, false],
+      ]);
+  });
+
+  it('draws no row for a remote gateway that did not answer', () => {
+    const rows = notifyRows(props({
+      remotePeers: [remote('lab', [ws('notes', 3)], 'timed out')],
+    }));
+    expect(rows).toEqual([]);
+  });
+
+  it('drops the remote row that is this very page', () => {
+    // The page is `notes@lab`, so its live count is `ownUnread`. The polled
+    // remote row for it is stale for a moment after a mark-read.
+    const rows = notifyRows(props({
+      ownId: 'notes@lab',
+      ownName: 'notes @lab',
+      ownUnread: 0,
+      remotePeers: [remote('lab', [ws('notes', 9), ws('other', 1)])],
+    }));
+    expect(rows.map((r) => r.id)).toEqual(['other@lab']);
   });
 
   it('names this workspace even before /health has answered', () => {

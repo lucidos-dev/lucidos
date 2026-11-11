@@ -157,6 +157,7 @@ pub(crate) async fn notify(
             tap: notice.tap,
             actor,
             audience: None,
+            push_group: None,
         }))
         .await;
     if let Err(e) = emitted {

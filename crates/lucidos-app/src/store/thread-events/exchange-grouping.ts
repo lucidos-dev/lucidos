@@ -557,6 +557,11 @@ export const EXCHANGE_START_TYPES: ReadonlySet<string> = new Set([
   // transcript by who is talking. Which turn was running underneath comes
   // second, so the caller opens a boundary either way.
   'SpokenMessageReceived',
+  // A *people-only message*, and the agent pause flipping (ADR 0649). Notes
+  // that hold no turn: see `isTurnlessBoundary`.
+  'PeopleMessagePosted',
+  'AgentPaused',
+  'AgentResumed',
 ]);
 
 /** Whether this event opens a new exchange. Takes the EVENT, not its type,
@@ -637,6 +642,9 @@ export const BOUNDARY_CONTINUATION_HANDOFF: ReadonlyMap<string, ContinuationHand
   ['ChildThreadStopped', 'own-arm'],
   ['ChildThreadDetached', 'own-arm'],
   ['ChildReportFiled', 'own-arm'],
+  ['PeopleMessagePosted', 'own-arm'],
+  ['AgentPaused', 'own-arm'],
+  ['AgentResumed', 'own-arm'],
 ]);
 
 /** Does this boundary take the running turn? `previous` held it.
@@ -2614,7 +2622,7 @@ function foldEvent(
       //
       // A `ChildThreadStopped`, `ChildThreadDetached` or `ChildReportFiled` is
       // handled the same way: it wakes nothing, so a turn the parent is running
-      // keeps writing where it was.
+      // keeps writing where it was. So are a people-only message and a pause.
       // An unsent message never reached the engine, so no agent reads it and it
       // takes no turn either.
       if (isTurnlessBoundary(event) || event._unsent) {
@@ -3038,8 +3046,9 @@ export function handleEvent(
       thread.unclaimedUtterances = [];
     }
     // A real MessageReceived from the backend removes the matching optimistic
-    // pending message by event_id.
-    if ((event.type === 'MessageReceived' || event.type === 'PromptInjected') && thread.pendingUserMessages.length > 0) {
+    // pending message by event_id. A send the engine kept between people
+    // lands as a `PeopleMessagePosted` under the same id.
+    if ((event.type === 'MessageReceived' || event.type === 'PromptInjected' || event.type === 'PeopleMessagePosted') && thread.pendingUserMessages.length > 0) {
       if (eventId) {
         const idx = thread.pendingUserMessages.findIndex(p => p.eventId === eventId);
         if (idx !== -1) {

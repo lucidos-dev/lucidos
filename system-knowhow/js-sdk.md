@@ -309,7 +309,8 @@ only stops the page panning sideways, and the pane swipe still works.
 **On a phone, the Lucidos header glides away after the reader scrolls down your
 app, with no code from you.** It moves once the finger lifts, never during the
 drag. It glides back after a scroll up, near the top, or on a pane swipe. This
-follows the user's *dynamic bars* setting, and with it off the header stays put.
+follows the user's *dynamic bars* setting, which is on by default. With it off,
+the header stays put.
 
 `sdk.js` only watches the scroll and the touches, and posts them to Lucidos.
 Every listener is passive, so your app scrolls exactly as before. It sees the
@@ -945,6 +946,7 @@ The engine already holds credentials and routing for every model provider in the
 - **Not configured → 404.** With no credential/config and no `apis.json` entry, the call returns 404 naming what to set.
 - **Every default base already includes `/v1`.** Send `/models`, never `/v1/models`, which doubles the segment and answers 404. A `local` base you configure yourself may lack it.
 - **`opencode-free` has no proxy.** The keyless free tier serves chat only, and an app must not build on an anonymous endpoint that can vanish without notice (ADR 0104).
+- **`chatgpt-plan` has no proxy.** Apps and scripts never spend the user's ChatGPT plan (ADR 0636). The `openai` proxy always uses the API key.
 - **`claude-gateway` shares the engine's sign-in.** Configure and sign in under Settings → Providers.
   Send `/messages` with the normal Anthropic body: `model`, `max_tokens`, and `messages`; `stream: true` is supported.
   Choose a model served to your account. The engine resolves listed snapshots and enforces managed model policy.
@@ -1244,9 +1246,6 @@ type SideEffectCategory =
   | 'out_of_workspace_destruction'
   | 'other';
 
-// 'deny' never parks a card; minutes run from 1 to 1440.
-type PermissionWait = 'deny' | number | 'indefinite';
-
 interface Trigger {
   id: string;
   name: string;
@@ -1268,9 +1267,9 @@ interface Trigger {
   // Side-effect grant: irreversible categories this trigger may perform
   // unattended. Omitted when empty (= no grant).
   side_effect_grant?: SideEffectCategory[];
-  // How long an unattended fire's parked permission card waits (triggers.md
-  // § "Permission wait"). Omitted when the workspace preference decides.
-  permission_wait?: PermissionWait;
+  // Whether its runs may start coding-agent threads (triggers.md
+  // § "Coding-agent grant"). Always present.
+  coding_agent_grant: boolean;
   // MCP server ids its fires use. Only these run unattended in its threads.
   mcp_servers?: string[];
   // Chat model this trigger's intent fires on, and its thinking budget. Both
@@ -1298,11 +1297,12 @@ interface CreateTrigger {
   /** Optional *trigger group* id; omit for ungrouped. */
   group_id?: string;
   /** Side-effect grant: irreversible categories this trigger may perform
-   *  unattended. Omit / `[]` = none granted (the safe default). */
+   *  unattended. Omit / `[]` = none granted (the safe default). Only the
+   *  owner grants it: an app frame sending a category is refused. */
   side_effect_grant?: SideEffectCategory[];
-  /** Permission wait for unattended fires. Omit / null = the workspace
-   *  preference `unattended_permission_wait`. */
-  permission_wait?: PermissionWait | null;
+  /** Let its runs start coding-agent threads. Only the owner grants it: an
+   *  app frame setting `true` is refused. Omit = false. */
+  coding_agent_grant?: boolean;
   /** MCP server ids its fires use. A fire refuses a call to any other server. */
   mcp_servers?: string[];
   /** Pin the intent to a chat model and a thinking budget
@@ -1331,11 +1331,11 @@ interface UpdateTrigger {
   /** Move into a group (string id), clear membership (null), or leave it
    *  unchanged (absent). */
   group_id?: string | null;
-  /** Full replacement for the side-effect grant; pass `[]` to clear all. */
+  /** Full replacement for the side-effect grant; pass `[]` to clear all. An
+   *  app frame may narrow it, never add a category the trigger lacks. */
   side_effect_grant?: SideEffectCategory[];
-  /** Set the permission wait, clear it back to the workspace preference
-   *  (null), or leave it unchanged (absent). */
-  permission_wait?: PermissionWait | null;
+  /** Revoke (false) coding agents. An app frame may never set true. */
+  coding_agent_grant?: boolean;
   /** Full replacement for the MCP server ids; pass `[]` to clear them. */
   mcp_servers?: string[];
   /** Pin the intent's model / thinking budget / backend (string), clear it
@@ -1873,6 +1873,7 @@ From scripts (Python/bash), use the `lucidos notify` CLI, which builds the same 
 ```ts
 lucidos.threads.list(opts?: ThreadsListOptions): Promise<ThreadSummary[]>
 lucidos.threads.count(opts?: Omit<ThreadsListOptions, 'limit'>): Promise<number>
+lucidos.threads.people  // driver and watchers, see § lucidos.threads.people
 ```
 
 `list()` calls `GET /api/v1/threads/list` and returns a newest-first array of `ThreadSummary` rows from the projection. `count()` calls `GET /api/v1/threads/count` and resolves to the count under the same filter, cheaper on big workspaces than `(await list()).length`.
@@ -2030,34 +2031,36 @@ interface ThreadSummary {
 | Spawn a new thread from an app | `lucidos.ui.startThread({ prompt })`, plus `coding_agent` and `folder` to preselect a coding target |
 | Open a link outside Lucidos from JS | `lucidos.ui.openExternal(url)` (never `window.open`) |
 
-## lucidos.workItems: Driver and Watchers
+## lucidos.threads.people: Driver and Watchers
 
-In a *team workspace*, a *work item* is a root thread and its sub-threads (ADR 0623). It has at most one *driver* and any number of *watchers*. Each is a person (an operator). Roles route pushes and feed the factory app's views. They are never authority: anyone can still answer any gate.
+In a *team workspace*, a root thread and its sub-threads have at most one *driver* and any number of *watchers* (ADR 0623). Each is a person (an operator). Roles route pushes and feed the factory app's views. They are never authority: anyone can still answer any gate.
 
 ```javascript
-const { items, person } = await lucidos.workItems.list();
-// items: open work items, newest activity first, at most 200:
+const { items, person } = await lucidos.threads.people.list();
+// items: open root threads, newest activity first, at most 200:
 // [{ root_thread_id, title, last_activity, driver, watchers,
 //    gate_open, escalated, needs_team, yours }]
 // person: the calling device's person, or null
 
-const roles = await lucidos.workItems.get(threadId);
+const people = await lucidos.threads.people.get(threadId);
 // { root_thread_id, driver: { id, name } | null, watchers: [{ id, name }] }
 
-await lucidos.workItems.take(threadId);    // Take, or Take over from the driver
-await lucidos.workItems.release(threadId); // stop driving; a no-op if you do not drive
-await lucidos.workItems.watch(threadId);
-await lucidos.workItems.unwatch(threadId); // from any of your devices
+await lucidos.threads.people.take(threadId);    // Take, or Take over from the driver
+await lucidos.threads.people.release(threadId); // stop driving; a no-op if you do not drive
+await lucidos.threads.people.watch(threadId);
+await lucidos.threads.people.unwatch(threadId); // from any of your devices
 ```
 
-- `list` returns root threads that are not archived, the home thread aside. Archiving the root completes a work item.
-- `gate_open`: a thread of the work item waits on a question. `needs_team` is the Team view: an open gate with no driver, or one that escalated. `yours`: your person drives or watches it, so Mine is `items.filter(i => i.yours)`.
-- Any thread id names its work item, through its family root.
-- Each change acts as the person holding the calling device and returns the roles after it. A repeat that changes nothing records nothing.
+- Routes: `GET /api/v1/threads/people`, `GET /api/v1/threads/:thread_id/people`, and `POST` on `.../people/take`, `release`, `watch` and `unwatch`.
+- `list` returns root threads that are not archived, the home thread aside. Archiving the root completes its work.
+- `gate_open`: a thread in the family waits on a question. `needs_team` is the Team view: an open gate with no driver, or one that escalated. `yours`: your person drives or watches it, so Mine is `items.filter(i => i.yours)`.
+- Any thread id names its root thread, through its family root.
+- Each change acts as the person holding the calling device and returns the people after it. A repeat that changes nothing records nothing.
 - A device that belongs to no person gets a 409 with `reason: "no_person"`. Add it to a person in Settings, People.
 - Answering a gate also makes you the driver. So does a keyed trigger fire whose *actor* email you hold.
-- A push about a work item with a driver reaches the driver's and watchers' devices. With no driver, or once a gate escalated past `driver_timeout_hours`, it reaches the whole team. A gateway with one person always pushes everyone.
-- Watch the role events (`WorkItemDriverTaken` and the rest, `thread-events.md`) through `lucidos.sse` to refresh a view.
+- A push about a root thread with a driver reaches the driver's and watchers' devices. With no driver, or once a gate escalated past `driver_timeout_hours`, it reaches the whole team. A gateway with one person always pushes everyone.
+- Watch the role events (`WorkItemDriverTaken` and the rest, `thread-events.md`) through `lucidos.sse` to refresh a view. Their names are legacy spellings, kept because stored events never change.
+- `lucidos.workItems` was the retired name of this namespace. An app copied before the rename must be copied again.
 
 ## lucidos.modelRequest
 
@@ -2209,13 +2212,19 @@ widget looks the same in both. The full contract is
   mean the box.
 - **Fit by showing less, never by shrinking text.** Keep type on the theme
   tokens, so the UI scale reaches it.
-- **Never scroll inside.** Content past the box is clipped under a fade, and
-  ⋯ › Open in Canvas shows the widget full size.
+- **Never scroll inside.** Content past the box's bottom or right edge is
+  clipped under a fade, and ⋯ › Open in Canvas shows the widget full size.
 - **An option has no size.** There the frame takes the height the SDK
   reports for `document.body`, so never size the body to the viewport in an
   option.
 - **Load the SDK.** It stamps the size, and the host reads the content
-  height it reports to decide the fade.
+  height and width it reports to decide each fade.
+- **The SDK also measures for the *widget fit check*.** When the host's size
+  push carries a `measure` token, the SDK waits for the page to settle. Then
+  it reports each text, image, SVG, canvas or video the box cuts off. The
+  engine turns that report into the `[WIDGET FIT]` note
+  (`system-knowhow/building-an-app.md` § The widget box, rule 8). A widget
+  does nothing for it but load the SDK.
 - The same widget opened full size in the Canvas pane gets no size, so there
   it is an ordinary app.
 

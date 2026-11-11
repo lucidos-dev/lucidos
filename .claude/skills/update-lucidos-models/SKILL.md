@@ -139,11 +139,26 @@ README names each file's source.
    the shipped *price table*, `llm/model_prices.json`, on the card in force
    today. A model with no card stops it. Add or update cards there first,
    following `system-knowhow/model-price-check.md`.
+   - Preserve import evidence privately alongside the inputs: source URL,
+     extraction date, exact variant/display label, model and explicit effort,
+     harness and relevant settings. Do not infer an effort from a bare family
+     name or copy one observation across efforts. A duplicate pair is an error.
+     Historical rows without this evidence remain unverified; do not manufacture
+     provenance retroactively.
 6. **Run the script.** `PYTHONDONTWRITEBYTECODE=1 python3
    .claude/skills/update-lucidos-models/estimate_rungs.py
    docs/plans/rung-estimate-inputs` rewrites the file. Add `--print` to read
    the estimates first. Its docstring states the blend and both profiles.
-7. **Run the tests.** `./scripts/test-engine.sh -- -- runtime::intelligence_ladder`
+   Review every normalization diagnostic against the source variant and harness.
+   The operational estimates use a cumulative maximum over effort within each
+   model, on both profiles, before sorting and frontier selection. This permits
+   ties and never claims evidence of strict improvement. Raw observations are
+   preserved. `coding_estimated` means absent index coverage; even covered
+   scores can be smoothed, as the generated source description states.
+7. **Run the tests.** First run `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+   discover -s .claude/skills/update-lucidos-models -p test_estimate_rungs.py`.
+   The hardening gate runs these import and normalization regressions too.
+ `./scripts/test-engine.sh -- -- runtime::intelligence_ladder`
    checks every pair's fields and that each surface's on pairs form a
    frontier. The script keeps each surface's shipped default on, so the
    frontier check skips it and a pin test checks it is an on rung. The tests

@@ -158,7 +158,7 @@ The HTTP API accepts a procedure-laden intent and will not stop you.
 - **`on`**: "when X happens". Reactive. Each entry in the `on` array is a *trigger subscription*: an event type plus an optional payload filter. The event must already be emitted by something (an app, another trigger, an integration). A match spawns a new *trigger thread* and leaves the subscription armed for the next one, which is what makes a trigger a standing rule.
 - **Both**: rare. It usually means a cron with a payload-shaped condition that should be event-driven. Re-examine before doing this.
 
-If the user says "notify me when X" and X isn't an event yet, you have two work items: (1) make X emit an event, (2) trigger on it. Tell the user that explicitly.
+If the user says "notify me when X" and X isn't an event yet, you have two jobs: (1) make X emit an event, (2) trigger on it. Tell the user that explicitly.
 
 **Check first whether the engine already emits it.** An `on:` entry takes a persisted thread event, a domain event your workspace emits, or a persisted **system event**: `BackupCompleted`, `BackupFailed`, `NotificationCreated`, `TriggerCompleted`, `PluginInstalled` and the rest (ADR 0113). "Tell me if a backup fails" needs no new emitter. What stays out is a transient frame such as `BackupProgress` or `Toast`, which writes no row and reaches no matcher. Subscribe to the event that ends the run instead. `system-knowhow/thread-events.md` § "Today the scheduler uses a blocklist" carries the full rule.
 
@@ -468,7 +468,7 @@ body = raw.get("payload") if isinstance(raw.get("payload"), dict) else raw
 
 ## Continue key
 
-By default every fire starts a new thread. Set `continue_key` on an intent trigger when later fires about the same thing belong in the thread an earlier fire started: comments on one ticket, replies in one chat thread, updates to one pull request. The key ties them to one *work item*.
+By default every fire starts a new thread. Set `continue_key` on an intent trigger when later fires about the same thing belong in the thread an earlier fire started: comments on one ticket, replies in one chat thread, updates to one pull request. The key ties them to one *root thread*.
 
 A key spec is a list of parts. Each part is a **field path** in the syntax a `condition` uses. A part can also list field paths, and the first one with a value wins. Lucidos resolves every part against the fire's stored event payload, so the § "The envelope" rules apply: a webhook's fields sit under `payload.`.
 
@@ -483,7 +483,7 @@ How a keyed fire lands:
 - **The key is the JSON array of the resolved values.** Lucidos compares it and never parses it. A number and the same digits as a string give the same key.
 - **Every part must resolve** to a non-empty string, number or boolean. If any part has no value, the fire has no key and starts a new, unkeyed thread.
 - **A key that matches an open thread continues it.** The fire arrives there as a new message, and the thread's first message still holds the intent. Otherwise a new thread starts and keeps the key.
-- **Keys are shared across triggers.** Two triggers that build the same key reach the same thread. That lets an intake trigger and a follow-up trigger feed one work item. Put a source name in the spec when two sources could collide.
+- **Keys are shared across triggers.** Two triggers that build the same key reach the same thread. That lets an intake trigger and a follow-up trigger feed one root thread. Put a source name in the spec when two sources could collide.
 - **One key maps to at most one open thread**, even when two fires race.
 - **The Archive action releases the key.** The next fire with that key starts a fresh thread, and unarchiving does not take the key back. An unattended run that lands in Archive on its own when it finishes keeps its key, so the next comment still reaches it.
 - **A retry starts its own unkeyed thread**, because the run it retries still holds the key.
@@ -788,7 +788,7 @@ Groups are orthogonal to `app_id`: an app-owned trigger can live in any group. `
 
 ## Side-effect grant: authorizing unattended risk
 
-This matters **only when the workspace has the command guard on** (Settings → Permissions → Command safety; off by default). The guard then classifies every `run_bash` / `run_python` command a trigger's intent runs. An MCP server the trigger sets up counts as the command it runs, and destroying files inside the workspace is gated there too. Most commands (reads, data crunching, downloads, writes inside the workspace) run untouched. An **irreversible** one is gated: sending email, a mutating HTTP request (POST/PUT/DELETE), a cloud-CLI change (`gh`/`aws`/`gcloud`), destroying files outside the workspace. A request that sends a local file or an environment variable (`curl -H @file`, `--url-query @file`, `--variable`) counts as mutating HTTP too.
+This matters **only while the workspace has the command guard on** (Settings → Permissions → Command safety; on unless the user turned it off). The guard then classifies every `run_bash` / `run_python` command a trigger's intent runs. An MCP server the trigger sets up counts as the command it runs, and destroying files inside the workspace is gated there too. Most commands (reads, data crunching, downloads, writes inside the workspace) run untouched. An **irreversible** one is gated: sending email, a mutating HTTP request (POST/PUT/DELETE), a cloud-CLI change (`gh`/`aws`/`gcloud`), destroying files outside the workspace. A request that sends a local file or an environment variable (`curl -H @file`, `--url-query @file`, `--variable`) counts as mutating HTTP too.
 
 A chat turn would *ask* the user to approve such a command, but a trigger fires with nobody to ask. So the trigger carries a **side-effect grant**: the irreversible side-effect categories it is pre-authorized to perform. At fire time:
 
@@ -799,31 +799,23 @@ The categories are **email**, **external API** (mutating HTTP), **cloud CLI** (g
 
 A `gh` read such as `gh run view` or `gh pr checks` is not a cloud-CLI side effect, so it needs no grant.
 
-**The user sets the grant, not you.** The `triggers(action="create")` / `triggers(action="update")` tools accept no grant field, on purpose: an autonomous agent can't widen its own unattended authority. The user ticks the "Allowed side-effects" checkboxes in the trigger's settings. So when a trigger's intent needs an irreversible side-effect ("email me the digest every morning"), **tell the user** to tick the matching one. Here that is *Send email or messages*. With command safety on, the run otherwise fails the first time it tries to send; with it off, none of this applies.
+**The user sets the grant, not you.** The `triggers(action="create")` / `triggers(action="update")` tools accept no grant field, on purpose: an autonomous agent can't widen its own unattended authority. The HTTP API, CLI and SDK refuse a new category from an agent or an app frame. They accept a narrower or unchanged set from anyone. A plugin's `trigger.toml` never sets it. The user ticks the "Allowed side-effects" checkboxes in the trigger's settings.
 
-**The grant also flows to coding-agent work the trigger spawns.** A *coding-agent thread* (Claude Code / Codex) that a trigger's intent launches runs **unattended**, directly or via a sub-thread an orchestrator spawns. Nobody answers its permission cards. So the engine walks the spawn tree to the root trigger and resolves each request from that trigger's grant:
+So when a trigger's intent needs an irreversible side-effect ("email me the digest every morning"), **tell the user** to tick the matching one. Here that is *Send email or messages*. With command safety on, the run otherwise fails the first time it tries to send; with it off, none of this applies.
 
-- benign in-workspace work (reads, in-workspace edits, git, `lucidos data write` to `data/`) is auto-allowed;
-- an irreversible side-effect is allowed only if its category is in the grant;
-- a catastrophic command is always denied.
+**A coding-agent thread the trigger starts does not read this grant.** It needs the trigger's coding-agent grant (below) to start at all. It then takes the same permission gates as every coding-agent session: the workspace's "Always allow" lines, then a card that waits for a human. See `coding-agent-events.md` § "Every session uses the workspace's grants".
 
-The chat command guard fails the *whole* run on an ungranted side-effect, but this path denies just the one request. The agent gets the denial and works around it or reports the step failed. This holds whatever the command safety toggle says. So a coding-agent trigger that needs an external API call still needs **Call external APIs** ticked. Otherwise that one call is denied, and the rest of the run proceeds. See `coding-agent-events.md` § "Unattended auto-resolution".
+### Coding-agent grant
 
-The flow follows child spawns only. A top spawn, by `spawn_thread` with `relation: "top"` or by `lucidos spawn-thread` without `--relation child`, is independent of the trigger: its cards wait for a human. Spawn the coding agent as a child when the run must finish unattended. A spawn into another workspace is always a top spawn, so it always asks.
+A trigger's runs may start a *coding-agent thread* only when the trigger holds the **coding-agent grant** (`coding_agent_grant`, default `false`). It applies to intent and script triggers alike, since a script can start a thread through the CLI. Without it, the spawn is refused and the run fails with a notification naming the trigger and the missing grant.
 
-### Permission wait
+The engine traces each coding-agent run to its cause. A child, a top-level spawn or a CLI spawn from a trigger's run all count as that trigger's, however many threads lie between. Moving a thread to top level does not change its cause. A thread a webhook started never starts a coding agent, and neither does anything it spawns.
 
-Some requests fit none of the rules above: the engine cannot classify the command. If a trigger will announce the card, the engine parks a permission card on the coding-agent thread instead of denying it. That means an enabled, unpaused trigger that fires on the card's permission request, such as "When agent needs me". The engine sends no push of its own. The trigger's notification opens the thread, and the user can answer from any device. The card offers to allow the request once or for this thread, never "Always allow".
+A trigger whose fire continues another trigger's thread (a shared continue key) needs the grant too, since its input steers that thread's agents. Once such a trigger is deleted, nobody can grant it, so that thread starts no more coding agents: archive it.
 
-The **permission wait** sets how long that card waits before the engine denies it. It has one form everywhere (trigger settings, `trigger.toml`, the HTTP API, the SDK and the CLI):
+**An agent's edit to the work clears both grants.** The user granted the trigger as it was. So when an agent or an app frame changes a granted trigger's `run`, `on` or `mcp_servers`, the edit lands. Both the coding-agent grant and the side-effect grant drop, and the reply says so. **Tell the user plainly** that the grants are gone, and ask them to tick them again if they trust the new version. A rename, a pause or the user's own edit keeps them.
 
-| Value | Effect |
-|---|---|
-| `"deny"` | Never park a card: deny at once, as when no trigger would announce the card. |
-| whole minutes, 1 to 1440 | Park the card and deny it when nobody answers in time. |
-| `"indefinite"` | Park the card and wait for an answer, like an attended prompt. |
-
-A trigger's `permission_wait` applies to every coding-agent thread in its spawn tree. A trigger without one uses the workspace preference `unattended_permission_wait` (default `30`). The user picks it under *Permission wait* in the trigger's settings. A card that timed out says nobody answered it within its permission wait. With no trigger that announces the card, the request is denied at once, whatever the wait says.
+**Only the user grants it.** The user ticks *Allow coding agents* in the trigger's settings. The `triggers` LLM tool cannot set it. The HTTP API, CLI and SDK refuse `true` from an agent or an app frame when the trigger lacks it, and accept `false` from anyone. A plugin's `trigger.toml` never sets it. So when a trigger's intent needs a coding agent, **tell the user** to tick it, and say what steers the trigger: its coding agents hold every grant the user gave coding agents.
 
 ### Context ceiling
 
@@ -862,6 +854,8 @@ This applies to every shape of change:
 | "Stop bringing this up, keep it in the archive" | `triggers(action="update", trigger_id, go_to_review=false)` |
 | "Add another time it should run" | `triggers(action="update", trigger_id, cron=[existing..., new_expr])`: append to the cron array, don't make a sibling trigger |
 | "Run it once more, like at 7pm tonight" | `triggers(action="update", trigger_id, cron=[existing..., one_shot_expr])`, then another `triggers(action="update")` after it fires to remove the one-shot entry. Never a duplicate trigger, not even temporarily |
+
+**An edit, pause or delete never stops a run in flight.** A trigger write re-arms or disarms the schedule only. A fire that is already running finishes on its own, and the new configuration applies to the next fire. The user stops a live run from its thread (ADR 0650). A scheduled fire still waiting in the queue when the write lands is dropped. A queued event fire or catch-up fire stays queued and still runs.
 
 If you truly need a different trigger (a different *workflow*, not a tweak), give it a clearly different name. Two live triggers with the same name are a UX trap: no picker tells them apart.
 
@@ -987,11 +981,11 @@ Never claim "I'll delete it after it runs" without one of the above.
 **The scheduler never reads this file.** `data/triggers/<slug>/trigger.toml` is a
 **derived read-model** of the trigger's definition. It mirrors the durable
 subset of its config (`name`, `slug`, `schedule`, `timezone`, `run`, `on`,
-`app_id`, `go_to_review`, `group_id`, `side_effect_grant`, `permission_wait`,
+`app_id`, `go_to_review`, `group_id`, `side_effect_grant`, `coding_agent_grant`,
 `context_ceiling`, `mcp_servers`, `model`, `reasoning_effort`, `provider`). A
 trigger on the account trigger model omits the last three. One on the workspace
-permission wait omits `permission_wait`, and one on the workspace ceiling omits
-`context_ceiling`. The engine maintains it from the trigger events: written on
+ceiling omits `context_ceiling`, and an ungranted one omits
+`coding_agent_grant`. The engine maintains it from the trigger events: written on
 create/update, removed on delete, rebuilt from events on boot (ADR 0019).
 Runtime and identity fields (`id`, `last_run`, `last_run_status`, `paused`) are
 left out. It is **not version-controlled**: the engine adds

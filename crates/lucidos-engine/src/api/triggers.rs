@@ -1,6 +1,5 @@
 use super::*;
 
-use crate::core::permission_wait::PermissionWait;
 use crate::core::prefs;
 use crate::engine::command_guard::SideEffectCategory;
 use crate::engine::context_ceiling::ContextCeiling;
@@ -65,10 +64,10 @@ pub struct TriggerInfo {
     /// side-effect categories it may perform unattended. Empty = none granted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub side_effect_grant: Vec<SideEffectCategory>,
-    /// How long a parked permission card waits on an unattended fire. Absent =
-    /// the workspace preference `unattended_permission_wait`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub permission_wait: Option<PermissionWait>,
+    /// The trigger's **coding-agent grant**: whether its runs may start a
+    /// coding-agent thread. Always present, so a client never reads a missing
+    /// field as a grant.
+    pub coding_agent_grant: bool,
     /// The context ceiling copied onto each fired thread (ADR 0629). Absent =
     /// the workspace preference `coding_agent_context_ceiling`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -134,7 +133,7 @@ impl TriggerInfo {
             go_to_review: config.go_to_review,
             group_id: config.group_id.clone(),
             side_effect_grant: config.side_effect_grant.clone(),
-            permission_wait: config.permission_wait,
+            coding_agent_grant: config.coding_agent_grant,
             context_ceiling: config.context_ceiling,
             mcp_servers: config.mcp_servers.clone(),
             plugin_id: config.plugin_id.clone(),
@@ -201,13 +200,14 @@ pub struct CreateTriggerCronRequest {
     /// The trigger's **side-effect grant** (ADR 0002, Phase 5): the irreversible
     /// side-effect categories it's authorized to perform unattended. Empty (the
     /// default) = the command guard fails the trigger if its intent attempts any
-    /// irreversible side-effect. Unknown category strings 4xx via serde.
+    /// irreversible side-effect. Unknown category strings 4xx via serde. Only a
+    /// person may set one: see [`refuse_unowned_grant`].
     #[serde(default)]
     pub side_effect_grant: Vec<SideEffectCategory>,
-    /// The *permission wait*, checked by [`parse_permission_wait_arg`]. Omitted
-    /// or null = the workspace preference `unattended_permission_wait`.
+    /// The **coding-agent grant**. Default false. Only a person may set it:
+    /// see [`refuse_unowned_grant`].
     #[serde(default)]
-    pub permission_wait: Option<serde_json::Value>,
+    pub coding_agent_grant: bool,
     /// The context ceiling copied onto each fired thread, read by
     /// `ContextCeiling::parse`. Omitted or null = the workspace preference. An
     /// agent may not set one above the workspace's.
@@ -275,14 +275,16 @@ pub struct UpdateTriggerCronRequest {
     pub group_id: Option<Option<String>>,
     /// Full replacement for the **side-effect grant** (ADR 0002, Phase 5). None =
     /// field absent (don't change), Some(empty) = clear all grants, Some(non-empty)
-    /// = replace with the new set. Unknown category strings 4xx via serde.
+    /// = replace with the new set. Unknown category strings 4xx via serde. Only a
+    /// person may add a category: see [`refuse_unowned_grant`].
     #[serde(default)]
     pub side_effect_grant: Option<Vec<SideEffectCategory>>,
+    /// None = field absent (don't change). Only a person may set `true`: see
+    /// [`refuse_unowned_grant`].
+    #[serde(default)]
+    pub coding_agent_grant: Option<bool>,
     /// None = field absent (don't change), Some(None) = explicitly null (back to
     /// the workspace preference), Some(Some(v)) = set, checked like create.
-    #[serde(default, deserialize_with = "crate::api::deserialize_some")]
-    pub permission_wait: Option<Option<serde_json::Value>>,
-    /// Same triple state as [`Self::permission_wait`], for the context ceiling.
     #[serde(default, deserialize_with = "crate::api::deserialize_some")]
     pub context_ceiling: Option<Option<String>>,
     /// Full replacement for the MCP server ids. None = field absent (don't
@@ -309,17 +311,6 @@ pub struct UpdateTriggerCronRequest {
     /// Same triple state as [`Self::continue_key`], for the actor field.
     #[serde(default, deserialize_with = "crate::api::deserialize_some")]
     pub actor: Option<Option<serde_json::Value>>,
-}
-
-/// Check a submitted permission wait. Absent or null reads as `None`, the
-/// workspace preference. Anything [`PermissionWait::from_json`] refuses is a 400.
-pub(crate) fn parse_permission_wait_arg(
-    raw: Option<&serde_json::Value>,
-) -> Result<Option<PermissionWait>, String> {
-    match raw {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(value) => PermissionWait::from_json(value).map(Some),
-    }
 }
 
 /// Check a submitted context ceiling. Absent or null reads as `None`, the
@@ -408,7 +399,30 @@ pub(super) async fn list_historical_triggers(
     Ok(Json(HistoricalTriggersResponse { triggers }))
 }
 
-/// Create a new trigger
+/// An agent or an app frame: a caller that may not widen a trigger's grants.
+fn is_unowned_caller(headers: &HeaderMap) -> bool {
+    let origin = crate::api::actor::user_actor(headers, None);
+    super::intelligence_ladder::is_agent_caller(headers, origin.as_ref())
+        || headers.contains_key(super::app_reach::APP_ID_HEADER)
+}
+
+/// Refuse a write that `widens` a trigger's grants from anyone but a person.
+/// The coding-agent grant and the side-effect grant both make the owner face,
+/// per trigger, what its unattended runs may do (ADR 0641). An agent or an app
+/// frame widening one would skip that choice. Narrowing, or sending back a
+/// grant the trigger already holds, stays open to every caller.
+pub(super) fn refuse_unowned_grant(headers: &HeaderMap, widens: bool) -> Result<(), String> {
+    if widens && is_unowned_caller(headers) {
+        return Err(
+            "Only the owner can widen a trigger's grants: ask them to tick 'Allow coding \
+             agents' or the allowed side-effects on the trigger. Restoring older work on a \
+             granted trigger needs the owner too."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Refuse an agent's trigger model pick off the chat intelligence ladder,
 /// judged as the trigger will fire on it. The owner's pick passes (ADR 0525).
 async fn refuse_agent_chat_pick(
@@ -431,6 +445,7 @@ async fn refuse_agent_chat_pick(
     .await
 }
 
+/// Create a new trigger
 pub(super) async fn create_trigger(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -550,16 +565,18 @@ pub(super) async fn create_trigger(
             payload["group_id"] = serde_json::json!(trimmed);
         }
     }
+    let widens = request.coding_agent_grant || !request.side_effect_grant.is_empty();
+    if let Err(e) = refuse_unowned_grant(&headers, widens) {
+        return ApiResult::err(e);
+    }
     // Side-effect grant (Phase 5): only stamp when non-empty so legacy/no-grant
     // triggers keep a clean payload (an absent field reads back as "no grant").
     if !request.side_effect_grant.is_empty() {
         payload["side_effect_grant"] = serde_json::to_value(&request.side_effect_grant)
             .expect("SideEffectCategory serialization is infallible");
     }
-    match parse_permission_wait_arg(request.permission_wait.as_ref()) {
-        Ok(Some(wait)) => payload["permission_wait"] = wait.to_json(),
-        Ok(None) => {}
-        Err(e) => return ApiResult::err(e),
+    if request.coding_agent_grant {
+        payload["coding_agent_grant"] = serde_json::json!(true);
     }
     let ceiling = match parse_context_ceiling_arg(request.context_ceiling.as_deref()) {
         Ok(ceiling) => ceiling,
@@ -718,7 +735,7 @@ pub(super) async fn update_trigger(
     // Only what this request supplies. An `on:` list left absent keeps whatever
     // the trigger already had, and re-refusing it would strand a trigger the
     // user can no longer rename.
-    let event_warnings = match crate::core::event_subscription::check_subscriptions(
+    let mut event_warnings = match crate::core::event_subscription::check_subscriptions(
         &state.pool,
         normalized_on.as_deref().unwrap_or_default(),
         crate::core::event_subscription::SubscriptionSurface::Trigger,
@@ -781,11 +798,8 @@ pub(super) async fn update_trigger(
         update_payload["side_effect_grant"] =
             serde_json::to_value(grant).expect("SideEffectCategory serialization is infallible");
     }
-    if let Some(raw) = &request.permission_wait {
-        match parse_permission_wait_arg(raw.as_ref()) {
-            Ok(wait) => update_payload["permission_wait"] = serde_json::json!(wait),
-            Err(e) => return ApiResult::err(e),
-        }
+    if let Some(grant) = request.coding_agent_grant {
+        update_payload["coding_agent_grant"] = serde_json::json!(grant);
     }
     if let Some(raw) = &request.context_ceiling {
         let ceiling = match parse_context_ceiling_arg(raw.as_deref()) {
@@ -873,6 +887,14 @@ pub(super) async fn update_trigger(
     {
         return ApiResult::err(e);
     }
+    if let Err(e) = refuse_unowned_grant(&headers, existing.widens_a_grant(&next)) {
+        return ApiResult::err(e);
+    }
+    let clears_grants = existing.unowned_edit_clears_grants(&next) && is_unowned_caller(&headers);
+    if clears_grants {
+        TriggerConfig::clear_grants_in(&mut update_payload);
+        event_warnings.push(existing.grants_cleared_notice());
+    }
 
     // Read-your-writes: the pause this request carries has to be visible to the
     // very next request. `POST /api/v1/triggers/run` reads the registry to
@@ -891,6 +913,9 @@ pub(super) async fn update_trigger(
     {
         log!("[Triggers] TriggerUpdated emit failed: {}", e);
         return ApiResult::err(format!("Failed to update trigger: {e}"));
+    }
+    if clears_grants {
+        crate::scheduler::user_tasks::notify_trigger_grants_cleared(&state.engine, &existing).await;
     }
 
     // Only an update that actually rewrote the schedule has a preview to report;
@@ -1017,30 +1042,73 @@ mod tests {
         assert!(serde_json::from_value::<CreateTriggerCronRequest>(create).is_err());
     }
 
-    /// The boundary accepts exactly what [`PermissionWait::from_json`] accepts,
-    /// and reads null as the workspace preference.
-    #[test]
-    fn a_permission_wait_is_checked_by_the_one_parser() {
-        use serde_json::json;
-        assert_eq!(parse_permission_wait_arg(None), Ok(None));
-        assert_eq!(parse_permission_wait_arg(Some(&json!(null))), Ok(None));
-        assert_eq!(
-            parse_permission_wait_arg(Some(&json!(15))),
-            Ok(Some(PermissionWait::Minutes(15)))
-        );
-        assert_eq!(
-            parse_permission_wait_arg(Some(&json!("indefinite"))),
-            Ok(Some(PermissionWait::Indefinite))
-        );
-        for refused in [json!(0), json!(1441), json!("forever"), json!(true)] {
-            assert!(
-                parse_permission_wait_arg(Some(&refused)).is_err(),
-                "{refused}"
+    fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(v).unwrap(),
             );
         }
-        let update: UpdateTriggerCronRequest =
-            serde_json::from_value(json!({ "permission_wait": null })).unwrap();
-        assert_eq!(update.permission_wait, Some(None), "null clears");
+        h
+    }
+
+    /// Only a person widens a trigger's grants. An agent or an app frame may
+    /// narrow them, or send back what the trigger holds.
+    #[test]
+    fn only_a_person_widens_a_grant() {
+        use crate::api::actor::{
+            init_agent_origin_secret, mint_agent_origin_token, HEADER_AGENT_ORIGIN_TOKEN,
+            HEADER_DEVICE_ID,
+        };
+        init_agent_origin_secret("coding-agent-grant-secret".into());
+        let token = mint_agent_origin_token(Some(Uuid::new_v4()), 0, None).unwrap();
+        let agent = headers_with(&[
+            (HEADER_AGENT_ORIGIN_TOKEN, &token),
+            (HEADER_DEVICE_ID, "owner-phone"),
+        ]);
+        let app = headers_with(&[
+            (super::super::app_reach::APP_ID_HEADER, "habit-tracker"),
+            (HEADER_DEVICE_ID, "owner-phone"),
+        ]);
+        let owner = headers_with(&[(HEADER_DEVICE_ID, "owner-phone")]);
+
+        let held = TriggerConfig::from_created_payload(&serde_json::json!({
+            "trigger_id": "t", "name": "T", "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+            "run": { "type": "intent", "intent": "x" },
+            "side_effect_grant": ["email"], "coding_agent_grant": true,
+        }))
+        .unwrap();
+        let widens = |update: serde_json::Value| {
+            let mut next = held.clone();
+            next.apply_update(&update);
+            held.widens_a_grant(&next)
+        };
+        let wider = [
+            serde_json::json!({ "side_effect_grant": ["email", "cloud_cli"] }),
+            serde_json::json!({ "side_effect_grant": ["external_api"] }),
+        ];
+        let same_or_narrower = [
+            serde_json::json!({ "side_effect_grant": ["email"] }),
+            serde_json::json!({ "side_effect_grant": [] }),
+            serde_json::json!({ "coding_agent_grant": true }),
+            serde_json::json!({ "coding_agent_grant": false }),
+        ];
+        for caller in [&agent, &app] {
+            for update in &wider {
+                let err = refuse_unowned_grant(caller, widens(update.clone())).unwrap_err();
+                assert!(err.contains("Only the owner"), "{update}: {err}");
+            }
+            for update in &same_or_narrower {
+                assert!(
+                    refuse_unowned_grant(caller, widens(update.clone())).is_ok(),
+                    "{update}"
+                );
+            }
+        }
+        for update in &wider {
+            assert!(refuse_unowned_grant(&owner, widens(update.clone())).is_ok());
+        }
     }
 
     // --- Script paths at the create / update boundary ---

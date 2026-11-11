@@ -114,6 +114,17 @@ describe('provider search entries', () => {
     }
   });
 
+  it('finds the moved command-safety rows by their old ids', () => {
+    const moved: Array<[string, string, string]> = [
+      ['command-safety:judge-model', 'models:command-judge', 'models'],
+      ['command-safety:coding-agents', 'permissions:coding-agent-auto-answer', 'permissions'],
+    ];
+    for (const [old, current, subview] of moved) {
+      expect(findSettingsEntry(old)?.id, old).toBe(current);
+      expect(findSettingsEntry(old)?.subview, old).toBe(subview);
+    }
+  });
+
   it('leaves an anchor that did not move alone', () => {
     expect(aliasRetiredSettingsAnchor('models:manage')).toBe('models:manage');
     expect(aliasRetiredSettingsAnchor('constructor')).toBe('constructor');

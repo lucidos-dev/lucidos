@@ -278,6 +278,7 @@ impl LucidosEngine {
             .into_iter()
             .filter_map(|t| {
                 nodes.get(&t).map(|n| RecallLine {
+                    sender_device_id: None,
                     id: format!("w/{t}"),
                     text: n.text.clone(),
                 })
@@ -407,6 +408,7 @@ mod tests {
 
     fn line(id: &str, text: &str) -> RecallLine {
         RecallLine {
+            sender_device_id: None,
             id: id.to_string(),
             text: text.to_string(),
         }

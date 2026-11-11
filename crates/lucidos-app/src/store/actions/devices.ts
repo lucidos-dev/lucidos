@@ -2,7 +2,7 @@ import { signal } from '@preact/signals';
 import type { Loadable } from '../types';
 import { toFailed, setLoadingIfFresh } from '../types';
 import type { DeviceInfo } from '../../api/types';
-import { registerDevice as apiRegisterDevice, listDevices as apiListDevices, renameDevice as apiRenameDevice, setDevicePush as apiSetDevicePush, deleteDevice as apiDeleteDevice, handOverDevice, setPreference } from '../../api/client';
+import { registerDevice as apiRegisterDevice, listDevices as apiListDevices, renameDevice as apiRenameDevice, setDevicePush as apiSetDevicePush, deleteDevice as apiDeleteDevice, handOverDevice, getCallerDevice, setPreference } from '../../api/client';
 import { pairingSession } from '../../api/client/pairing';
 import { showToast, showConfirm } from '../store';
 import { errorDetail } from '../../utils/errorDetail';
@@ -15,7 +15,7 @@ import { deviceName } from '../../utils/deviceFriendlyName';
 import { pairedDevices, pairedRows } from './pairedDevices';
 // The key is owned by the leaf that also builds the request header, so the id
 // this module mints and the id every API call sends cannot drift apart.
-import { DEVICE_ID_KEY } from '../../utils/deviceIdHeader';
+import { DEVICE_ID_KEY, getRelayedDeviceId, setRelayedDeviceId } from '../../utils/deviceIdHeader';
 
 /** Upper bound on the native-store reconcile so a wedged IPC can't hold the boot
  *  splash — past it, boot proceeds on the existing localStorage value. */
@@ -72,6 +72,8 @@ export function turnDeviceName(deviceId: string): string {
 /** Get or create the device ID for this browser. Used as the `device_id` query
  *  param on per-device API calls (preferences, push subscriptions, etc.). */
 export function getDeviceId(): string {
+  const relayed = getRelayedDeviceId();
+  if (relayed) return relayed;
   let id = localStorage.getItem(DEVICE_ID_KEY);
   if (!id) {
     id = generateUuid();
@@ -248,6 +250,86 @@ export async function adoptGatewayDeviceId(workspace: string | null): Promise<bo
   })();
   // `false` on a timeout, which is honest: nothing was adopted, and on desktop
   // it lets the native reconcile answer instead.
+  return withDeadline(adopt, GATEWAY_DEVICE_ID_TIMEOUT_MS, false);
+}
+
+/** The caller id this relayed route last adopted. Workspace storage prefixes
+ *  every non-global key with the workspace id, which is `<slug>@<gateway>` on a
+ *  relayed route, so this plain key is already per route. */
+const RELAYED_DEVICE_ID_KEY = 'lucidos-relayed-device-id';
+
+/**
+ * Take the id the relaying gateway namespaces this browser's device to, and
+ * move the plain row onto it.
+ *
+ * A remote gateway asserts `<gateway>:<device>` to the engine, so the engine
+ * keeps the row under that id. A page that sent its plain id would register a
+ * second device, and its push, preferences and attribution would split.
+ * The id is held in memory for this page load (`setRelayedDeviceId`), never in
+ * `lucidos-device-id`, which the page's direct routes still own.
+ *
+ * Returns whether a caller id was named. Like the gateway adoption, the
+ * override and the key are set AFTER `handOver` resolves. Until then the page
+ * keeps its old id. So no row is registered under the caller id before the old
+ * row moves there, and a failure retries on the next load.
+ *
+ * The row lives under the id this route last adopted. A changed caller id (a
+ * re-paired gateway) therefore hands over from that id, not the plain one.
+ *
+ * Pure/injectable, so every branch is testable without a DOM or a gateway.
+ */
+export async function adoptRelayedDeviceIdentity(deps: {
+  caller: () => Promise<{ device_id: string | null }>;
+  storage: Pick<Storage, 'getItem' | 'setItem'>;
+  handOver: (oldId: string, newId: string) => Promise<unknown>;
+}): Promise<boolean> {
+  const { caller, storage, handOver } = deps;
+  const callerId = (await caller()).device_id?.trim();
+  if (!callerId) return false;
+
+  const adopted = storage.getItem(RELAYED_DEVICE_ID_KEY);
+  if (adopted !== callerId) {
+    const previous = adopted ?? storage.getItem(DEVICE_ID_KEY);
+    if (previous && previous !== callerId) {
+      await handOver(previous, callerId);
+    }
+    storage.setItem(RELAYED_DEVICE_ID_KEY, callerId);
+  }
+  setRelayedDeviceId(callerId);
+  return true;
+}
+
+/**
+ * Production entry for the adoption above, for a relayed route only. Same
+ * best-effort carve-out and deadline as `adoptGatewayDeviceId`: it runs on
+ * every load with no user intent, and the next load retries.
+ */
+export async function adoptRelayedDeviceId(): Promise<boolean> {
+  const adopt = (async () => {
+    try {
+      return await adoptRelayedDeviceIdentity({
+        caller: getCallerDevice,
+        storage: localStorage,
+        handOver: async (oldId, newId) => {
+          try {
+            await handOverDevice(oldId, newId);
+          } catch (e) {
+            // Telemetry carve-out (`.claude/rules/frontend.md`), as in
+            // `adoptGatewayDeviceId`: the breadcrumb reaches `engine.log`.
+            postClientLog('devices', 'hand_over_failed', {
+              old_device_id: oldId,
+              device_id: newId,
+              reason: errorDetail(e),
+            });
+            throw e;
+          }
+        },
+      });
+    } catch (e) {
+      console.warn('[Devices] could not adopt the relayed device id', e);
+      return false;
+    }
+  })();
   return withDeadline(adopt, GATEWAY_DEVICE_ID_TIMEOUT_MS, false);
 }
 

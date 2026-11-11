@@ -150,6 +150,7 @@ async fn a_human_answer_clears_it_and_an_agent_or_engine_answer_does_not() {
         user_agent: None,
         mode: ActorMode::Agent,
         source_thread_id: Some(Uuid::new_v4()),
+        emitting_trigger_id: None,
     };
     emit_answer(&bus, thread_id, Some(parent), false).await;
     assert!(

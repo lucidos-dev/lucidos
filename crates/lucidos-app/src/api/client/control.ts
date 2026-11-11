@@ -69,9 +69,29 @@ async function controlJson<T>(path: string, init?: RequestInit): Promise<T> {
   return res.status === 204 || res.status === 202 ? (undefined as T) : res.json();
 }
 
+/** This gateway's workspaces and the user's stored order. `order` holds route
+ *  segments (`<slug>` or `<slug>@<gateway>`); `utils/workspaceOrder` applies it. */
+export interface WorkspaceListing {
+  workspaces: WorkspaceStatus[];
+  order: string[];
+}
+
+export async function listWorkspacesWithOrder(): Promise<WorkspaceListing> {
+  const body = await controlJson<Partial<WorkspaceListing>>('/workspaces');
+  return { workspaces: body.workspaces ?? [], order: body.order ?? [] };
+}
+
 export async function listWorkspaces(): Promise<WorkspaceStatus[]> {
-  const body = await controlJson<{ workspaces: WorkspaceStatus[] }>('/workspaces');
-  return body.workspaces ?? [];
+  return (await listWorkspacesWithOrder()).workspaces;
+}
+
+/** Replace the stored workspace order. Every paired device draws it. */
+export async function setWorkspaceOrder(order: readonly string[]): Promise<void> {
+  await controlJson<void>('/workspace-order', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ order }),
+  });
 }
 
 export async function createWorkspace(name: string): Promise<WorkspaceStatus> {
@@ -897,7 +917,7 @@ export function updateRemoteGatewayHeaders(name: string, headers: Record<string,
 
 /** One of a remote gateway's workspaces. Mirrors `gateway_protocol::ListedWorkspace`,
  *  which carries the fields `workspaceState` reads and no port. */
-export type ListedWorkspace = Pick<WorkspaceStatus, 'id' | 'name' | 'health' | 'last_error'>;
+export type ListedWorkspace = Pick<WorkspaceStatus, 'id' | 'name' | 'health' | 'last_error' | 'unread_count'>;
 
 /** One remote gateway's workspaces, or why this gateway could not list them.
  *  Mirrors `remote_workspaces::RemoteGatewayListing`. */

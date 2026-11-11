@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { panelOverlay, focusedThreadId, toasts, confirmState, settleConfirm } from '../store';
 import type { App } from '../types';
+import { widgetFitRequests } from '../widgetFit';
 
 // Mock all side-effect imports that handleNavigationRequest calls
 const switchMenuItem = vi.fn();
@@ -456,6 +457,37 @@ describe('push prompt scoping', () => {
   });
 });
 
+// A fit check names one device with a visible window. Only that device's
+// window renders it, so no other page answers first (engine/widget_fit.rs).
+describe('widget fit check scoping', () => {
+  function fitCheck(device_id: string) {
+    return {
+      thread_id: 'thread-A',
+      event: {
+        type: 'WidgetFitRequested', app_id: 'trip', request_id: 'req-1', sizes: ['small', 'large'],
+        ui_scale: 125, scale_device_id: 'the-phone', actor: { kind: 'device', device_id },
+      },
+    };
+  }
+
+  beforeEach(() => {
+    getDeviceId.mockReturnValue('this-device');
+    widgetFitRequests.value = [];
+  });
+
+  it('renders a check that names this device', () => {
+    handleThreadEvent(fitCheck('this-device'));
+    expect(widgetFitRequests.value).toEqual([
+      { requestId: 'req-1', appId: 'trip', sizes: ['small', 'large'], scale: 125, scaleDevice: 'the-phone' },
+    ]);
+  });
+
+  it('stays silent on a check for another device', () => {
+    handleThreadEvent(fitCheck('other-device'));
+    expect(widgetFitRequests.value).toEqual([]);
+  });
+});
+
 describe('with a second window on this device', () => {
   let other: BroadcastChannel;
   let stop: () => void;
@@ -511,6 +543,21 @@ describe('with a second window on this device', () => {
     await otherShows({ focusedThreadId: 'thread-A' });
     handleThreadEvent({ thread_id: 'thread-A', event: { type: 'PushNotificationRequested' } });
     expect(confirmState.value.visible).toBe(false);
+  });
+
+  it('leaves a fit check to the window showing its thread', async () => {
+    getDeviceId.mockReturnValue('this-device');
+    widgetFitRequests.value = [];
+    focusedThreadId.value = 'thread-C';
+    await otherShows({ focusedThreadId: 'thread-A' });
+    handleThreadEvent({
+      thread_id: 'thread-A',
+      event: {
+        type: 'WidgetFitRequested', app_id: 'trip', request_id: 'req-1', sizes: ['small'], ui_scale: 100,
+        actor: { kind: 'device', device_id: 'this-device' },
+      },
+    });
+    expect(widgetFitRequests.value).toEqual([]);
   });
 
   it('leaves a capture to the window showing the app', async () => {

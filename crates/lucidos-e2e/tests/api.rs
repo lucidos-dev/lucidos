@@ -112,12 +112,12 @@ mod failed_turn_follow_up_test;
 mod read_decision_test;
 #[path = "api_support/read_request_test.rs"]
 mod read_request_test;
+#[path = "api_support/thread_people_test.rs"]
+mod thread_people_test;
 #[path = "api_support/wake_decision_test.rs"]
 mod wake_decision_test;
 #[path = "api_support/wake_mode_test.rs"]
 mod wake_mode_test;
-#[path = "api_support/work_item_roles_test.rs"]
-mod work_item_roles_test;
 
 #[path = "api_support/agent_question_test.rs"]
 mod agent_question_test;
@@ -255,6 +255,9 @@ mod response_styles_test;
 
 #[path = "api_support/claude_gateway_test.rs"]
 mod claude_gateway_test;
+
+#[path = "api_support/chatgpt_plan_test.rs"]
+mod chatgpt_plan_test;
 
 #[path = "api_support/backup_key_test.rs"]
 mod backup_key_test;

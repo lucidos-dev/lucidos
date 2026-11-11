@@ -219,6 +219,10 @@ expect_eq "preferences" "lint app-lib ts first-paint" "$(select_for crates/lucid
 expect_eq "proc tree" "shell-lint harden-suites" "$(select_for scripts/lib/proc_tree.sh)"
 expect_eq "release" "shell-lint release" "$(select_for scripts/lib/release_draft.sh)"
 expect_eq "self" "shell-lint harden-suites" "$(select_for scripts/lib/harden_suites.sh)"
+expect_eq "fast tier keeps estimate guards" "rung-estimates" "$(hs_fast_tier_suite rung-estimates)"
+expect_eq "rung estimator tests" "rung-estimates" "$(select_for .claude/skills/update-lucidos-models/test_estimate_rungs.py)"
+expect_eq "rung input refresh" "rung-estimates" "$(select_for docs/plans/rung-estimate-inputs/aa_coding.csv)"
+expect_has "rung suite runs Python regressions" "unittest discover" "$(hs_suite_command rung-estimates normal "$TMP")"
 expect_eq "harden scope" "shell-lint harden-scope" "$(select_for scripts/harden-scope.sh)"
 expect_eq "harden scope test" "shell-lint harden-scope" "$(select_for scripts/lib/harden_scope_test.sh)"
 expect_eq "harden other-model review" "shell-lint harden-other-model-review" \

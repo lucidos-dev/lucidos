@@ -130,6 +130,7 @@ const NOT_SECRETS: &[(&str, &str)] = &[
     ("credentials", "auth_type"),
     ("credentials", "env_var_name"),
     ("claude_gateway_accounts", "token_expiry"),
+    ("chatgpt_plan_accounts", "token_expiry"),
     ("email_accounts", "oauth_account_id"),
     // Variable name to credential name: a pointer, never the value.
     ("mcp_servers", "env_credentials"),

@@ -182,7 +182,7 @@ fn test_trigger_config(id: &str) -> crate::triggers::TriggerConfig {
         go_to_review: false,
         group_id: None,
         side_effect_grant: vec![],
-        permission_wait: None,
+        coding_agent_grant: false,
         context_ceiling: None,
         mcp_servers: vec![],
         plugin_id: None,
@@ -521,7 +521,7 @@ async fn submit_within_capacity_admits_executes_and_completes() {
 
     let outcome = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
     assert!(outcome.admitted, "first submit must admit under capacity");
     assert_eq!(outcome.position, 0);
@@ -558,15 +558,15 @@ async fn submit_over_capacity_queues_then_drains_in_fifo_order() {
 
     let a = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
     let b = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
     let c = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
     assert!(a.admitted);
     assert!(!b.admitted, "over capacity → queued, not spawned");
@@ -601,11 +601,11 @@ async fn drop_entry_deletes_row_and_resolves_completion() {
 
     let a = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
     let b = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
     assert!(!b.admitted);
 
@@ -636,11 +636,11 @@ async fn run_now_force_admits_ignoring_caps() {
 
     let a = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
     let b = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
     assert!(a.admitted);
     assert!(!b.admitted);
@@ -669,28 +669,16 @@ async fn per_trigger_fifo_and_drop_oldest_overflow() {
         .insert("trig-a".to_string(), test_trigger_config("trig-a"));
 
     // per-trigger concurrency 1: first fire admits, the rest queue.
-    let a = f
-        .queue
-        .submit(event_trigger_request("trig-a"), None, None)
-        .await;
-    let b = f
-        .queue
-        .submit(event_trigger_request("trig-a"), None, None)
-        .await;
-    let c = f
-        .queue
-        .submit(event_trigger_request("trig-a"), None, None)
-        .await;
+    let a = f.queue.submit(event_trigger_request("trig-a"), None).await;
+    let b = f.queue.submit(event_trigger_request("trig-a"), None).await;
+    let c = f.queue.submit(event_trigger_request("trig-a"), None).await;
     assert!(a.admitted);
     assert!(!b.admitted, "per-trigger cap of 1 → second fire queues");
     assert!(!c.admitted);
 
     // max_queued_per_trigger = 2 → the next fire overflows; DropOldest
     // drops B (the oldest queued) and keeps the newcomer.
-    let d = f
-        .queue
-        .submit(event_trigger_request("trig-a"), None, None)
-        .await;
+    let d = f.queue.submit(event_trigger_request("trig-a"), None).await;
     assert!(!d.admitted);
     let pool = f.pool.clone();
     let b_id = b.entry_id;
@@ -717,10 +705,7 @@ async fn per_trigger_fifo_and_drop_oldest_overflow() {
         .write()
         .unwrap()
         .insert("trig-b".to_string(), test_trigger_config("trig-b"));
-    let other = f
-        .queue
-        .submit(event_trigger_request("trig-b"), None, None)
-        .await;
+    let other = f.queue.submit(event_trigger_request("trig-b"), None).await;
     assert!(other.admitted, "other triggers admit independently");
 
     f.pool.close().await;
@@ -737,7 +722,7 @@ async fn cron_coalesces_redundant_fires_on_submit() {
 
     // First cron fire admits and runs (the executor parks it as the in-flight
     // fire).
-    let a = f.queue.submit(cron_request("trig-a"), None, None).await;
+    let a = f.queue.submit(cron_request("trig-a"), None).await;
     assert!(a.admitted, "first cron fire admits");
     assert_eq!(
         row_status(&f.pool, a.entry_id).await.as_deref(),
@@ -747,7 +732,7 @@ async fn cron_coalesces_redundant_fires_on_submit() {
     // A second cron fire while one is active → coalesced: not admitted, no queue
     // row, and its completion resolves immediately so the cron loop / missed-grace
     // submitter proceeds to the next occurrence rather than hanging.
-    let b = f.queue.submit(cron_request("trig-a"), None, None).await;
+    let b = f.queue.submit(cron_request("trig-a"), None).await;
     assert!(!b.admitted, "redundant cron fire must not admit");
     assert_eq!(b.position, 0);
     assert_eq!(
@@ -761,7 +746,7 @@ async fn cron_coalesces_redundant_fires_on_submit() {
         .expect("completion channel ok");
 
     // A third fire also coalesces — the backlog can never grow past one.
-    let c = f.queue.submit(cron_request("trig-a"), None, None).await;
+    let c = f.queue.submit(cron_request("trig-a"), None).await;
     assert!(!c.admitted);
     assert_eq!(row_status(&f.pool, c.entry_id).await, None);
 
@@ -784,12 +769,12 @@ async fn cron_coalesces_against_a_queued_fire() {
     // Occupy the only slot with background work so the cron fire can't admit.
     let blocker = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
     assert!(blocker.admitted);
 
     // First cron fire queues (pool full).
-    let a = f.queue.submit(cron_request("trig-a"), None, None).await;
+    let a = f.queue.submit(cron_request("trig-a"), None).await;
     assert!(!a.admitted);
     assert_eq!(
         row_status(&f.pool, a.entry_id).await.as_deref(),
@@ -797,7 +782,7 @@ async fn cron_coalesces_against_a_queued_fire() {
     );
 
     // Second cron fire coalesces against the queued one — no second row.
-    let b = f.queue.submit(cron_request("trig-a"), None, None).await;
+    let b = f.queue.submit(cron_request("trig-a"), None).await;
     assert!(!b.admitted);
     assert_eq!(row_status(&f.pool, b.entry_id).await, None);
     assert_eq!(
@@ -865,12 +850,9 @@ async fn drain_skips_paused_triggers_and_drops_deleted_ones() {
 
     let blocker = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
-    let fire = f
-        .queue
-        .submit(event_trigger_request("trig-a"), None, None)
-        .await;
+    let fire = f.queue.submit(event_trigger_request("trig-a"), None).await;
     assert!(blocker.admitted);
     assert!(!fire.admitted);
 
@@ -907,10 +889,7 @@ async fn drain_skips_paused_triggers_and_drops_deleted_ones() {
     .await;
 
     // A queued fire whose trigger was deleted gets dropped at drain time.
-    let orphan = f
-        .queue
-        .submit(event_trigger_request("trig-a"), None, None)
-        .await;
+    let orphan = f.queue.submit(event_trigger_request("trig-a"), None).await;
     assert!(
         !orphan.admitted,
         "per-trigger cap holds while the fire runs"
@@ -931,10 +910,7 @@ async fn recover_requeues_admitted_trigger_entries_after_restart() {
         .unwrap()
         .insert("trig-a".to_string(), test_trigger_config("trig-a"));
 
-    let a = f
-        .queue
-        .submit(event_trigger_request("trig-a"), None, None)
-        .await;
+    let a = f.queue.submit(event_trigger_request("trig-a"), None).await;
     assert!(a.admitted);
     assert_eq!(
         row_status(&f.pool, a.entry_id).await.as_deref(),
@@ -968,7 +944,7 @@ async fn recover_hands_off_spawn_entries_whose_thread_materialized() {
     let f = fixture(5).await;
     let child = Uuid::new_v4();
 
-    let a = f.queue.submit(sub_thread_request(child), None, None).await;
+    let a = f.queue.submit(sub_thread_request(child), None).await;
     assert!(a.admitted);
 
     // Materialize the thread, which is what the dead process's execution did
@@ -1145,7 +1121,7 @@ async fn admitting_a_cron_entry_records_its_thread_id() {
         .unwrap()
         .insert("trig-a".to_string(), test_trigger_config("trig-a"));
 
-    let a = f.queue.submit(cron_request("trig-a"), None, None).await;
+    let a = f.queue.submit(cron_request("trig-a"), None).await;
     assert!(a.admitted);
     assert_eq!(
         row_thread_id(&f.pool, a.entry_id).await,
@@ -1213,10 +1189,7 @@ async fn a_trigger_fires_queue_frames_name_the_trigger_that_owns_them() {
         .insert("trig-a".to_string(), test_trigger_config("trig-a"));
 
     let mut rx = f.bus.subscribe();
-    let a = f
-        .queue
-        .submit(event_trigger_request("trig-a"), None, None)
-        .await;
+    let a = f.queue.submit(event_trigger_request("trig-a"), None).await;
     assert!(a.admitted);
     f.executor.release_one(); // execution finishes → the sibling task completes
 
@@ -1239,9 +1212,7 @@ async fn a_sub_thread_a_fire_submits_does_not_inherit_the_fires_marker() {
     let queue = f.queue.clone();
     let sub = crate::scheduler::user_tasks::ACTIVE_TRIGGER_ID
         .scope("trig-a".to_string(), async move {
-            queue
-                .submit(sub_thread_request(Uuid::new_v4()), None, None)
-                .await
+            queue.submit(sub_thread_request(Uuid::new_v4()), None).await
         })
         .await;
     assert!(sub.admitted);
@@ -1271,7 +1242,7 @@ async fn a_spawn_from_a_script_fire_names_the_fire_without_marking_its_frames() 
         "spawning_trigger_id": "trig-a",
     }))
     .expect("an agent-chat request");
-    let spawn = f.queue.submit(request, None, None).await;
+    let spawn = f.queue.submit(request, None).await;
     assert!(spawn.admitted);
     f.executor.release_one();
 
@@ -1304,24 +1275,12 @@ async fn pause_trigger_overflow_pauses_via_bus_event() {
         .insert("trig-a".to_string(), test_trigger_config("trig-a"));
 
     let mut rx = f.bus.subscribe();
-    let _a = f
-        .queue
-        .submit(event_trigger_request("trig-a"), None, None)
-        .await;
-    let _b = f
-        .queue
-        .submit(event_trigger_request("trig-a"), None, None)
-        .await;
-    let _c = f
-        .queue
-        .submit(event_trigger_request("trig-a"), None, None)
-        .await;
+    let _a = f.queue.submit(event_trigger_request("trig-a"), None).await;
+    let _b = f.queue.submit(event_trigger_request("trig-a"), None).await;
+    let _c = f.queue.submit(event_trigger_request("trig-a"), None).await;
     // Fourth fire overflows (cap 2) → trigger paused through the bus, the
     // newcomer stays queued (nothing dropped).
-    let d = f
-        .queue
-        .submit(event_trigger_request("trig-a"), None, None)
-        .await;
+    let d = f.queue.submit(event_trigger_request("trig-a"), None).await;
     assert!(!d.admitted);
     assert_eq!(
         row_status(&f.pool, d.entry_id).await.as_deref(),
@@ -1364,12 +1323,12 @@ async fn user_slot_admits_under_capacity_and_counts_against_the_pool() {
     // 2nd slot, but a third occupant queues — the user is counted.
     let bg = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
     assert!(bg.admitted, "one slot left after the user slot");
     let bg2 = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
     assert!(
         !bg2.admitted,
@@ -1386,7 +1345,7 @@ async fn user_slot_queues_at_true_pool_max_then_admits_on_release() {
     // Fill the only slot with background work.
     let bg = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
     assert!(bg.admitted);
 
@@ -1424,7 +1383,7 @@ async fn a_cancelled_waiter_releases_its_reserved_slot() {
     // Fill the only slot with background work, so the user request queues.
     let bg = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
     assert!(bg.admitted);
 
@@ -1493,7 +1452,7 @@ async fn reserved_background_floor_reclaims_ahead_of_waiting_user() {
     // A background spawn and a third user both wait (pool full).
     let bg = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
     assert!(!bg.admitted);
     let u3 = Uuid::new_v4();
@@ -1535,12 +1494,12 @@ async fn user_waiter_preempts_background_above_the_floor() {
     // Fill the slot with background, then queue a background AND a user.
     let bg1 = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
     assert!(bg1.admitted);
     let bg2 = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
     assert!(!bg2.admitted);
     let tid = Uuid::new_v4();
@@ -1618,7 +1577,7 @@ async fn admission_counts_a_running_user_thread_no_subscriber_saw() {
 
     let bg = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
     assert!(
         !bg.admitted,
@@ -1827,7 +1786,7 @@ async fn a_thread_that_starts_and_parks_unobserved_holds_no_slot() {
 
     let bg = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
     assert!(
         bg.admitted,
@@ -1874,7 +1833,7 @@ async fn a_drain_admits_into_a_slot_a_user_thread_freed() {
 
     let bg = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
     assert!(!bg.admitted, "pool of 1 is saturated by the user thread");
 
@@ -1971,7 +1930,7 @@ async fn a_follow_up_into_an_agent_started_thread_counts_while_it_runs() {
 
     let bg = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
     assert!(
         !bg.admitted,
@@ -2056,7 +2015,7 @@ async fn snapshot_merges_background_rows_and_user_entries() {
     // Background sub-thread spawn → a persisted `thread_queue` row.
     let bg = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
     assert!(bg.admitted);
     // User-initiated reservation → in-memory only, no row.
@@ -2176,7 +2135,7 @@ async fn a_fires_spawned_work_runs_at_the_fires_own_depth() {
     let outcome = EVENT_TRIGGER_DEPTH
         .scope(
             FIRE_DEPTH,
-            queue.submit(sub_thread_request(Uuid::new_v4()), None, None),
+            queue.submit(sub_thread_request(Uuid::new_v4()), None),
         )
         .await;
     assert!(outcome.admitted);
@@ -2228,7 +2187,7 @@ async fn a_queued_spawn_keeps_its_depth_when_the_drainer_admits_it() {
     let first = EVENT_TRIGGER_DEPTH
         .scope(
             FIRE_DEPTH,
-            queue.submit(sub_thread_request(Uuid::new_v4()), None, None),
+            queue.submit(sub_thread_request(Uuid::new_v4()), None),
         )
         .await;
     assert!(first.admitted);
@@ -2237,7 +2196,7 @@ async fn a_queued_spawn_keeps_its_depth_when_the_drainer_admits_it() {
     let second = EVENT_TRIGGER_DEPTH
         .scope(
             FIRE_DEPTH,
-            queue.submit(sub_thread_request(Uuid::new_v4()), None, None),
+            queue.submit(sub_thread_request(Uuid::new_v4()), None),
         )
         .await;
     assert!(!second.admitted, "the pool is full, so this one queues");
@@ -2289,10 +2248,7 @@ async fn an_admitted_spawns_thread_carries_the_chain_depth_until_it_completes() 
 
     let child = Uuid::new_v4();
     let outcome = EVENT_TRIGGER_DEPTH
-        .scope(
-            FIRE_DEPTH,
-            queue.submit(sub_thread_request(child), None, None),
-        )
+        .scope(FIRE_DEPTH, queue.submit(sub_thread_request(child), None))
         .await;
     assert!(outcome.admitted);
     entered.recv().await.expect("execute runs");
@@ -2331,10 +2287,7 @@ async fn a_re_queued_entry_re_fires_at_the_depth_it_was_submitted_with() {
     let f = fixture(4).await;
     let child = Uuid::new_v4();
     let outcome = EVENT_TRIGGER_DEPTH
-        .scope(
-            FIRE_DEPTH,
-            f.queue.submit(sub_thread_request(child), None, None),
-        )
+        .scope(FIRE_DEPTH, f.queue.submit(sub_thread_request(child), None))
         .await;
     assert!(outcome.admitted);
 
@@ -2387,7 +2340,7 @@ async fn a_handed_off_row_leaves_no_chain_depth_behind() {
     let f = fixture(4).await;
     let child = Uuid::new_v4();
     let outcome = EVENT_TRIGGER_DEPTH
-        .scope(2, f.queue.submit(sub_thread_request(child), None, None))
+        .scope(2, f.queue.submit(sub_thread_request(child), None))
         .await;
     assert!(outcome.admitted);
     // A live thread is what makes the boot sweep hand off instead of re-queue.
@@ -2477,8 +2430,7 @@ async fn the_frame_closing_a_fire_carries_the_fires_depth() {
     let outcome = EVENT_TRIGGER_DEPTH
         .scope(
             FIRE_DEPTH,
-            f.queue
-                .submit(sub_thread_request(Uuid::new_v4()), None, None),
+            f.queue.submit(sub_thread_request(Uuid::new_v4()), None),
         )
         .await;
     assert!(outcome.admitted);
@@ -2539,9 +2491,7 @@ async fn a_deep_burst_that_drains_fast_never_reports_a_delay() {
     let mut rx = f.bus.subscribe();
 
     for _ in 0..BURST {
-        f.queue
-            .submit(event_trigger_request("trig-a"), None, None)
-            .await;
+        f.queue.submit(event_trigger_request("trig-a"), None).await;
     }
     let depth = f.queue.state.lock().await.queued.len();
     assert_eq!(depth, BURST - 1, "per-trigger cap of 1 queues all but one");
@@ -2580,14 +2530,8 @@ async fn a_fire_stalled_past_the_wait_threshold_reports_a_delay_once() {
         .write()
         .unwrap()
         .insert("trig-a".to_string(), test_trigger_config("trig-a"));
-    let running = f
-        .queue
-        .submit(event_trigger_request("trig-a"), None, None)
-        .await;
-    let stalled = f
-        .queue
-        .submit(event_trigger_request("trig-a"), None, None)
-        .await;
+    let running = f.queue.submit(event_trigger_request("trig-a"), None).await;
+    let stalled = f.queue.submit(event_trigger_request("trig-a"), None).await;
     assert!(running.admitted);
     assert!(!stalled.admitted, "the second fire waits behind the first");
 
@@ -2623,9 +2567,7 @@ async fn a_fire_stalled_past_the_wait_threshold_reports_a_delay_once() {
         .unwrap()
         .insert("trig-p".to_string(), test_trigger_config("trig-p"));
     for _ in 0..2 {
-        f.queue
-            .submit(event_trigger_request("trig-p"), None, None)
-            .await;
+        f.queue.submit(event_trigger_request("trig-p"), None).await;
     }
     let set_paused = |paused: bool| {
         f.trigger_configs
@@ -2682,7 +2624,7 @@ async fn awake_hold_released(entry_id: Uuid) -> bool {
 #[tokio::test]
 async fn an_entry_keeps_the_computer_awake_until_its_work_ends() {
     let f = fixture(4).await;
-    let entry = f.queue.submit(cron_request("trig-awake"), None, None).await;
+    let entry = f.queue.submit(cron_request("trig-awake"), None).await;
     assert!(entry.admitted);
     assert!(crate::core::keep_awake::is_held(
         &entry.entry_id.to_string()
@@ -2714,7 +2656,7 @@ async fn an_entry_whose_work_panics_releases_its_hold() {
         Arc::new(PanickingExecutor),
         Arc::default(),
     );
-    let entry = queue.submit(cron_request("trig-panic"), None, None).await;
+    let entry = queue.submit(cron_request("trig-panic"), None).await;
     assert!(entry.admitted);
     assert!(
         awake_hold_released(entry.entry_id).await,
@@ -2741,9 +2683,9 @@ async fn a_trigger_fire_queued_before_shutdown_waits_for_the_next_engine() {
 
     let blocker = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
-    let fire = f.queue.submit(cron_request("trig-a"), None, None).await;
+    let fire = f.queue.submit(cron_request("trig-a"), None).await;
     assert!(blocker.admitted);
     assert!(!fire.admitted, "the pool is full, so the fire queues");
 
@@ -2794,10 +2736,10 @@ async fn a_trigger_fire_submitted_during_shutdown_is_queued_not_started() {
     }
     f.shutting_down.store(true, Ordering::SeqCst);
 
-    let cron = f.queue.submit(cron_request("trig-cron"), None, None).await;
+    let cron = f.queue.submit(cron_request("trig-cron"), None).await;
     let event = f
         .queue
-        .submit(event_trigger_request("trig-event"), None, None)
+        .submit(event_trigger_request("trig-event"), None)
         .await;
 
     for (kind, outcome) in [("cron", &cron), ("event-trigger", &event)] {
@@ -2812,7 +2754,7 @@ async fn a_trigger_fire_submitted_during_shutdown_is_queued_not_started() {
 
     // A held cron fire still coalesces a second fire of the same trigger.
     // So a catch-up of the same slot cannot double it.
-    let again = f.queue.submit(cron_request("trig-cron"), None, None).await;
+    let again = f.queue.submit(cron_request("trig-cron"), None).await;
     assert!(again.coalesced);
     assert_eq!(cron_row_count(&f.pool, "trig-cron").await, 1);
 
@@ -2827,7 +2769,7 @@ async fn a_spawn_still_admits_during_shutdown() {
 
     let spawn = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
     assert!(
         spawn.admitted,
@@ -2847,9 +2789,9 @@ async fn run_now_does_not_start_a_held_trigger_fire() {
         .insert("trig-a".to_string(), test_trigger_config("trig-a"));
     let blocker = f
         .queue
-        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .submit(sub_thread_request(Uuid::new_v4()), None)
         .await;
-    let fire = f.queue.submit(cron_request("trig-a"), None, None).await;
+    let fire = f.queue.submit(cron_request("trig-a"), None).await;
     assert!(blocker.admitted);
     assert!(!fire.admitted);
 
@@ -2876,7 +2818,7 @@ async fn boot_holds_trigger_admission_across_submit_drain_hints_and_run_now() {
         .unwrap()
         .insert("trig-a".into(), test_trigger_config("trig-a"));
     f.queue.begin_boot_recovery();
-    let fire = f.queue.submit(cron_request("trig-a"), None, None).await;
+    let fire = f.queue.submit(cron_request("trig-a"), None).await;
     assert!(!fire.admitted);
     f.queue.occupancy_moved().await;
     f.queue.drain().await;

@@ -40,6 +40,15 @@
 #                  are `NoticeCondition` in release_notices.rs:
 #                    on-classic-memory   the workspace chose Classic memory.
 #                    has-intents         the workspace holds an intent.
+#                    has-ungranted-coding-agent-trigger
+#                                        a live trigger without the
+#                                        coding-agent grant has started a
+#                                        coding-agent thread.
+#                    command-guard-turns-on
+#                                        the workspace never set the command
+#                                        guard, and holds a trigger, an
+#                                        unapproved MCP server, or no judge
+#                                        model.
 #   superseded_by  optional. The id of a LATER notice that replaces this one.
 #                  Once that notice, or one further down its own chain, is
 #                  reached and its only_when holds, this one is hidden as if
@@ -326,3 +335,61 @@ medium or large. The pill on its card picks the size. A widget built to grow \
 with its content may now cut off in its card, as it already did on a \
 dashboard. Ask Lucidos to redraw it for each size.
 """
+
+[[notice]]
+id = "triggers-need-the-coding-agent-grant"
+since = "0.56.1"
+title = "Triggers that start coding agents need your grant"
+only_when = "has-ungranted-coding-agent-trigger"
+body = """
+A coding agent now gets the same permissions however it started. In return, a \
+trigger may start one only when you grant it. Open the trigger and tick \
+**Allow coding agents**.
+
+At least one of your triggers has started a coding agent and has no grant yet. \
+Its next such run is refused, and you get a notification naming the trigger.
+
+Grant only a trigger you trust with your coding agents' permissions. Watch for \
+one that reads outside content, such as email, chat messages or web pages: \
+that content steers the coding agent too. The button lists each trigger, what \
+it reads, and a link to grant it.
+"""
+action_label = "Check my triggers"
+action_prompt = "Run only the coding-agent grant audit check on my triggers."
+
+[[notice]]
+id = "command-guard-on-by-default"
+since = "0.57.2"
+title = "The command guard is now on"
+only_when = "command-guard-turns-on"
+body = """
+The command guard now checks every command the Lucidos Agent runs, unless you \
+turned it off yourself. A risky command asks you first, and an irreversible \
+one in a trigger runs only within that trigger's allowed side-effects.
+
+Three things in your workspace may notice:
+
+- **Triggers.** A run that sends email, posts to an API or changes a cloud \
+service now fails unless you ticked that side-effect in the trigger's settings. \
+You get a notification naming the trigger.
+- **MCP servers.** A server whose start command nobody approved does not start \
+until you press Start under Settings > MCP Servers.
+- **The judge model.** The guard asks a small, measured model about commands \
+its lists do not settle. If none of your providers serves one, every turn \
+stops with an error until you pick one or turn the judge off.
+
+Your choices, each one tap away:
+
+- **The guard itself.** Keep it on, or turn it off in \
+[Command safety](settings:permissions#command-safety). The judge switch lives \
+there too.
+- **The judge model.** Pick the model that places unclear commands in \
+[Command judge](settings:models#command-judge).
+- **Coding agents.** The guard never answers Claude Code or Codex for you. \
+[Auto-answer coding-agent cards](settings:permissions#coding-agent-auto-answer) \
+does, and stays as you had it.
+
+The button lists each trigger and server that needs you. It changes nothing.
+"""
+action_label = "Check what the guard affects"
+action_prompt = "Run only the command guard audit checks on my triggers and MCP servers."

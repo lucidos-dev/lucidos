@@ -177,6 +177,7 @@ async fn a_trigger_the_agent_wrote_carries_none() {
             user_agent: None,
             mode: ActorMode::Agent,
             source_thread_id: Some(Uuid::new_v4()),
+            emitting_trigger_id: None,
         }),
     )
     .await;
@@ -322,6 +323,7 @@ async fn an_engine_resume_of_a_fire_is_weighed_by_its_trigger() {
             user_agent: None,
             mode: ActorMode::Agent,
             source_thread_id: Some(Uuid::new_v4()),
+            emitting_trigger_id: None,
         }),
     )
     .await;

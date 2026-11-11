@@ -6,6 +6,7 @@ impl LucidosEngine {
         name: &str,
         args: &serde_json::Value,
         thread_id: uuid::Uuid,
+        device_id: Option<&str>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         match name {
             "create_app" => {
@@ -60,10 +61,14 @@ impl LucidosEngine {
                         name, path, commit, lint
                     ));
                 }
+                let manifest = format!("apps/{id}/manifest.json");
+                let fit = self
+                    .widget_fit_notes([manifest.as_str()], thread_id, device_id)
+                    .await;
                 // A reply draws it, so the agent embeds it there (ADR 0466).
                 Ok(format!(
                     "Created widget '{name}' at {path} (commit: {commit}). Embed it in your \
-                     reply to show it: ![{name}](app:{id}){lint}"
+                     reply to show it: ![{name}](app:{id}){lint}{fit}"
                 ))
             }
             "list_apps" => list_apps_text(&self.app_manager),

@@ -24,18 +24,21 @@
  * rather than the other way round.
  */
 
+import type { ComponentChildren } from 'preact';
 import { useSignal } from '@preact/signals';
 import { CleanupManager } from './CleanupManager';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { Overlay } from '../shared/Overlay';
-import { RetryIcon, SettingsIcon } from '../shared/icons';
+import { ChevronDownIcon, ChevronUpIcon, GripIcon, RetryIcon, SettingsIcon } from '../shared/icons';
 import { LoadingFade } from '../shared/LoadingFade';
 import { SkeletonProvider, SkText, SkBlock } from '../shared/Skeleton';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { useTooltip } from '../../hooks/useTooltip';
 import { useWindowDragRegion } from '../../hooks/useWindowDragRegion';
+import { useRowDrag } from '../../hooks/useRowDrag';
+import { hasCoarsePointer } from '../../utils/viewport';
 import { isInteractiveTarget } from '../../utils/dom';
 import { errorDetail } from '../../utils/errorDetail';
 import { dismissBootSplash } from '../../utils/bootSplash';
@@ -62,8 +65,9 @@ import {
 import { isPairingShellDocument } from '../../utils/pairingShell';
 import { hasUnspentPairingLaunch } from '../../utils/pairingCodeSeed';
 import {
-  listWorkspaces,
+  listWorkspacesWithOrder,
   listRemoteWorkspaces,
+  setWorkspaceOrder,
   createWorkspace,
   renameWorkspace,
   restartWorkspace,
@@ -114,8 +118,16 @@ import {
   type RemoteGatewayDraft,
 } from '../settings/remoteGatewayForm';
 import { GlyphBadge } from '../shared/GlyphBadge';
-import { RemoteWorkspaceRows } from './RemoteWorkspaceRows';
-import { mergeRemoteListings, recallRemoteListings, rememberRemoteListings, type RemoteGatewayView } from './remoteWorkspaces';
+import { RemoteWorkspaceRowBody, UnreachableGatewayNotes } from './RemoteWorkspaceRow';
+import {
+  mergeRemoteListings,
+  recallRemoteListings,
+  rememberRemoteListings,
+  remoteWorkspaceOpenable,
+  type RemoteGatewayView,
+} from './remoteWorkspaces';
+import { keepUndrawnKeys, moveOrderKey, orderWorkspaces, stepOrderKey, type OrderedWorkspace } from '../../utils/workspaceOrder';
+import { makeOrderSaver } from './orderSave';
 import { singleFlight } from './singleFlight';
 
 /** Background ticks between two asks of the remote gateways. Each ask crosses
@@ -333,6 +345,12 @@ function PickerSkeleton({ rows = 3 }: { rows?: number }) {
   );
 }
 
+type PickerEntry = OrderedWorkspace<WorkspaceStatus>;
+type RemotePickerEntry = Extract<PickerEntry, { kind: 'remote' }>;
+
+/** Remote rows join the list once the first ask of the remote gateways lands. */
+const NO_REMOTE_VIEWS: readonly RemoteGatewayView[] = [];
+
 export function WorkspacePicker() {
   // The picker is its own render root (`main.tsx` renders EITHER <WorkspacePicker/>
   // OR <App/>), so it must install the global tooltip system itself — App.tsx's
@@ -341,11 +359,22 @@ export function WorkspacePicker() {
 
   const workspaces = useSignal<Loadable<WorkspaceStatus[]>>({ status: 'not-loaded' });
   const remoteWorkspaces = useSignal<Loadable<RemoteGatewayView[]>>({ status: 'not-loaded' });
+  // The workspace order as the gateway stores it, or as a drop just drew it.
+  const order = useSignal<readonly string[]>([]);
+  const error = useSignal<string | null>(null);
+  const [orderSaver] = useState(() => makeOrderSaver({
+    draw: (drawn) => { order.value = drawn; },
+    save: setWorkspaceOrder,
+    // The picker's own error line: no toast host is mounted here.
+    report: (message) => { error.value = message; },
+  }));
+  // The rows as drawn: what a drop or a Move step reorders. A drag holds them
+  // still, so a poll landing mid-drag cannot change the row under the finger.
+  const drawnEntries = useRef<PickerEntry[]>([]);
   // One ask of the remote gateways at a time, and how many ticks since the last.
   const remoteAsk = useRef<((fresh?: boolean) => Promise<void>) | null>(null);
   const ticksSinceRemoteAsk = useRef(0);
   const busy = useSignal(false);
-  const error = useSignal<string | null>(null);
   // Skeleton row count, captured once at mount (see where it's read below).
   const skeletonRowsRef = useRef<number | undefined>(undefined);
   // Which footer form is open. ONE signal rather than a boolean per form: both
@@ -419,8 +448,10 @@ export function WorkspacePicker() {
   );
 
   async function fetchWorkspaces(): Promise<void> {
-    const list = await listWorkspaces();
+    const read = orderSaver.readStarted();
+    const { workspaces: list, order: stored } = await listWorkspacesWithOrder();
     workspaces.value = { status: 'loaded', data: list };
+    orderSaver.stored(stored, read);
     // Never clears `error`: the 2s poll runs this too, and would wipe a failed
     // action's message before the user read it. `withBusy` clears it instead.
     // Remember the count so a future load can size its skeleton to this list
@@ -855,6 +886,8 @@ export function WorkspacePicker() {
    *  A row with no trigger (renaming, deleting) is not one of these rows at all,
    *  and never carries this handler. */
   function openRowMenu(e: MouseEvent, id: string) {
+    // On touch a hold lifts the row to drag it, and the ⋯ button opens the menu.
+    if (hasCoarsePointer()) return;
     const trigger = (e.currentTarget as HTMLElement).querySelector<HTMLElement>(MORE_BUTTON);
     if (!trigger) return;
     e.preventDefault();
@@ -862,7 +895,156 @@ export function WorkspacePicker() {
     menuOpenId.value = id;
   }
 
+  /** Draw `reordered`, the drawn keys in a new order, and store it. A stored
+   *  key with no row on screen keeps its place. */
+  function reorder(reordered: readonly string[]) {
+    void orderSaver.reorder(keepUndrawnKeys(order.value, reordered));
+  }
+  const drawnKeys = () => drawnEntries.current.map((entry) => entry.key);
+
+  const { listRef, drag, rowProps, gripProps } = useRowDrag<HTMLUListElement>((from, to) => {
+    const keys = drawnKeys();
+    if (from !== to && keys[from] !== undefined) reorder(moveOrderKey(keys, keys[from], to));
+  }, hasCoarsePointer);
+
   const v = workspaces.value;
+  const remoteViews = remoteWorkspaces.value.status === 'loaded' ? remoteWorkspaces.value.data : NO_REMOTE_VIEWS;
+  if (!drag) {
+    drawnEntries.current = v.status === 'loaded' ? orderWorkspaces(v.data, remoteViews, order.value) : [];
+  }
+  const entries = drawnEntries.current;
+
+  /** The row's ⋯ button and the menu it opens. `id` names the row's menu. */
+  function rowMenu(id: string, label: string, disabled: boolean, items: ComponentChildren) {
+    return (
+      <div class="ws-picker-menu-wrap">
+        <button
+          class="ws-picker-icon ws-picker-icon-more"
+          data-role="ws-row-more"
+          disabled={disabled}
+          data-tooltip="More"
+          aria-label={label}
+          aria-haspopup="menu"
+          aria-expanded={menuOpenId.value === id}
+          onClick={(e) => {
+            e.stopPropagation();
+            const btn = e.currentTarget as HTMLElement;
+            if (menuOpenId.value === id) {
+              menuOpenId.value = null;
+            } else {
+              menuAnchor.value = btn;
+              menuOpenId.value = id;
+            }
+          }}
+        ><MoreIcon /></button>
+        <Overlay
+          open={menuOpenId.value === id}
+          onClose={() => {
+            menuOpenId.value = null;
+          }}
+          anchor={menuAnchor.value}
+          backdrop={false}
+          panelClass="ws-picker-menu"
+          panelRole="menu"
+        >
+          {items}
+        </Overlay>
+      </div>
+    );
+  }
+
+  /** Move up and Move down: the keyboard's and screen reader's way to reorder. */
+  function moveItems(key: string) {
+    const at = drawnKeys().indexOf(key);
+    const step = (direction: 'up' | 'down') => (e: MouseEvent) => {
+      e.stopPropagation();
+      menuOpenId.value = null;
+      reorder(stepOrderKey(drawnKeys(), key, direction));
+    };
+    return (
+      <>
+        <button class="ws-picker-menu-item" role="menuitem" disabled={at <= 0} onClick={step('up')}>
+          <ChevronUpIcon size="1rem" />
+          <span>Move up</span>
+        </button>
+        <button
+          class="ws-picker-menu-item"
+          role="menuitem"
+          disabled={at < 0 || at === drawnKeys().length - 1}
+          onClick={step('down')}
+        >
+          <ChevronDownIcon size="1rem" />
+          <span>Move down</span>
+        </button>
+      </>
+    );
+  }
+
+  /** The list item every row sits in: its place in the drag, and its grip.
+   *  A row being renamed is not `draggable`. */
+  function rowShell(entry: PickerEntry, index: number, draggable: boolean, body: ComponentChildren) {
+    const lift = drag?.from === index ? drag.dy : undefined;
+    const dropAt = drag && drag.to === index && drag.to !== drag.from ? (drag.to > drag.from ? 'after' : 'before') : null;
+    const unreachable = entry.kind === 'remote' && entry.view.unreachable !== null;
+    // The hold guard swallows the click a drag ends on, so it runs on the way
+    // down, before the row under it opens the workspace.
+    const { onClick: dragClickGuard, ...holdProps } = rowProps;
+    return (
+      <li
+        class={`ws-picker-row${unreachable ? ' ws-picker-row-unreachable' : ''}${lift !== undefined ? ' ws-picker-row-lifted' : ''}${dropAt ? ` ws-picker-row-drop-${dropAt}` : ''}`}
+        key={entry.key}
+        data-row-index={index}
+        style={lift !== undefined ? { '--ws-picker-drag-dy': `${lift}px` } : undefined}
+        {...(draggable ? { ...holdProps, onClickCapture: dragClickGuard } : {})}
+      >
+        {draggable && (
+          <span class="ws-picker-grip" aria-hidden="true" {...gripProps}>
+            <GripIcon size="0.875rem" />
+          </span>
+        )}
+        {body}
+      </li>
+    );
+  }
+
+  function remoteRow(entry: RemotePickerEntry, index: number) {
+    const { view, workspace: w, key } = entry;
+    const alternateMode = remoteWorkspaceOpenable(view, w) ? alternateOpenMode(workspaceState(w), WORKSPACE_ID, key) : null;
+    const openRemote = (mode: WorkspaceOpenMode) => {
+      void withBusy(async () => {
+        await openWorkspaceIn(mode, key);
+      });
+    };
+    return rowShell(entry, index, true, (
+      <RemoteWorkspaceRowBody
+        view={view}
+        workspace={w}
+        onOpen={(_route, mode) => openRemote(mode)}
+        onContextMenu={(e) => openRowMenu(e, key)}
+        actions={rowMenu(key, `More actions for ${w.name} on ${view.gateway}`, busy.value, (
+          <>
+            {alternateMode !== null && (
+              <button
+                class="ws-picker-menu-item"
+                role="menuitem"
+                disabled={busy.value}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  menuOpenId.value = null;
+                  openRemote(alternateMode);
+                }}
+              >
+                {alternateMode === 'separate' ? <PopOutIcon /> : <PopInIcon />}
+                <span>{openModeLabel(alternateMode)}</span>
+              </button>
+            )}
+            {moveItems(key)}
+          </>
+        ))}
+      />
+    ));
+  }
+
   // Gate the skeleton behind the standard SPINNER_DELAY_MS (300ms), like every
   // other view — a fast local gateway resolves well inside that window, so the
   // skeleton never appears and can't flash. There IS competing content behind it
@@ -1043,8 +1225,10 @@ export function WorkspacePicker() {
             their fields say what they do, so a sentence restating them is noise
             on the first screen a new user meets. */}
         {v.status === 'loaded' && (
-          <ul class="ws-picker-list">
-            {v.data.map((w) => {
+          <ul class="ws-picker-list" ref={listRef}>
+            {entries.map((entry, index) => {
+              if (entry.kind === 'remote') return remoteRow(entry, index);
+              const w = entry.workspace;
               const state = workspaceState(w);
               const running = state === 'healthy' || state === 'booting';
               // Non-null for the one state that is a fault, which is also the
@@ -1064,9 +1248,7 @@ export function WorkspacePicker() {
                 .filter(Boolean)
                 .join(' · ');
               const alternateMode = alternateOpenMode(state, WORKSPACE_ID, w.id);
-              return (
-                <li class="ws-picker-row" key={w.id}>
-                  {renamingId.value === w.id ? (
+              return rowShell(entry, index, renamingId.value !== w.id, renamingId.value === w.id ? (
                     <div class="ws-picker-rename">
                       <div class="ws-picker-inline">
                         <input
@@ -1264,36 +1446,8 @@ export function WorkspacePicker() {
                               }}
                             >{state === 'unhealthy' ? <RetryIcon /> : <PlayIcon />}</button>
                           )}
-                          <div class="ws-picker-menu-wrap">
-                            <button
-                              class="ws-picker-icon ws-picker-icon-more"
-                              data-role="ws-row-more"
-                              disabled={busy.value || w.health === 'restoring'}
-                              data-tooltip="More"
-                              aria-label={`More actions for ${w.name}`}
-                              aria-haspopup="menu"
-                              aria-expanded={menuOpenId.value === w.id}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                const btn = e.currentTarget as HTMLElement;
-                                if (menuOpenId.value === w.id) {
-                                  menuOpenId.value = null;
-                                } else {
-                                  menuAnchor.value = btn;
-                                  menuOpenId.value = w.id;
-                                }
-                              }}
-                            ><MoreIcon /></button>
-                            <Overlay
-                              open={menuOpenId.value === w.id}
-                              onClose={() => {
-                                menuOpenId.value = null;
-                              }}
-                              anchor={menuAnchor.value}
-                              backdrop={false}
-                              panelClass="ws-picker-menu"
-                              panelRole="menu"
-                            >
+                          {rowMenu(w.id, `More actions for ${w.name}`, busy.value || w.health === 'restoring', (
+                            <>
                               {/* Leads the menu because it is the only item that
                                   OPENS the workspace, which is what the row is
                                   for; the three below it configure or destroy it.
@@ -1372,8 +1526,9 @@ export function WorkspacePicker() {
                                 <TrashIcon />
                                 <span>Delete</span>
                               </button>
-                            </Overlay>
-                          </div>
+                              {moveItems(entry.key)}
+                            </>
+                          ))}
                         </div>
                       </div>
                       {/* What the red dot means, in words, on the row it is
@@ -1391,9 +1546,7 @@ export function WorkspacePicker() {
                           taller, by exactly the line that explains it. */}
                       {fault && <p class="ws-picker-row-note">{fault}</p>}
                     </div>
-                  )}
-                </li>
-              );
+                  ));
             })}
           </ul>
         )}
@@ -1404,18 +1557,7 @@ export function WorkspacePicker() {
             Failed to load remote workspaces: {remoteWorkspaces.value.error}
           </div>
         )}
-        {/* Nothing while the first ask is out: the local list above is already
-            the whole picker for a gateway with no remote gateways. */}
-        {remoteWorkspaces.value.status === 'loaded' && (
-          <RemoteWorkspaceRows
-            views={remoteWorkspaces.value.data}
-            onOpen={(route, mode) => {
-              void withBusy(async () => {
-                await openWorkspaceIn(mode, route);
-              });
-            }}
-          />
-        )}
+        <UnreachableGatewayNotes views={remoteViews} />
 
         {restoreBanner({ status: restore, busy: busy.value, onDismiss: onDismissRestore })}
 

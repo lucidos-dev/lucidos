@@ -1,6 +1,6 @@
 ---
 name: Workspace audit: cross-cutting
-description: The cross-cutting audit section: credentials in workspace code, broken references, duplicates, removed CLI flags, removed thread-summary fields and retired LLM tools.
+description: The cross-cutting audit section: credentials in workspace code, broken references, duplicates, removed CLI flags, removed thread-summary fields, retired LLM tools and the retired work-item names.
 sources: ["system-knowhow/js-sdk.md", "system-knowhow/lucidos-cli.md", "system-knowhow/intent-registry.md", "system-knowhow/triggers.md", "crates/lucidos-cli/src/*", "crates/lucidos-engine/src/llm/tools/*", "crates/lucidos-engine/src/engine/tools/*", "crates/lucidos-engine/src/api/threads*", "crates/lucidos-engine/src/core/store/threads/*"]
 ---
 
@@ -20,6 +20,7 @@ scan removed-fields "coding_agent_(applying|has_diff|proposed|incomplete|require
 scan cred-env "CRED_[A-Z0-9_]+" --exclude-dir=auth $all
 scan auth-header "Authorization|X-API-Key" $inc apps
 scan retired-tools "execute_intent" $all
+scan retired-work-items "lucidos\.workItems|/api/v1/work-items" $all
 ```
 
 ## Checks
@@ -93,6 +94,13 @@ For each finding, capture: **location**, **what's wrong**, **which reference own
       run the digest". The call now fails with a hint.
     - **stale**: a passing mention of the retired tool that tells nobody to call it,
       such as "runs through `execute_intent`" (the retired tool).
+- **The retired work-item names.** The `retired-work-items` scan finds the
+  retired `lucidos.workItems` namespace and `/api/v1/work-items` routes (ADR
+  0649). Both are gone, with no alias, so a hit is **broken**. Recommend
+  `lucidos.threads.people` and `/api/v1/threads/people`, per
+  `system-knowhow/js-sdk.md` § "lucidos.threads.people". A hit in the Factory
+  app means the team copied it before the rename: copy its three files again
+  (`system-knowhow/team-workspace.md` § 5).
 
 ## Remediation
 

@@ -914,6 +914,7 @@ mod tests {
             event_id: None,
             thread_id: None,
             agent: None,
+            sender_device_id: None,
         }
     }
 

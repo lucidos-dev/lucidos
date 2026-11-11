@@ -7,6 +7,7 @@ pub mod cache_lifetime;
 /// `docs/temporary-measures.md`.
 pub(crate) mod cache_probe;
 pub mod call_trace;
+pub mod chatgpt_plan;
 pub mod claude_gateway;
 pub(crate) mod claude_prefill;
 pub mod image;

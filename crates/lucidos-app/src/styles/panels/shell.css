@@ -1837,14 +1837,15 @@
     /* At narrow pane widths, optional actions share the leading overflow
        slot with Refresh. The bell and dashboard toggle keep their own slots.
        Only the chevrons use the mobile button width; other controls keep
-       their desktop targets. */
+       their desktop targets. Reserve the gap between controls and one gap
+       before the title, rather than charging a third unused gap. */
     .app-header .content-header-elements:has([data-compact]) {
-        --content-side-reserve: max(calc(var(--header-icon-box) + 3 * 0.15rem + var(--header-padding-x)), calc(var(--content-leading-inset) + 2 * var(--header-icon-box) + 3 * 0.15rem));
+        --content-side-reserve: max(calc(var(--header-icon-box) + 2 * 0.15rem + var(--header-padding-x)), calc(var(--content-leading-inset) + 2 * var(--header-icon-box) + 2 * 0.15rem));
         gap: 0.15rem;
     }
 
     :root[data-dashboard-rail-toggle]:not([data-dashboard-rail]) .app-header .content-header-elements:has([data-compact]) {
-        --content-side-reserve: calc(2 * var(--header-icon-box) + 3 * 0.15rem + max(var(--header-padding-x), var(--content-leading-inset)));
+        --content-side-reserve: calc(2 * var(--header-icon-box) + 2 * 0.15rem + max(var(--header-padding-x), var(--content-leading-inset)));
         padding-right: calc(var(--header-padding-x) + var(--header-icon-box) + 0.15rem);
     }
 

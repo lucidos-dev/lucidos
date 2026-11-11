@@ -32,6 +32,8 @@ const ARTIFACT_CHARS: usize = 30_000;
 pub(crate) struct RecallLine {
     pub(crate) id: String,
     pub(crate) text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sender_device_id: Option<String>,
 }
 
 /// Open `id` `levels` levels down. A leaf opens into its source.
@@ -49,6 +51,7 @@ pub(crate) async fn zoom(
             if id.addr.is_leaf() {
                 let entry = &tree.entries[id.addr.start as usize];
                 return Ok(vec![RecallLine {
+                    sender_device_id: entry.sender_device_id.clone(),
                     id: id.to_string(),
                     text: entry.message(),
                 }]);
@@ -286,6 +289,11 @@ impl ThreadTree {
     fn push(&self, addr: NodeAddr, out: &mut Vec<RecallLine>) {
         if let Some(text) = self.lines.get(&addr) {
             out.push(RecallLine {
+                sender_device_id: if addr.is_leaf() {
+                    self.entries[addr.start as usize].sender_device_id.clone()
+                } else {
+                    None
+                },
                 id: NodeId {
                     scope: SummaryScope::Thread(self.thread),
                     addr,
@@ -361,6 +369,7 @@ async fn workspace_lines(
             };
             if let Some(node) = nodes.remove(&addr) {
                 next.push(Slot::Line(RecallLine {
+                    sender_device_id: None,
                     id: format!("w/{addr}"),
                     text: node.text,
                 }));
@@ -381,6 +390,7 @@ async fn workspace_lines(
         .collect();
     if missing > 0 {
         out.push(RecallLine {
+            sender_device_id: None,
             id: "w/pending".to_string(),
             text: format!(
                 "{missing} newer entries are not summarised yet. search finds their words"
@@ -402,6 +412,7 @@ async fn open_workspace_leaf(
     if let Some(thread) = node.source_thread_id {
         let Some(tree) = ThreadTree::load_if_present(pool, thread).await? else {
             return Ok(vec![RecallLine {
+                sender_device_id: None,
                 id: id.to_string(),
                 text: "(a thread no longer here)".to_string(),
             }]);
@@ -419,6 +430,7 @@ async fn open_workspace_leaf(
         .map(|content| crate::engine::context::truncate_head_tail(&content, ARTIFACT_CHARS))
         .unwrap_or_else(|| format!("({path} at {commit} can no longer be read)"));
     Ok(vec![RecallLine {
+        sender_device_id: None,
         id: id.to_string(),
         text: format!("artifact: {path}\n{text}"),
     }])
@@ -430,6 +442,34 @@ mod tests {
 
     fn addr(start: u64, span: u64) -> NodeAddr {
         NodeAddr { start, span }
+    }
+
+    #[test]
+    fn thread_lines_carry_the_sender_only_at_leaves() {
+        use crate::engine::summary_tree::log::EntryKind;
+        use crate::engine::thread_events::ActorMode;
+
+        let entry = LogEntry {
+            kind: EntryKind::Prompt(ActorMode::Human),
+            text: "find the plan".to_string(),
+            event_id: Uuid::new_v4(),
+            sender_device_id: Some("sending-device".to_string()),
+        };
+        let tree = ThreadTree {
+            thread: Uuid::new_v4(),
+            title: None,
+            entries: vec![entry.clone(), entry],
+            turns: Vec::new(),
+            lines: HashMap::from([
+                (addr(0, 1), "prompt (human): find the plan".to_string()),
+                (addr(0, 2), "a summary".to_string()),
+            ]),
+        };
+        let lines = tree.lines(vec![addr(0, 1), addr(0, 2)]);
+        assert_eq!(lines[0].sender_device_id.as_deref(), Some("sending-device"));
+        assert_eq!(lines[1].sender_device_id, None);
+        let summary = serde_json::to_value(&lines[1]).unwrap();
+        assert!(summary.get("sender_device_id").is_none());
     }
 
     #[test]

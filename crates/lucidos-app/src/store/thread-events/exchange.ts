@@ -208,7 +208,8 @@ export function findMcpPermissionResolution(
  *  reader said the same thing either way, so both read the same way. The
  *  transcript draws these as bubbles, and its find bar searches them. */
 export function isUserBubbleEvent(userEvent: { type: string }): boolean {
-  return userEvent.type === 'MessageReceived' || userEvent.type === 'SpokenMessageReceived';
+  return userEvent.type === 'MessageReceived' || userEvent.type === 'SpokenMessageReceived'
+    || userEvent.type === 'PeopleMessagePosted';
 }
 
 /**
@@ -306,7 +307,8 @@ export function modeToInitiator(mode: ActorMode | undefined): ThreadInitiator {
  *  the bytes live in the content-addressed blob store and are loaded by the
  *  renderer via `<img src="/api/v1/blobs/<hash>">`. */
 export function exchangeUserImageHashes(exchange: Exchange): string[] {
-  if (exchange.userEvent.type !== 'MessageReceived') return [];
+  const type = exchange.userEvent.type;
+  if (type !== 'MessageReceived' && type !== 'PeopleMessagePosted') return [];
   const raw = (exchange.userEvent as { user_image_hashes?: unknown }).user_image_hashes;
   if (!Array.isArray(raw)) return [];
   return raw.filter((h): h is string => typeof h === 'string');

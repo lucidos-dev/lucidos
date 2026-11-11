@@ -89,8 +89,6 @@ pub enum PrefValue {
     /// the workspace font exists is asked where it is used, which falls back
     /// when it does not (ADR 0308).
     FontFamily,
-    /// A *permission wait*, read by `PermissionWait::parse`.
-    PermissionWait,
     /// A *context ceiling*, read by `ContextCeiling::parse`.
     ContextCeiling,
 }
@@ -362,8 +360,9 @@ const COMPOSER_ENTER_KEYS: &[&str] = &["send", "newline"];
 /// `lucidos-eval` pins the memory tasks to it, so its runs stay comparable.
 pub const BACKGROUND_MODEL: &str = "claude-haiku-5-5";
 
-/// The command judge's default, the model `lucidos-eval command-judge`
-/// measured with no irreversible command classed safe (ADR 0406).
+/// The command judge's default, the first of the models
+/// `lucidos-eval command-judge` measured with no irreversible command classed
+/// safe (ADR 0406).
 pub const COMMAND_JUDGE_MODEL: &str = "gemini-3.1-flash-lite";
 
 /// The wake decision's default, the last of the models
@@ -926,7 +925,7 @@ pub const DRIVER_TIMEOUT_HOURS: Pref<Number> = Pref::number(PrefSpec {
     scope: PrefScope::Global,
     value: PrefValue::Number { min: 0.0, max: 720.0 },
     default: PrefDefault::Value("0"),
-    description: "In a team workspace, how long a gate may wait on its work item's driver before it escalates, in hours. An escalated gate pushes the whole team once, and the driver keeps the work item. 0 never escalates. The team setup sets it, typically to 24.",
+    description: "In a team workspace, how long a gate may wait on its root thread's driver before it escalates, in hours. An escalated gate pushes the whole team once, and the driver keeps the root thread. 0 never escalates. The team setup sets it, typically to 24.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -969,7 +968,7 @@ pub const MOBILE_DYNAMIC_BARS: Pref<Flag> = Pref::flag(PrefSpec {
     access: PrefAccess::Agent,
     scope: PrefScope::Global,
     value: PrefValue::Bool,
-    default: PrefDefault::Value("false"),
+    default: PrefDefault::Value("true"),
     description: "On a phone, slide the header and the prompt away while scrolling down and bring them back on scroll up ('true'), instead of keeping both always visible ('false'). The installed iOS app ignores this and always slides them.",
     side_effect: PrefSideEffect::None,
 });
@@ -1521,17 +1520,6 @@ pub const BACKUP_REMINDER_DISMISSED: Pref<Optional> = Pref::optional(PrefSpec {
     side_effect: PrefSideEffect::None,
 });
 
-pub const UNATTENDED_PERMISSION_WAIT: Pref<Text> = Pref::text(PrefSpec {
-    key: "unattended_permission_wait",
-    label: "Unattended permission wait",
-    access: PrefAccess::Agent,
-    scope: PrefScope::Global,
-    value: PrefValue::PermissionWait,
-    default: PrefDefault::Value("30"),
-    description: "How long a coding-agent session nobody is watching waits on a permission card the command guard refused to settle. It parks the card only when a device can take a push, and pushes it. 'deny' never parks; a whole number of minutes (1–1440) parks, then denies when nobody answers; 'indefinite' waits like an attended card. A trigger's own permission_wait overrides this for its runs and their sub-threads.",
-    side_effect: PrefSideEffect::None,
-});
-
 // ---- Human-only: real settings the agent must not write ----
 
 pub const COMMAND_GUARD: Pref<Flag> = Pref::flag(PrefSpec {
@@ -1542,8 +1530,8 @@ pub const COMMAND_GUARD: Pref<Flag> = Pref::flag(PrefSpec {
     },
     scope: PrefScope::Global,
     value: PrefValue::Bool,
-    default: PrefDefault::Value("false"),
-    description: "Master switch for the command guard (ADR 0002), the pre-dispatch safety gate over the Lucidos Agent's bash and python tools. Ships dark: a workspace opts in.",
+    default: PrefDefault::Value("true"),
+    description: "Master switch for the command guard (ADR 0002), the pre-dispatch safety gate over the Lucidos Agent's bash and python tools. On by default: a workspace with no row runs guarded, and an explicit 'false' turns it off.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1560,16 +1548,16 @@ pub const COMMAND_GUARD_JUDGE: Pref<Flag> = Pref::flag(PrefSpec {
     side_effect: PrefSideEffect::None,
 });
 
-pub const COMMAND_GUARD_CODING_AGENTS: Pref<Flag> = Pref::flag(PrefSpec {
-    key: "command_guard_coding_agents",
-    label: "Answer coding-agent questions",
+pub const CODING_AGENT_AUTO_ANSWER: Pref<Flag> = Pref::flag(PrefSpec {
+    key: "coding_agent_auto_answer",
+    label: "Auto-answer coding-agent cards",
     access: PrefAccess::Human {
-        hint: "managed in Settings → Permissions (Command safety)",
+        hint: "auto-answer runs coding-agent commands without asking, so only a person turns it on, in Settings → Permissions (Coding agent permissions)",
     },
     scope: PrefScope::Global,
     value: PrefValue::Bool,
-    default: PrefDefault::Value("true"),
-    description: "Whether the command guard answers the permission cards of coding-agent commands (Codex command_execution, Claude Code Bash). On, a command the guard places as safe or reversible runs without a card. There is no undo for a wrong reversible verdict. Off, the guard runs no Claude Code command unasked. A catastrophic command the guard recognises is refused whatever this says, and a Codex sandbox escape the guard places as safe runs whatever this says. Read only while command_guard is on.",
+    default: PrefDefault::Value("false"),
+    description: "Whether Lucidos answers the permission cards of coding-agent commands (Codex command_execution, Claude Code Bash) with the command guard's classifier and judge. On, a command placed as safe or reversible runs without a card. There is no undo for a wrong reversible verdict. Off, no Claude Code command runs unasked. Independent of command_guard. A catastrophic command the guard recognises is refused whatever this says, and a Codex sandbox escape placed as safe runs whatever this says.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1577,15 +1565,12 @@ pub const MODEL_COMMAND_JUDGE: Pref<Text> = Pref::text(PrefSpec {
     key: "model_command_judge",
     label: "Command-judge model",
     access: PrefAccess::Human {
-        hint: "managed in Settings → Permissions (Command safety)",
+        hint: "managed in Settings → Models (Command judge)",
     },
     scope: PrefScope::Global,
     value: PrefValue::Text,
     default: PrefDefault::Value(COMMAND_JUDGE_MODEL),
-    description: concat!(
-        "The model the command-guard judge runs on.",
-        aux_fallback_note!()
-    ),
+    description: "The model the command-guard judge runs on, for the Lucidos Agent's commands and for coding-agent auto-answer. While unset, the engine runs the first of this default, gpt-6-luna and claude-haiku-5-5 that a configured provider serves: the models lucidos-eval command-judge measured. It never runs on the chat model. With none of them served, or a set model no provider serves, a Lucidos Agent turn under the command guard and its judge refuses to start, and auto-answer cards every command it would judge. GET /api/v1/models/background says which model runs.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1593,7 +1578,7 @@ pub const REASONING_COMMAND_JUDGE: Pref<Text> = Pref::text(PrefSpec {
     key: "reasoning_command_judge",
     label: "Command-judge reasoning",
     access: PrefAccess::Human {
-        hint: "the judge's thinking budget is part of the command guard, so it is managed in Settings → Permissions (Command safety), not via set_preference",
+        hint: "the judge's thinking budget is part of the command guard, so it is managed in Settings → Models (Command judge), not via set_preference",
     },
     scope: PrefScope::Global,
     value: PrefValue::Enum(REASONING_EFFORTS),
@@ -1609,7 +1594,7 @@ pub const JUDGMENT_COMMAND_GUARD: Pref<Optional> = Pref::optional(PrefSpec {
     key: "judgment_command_guard",
     label: "Command-guard backend",
     access: PrefAccess::Human {
-        hint: "which backend classifies the agent's own commands (chat, or a System One model such as jev or clef) is part of the command guard, so it is managed in Settings → Permissions (Command safety), not via set_preference",
+        hint: "which backend classifies the agent's own commands (chat, or a System One model such as jev or clef) is part of the command guard, so it is managed in Settings → Models (Command judge), not via set_preference",
     },
     scope: PrefScope::Global,
     value: PrefValue::Text,
@@ -1884,6 +1869,19 @@ pub const PROVIDER_ENABLED_CLAUDE_GATEWAY: Pref<Flag> = Pref::flag(PrefSpec {
     side_effect: PrefSideEffect::None,
 });
 
+pub const PROVIDER_ENABLED_CHATGPT_PLAN: Pref<Flag> = Pref::flag(PrefSpec {
+    key: "provider_enabled_chatgpt_plan",
+    label: "ChatGPT plan provider",
+    access: PrefAccess::Human {
+        hint: concat!("whether the ChatGPT plan provider is switched on: managed in ", providers_settings!(), ", never via set_preference"),
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::Bool,
+    default: PrefDefault::Value("true"),
+    description: "Whether the ChatGPT plan provider is switched on. A veto over a signed-in plan: off parks it and keeps the sign-in.",
+    side_effect: PrefSideEffect::None,
+});
+
 pub const PROVIDER_ENABLED_TYPESAFE: Pref<Flag> = Pref::flag(PrefSpec {
     key: "provider_enabled_typesafe",
     label: "TypeSafe provider",
@@ -1946,6 +1944,19 @@ pub const CLAUDE_GATEWAY_URL: Pref<Optional> = Pref::optional(PrefSpec {
     value: PrefValue::Text,
     default: PrefDefault::Unset("no Claude gateway"),
     description: "The origin of the Claude gateway Lucidos signs in to, such as https://gateway.example.",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const CHATGPT_PLAN_WELCOME_SHOWN: Pref<Flag> = Pref::flag(PrefSpec {
+    key: "chatgpt_plan_welcome_shown",
+    label: "ChatGPT plan welcome shown",
+    access: PrefAccess::Human {
+        hint: "internal UI state — whether the one-time 'You're using your ChatGPT plan' dialog has been shown after the first Sign in with ChatGPT; managed by the ChatGPT plan card, not a setting",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::Bool,
+    default: PrefDefault::Value("false"),
+    description: "Whether the first Sign in with ChatGPT has shown its one-time welcome dialog.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -2169,8 +2180,7 @@ pub const CATALOG: &[&PrefSpec] = &[
     &BACKUP_REMINDER_DISMISSED.spec,
     &COMMAND_GUARD.spec,
     &COMMAND_GUARD_JUDGE.spec,
-    &COMMAND_GUARD_CODING_AGENTS.spec,
-    &UNATTENDED_PERMISSION_WAIT.spec,
+    &CODING_AGENT_AUTO_ANSWER.spec,
     &MODEL_COMMAND_JUDGE.spec,
     &REASONING_COMMAND_JUDGE.spec,
     &JUDGMENT_COMMAND_GUARD.spec,
@@ -2194,11 +2204,13 @@ pub const CATALOG: &[&PrefSpec] = &[
     &PROVIDER_ENABLED_XAI.spec,
     &PROVIDER_ENABLED_LOCAL.spec,
     &PROVIDER_ENABLED_CLAUDE_GATEWAY.spec,
+    &PROVIDER_ENABLED_CHATGPT_PLAN.spec,
     &PROVIDER_ENABLED_TYPESAFE.spec,
     &PROVIDER_ENABLED_CLOUDFLARE_WORKERS_AI.spec,
     &PROVIDER_ENABLED_SYSTEM_ONE_CUSTOM.spec,
     &LOCAL_BASE_URL.spec,
     &CLAUDE_GATEWAY_URL.spec,
+    &CHATGPT_PLAN_WELCOME_SHOWN.spec,
     &SYSTEM_ONE_CUSTOM_URL.spec,
     &SYSTEM_ONE_CUSTOM_MODEL.spec,
     &SYSTEM_ONE_OPENROUTER_MODEL.spec,
@@ -2226,6 +2238,10 @@ pub const RETIRED_KEYS: &[(&str, &str)] = &[
     (
         "vapid_keys",
         "vapid_keys moved to its own table: a signing key is a sealed secret, not a preference (ADR 0509).",
+    ),
+    (
+        "unattended_permission_wait",
+        "unattended_permission_wait was removed: every coding-agent session takes the workspace's grants, and a card waits for a human.",
     ),
 ];
 
@@ -2448,9 +2464,6 @@ pub fn validate(spec: &PrefSpec, value: &str) -> Result<(), String> {
                 ))
             }
         }
-        PrefValue::PermissionWait => crate::core::permission_wait::PermissionWait::parse(value)
-            .map(|_| ())
-            .map_err(|e| format!("'{}': {}", spec.key, e)),
         PrefValue::ContextCeiling => crate::engine::context_ceiling::ContextCeiling::parse(value)
             .map(|_| ())
             .map_err(|e| format!("'{}': {}", spec.key, e)),
@@ -2544,10 +2557,6 @@ pub fn allowed_values_hint(spec: &PrefSpec) -> String {
         PrefValue::FontFamily => format!(
             "{} | ws-<slug> (a workspace font)",
             crate::core::fonts::FONT_PREFERENCE_VALUES.join(" | ")
-        ),
-        PrefValue::PermissionWait => format!(
-            "deny | indefinite | whole minutes 1–{}",
-            crate::core::permission_wait::MAX_PERMISSION_WAIT_MINUTES
         ),
         PrefValue::ContextCeiling => "off | <N>k | <P>% of the window".to_string(),
     }
@@ -2715,6 +2724,15 @@ mod tests {
     fn command_guard_is_not_settable_but_has_a_hint() {
         assert!(lookup(COMMAND_GUARD.key()).is_none());
         assert!(internal_hint(COMMAND_GUARD.key()).is_some());
+    }
+
+    /// Auto-answer runs coding-agent commands unasked, so a prompt injection
+    /// must not turn it on.
+    #[test]
+    fn coding_agent_auto_answer_is_not_settable_but_has_a_hint() {
+        assert!(lookup(CODING_AGENT_AUTO_ANSWER.key()).is_none());
+        let hint = internal_hint(CODING_AGENT_AUTO_ANSWER.key()).expect("internal");
+        assert!(hint.contains("Coding agent permissions"), "{hint}");
     }
 
     /// The local model host reads every prompt and writes the replies the

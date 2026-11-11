@@ -108,6 +108,9 @@ secret_columns! {
     McpServerEnv => "mcp_servers"."env", JsonValues, empty: false, discard: DropEntry;
     ClaudeGatewayAccessToken => "claude_gateway_accounts"."access_token", Text, empty: false, discard: DeleteRow;
     ClaudeGatewayRefreshToken => "claude_gateway_accounts"."refresh_token", Text, empty: false, discard: DeleteRow;
+    ChatGptPlanIdToken => "chatgpt_plan_accounts"."id_token", Text, empty: false, discard: DeleteRow;
+    ChatGptPlanAccessToken => "chatgpt_plan_accounts"."access_token", Text, empty: false, discard: DeleteRow;
+    ChatGptPlanRefreshToken => "chatgpt_plan_accounts"."refresh_token", Text, empty: false, discard: DeleteRow;
 }
 
 /// The mailbox password column, which held a copy of the `email_password`

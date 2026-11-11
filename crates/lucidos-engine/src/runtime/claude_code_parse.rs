@@ -33,6 +33,9 @@ pub struct CcStreamState {
     /// nothing (a `thinking` block). It is released after the same message's
     /// next frame, so the capture follows the step it belongs to.
     held_sub_agent_usage: Vec<(String, AgentEvent)>,
+    /// The text of CC's API-error banner, while it is the turn's last
+    /// top-level assistant message. The turn's `result` fails with it.
+    turn_ending_api_error: Option<String>,
 }
 
 fn is_always_thinking(model: Option<&str>) -> bool {
@@ -50,6 +53,21 @@ fn call_usage(usage: &serde_json::Value) -> ApiUsage {
 /// cache counts, so it covers them.
 fn is_from_a_real_call(usage: &ApiUsage) -> bool {
     usage.input_tokens > 0 || usage.output_tokens > 0
+}
+
+/// An assistant message's text blocks, joined and trimmed.
+fn message_text(message: Option<&serde_json::Value>) -> String {
+    message
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|block| block.get("type").and_then(|v| v.as_str()) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 #[derive(Debug)]
@@ -113,6 +131,7 @@ impl CcStreamState {
     /// the terminal re-reports its usage, which is the safe direction.
     fn end_turn(&mut self) {
         self.usage_reported_message_ids.clear();
+        self.turn_ending_api_error = None;
     }
 
     /// The `Usage` event for one API call, unless it is all zero or its
@@ -377,8 +396,8 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
             // CC's internal `isApiErrorMessage`, documented in its SDK schema as
             // "True when this assistant message wraps an API error".
             //
-            // It is CC's error SURFACE, not model prose. The same string comes back
-            // as the turn's `result` error and becomes `ResponseFailed`, which the
+            // It is CC's error SURFACE, not model prose. When it ends the turn, its
+            // text becomes the `result` error and then `ResponseFailed`, which the
             // transcript already renders in the failure card. Ingesting it as text
             // therefore printed the failure twice: once as a paragraph in the
             // response body, and again in the red card right beneath it.
@@ -392,6 +411,14 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                 .get("is_api_error_message")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            // The banner's text is the turn's failure reason, even when CC
+            // stamps the `result` successful. A gateway's own error body
+            // (a spend cap, say) carries no `API Error` prefix to match on.
+            if parent_tool_use_id.is_none() {
+                state.turn_ending_api_error = is_api_error_banner
+                    .then(|| message_text(message))
+                    .filter(|text| !text.is_empty());
+            }
             let prose = |text: String| match &parent_tool_use_id {
                 Some(parent) => AgentEvent::SubAgentMessage {
                     text,
@@ -633,7 +660,8 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                 })
             } else {
                 None
-            };
+            }
+            .or_else(|| state.turn_ending_api_error.take());
             // A call still open here was cut off before its `message_delta`.
             // Then the turn is over, so the ids it reported can go.
             let mut events: Vec<AgentEvent> = state.close_open_call().into_iter().collect();

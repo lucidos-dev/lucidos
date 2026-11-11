@@ -30,6 +30,7 @@ function trigger(goToReview: boolean): TriggerInfo {
     cron_expressions: ['0 0 9 * * *'],
     timezone: 'UTC',
     paused: false,
+    coding_agent_grant: false,
     run: { type: 'intent', intent: 'summarize the day' },
     go_to_review: goToReview,
   };

@@ -402,13 +402,16 @@ impl VertexProvider {
 
     /// Does this model's endpoint ignore the configured region?
     ///
-    /// True only for `gemini-3*`, which is published globally. Named rather
+    /// True for Gemini 3 and the verified Gemini 4 routes; global is supported
+    /// independently of the workspace's configured Claude region. Named rather
     /// than spelled inline because two things must agree: which endpoint the
     /// request takes, and whether a failure may tell the user to change the
     /// region. [`endpoint_for_model`](Self::endpoint_for_model) branches on
     /// this, so the two cannot drift.
     fn region_is_pinned(model: &str) -> bool {
-        !Self::is_claude_model(model) && model.starts_with("gemini-3")
+        !Self::is_claude_model(model)
+            && (model.starts_with("gemini-3")
+                || crate::llm::model_registry::unified_output_limit(model).is_some())
     }
 
     fn endpoint_for_model(&self, model: &str) -> String {
@@ -721,6 +724,8 @@ mod tests {
             "gemini-2.5-flash",
             "gemini-3-flash-preview",
             "gemini-3.8-flash",
+            "gemini-4-argon",
+            "gemini-4-carbon",
         ] {
             let went_global = location_from_endpoint(&provider.endpoint_for_model(model))
                 .as_deref()

@@ -337,19 +337,19 @@ fn plan_cascade(
     })
 }
 
-/// Archiving a work item's root finishes it, so its driver and watchers hear
+/// Archiving a root thread finishes it, so its driver and watchers hear
 /// it (ADR 0623). The archive stands either way, so a failed notice only logs.
-async fn notify_work_item_done(
+async fn notify_root_done(
     engine: &std::sync::Arc<LucidosEngine>,
     thread_id: Uuid,
     actor: Option<&MessageOrigin>,
 ) {
-    use crate::engine::work_item::{notify, WorkItemNotice};
+    use crate::engine::thread_people::{notify, PeopleNotice};
     let snapshot = crate::gateway_operators::current();
     let notified = match crate::engine::thread_family::family_root(engine.pool(), thread_id).await {
         Ok(root) if root == thread_id => {
             let by = actor.and_then(|a| snapshot.operator_of_origin(a));
-            notify(engine, root, WorkItemNotice::Completed { by }, &snapshot).await
+            notify(engine, root, PeopleNotice::Completed { by }, &snapshot).await
         }
         Ok(_) => Ok(()),
         Err(e) => Err(e.into()),
@@ -637,7 +637,7 @@ pub(crate) async fn archive_family(
     }
 
     if archived.contains(&thread_uuid) {
-        notify_work_item_done(engine, thread_uuid, actor.as_ref()).await;
+        notify_root_done(engine, thread_uuid, actor.as_ref()).await;
     }
 
     // A target already stored archived sits in Current only while a count says

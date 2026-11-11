@@ -9,12 +9,13 @@ use super::LucidosEngine;
 use crate::core::apps::WidgetSize;
 use crate::engine::dashboard::{self, DashboardChange, DashboardTile, DashboardView};
 use crate::engine::thread_events::{ArrangedTile, Dashboard};
+use crate::engine::widget_fit::{self, WidgetFitContext, WIDGET_FIT_BOX_BUDGET};
 use crate::engine::widgets::{self, WidgetInstance};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-const ACTIONS: &str = "list, size, make_reusable, stop_reusing, dashboard, add_to_dashboard, \
-                       remove_from_dashboard, arrange";
+const ACTIONS: &str = "list, size, fit, make_reusable, stop_reusing, dashboard, \
+                       add_to_dashboard, remove_from_dashboard, arrange";
 
 impl LucidosEngine {
     pub(crate) async fn execute_widgets(
@@ -27,6 +28,14 @@ impl LucidosEngine {
         match action {
             "list" => self.widgets_list(),
             "size" => self.widgets_card_size(args, thread_id).await,
+            "fit" => {
+                let app_id = app_id(args)?;
+                let target = target_thread(args, thread_id)?;
+                let preferred = self.last_used_device(thread_id, device_id).await;
+                Ok(self
+                    .check_widget_fit(app_id, target, preferred.as_deref())
+                    .await)
+            }
             "make_reusable" => self.widgets_set_reusable(args, thread_id, true).await,
             "stop_reusing" => self.widgets_set_reusable(args, thread_id, false).await,
             "dashboard" => {
@@ -116,6 +125,52 @@ impl LucidosEngine {
         } else {
             format!("Widget '{app_id}' is no longer reusable: its origin thread owns it again.")
         })
+    }
+}
+
+impl LucidosEngine {
+    fn widget_fit_context(&self) -> WidgetFitContext<'_> {
+        WidgetFitContext {
+            bus: &self.event_bus,
+            pool: &self.pool,
+            apps: &self.app_manager,
+            pending: &self.pending_widget_fits,
+        }
+    }
+
+    /// The widget fit note for one widget, rendered in `thread_id`.
+    pub(crate) async fn check_widget_fit(
+        &self,
+        app_id: &str,
+        thread_id: Uuid,
+        preferred: Option<&str>,
+    ) -> String {
+        let cx = self.widget_fit_context();
+        widget_fit::check_widget_fit(&cx, app_id, thread_id, preferred, WIDGET_FIT_BOX_BUDGET).await
+    }
+
+    /// What a write tool appends to its result for the widget files it wrote.
+    /// It never fails, so a write's result always stands.
+    pub(crate) async fn widget_fit_notes<'p>(
+        &self,
+        written: impl IntoIterator<Item = &'p str>,
+        thread_id: Uuid,
+        device_id: Option<&str>,
+    ) -> String {
+        let cx = self.widget_fit_context();
+        let widgets = widget_fit::written_widgets(cx.apps, written);
+        if widgets.is_empty() {
+            return String::new();
+        }
+        let preferred = self.last_used_device(thread_id, device_id).await;
+        widget_fit::widget_fit_notes(
+            &cx,
+            &widgets,
+            thread_id,
+            preferred.as_deref(),
+            WIDGET_FIT_BOX_BUDGET,
+        )
+        .await
     }
 }
 

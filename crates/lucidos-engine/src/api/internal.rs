@@ -97,7 +97,6 @@ pub(super) async fn permission_prompt(
         state.engine.pool(),
         &state.engine.event_bus,
         &state.engine.pending_cc_permission,
-        &state.engine.trigger_configs,
         &state.workspace_path,
         worktree_path.as_deref(),
         Some(&state.engine),

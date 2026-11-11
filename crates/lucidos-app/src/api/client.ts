@@ -5,6 +5,7 @@
 export * from './client/_core';
 export * from './client/chat';
 export * from './client/claudeGateway';
+export * from './client/chatgptPlan';
 export * from './client/changes';
 export * from './client/apps';
 export * from './client/data';
@@ -20,6 +21,7 @@ export * from './client/settings';
 export * from './client/themes';
 export * from './client/models';
 export * from './client/mcp';
+export * from './client/people';
 export * from './client/pluginMarketplaces';
 export * from './client/readerDevices';
 export * from './client/releaseNotices';

@@ -45,9 +45,9 @@ pub(crate) fn lookup_repo_commands_in_cache(
 pub(crate) const BROAD_ALLOW_INEFFECTIVE: &[&str] =
     &["Edit", "ExitPlanMode", "NotebookEdit", "Write"];
 
-/// Directories no persisted Bash grant may write under: Claude Code's own
-/// settings and hooks, and git metadata, whose hooks and config run on later
-/// git calls. Read through [`input_touches_protected_path`].
+/// Directories no head grant may write under, only the bare `Bash` line:
+/// Claude Code's own settings and hooks, and git metadata, whose hooks and
+/// config run on later git calls. Read through [`input_touches_protected_path`].
 pub(crate) const CC_PROTECTED_PATH_MARKERS: &[&str] = &[".claude/", ".git/"];
 
 // Tools whose `AllowScope::Session` pattern is per-file, derived from the
@@ -76,7 +76,7 @@ pub(crate) const CODEX_COMMAND_TOOL: &str = "command_execution";
 
 /// Claude Code's command tool. A `Bash` card means the tool is missing from a
 /// `--allowedTools` list the user curates, so it reaches the attended command
-/// gate only under `command_guard_coding_agents`.
+/// gate only under `coding_agent_auto_answer`.
 pub(crate) const CLAUDE_CODE_COMMAND_TOOL: &str = "Bash";
 
 /// Where a granted "Always allow" click is remembered.
@@ -88,9 +88,10 @@ pub(crate) const CLAUDE_CODE_COMMAND_TOOL: &str = "Bash";
 ///     thread, and durable: the grant is persisted as the resolution event's
 ///     `persist_scope`, and `cc_permission::hydrate_session_allows` refills the
 ///     cache from the event store on the first prompt after an engine restart.
-///     Works for *every* tool and *every* path (including CC's own protected
-///     paths like `.claude/` and `.git/`), because the engine intercepts before
-///     the prompt fires.
+///     Works for *every* tool and *every* file path (including CC's own
+///     protected paths like `.claude/` and `.git/`), because the engine
+///     intercepts before the prompt fires. A command that may write there is
+///     the exception: only the bare `Bash` line covers it.
 ///
 /// Wire form: `"narrow"` / `"broad"` / `"session"` (snake_case enum).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -140,8 +141,9 @@ impl GrantOffer {
 ///          bare entry never suppresses anything. Applies to `Broad` only
 ///          (the Narrow scope already returns `None` for these tools).
 ///       2. The tool is `Bash` and the command may write under `.claude/`
-///          or `.git/` (per `input_touches_protected_path`). No persisted
-///          line covers such a write. Applies to both `Broad` and `Narrow`.
+///          or `.git/` (per `input_touches_protected_path`). Only the bare
+///          `Bash` line covers such a write. Applies to `Narrow` (and
+///          `Session`), never to `Broad`.
 ///       3. The tool is `file_change`.
 ///
 ///     A Codex `command_execution` persists Claude Code's `Bash` line, so it
@@ -156,15 +158,16 @@ impl GrantOffer {
 ///
 ///   * `Session` → stored on `PermissionState::session_allows` and matched
 ///     exact-string against patterns derived from future prompts in the same
-///     thread, including CC-protected paths the persisted scopes can't reach:
+///     thread, including the `Edit` / `Write` paths the persisted scopes
+///     can't reach:
 ///       * `Edit | Write` → `Tool(<file_path>)` (per-file)
 ///       * `NotebookEdit` → `NotebookEdit(<notebook_path>)`
 ///       * `Bash | command_execution` → `<tool>(<grant-head>:*)` ([`command_grant_head`])
 ///       * `Skill` → `Skill(<plugin>:*)` (same as narrow)
 ///       * everything else → bare `tool_name`
 ///
-///     `None` for `file_change`, and for a path tool or command with no path
-///     or head.
+///     `None` for `file_change`, for a path tool or command with no path
+///     or head, and for a command that may write under `.claude/` or `.git/`.
 ///
 /// A card offers a derived pattern only when it covers its own request
 /// (`cc_permission::grant_offer`).
@@ -182,9 +185,11 @@ pub(crate) fn derive_allow_pattern(
         tool_name
     };
     match scope {
-        AllowScope::Broad | AllowScope::Narrow
-            if CODEX_BACKEND_TOOLS.contains(&persisted_tool)
-                || input_touches_protected_path(persisted_tool, input) =>
+        AllowScope::Broad | AllowScope::Narrow if CODEX_BACKEND_TOOLS.contains(&persisted_tool) => {
+            None
+        }
+        AllowScope::Narrow | AllowScope::Session
+            if input_touches_protected_path(tool_name, input) =>
         {
             None
         }
@@ -237,18 +242,15 @@ pub(crate) fn derive_allow_pattern(
     }
 }
 
-/// True when a `Bash` command may WRITE under `.claude/` or `.git/`
-/// ([`command_guard::command_may_write_under`]). No persisted grant covers
-/// such a write: it could widen the agent's own permissions or plant a git
-/// hook. A command that only mentions or reads those paths is not touched.
-/// The engine matches every Bash grant itself. A mention refused here would
-/// card on every call, with no "Always allow" to stop it (ADR 0634).
-///
-/// Session scope is unaffected: the engine intercepts before CC's gate.
+/// True when a `Bash` or Codex command may WRITE under `.claude/` or `.git/`
+/// ([`command_guard::command_may_write_under`]). Only the bare `Bash` line
+/// covers such a write. A head grant, persisted or session, never does: one
+/// click on `cat` would otherwise let a redirect plant a git hook. A command
+/// that only mentions or reads those paths is not touched (ADR 0634).
 ///
 /// [`command_guard::command_may_write_under`]: crate::engine::command_guard::command_may_write_under
 pub(crate) fn input_touches_protected_path(tool_name: &str, input: &serde_json::Value) -> bool {
-    if tool_name != "Bash" {
+    if !matches!(tool_name, CLAUDE_CODE_COMMAND_TOOL | CODEX_COMMAND_TOOL) {
         return false;
     }
     input

@@ -98,6 +98,11 @@ fn models_offering(menu: &str, effort: &str) -> Option<Vec<String>> {
 }
 
 pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
+    check_actor_mode(
+        args.mode,
+        std::env::var_os("LUCIDOS_AGENT_ORIGIN_TOKEN").is_some(),
+    )?;
+
     let selected_coding_agent = if args.codex {
         Some(crate::CliCodingAgent::Codex)
     } else {
@@ -376,6 +381,14 @@ const NOTHING_TO_SEND: &str = "--message is empty and no --image was given, so t
     nothing to start the thread with. If the message comes from `$(cat <file>)`, check the \
     file exists.";
 
+/// Agent subprocesses cannot choose human attribution, even across workspaces.
+fn check_actor_mode(mode: CliMode, subprocess: bool) -> Result<(), BoxError> {
+    if subprocess && matches!(mode, CliMode::Human) {
+        return Err("--mode human cannot be used from an agent subprocess: it would record the request as the user. Omit --mode to spawn with the default agent attribution. Do not remove your origin token or post directly to the API to bypass this restriction.".into());
+    }
+    Ok(())
+}
+
 /// Refuse a spawn with no text and no image before any request goes out.
 ///
 /// The target engine refuses one too. Failing here also names the likely cause,
@@ -526,9 +539,9 @@ pub(crate) fn resolve_target(name_or_path: &str) -> Result<PathBuf, BoxError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_effort_fits_model, check_integrated_spawn, effort_rows, inline_images, link_label,
-        models_offering, require_input, workspaces_root, CC_MENU, CODEX_MENU, EFFORT_LEVELS,
-        NOTHING_TO_SEND,
+        check_actor_mode, check_effort_fits_model, check_integrated_spawn, effort_rows,
+        inline_images, link_label, models_offering, require_input, workspaces_root, CC_MENU,
+        CODEX_MENU, EFFORT_LEVELS, NOTHING_TO_SEND,
     };
     use crate::CliCodingAgent;
     use crate::CliMode;
@@ -536,6 +549,24 @@ mod tests {
     use std::collections::BTreeSet;
     use std::ffi::OsString;
     use std::path::PathBuf;
+
+    #[test]
+    fn subprocess_cannot_claim_human_attribution() {
+        let error = check_actor_mode(CliMode::Human, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Omit --mode"));
+        assert!(error.contains("Do not remove your origin token"));
+        assert!(check_actor_mode(CliMode::Agent, true).is_ok());
+        assert!(check_actor_mode(CliMode::Engine, true).is_ok());
+    }
+
+    #[test]
+    fn terminal_actor_modes_remain_available() {
+        for mode in [CliMode::Human, CliMode::Agent, CliMode::Engine] {
+            assert!(check_actor_mode(mode, false).is_ok());
+        }
+    }
 
     fn menu_levels(menu: &str) -> BTreeSet<String> {
         let rows = effort_rows(menu);

@@ -72,8 +72,7 @@ cargo build -p lucidos-engine --release    # Engine
 - **Never add a workflow that compiles, lints, type-checks or tests per push or
   PR.** Lucidos is not PR-based, so such a trigger never fires or fires too late.
   A per-change check goes into `scripts/lib/harden_suites.sh` (`hs_select_suites`, `hs_suite_command`).
-- **Nothing in a workflow deploys.** Deploys run on the maintainer's machine,
-  because a Cloudflare token that can deploy Pages can also edit the zone's DNS
+- **Nothing in a workflow deploys.** Deploys run on the maintainer's machine
   (ADR 0031).
 - **The main check gates nothing.** `scripts/main-check.sh <sha>` runs after a
   landing, and a red one opens one fix thread. `/harden` reads it with
@@ -132,8 +131,7 @@ rules, each asserted by `release_tarballs_gate_test.sh`:
 - **Linux tarballs via CI (`release-tarballs.yml`).** Linux builds inside the glibc
   2.35 floor container, and only the tag push attaches, to a DRAFT release. The
   attach step never deletes an asset from a published release. The macOS tarballs
-  on a Release are unsigned, because CI cannot hold the Developer ID identity
-  (ADR 0034). The workflow header holds the rest.
+  on a Release are unsigned (ADR 0034). The workflow header holds the rest.
 
 ### The release candidate IS the published artifact (rc-first, ADR 0024)
 
@@ -154,9 +152,9 @@ one tree and ship another.
 - **Phase B (`--publish-verified`) promotes and never rebuilds.**
   `release_promote_preflight` refuses a moved rc or mirror `main`, a missing
   `RC_PARENT`, a `source_commit` mismatch and drifted hashes.
-  `release-to-lucidos.sh --promote-rc` pushes that same object, tags by SHA,
-  creates a DRAFT Release, waits for the tarballs and publishes. `release.sh` then
-  settles the source side before emitting `LucidosReleased` (ADRs 0250, 0042).
+  `release-to-lucidos.sh --promote-rc` tags that same object by SHA and
+  publishes a DRAFT Release once the tarballs land. `release.sh` then settles the
+  source side before emitting `LucidosReleased` (ADRs 0250, 0042).
 - **The legacy one-shot has no rc gate**, and is held to both ADR 0039 rules.
 
 #### The mirror's `main` is a linear release history (ADR 0039)
@@ -169,10 +167,11 @@ object while the scan inspects only the tip. All of it is in `release_tree.sh`:
   `main`. **`RC_PARENT` is decided once**, in Phase A.
 - **`release_main_push_decision` returns `published`, `lease`, `create` or
   `refuse`.** `lease` pushes with `--force-with-lease=refs/heads/main:<parent>`.
-- **`release_mirror_history_check` runs on every publish path** (Phase A, Phase B's
-  guard, the one-shot). It refuses both fewer and more commits than tags, and
-  takes an in-flight count that is 0 except for a retry. Never `git fetch --tags`
-  here (ADR 0029).
+- **The mirror's `main` moves last (ADR 0642).** `release_mirror_main_advance`
+  runs after every publish and never rewinds.
+- **`release_mirror_history_check` runs on every publish path.** It refuses both
+  fewer and more commits than tags, except an in-flight tag on a direct child of
+  `main`. Never `git fetch --tags` here (ADR 0029).
 - **`RELEASE_MIRROR_HISTORY_EXCEPTIONS` is re-verified against the live mirror
   every run.** A stale entry refuses, the SHA is the full 40 hex, and a human adds
   entries (`docs/temporary-measures.md`).
@@ -223,7 +222,8 @@ to `main`, creates a `v*` tag or publishes a Release. Preserve that.
   unreadable mirror fails closed to skip.
 - **`--notarize-deadline` stages nothing on expiry.** It replaces
   `NOTARIZE_POLL_TIMEOUT` and is refused with `--defer-notarization`.
-- **`--abandon` refuses once `v<version>` is published.**
+- **`--abandon` refuses once `v<version>` is published.** It deletes a tag `main`
+  never took.
 - **Both Phase A entry points call `run_release_build_dmg`**, the one reader of
   build-dmg.sh's exit status.
 

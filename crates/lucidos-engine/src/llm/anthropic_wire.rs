@@ -1522,6 +1522,7 @@ mod tests {
             "claude-fable-5",
             "claude-fable-5[1m]",
             "claude-fable-5-1",
+            "claude-fable-5-2",
             "claude-fable-5-1[1m]",
         ] {
             assert!(supports_extended_thinking(id), "extended: {id}");
@@ -1670,6 +1671,7 @@ mod tests {
             "claude-sonnet-5-5[1m]",
             "claude-fable-5",
             "claude-fable-5-1",
+            "claude-fable-5-2",
         ] {
             let (base, _) = parse_context_suffix(id);
             let (thinking, output_config, max_tokens) = thinking_config(base, Some("none"));
@@ -2390,6 +2392,7 @@ mod tests {
             "claude-opus-5-5[1m]",
             "claude-sonnet-5-5",
             "claude-fable-5-1",
+            "claude-fable-5-2",
         ] {
             let err = forced_request(model, None).expect_err(model);
             assert!(err.contains("always thinks"), "{err}");

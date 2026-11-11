@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { ServedIntelligenceRung } from '../../api/types';
 import {
   draggedRung, KEEP_PRICES_CURRENT_CRON, KEEP_PRICES_CURRENT_SLUG, keepPricesCurrentTrigger, ladderOverride, movedRung,
-  percent, rowUnder, toggledRung,
+  percent, toggledRung,
 } from './intelligenceLadder';
 
 const rung = (model: string, effort: string, on = true): ServedIntelligenceRung => ({
@@ -74,18 +74,6 @@ describe('draggedRung', () => {
 
   it('stops just past an off rung it is dropped on', () => {
     expect(order(draggedRung(four, 0, 1))).toBe('cbad');
-  });
-});
-
-describe('rowUnder', () => {
-  const rows = [{ index: 0, bottom: 40 }, { index: 2, bottom: 80 }, { index: 3, bottom: 120 }];
-
-  it('names the row whose band holds the pointer, clamped at both ends', () => {
-    expect(rowUnder(rows, -10)).toBe(0);
-    expect(rowUnder(rows, 39)).toBe(0);
-    expect(rowUnder(rows, 40)).toBe(2);
-    expect(rowUnder(rows, 119)).toBe(3);
-    expect(rowUnder(rows, 500)).toBe(3);
   });
 });
 

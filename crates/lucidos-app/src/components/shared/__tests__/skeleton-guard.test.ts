@@ -45,6 +45,8 @@ function loadingLiterals(code: string): string[] {
 
 /** Consumers that may skip a skeleton, each with the rule that says so. */
 const CONSUMER_EXEMPT: Record<string, Exemption> = {
+  'components/chat/AgentPauseStrip.tsx': { tag: 'single-value', why: 'the paused line stays absent until the engine says the agent is paused' },
+  'components/chat/ThreadPeopleRow.tsx': { tag: 'single-value', why: 'the People line stays absent until the roles are read, then rolls in' },
   'components/chat/CacheKeepAlive.tsx': { tag: 'single-value', why: 'the cache-warm line stays absent until the engine says how long is left' },
   'components/chat/chat-exchange-parts.tsx': { tag: 'single-value', why: 'a change card holds its headline line empty until it loads' },
   'components/chat/ComposeDestinationRow.tsx': { tag: 'structure-first', why: 'destination dropdown; the lists only fill its options' },
@@ -63,6 +65,7 @@ const CONSUMER_EXEMPT: Record<string, Exemption> = {
   'components/settings/MemoryPage.tsx': { tag: 'structure-first', why: 'real sections; the inspector stays until preferences say Tree' },
   'components/settings/TreeBackfillStatus.tsx': { tag: 'structure-first', why: 'real progress row; the bar track draws at once, values wait' },
   'components/settings/ProviderBlock.tsx': { tag: 'structure-first', why: 'switch drawn at once; config rows stay shut until known' },
+  'components/settings/ChatGptPlanSettings.tsx': { tag: 'structure-first', why: 'real sign-in rows inside the provider fold; the button waits for the status' },
   'components/settings/ClaudeGatewaySettings.tsx': { tag: 'structure-first', why: 'real sign-in rows inside the provider fold; Sign in waits for the status' },
   'components/settings/SystemOneProviderFrame.tsx': { tag: 'structure-first', why: 'real controls; defer their values' },
   'components/settings/CustomSystemOneSettings.tsx': { tag: 'structure-first', why: 'real controls; defer their values' },

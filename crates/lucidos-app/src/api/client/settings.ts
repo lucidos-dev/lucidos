@@ -383,6 +383,11 @@ export function handOverDevice(
   });
 }
 
+/** The device id the gateway asserts for this request, or null with no gateway in front. */
+export function getCallerDevice(): Promise<{ device_id: string | null }> {
+  return json(`${API}/devices/caller`);
+}
+
 export function listDevices(): Promise<{ devices: DeviceInfo[] }> {
   return json(`${API}/devices`);
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Post a short outcome to the issue when the work item's root thread answers.
+"""Post a short outcome to the issue when the root thread answers.
 
 Copy to data/triggers/issue-tracker-outcomes/scripts/run.py. Fires on
 ResponseGenerated. Sub-thread replies and unkeyed threads are skipped, so

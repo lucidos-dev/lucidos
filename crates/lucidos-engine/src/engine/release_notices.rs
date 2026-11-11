@@ -26,11 +26,13 @@ use crate::core::preferences::PreferenceStore;
 use crate::core::prefs;
 use crate::core::IntentStore;
 use crate::engine::summary_tree::module::MemoryModule;
+use crate::triggers::TriggerConfig;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 /// The authored notices as of this build. Read that file's own header before
 /// adding one: its order is load-bearing.
@@ -74,6 +76,13 @@ pub enum NoticeCondition {
     /// The workspace holds at least one intent: an app intent or a trigger's
     /// procedure file.
     HasIntents,
+    /// A live trigger without the coding-agent grant has started a
+    /// coding-agent thread, so its next such run is refused.
+    HasUngrantedCodingAgentTrigger,
+    /// The workspace never set `command_guard`, so the guard turns on with
+    /// this release, and it holds something the guard treats differently: a
+    /// trigger, an MCP server nobody approved, or no command judge model.
+    CommandGuardTurnsOn,
 }
 
 impl NoticeCondition {
@@ -81,6 +90,8 @@ impl NoticeCondition {
         match self {
             Self::OnClassicMemory => facts.memory_module == Some(MemoryModule::Classic),
             Self::HasIntents => facts.has_intents,
+            Self::HasUngrantedCodingAgentTrigger => facts.has_ungranted_coding_agent_trigger,
+            Self::CommandGuardTurnsOn => facts.command_guard_turns_on,
         }
     }
 }
@@ -93,25 +104,126 @@ pub(crate) struct NoticeFacts {
     pub(crate) memory_module: Option<MemoryModule>,
     /// Whether the intent registry finds any intent under the data directory.
     pub(crate) has_intents: bool,
+    /// Whether an ungranted live trigger has started a coding-agent thread.
+    pub(crate) has_ungranted_coding_agent_trigger: bool,
+    /// Whether [`NoticeCondition::CommandGuardTurnsOn`] holds.
+    pub(crate) command_guard_turns_on: bool,
+}
+
+/// What the default-on command guard changes here that only the running
+/// engine knows. The API layer reads it, so [`NoticeFacts::read`] stays
+/// testable on a bare pool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct GuardExposure {
+    /// A registered MCP server whose launch line nobody approved.
+    pub(crate) unapproved_mcp_server: bool,
+    /// No provider serves a command judge model.
+    pub(crate) judge_unresolved: bool,
 }
 
 impl NoticeFacts {
     /// An unreadable memory module reads as Classic, which shows the Tree
-    /// notice: the recoverable direction.
-    pub(crate) async fn read(pool: &PgPool, workspace_path: &Path) -> Self {
+    /// notice: the recoverable direction. An unreadable trigger history shows
+    /// the coding-agent grant notice, and an unreadable guard row the command
+    /// guard notice, for the same reason.
+    pub(crate) async fn read(
+        pool: &PgPool,
+        workspace_path: &Path,
+        trigger_configs: &RwLock<HashMap<String, TriggerConfig>>,
+        exposure: GuardExposure,
+    ) -> Self {
         let memory_module = MemoryModule::stored(pool).await.unwrap_or_else(|e| {
             log!("[ReleaseNotices] Failed to read the memory module: {}", e);
             Some(MemoryModule::Classic)
         });
+        let ungranted = ungranted_trigger_ids(trigger_configs);
+        let has_ungranted_coding_agent_trigger = any_started_a_coding_agent(pool, &ungranted)
+            .await
+            .unwrap_or_else(|e| {
+                log!(
+                    "[ReleaseNotices] Failed to read trigger coding agents: {}",
+                    e
+                );
+                !ungranted.is_empty()
+            });
+        let command_guard_turns_on = command_guard_never_set(pool).await
+            && (has_a_trigger(trigger_configs)
+                || exposure.unapproved_mcp_server
+                || exposure.judge_unresolved);
         Self {
             memory_module,
             has_intents: workspace_has_intents(workspace_path),
+            has_ungranted_coding_agent_trigger,
+            command_guard_turns_on,
         }
     }
 }
 
+/// Whether the workspace has no `command_guard` row, so it follows the
+/// default. An explicit `false` keeps the guard off and owes no notice.
+async fn command_guard_never_set(pool: &PgPool) -> bool {
+    prefs::COMMAND_GUARD
+        .try_stored(pool)
+        .await
+        .map(|row| row.is_none())
+        .unwrap_or_else(|e| {
+            log!("[ReleaseNotices] Failed to read the command guard: {}", e);
+            true
+        })
+}
+
+fn has_a_trigger(trigger_configs: &RwLock<HashMap<String, TriggerConfig>>) -> bool {
+    trigger_configs
+        .read()
+        .map(|configs| !configs.is_empty())
+        .unwrap_or(true)
+}
+
 fn workspace_has_intents(workspace_path: &Path) -> bool {
     !IntentStore::load_all(&workspace_path.join(crate::core::DATA_DIR)).is_empty()
+}
+
+/// Every live trigger without the coding-agent grant. A deleted trigger is
+/// off the registry, and nobody can grant it.
+fn ungranted_trigger_ids(trigger_configs: &RwLock<HashMap<String, TriggerConfig>>) -> Vec<String> {
+    trigger_configs
+        .read()
+        .map(|configs| {
+            configs
+                .values()
+                .filter(|c| !c.coding_agent_grant)
+                .map(|c| c.id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a fire of one of `trigger_ids` has a coding-agent thread below it
+/// in the callback tree. The spawn gate also traces top spawns, but that walk
+/// reads every origin event, too slow for each page load. A trigger whose only
+/// coding agents are top spawns hears from the gate's refusal notification.
+async fn any_started_a_coding_agent(
+    pool: &PgPool,
+    trigger_ids: &[String],
+) -> Result<bool, sqlx::Error> {
+    if trigger_ids.is_empty() {
+        return Ok(false);
+    }
+    sqlx::query_scalar(
+        "WITH RECURSIVE tree AS ( \
+           SELECT thread_id FROM thread_summaries WHERE trigger_id = ANY($1) \
+           UNION \
+           SELECT c.thread_id FROM thread_summaries c \
+             JOIN tree t ON c.parent_thread_id = t.thread_id \
+         ) \
+         SELECT EXISTS ( \
+           SELECT 1 FROM tree JOIN thread_summaries s USING (thread_id) \
+           WHERE s.is_coding_agent \
+         )",
+    )
+    .bind(trigger_ids)
+    .fetch_one(pool)
+    .await
 }
 
 /// The file's top level: a single array of tables, `[[notice]]`.
@@ -571,18 +683,38 @@ mod tests {
     pub(super) const CLASSIC: NoticeFacts = NoticeFacts {
         memory_module: Some(MemoryModule::Classic),
         has_intents: true,
+        has_ungranted_coding_agent_trigger: true,
+        command_guard_turns_on: true,
     };
     pub(super) const TREE: NoticeFacts = NoticeFacts {
         memory_module: Some(MemoryModule::Tree),
         has_intents: true,
+        has_ungranted_coding_agent_trigger: true,
+        command_guard_turns_on: true,
     };
     const NEVER_CHOSE: NoticeFacts = NoticeFacts {
         memory_module: None,
         has_intents: true,
+        has_ungranted_coding_agent_trigger: true,
+        command_guard_turns_on: true,
     };
     const NO_INTENTS: NoticeFacts = NoticeFacts {
         memory_module: Some(MemoryModule::Tree),
         has_intents: false,
+        has_ungranted_coding_agent_trigger: true,
+        command_guard_turns_on: true,
+    };
+    const ALL_TRIGGERS_GRANTED: NoticeFacts = NoticeFacts {
+        memory_module: Some(MemoryModule::Tree),
+        has_intents: true,
+        has_ungranted_coding_agent_trigger: false,
+        command_guard_turns_on: true,
+    };
+    const GUARD_UNAFFECTED: NoticeFacts = NoticeFacts {
+        memory_module: Some(MemoryModule::Tree),
+        has_intents: true,
+        has_ungranted_coding_agent_trigger: true,
+        command_guard_turns_on: false,
     };
 
     /// `a` and `c` for everybody, with `b` only for a Classic workspace.
@@ -742,6 +874,92 @@ mod tests {
             .find(|n| n.id == "intents-run-in-the-thread")
             .unwrap();
         assert_eq!(intents.only_when, Some(NoticeCondition::HasIntents));
+    }
+
+    /// `a` and `c` for everybody, with `b` only where a trigger needs a grant.
+    fn b_only_with_an_ungranted_trigger() -> Vec<ReleaseNotice> {
+        let mut notices = three();
+        notices[1].only_when = Some(NoticeCondition::HasUngrantedCodingAgentTrigger);
+        notices
+    }
+
+    #[test]
+    fn the_coding_agent_grant_notice_shows_where_a_trigger_lacks_it() {
+        let view = view(
+            &b_only_with_an_ungranted_trigger(),
+            &v("3.0.0"),
+            &TREE,
+            Some("a"),
+        );
+        assert_eq!(ids(&view), ["a", "b", "c"]);
+        assert_eq!(view.next_id.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn the_coding_agent_grant_notice_hides_once_every_trigger_holds_it() {
+        let view = view(
+            &b_only_with_an_ungranted_trigger(),
+            &v("3.0.0"),
+            &ALL_TRIGGERS_GRANTED,
+            Some("a"),
+        );
+        assert_eq!(ids(&view), ["a", "c"]);
+        assert_eq!(view.next_id.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn has_ungranted_coding_agent_trigger_parses_from_its_kebab_case_name() {
+        let src = "[[notice]]\nid = \"a\"\nsince = \"1.0.0\"\ntitle = \"A\"\nbody = \"x\"\n\
+                   only_when = \"has-ungranted-coding-agent-trigger\"\n";
+        assert_eq!(
+            parse(src).unwrap()[0].only_when,
+            Some(NoticeCondition::HasUngrantedCodingAgentTrigger)
+        );
+    }
+
+    #[test]
+    fn the_shipped_coding_agent_grant_notice_shows_only_where_a_trigger_lacks_it() {
+        let notices = parse(RELEASE_NOTICES_TOML).unwrap();
+        let grant = notices
+            .iter()
+            .find(|n| n.id == "triggers-need-the-coding-agent-grant")
+            .unwrap();
+        assert_eq!(
+            grant.only_when,
+            Some(NoticeCondition::HasUngrantedCodingAgentTrigger)
+        );
+    }
+
+    #[test]
+    fn the_command_guard_notice_hides_where_the_flip_changes_nothing() {
+        let mut notices = three();
+        notices[1].only_when = Some(NoticeCondition::CommandGuardTurnsOn);
+        let shown = view(&notices, &v("3.0.0"), &TREE, Some("a"));
+        assert_eq!(shown.next_id.as_deref(), Some("b"));
+        let hidden = view(&notices, &v("3.0.0"), &GUARD_UNAFFECTED, Some("a"));
+        assert_eq!(ids(&hidden), ["a", "c"]);
+    }
+
+    /// I9: the shipped notice names its condition and runs only the targeted
+    /// audit checks, never the full audit. It links every setting the flip
+    /// leaves to the owner, so each choice is one tap away.
+    #[test]
+    fn the_shipped_command_guard_notice_is_conditional_and_targeted() {
+        let notices = parse(RELEASE_NOTICES_TOML).unwrap();
+        let guard = notices
+            .iter()
+            .find(|n| n.id == "command-guard-on-by-default")
+            .unwrap();
+        assert_eq!(guard.only_when, Some(NoticeCondition::CommandGuardTurnsOn));
+        let prompt = guard.action_prompt.as_deref().unwrap();
+        assert!(prompt.starts_with("Run only the command guard"), "{prompt}");
+        for link in [
+            "(settings:permissions#command-safety)",
+            "(settings:models#command-judge)",
+            "(settings:permissions#coding-agent-auto-answer)",
+        ] {
+            assert!(guard.body.contains(link), "the notice links {link}");
+        }
     }
 
     /// `c` replaces `a`.
@@ -1013,7 +1231,14 @@ mod tests {
     /// check alone and the button falls back to a guess, or the full pass.
     #[test]
     fn a_targeted_action_names_a_check_its_audit_section_owns() {
-        let targeted = [("two-dashboards", "workspace-audit/apps", "dashboard rename")];
+        let targeted = [
+            ("two-dashboards", "workspace-audit/apps", "dashboard rename"),
+            (
+                "triggers-need-the-coding-agent-grant",
+                "workspace-audit/triggers",
+                "coding-agent grant",
+            ),
+        ];
         let notices = parse(RELEASE_NOTICES_TOML).expect("release-notices.toml must validate");
         for (id, section, check) in targeted {
             let prompt = notices
@@ -1236,6 +1461,110 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert thread_summary");
+    }
+
+    /// A thread under `parent`, fired by `trigger_id`, a coding agent or not.
+    async fn add_thread_in_tree(
+        pool: &PgPool,
+        parent: Option<uuid::Uuid>,
+        trigger_id: Option<&str>,
+        is_coding_agent: bool,
+    ) -> uuid::Uuid {
+        let thread_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO thread_summaries \
+             (thread_id, title, source, message_count, last_activity, has_response, is_saved, \
+              parent_thread_id, trigger_id, is_coding_agent) \
+             VALUES ($1, 'a thread', 'chat', 0, NOW(), false, false, $2, $3, $4)",
+        )
+        .bind(thread_id)
+        .bind(parent)
+        .bind(trigger_id)
+        .bind(is_coding_agent)
+        .execute(pool)
+        .await
+        .expect("insert thread_summary");
+        thread_id
+    }
+
+    fn trigger_registry(grants: &[(&str, bool)]) -> RwLock<HashMap<String, TriggerConfig>> {
+        let configs = grants.iter().map(|(id, grant)| {
+            let config = TriggerConfig::from_created_payload(&serde_json::json!({
+                "trigger_id": id,
+                "name": format!("Trigger {id}"),
+                "schedule": ["0 0 3 * * *"],
+                "run": { "type": "intent", "intent": "fix what broke" },
+                "coding_agent_grant": grant,
+            }))
+            .expect("build TriggerConfig");
+            (id.to_string(), config)
+        });
+        RwLock::new(configs.collect())
+    }
+
+    async fn facts(pool: &PgPool, grants: &[(&str, bool)], exposure: GuardExposure) -> NoticeFacts {
+        let ws = tempfile::tempdir().unwrap();
+        NoticeFacts::read(pool, ws.path(), &trigger_registry(grants), exposure).await
+    }
+
+    async fn ungranted_fact(pool: &PgPool, grants: &[(&str, bool)]) -> bool {
+        facts(pool, grants, GuardExposure::default())
+            .await
+            .has_ungranted_coding_agent_trigger
+    }
+
+    /// I9: each exposure counts on its own, and only while the workspace
+    /// follows the default.
+    #[tokio::test]
+    async fn the_command_guard_turns_on_only_without_a_row_and_with_an_exposure() {
+        let (pool, db_name) = setup_test_db().await;
+        let none = GuardExposure::default();
+        let mcp = GuardExposure {
+            unapproved_mcp_server: true,
+            ..none
+        };
+        let judge = GuardExposure {
+            judge_unresolved: true,
+            ..none
+        };
+        let turns_on = async |grants: &[(&str, bool)], exposure| {
+            facts(&pool, grants, exposure).await.command_guard_turns_on
+        };
+        assert!(!turns_on(&[], none).await);
+        assert!(turns_on(&[("nightly", false)], none).await);
+        assert!(turns_on(&[], mcp).await);
+        assert!(turns_on(&[], judge).await);
+        for value in ["true", "false"] {
+            PreferenceStore::set_row_for_test(&pool, prefs::COMMAND_GUARD.key(), value)
+                .await
+                .unwrap();
+            assert!(!turns_on(&[("nightly", false)], mcp).await, "{value}");
+        }
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A coding agent two threads below the fire still counts, and a trigger
+    /// whose fires never started one does not.
+    #[tokio::test]
+    async fn an_ungranted_trigger_counts_once_its_tree_holds_a_coding_agent() {
+        let (pool, db_name) = setup_test_db().await;
+        let fire = add_thread_in_tree(&pool, None, Some("nightly"), false).await;
+        assert!(!ungranted_fact(&pool, &[("nightly", false)]).await);
+        let chat = add_thread_in_tree(&pool, Some(fire), None, false).await;
+        add_thread_in_tree(&pool, Some(chat), None, true).await;
+        assert!(ungranted_fact(&pool, &[("nightly", false)]).await);
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn a_granted_or_deleted_trigger_never_counts() {
+        let (pool, db_name) = setup_test_db().await;
+        let fire = add_thread_in_tree(&pool, None, Some("nightly"), false).await;
+        add_thread_in_tree(&pool, Some(fire), None, true).await;
+        assert!(!ungranted_fact(&pool, &[("nightly", true)]).await);
+        assert!(!ungranted_fact(&pool, &[]).await);
+        assert!(!ungranted_fact(&pool, &[("other", false)]).await);
+        teardown_test_db(&db_name).await;
     }
 
     /// The invariant the stamp exists for: nothing stacks over a first run.

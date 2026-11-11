@@ -535,8 +535,8 @@ A plugin ships a trigger by declaring it in a **`trigger.toml`** at
 (`apps/<id>/manifest.json`). The file is a *trigger definition* (see
 `triggers.md` § "On-disk trigger definition"): `name`, `run`
 (`intent` or `script`), `on` (trigger subscriptions), and the usual optional
-fields (`app_id`, `go_to_review`, `group_id`, `side_effect_grant`, and
-`model` / `reasoning_effort` to pin the intent to a specific chat model). Put any
+fields (`app_id`, `go_to_review`, `group_id`, and `model` /
+`reasoning_effort` to pin the intent to a specific chat model). Put any
 procedure the trigger needs in `triggers/<slug>/knowhow/`, beside it.
 
 What install does (ADR 0019):
@@ -553,10 +553,14 @@ What install does (ADR 0019):
 - **Update** re-syncs by `(plugin_id, slug)`: a still-declared slug is updated in
   place (preserving the user's paused state), a new slug is created, a dropped
   slug is removed.
+- **Never grants anything.** A `coding_agent_grant` or `side_effect_grant` in a
+  shipped file is ignored: install creates the trigger ungranted, and an update
+  keeps the user's own answer. If the trigger needs a grant, the plugin's setup
+  tells the user what to tick (`triggers.md` § "Coding-agent grant" and
+  § "Side-effect grant").
 
 The user sees the `trigger.toml` files in the install confirmation panel's file
-list (with their `side_effect_grant` visible in the parsed definition) before
-confirming, so activation is never silent.
+list before confirming, so activation is never silent.
 
 ## What doesn't belong in a plugin
 

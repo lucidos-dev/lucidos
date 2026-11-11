@@ -1233,6 +1233,21 @@ URI works. The rules live in `oauth-providers.md` § Web redirect URI.
   on the wrong computer. Open the remote workspace through this computer's own
   Lucidos instead.
 
+### Sign in with ChatGPT on a headless workspace
+
+The *ChatGPT plan provider* accepts only a loopback redirect,
+`http://127.0.0.1:14981/oauth/callback`. So the browser must run on a computer
+with a Lucidos gateway. No https route or web redirect URI changes that.
+
+- **A headless server or cloud workspace:** open it through the Lucidos on your
+  laptop, then press **Continue with ChatGPT** in Settings → Providers. The
+  laptop's gateway catches the redirect and passes it to the remote
+  workspace, which signs in as itself.
+- **A server with its own desktop browser:** run `lucidos chatgpt-plan sign-in`
+  there, and open the page it prints in that browser.
+- **A phone, or a browser opening a remote address directly:** refused before
+  any page opens. Use one of the two ways above.
+
 ### Claude Code's MCP login is a different flow
 
 A Claude Code session that logs in to an MCP server runs the `claude` CLI's own

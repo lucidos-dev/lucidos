@@ -242,6 +242,7 @@ mod tests {
                 user_agent: None,
                 mode: ActorMode::Agent,
                 source_thread_id: None,
+                emitting_trigger_id: None,
             }),
         };
         let payload = event.to_payload();

@@ -10,16 +10,29 @@ vi.mock('./_bridge', () => ({
   },
 }));
 
+// Each test settles the frame by hand, and says what the box cuts off.
+const fit = vi.hoisted(() => ({
+  settled: [] as Array<() => void>,
+  measure: (): unknown => ({ findings: [], total: 0 }),
+}));
+vi.mock('./widgetFit', () => ({
+  settle: () => new Promise<void>((resolve) => fit.settled.push(resolve)),
+  measureFit: () => fit.measure(),
+  domGeometry: { box: () => ({ width: 320, height: 320 }) },
+}));
+
 import {
   LONG_PRESS_DELAY_MS,
   PRESS_MOVE_TOLERANCE_PX,
   WIDGET_CHANNEL,
   WIDGET_CONTENT_SIZE_MESSAGE_TYPE,
+  WIDGET_FIT_MESSAGE_TYPE,
   WIDGET_MENU_MESSAGE_TYPE,
   WIDGET_PLACE_ATTRIBUTE,
   WIDGET_SIZE_ATTRIBUTE,
   _resetWidgetFrameForTesting,
   contentHeight,
+  contentWidth,
   inSidewaysBox,
   installWidgetFrame,
   widget,
@@ -30,6 +43,14 @@ describe('contentHeight', () => {
     Object.defineProperty(document.body, 'scrollHeight', { configurable: true, value: 120.4 });
     document.body.style.margin = '8px';
     expect(contentHeight(document)).toBe(137);
+  });
+});
+
+describe('contentWidth', () => {
+  it('measures the body and its side margins, overflow included', () => {
+    Object.defineProperty(document.body, 'scrollWidth', { configurable: true, value: 410.2 });
+    document.body.style.margin = '0 6px';
+    expect(contentWidth(document)).toBe(423);
   });
 });
 
@@ -47,6 +68,7 @@ describe('installWidgetFrame', () => {
     vi.stubGlobal('requestAnimationFrame', (run: () => void) => { run(); return 0; });
     vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} });
     Object.defineProperty(document.body, 'scrollHeight', { configurable: true, value: 200 });
+    Object.defineProperty(document.body, 'scrollWidth', { configurable: true, value: 300 });
     document.body.style.margin = '0';
   });
 
@@ -59,7 +81,7 @@ describe('installWidgetFrame', () => {
     installWidgetFrame();
     expect(posted).toEqual([]);
     mark({});
-    expect(posted).toEqual([{ type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, height: 200 }]);
+    expect(posted).toEqual([{ type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, width: 300, height: 200 }]);
   });
 
   it('every mark reports, so the host hears the size in a new place', () => {
@@ -67,8 +89,8 @@ describe('installWidgetFrame', () => {
     mark({ place: 'option' });
     mark({ place: 'option' });
     expect(posted).toEqual([
-      { type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, height: 200 },
-      { type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, height: 200 },
+      { type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, width: 300, height: 200 },
+      { type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, width: 300, height: 200 },
     ]);
   });
 
@@ -77,9 +99,67 @@ describe('installWidgetFrame', () => {
     mark({ place: 'inline', size: 'medium' });
     mark({ place: 'inline', size: 'large' });
     expect(posted).toEqual([
-      { type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, height: 200, size: 'medium' },
-      { type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, height: 200, size: 'large' },
+      { type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, width: 300, height: 200, size: 'medium' },
+      { type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, width: 300, height: 200, size: 'large' },
     ]);
+  });
+
+  describe('a measure token from the fit check', () => {
+    const reports = () => posted.filter((m) => (m as { type?: string }).type === WIDGET_FIT_MESSAGE_TYPE);
+    const settleAll = async () => {
+      for (const resolve of fit.settled.splice(0)) resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    };
+
+    beforeEach(() => {
+      fit.settled.length = 0;
+      fit.measure = () => ({ findings: [], total: 0 });
+    });
+
+    it('reports what the box cuts off once the frame settles, for its token and size', async () => {
+      const finding = { kind: 'ellipsis', edge: 'right', px: 40, path: 'li.flight', text: 'SK4711' };
+      fit.measure = () => ({ findings: [finding], total: 1 });
+      installWidgetFrame();
+      mark({ place: 'inline', size: 'large', measure: 'fit-1' });
+      expect(reports()).toEqual([]);
+      await settleAll();
+      expect(reports()).toEqual([{
+        type: WIDGET_FIT_MESSAGE_TYPE, token: 'fit-1', size: 'large', box: { width: 320, height: 320 }, findings: [finding], total: 1,
+      }]);
+    });
+
+    it('a repeat push with the same token measures once', async () => {
+      installWidgetFrame();
+      mark({ place: 'inline', size: 'large', measure: 'fit-1' });
+      mark({ place: 'inline', size: 'large', measure: 'fit-1', visible: true });
+      await settleAll();
+      expect(reports()).toHaveLength(1);
+    });
+
+    it('a newer token drops the report for the older one', async () => {
+      installWidgetFrame();
+      mark({ place: 'inline', size: 'small', measure: 'fit-1' });
+      mark({ place: 'inline', size: 'medium', measure: 'fit-2' });
+      await settleAll();
+      expect(reports()).toEqual([expect.objectContaining({ token: 'fit-2', size: 'medium' })]);
+    });
+
+    it('a push with no token drops a measure in flight', async () => {
+      installWidgetFrame();
+      mark({ place: 'inline', size: 'small', measure: 'fit-1' });
+      mark({ place: 'inline', size: 'small' });
+      await settleAll();
+      expect(reports()).toEqual([]);
+    });
+
+    it('a measurement that throws reports the error, so the check is never silent', async () => {
+      fit.measure = () => { throw new Error('no layout'); };
+      installWidgetFrame();
+      mark({ place: 'dashboard', size: 'xl', measure: 'fit-1' });
+      await settleAll();
+      expect(reports()).toEqual([{ type: WIDGET_FIT_MESSAGE_TYPE, token: 'fit-1', size: 'xl', error: 'no layout' }]);
+    });
   });
 
   it('a dashboard tile stamps its size and place, and lucidos.widget reads them', () => {

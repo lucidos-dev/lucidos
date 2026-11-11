@@ -95,6 +95,24 @@ fn the_namespace_is_matched_on_whole_segments() {
     assert!(!is_gateway_api_path("/dev/~/api/gateway/v1/pair"));
 }
 
+#[test]
+fn a_listed_workspace_reads_with_or_without_an_unread_count() {
+    let older: ListedWorkspace =
+        serde_json::from_value(json!({"id": "w1", "name": "Work", "health": "healthy"})).unwrap();
+    assert_eq!(older.unread_count, None);
+
+    let newer: ListedWorkspace = serde_json::from_value(
+        json!({"id": "w1", "name": "Work", "health": "healthy", "unread_count": 3}),
+    )
+    .unwrap();
+    assert_eq!(newer.unread_count, Some(3));
+    assert_eq!(serde_json::to_value(&newer).unwrap()["unread_count"], 3);
+    assert!(serde_json::to_value(&older)
+        .unwrap()
+        .get("unread_count")
+        .is_none());
+}
+
 #[tokio::test]
 async fn health_names_the_gateway_protocol() {
     let (state, _dir) = gateway();

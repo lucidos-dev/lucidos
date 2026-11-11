@@ -384,6 +384,81 @@
             "aliases": [],
             "commands": [],
             "flags": [
+              "help"
+            ],
+            "hidden": false,
+            "name": "sign-in"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "forget-account",
+              "help"
+            ],
+            "hidden": false,
+            "name": "sign-out"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "json"
+            ],
+            "hidden": false,
+            "name": "status"
+          }
+        ],
+        "flags": [
+          "help"
+        ],
+        "hidden": false,
+        "name": "chatgpt-plan"
+      },
+      {
+        "aliases": [],
+        "commands": [
+          {
+            "aliases": [],
+            "commands": [
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "help"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "sign-in"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "sign-out"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "status"
+              }
+            ],
+            "flags": [],
+            "hidden": false,
+            "name": "help"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
               "help",
               "url"
             ],
@@ -1308,6 +1383,35 @@
             "flags": [],
             "hidden": false,
             "name": "changes"
+          },
+          {
+            "aliases": [],
+            "commands": [
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "sign-in"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "sign-out"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "status"
+              }
+            ],
+            "flags": [],
+            "hidden": false,
+            "name": "chatgpt-plan"
           },
           {
             "aliases": [],
@@ -2377,6 +2481,13 @@
                 "flags": [],
                 "hidden": false,
                 "name": "dashboard-remove"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "fit"
               },
               {
                 "aliases": [],
@@ -4046,6 +4157,7 @@
             "flags": [
               "actor",
               "app-id",
+              "coding-agent-grant",
               "continue-key",
               "cron-expressions",
               "go-to-review",
@@ -4055,7 +4167,6 @@
               "model",
               "name",
               "on",
-              "permission-wait",
               "provider",
               "reasoning-effort",
               "run",
@@ -4150,6 +4261,7 @@
             "flags": [
               "actor",
               "app-id",
+              "coding-agent-grant",
               "continue-key",
               "cron-expressions",
               "go-to-review",
@@ -4161,7 +4273,6 @@
               "name",
               "on",
               "paused",
-              "permission-wait",
               "provider",
               "reasoning-effort",
               "run",
@@ -4420,6 +4531,17 @@
           },
           {
             "aliases": [],
+            "commands": [],
+            "flags": [
+              "app-id",
+              "help",
+              "thread-id"
+            ],
+            "hidden": false,
+            "name": "fit"
+          },
+          {
+            "aliases": [],
             "commands": [
               {
                 "aliases": [],
@@ -4448,6 +4570,13 @@
                 "flags": [],
                 "hidden": false,
                 "name": "dashboard-remove"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "fit"
               },
               {
                 "aliases": [],
@@ -4789,6 +4918,12 @@
       "ClaudeGatewaySignInCanceled",
       "ClaudeGatewaySignInFailed",
       "ClaudeGatewayManagedSettingsChanged",
+      "ChatGptPlanSignedIn",
+      "ChatGptPlanSignedOut",
+      "ChatGptPlanSignInStarted",
+      "ChatGptPlanSignInCanceled",
+      "ChatGptPlanSignInFailed",
+      "ChatGptPlanLimitReached",
       "DataFileWritten",
       "DataFileDeleted",
       "DataFileEdited",
@@ -4880,6 +5015,9 @@
       "WorkItemGateEscalated",
       "WorkItemWatched",
       "WorkItemUnwatched",
+      "PeopleMessagePosted",
+      "AgentPaused",
+      "AgentResumed",
       "ThreadStarted",
       "ThreadDiscarded",
       "HomeThreadCreated",
@@ -4959,6 +5097,7 @@
       "PushNotificationRequested",
       "AppUiRefreshRequested",
       "AppUiCaptureRequested",
+      "WidgetFitRequested",
       "NavigationRequested",
       "CodingAgentThreadSpawned",
       "CodingAgentDiffChanged",
@@ -5003,8 +5142,7 @@
     "triggers",
     "ui",
     "utils",
-    "widget",
-    "workItems"
+    "widget"
   ],
   "tools": {
     "aliases": {

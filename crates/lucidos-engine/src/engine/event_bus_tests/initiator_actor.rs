@@ -486,6 +486,7 @@ fn persisted_system_events_round_trip_through_json() {
             tap: crate::scheduler::notifications::Tap::Modal,
             actor: None,
             audience: None,
+            push_group: None,
         },
         SystemEvent::PreferencesChanged {
             key: crate::core::prefs::TIMEZONE.key().into(),

@@ -69,24 +69,28 @@ The `push_notifications` **preference** (the "on" switch in settings) only recor
 
 ## §2: The fan-out rule
 
-**Step 0: the audience (team workspaces only).** Every notification records who it is for, as device ids on `NotificationCreated` and its row (ADR 0623). A producer may name them. Otherwise, a notification that opens a thread of a *work item* is for that work item's audience. The engine finds the thread from the tap's thread target, else from `event_id`. The audience is the devices of the work item's *driver* and *watchers*.
+**Step 0: the audience (team workspaces only).** Every notification records who it is for, as device ids on `NotificationCreated` and its row (ADR 0623). A producer may name them. Otherwise, a notification that opens a thread is for its *root thread*'s audience. The engine finds the thread from the tap's thread target, else from `event_id`. The audience is the devices of the root thread's *driver* and *watchers*.
 
-- It is the whole team, as everywhere else, when the gateway knows fewer than two people. It is the whole team too when the work item has no driver, has an escalated gate, or names nobody who holds a device. So a gate always reaches someone, and a personal workspace pushes exactly as before.
+- It is the whole team, as everywhere else, when the gateway knows fewer than two people. It is the whole team too when the root thread has no driver, has an escalated gate, or names nobody who holds a device. So a gate always reaches someone, and a personal workspace pushes exactly as before.
 - Web push skips subscriptions outside the audience. `PresenceCheck` and `NativePushRequested` carry `audience` (device ids), and a page outside it shows nothing and pongs `not_shown`.
 - The inbox still lists every notification, but one outside your audience reads as read: it never lights your bell badge or your app badge.
 - A lookup that fails reaches the whole team.
 
 **Read state is per person on a team gateway.** With two or more people, a read from a device a person holds is that person's: it clears the notification on their other devices and leaves everyone else's unread. Mark all read works the same way, and so does clearing the in-app toast and the desktop banner: `NativePushDismissRequested` carries the reader's devices as `audience`. A caller no person holds reads and writes the team's shared flag, and so does the agent's `notifications` tool. With one person, everything reads the shared flag, as before. Each device's push badge counts what its own person has not read.
 
-**Work item notices (team workspaces only).** Three notifications reach one or a few people besides the gates:
+**People-only messages (team workspaces only, ADR 0649).** A *people-only message* raises one notification for its mentioned people plus the root thread's driver and watchers, never the sender's own person. A message that wakes the agent and mentions people tells only the mentioned. Either way a mentioned person with no role becomes a watcher first.
+
+A people-only message's notification records a *push group* on `NotificationCreated` and its row. Every push in the group carries the tag `people-<thread_id>`, so a burst replaces one banner, and an **Unwatch** action (see Layer 1). iOS draws no action buttons, so there it is a plain banner.
+
+**Thread people notices (team workspaces only).** Three notifications reach one or a few people besides the gates:
 
 | Notice | Sent when | For |
 |---|---|---|
-| "Kim answered your gate" | someone answers a gate on a work item another person drives, and so takes it over | the person who drove it |
-| "Kim took over" | someone taps **Take** on a work item another person drives | the person who drove it |
-| "Work item done" | the work item's root thread is archived | its driver and watchers, except whoever archived it |
+| "Kim answered your gate" | someone answers a gate on a root thread another person drives, and so takes it over | the person who drove it |
+| "Kim took over" | someone taps **Take** on a root thread another person drives | the person who drove it |
+| "Thread done" | the root thread is archived | its driver and watchers, except whoever archived it |
 
-Each opens the work item's root thread. Nobody hears one on a gateway with fewer than two people, and nobody whose person holds no device.
+Each opens the root thread. Nobody hears one on a gateway with fewer than two people, and nobody whose person holds no device.
 
 **Config change notices (team workspaces only).** A *config change* posts a notification naming who made it: a repository, trigger, MCP server or credential added, changed or removed (`engine/config_change.rs`). It reaches everyone but the person who made it. A change by an agent, or by a device no person holds, reaches the whole team. A change nobody made posts nothing: an engine write, an identity collapse, a one-shot trigger deleting itself.
 
@@ -622,21 +626,25 @@ Every push payload the engine emits conforms to the [W3C Push API "Declarative W
     "title": "...",
     "body": "...",
     "navigate": "https://host/<slug>/?notification=...&thread=...&event=...&tap=...",
-    "tag": "<notification_id or lucidos-notification>",
+    "tag": "<notification_id, people-<thread_id> for a push group, or lucidos-notification>",
+    "actions": [{ "action": "unwatch", "title": "Unwatch" }],
     "data": {
       "notification_id": "...",
       "thread_id": "...",
       "event_id": "...",
       "app_id": "...",
       "tap": { "kind": "modal" | "navigate", ... },
-      "navigate": "#notification=...  (HASH form, same params, for the Chrome SW)"
+      "navigate": "#notification=...  (HASH form, same params, for the Chrome SW)",
+      "unwatch_thread_id": "..."
     }
   },
   "app_badge": 3
 }
 ```
 
-Built by `build_push_payload` in `crates/lucidos-engine/src/scheduler/push.rs`. The top-level `web_push: 8030` is the Push API spec's opt-in for declarative parsing (homage to RFC 8030). Safari 18.5+ recognizes the declarative fields. On iOS the SW `push` handler still fires and must still call `showNotification()` for a visible banner (see Net behaviour). On tap, the only reliable field before page JS runs is `notification.navigate`. `notificationclick` is not a reliable channel for installed iOS PWAs.
+Built by `build_push_payload` in `crates/lucidos-engine/src/scheduler/push.rs`. `actions` and `unwatch_thread_id` appear only for a people-only message's push group, which `PushGroup::apply` stamps on inside the size fitting. The thread's driver gets the tag without the action, since a driver cannot unwatch. The SW passes `actions` to `showNotification`. A tap on Unwatch POSTs `/api/v1/threads/:thread_id/people/unwatch` and marks the notification read, and opens nothing.
+
+The top-level `web_push: 8030` is the Push API spec's opt-in for declarative parsing (homage to RFC 8030). Safari 18.5+ recognizes the declarative fields. On iOS the SW `push` handler still fires and must still call `showNotification()` for a visible banner (see Net behaviour). On tap, the only reliable field before page JS runs is `notification.navigate`. `notificationclick` is not a reliable channel for installed iOS PWAs.
 
 The top-level **`app_badge`** is the Declarative Web Push app-icon-badge field (sibling of `web_push` / `notification`). It is set at send time to the count that subscription's install should show: `0` clears the badge, and it is omitted only when no count can be read.
 - It is the **only** way a *closed* iOS PWA updates its home-screen badge: iOS reads `app_badge` in its parent process WITHOUT running the service worker.
@@ -651,7 +659,7 @@ The top-level **`app_badge`** is the Declarative Web Push app-icon-badge field (
 - The cut lands on a UTF-8 char boundary (real bodies carry emoji), snaps back to nearby whitespace when there is some, and appends `…`.
 - Truncation logs `[Push] Truncated <kind> body to fit the 3052 B payload ceiling: …` with both lengths. The surviving `build()` failure arm says plainly that NO push reached that subscription.
 
-**Only the body may shrink.** `web_push`, `notification.title`, both navigate URL forms, `tag`, the whole `data` block and the top-level `app_badge` survive intact. Cutting any of them breaks the tap path. A body that fits passes through byte-identical. If the envelope alone exceeds the ceiling (an enormous title, never truncated), the body is dropped and the failure logged per subscription, with no panic. The **notification row always keeps the full text**: the push is a banner, not the content of record.
+**Only the body may shrink.** `web_push`, `notification.title`, both navigate URL forms, `tag`, `actions`, the whole `data` block and the top-level `app_badge` survive intact. Cutting any of them breaks the tap path. A body that fits passes through byte-identical. If the envelope alone exceeds the ceiling (an enormous title, never truncated), the body is dropped and the failure logged per subscription, with no panic. The **notification row always keeps the full text**: the push is a banner, not the content of record.
 
 The PWA manifest declares `launch_handler: { client_mode: "navigate-existing" }`, so the OS reuses the existing PWA window (no new tab) when it navigates.
 

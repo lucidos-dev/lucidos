@@ -645,6 +645,8 @@ $ lucidos threads context-ceiling 200k
 
 Start a new *thread* in another (or this same) workspace: a *chat thread* by default, or a *coding-agent thread* with a coding-agent flag. `--to` takes an absolute path, or a bare workspace name. A bare name resolves against `$LUCIDOS_WORKSPACES_ROOT` when set, else the directory holding your own workspace, else `~/workspaces`. So a sibling workspace is always reachable by name. Caller provenance (`caller_*` fields) defaults from `$LUCIDOS_WORKSPACE` / `$LUCIDOS_THREAD_ID` / `$LUCIDOS_EVENT_ID`, which the engine sets on every spawned subprocess. Prints a clickable `[title](thread:<ws>/<uuid>)` markdown link on stdout.
 
+**Agents keep the default actor mode.** Omit `--mode`: it defaults to `agent`. The flag controls who authored the request. Never choose `--mode human` from an agent: it claims the user authored the request, and the CLI refuses it before resolving a workspace or sending a request. Do not strip the origin token or use a direct API call to bypass the restriction.
+
 A workspace on another install is not a sibling: a packaged app and a dev checkout serve separate workspace sets, so pass its absolute path. That is the only route there, since `run_coding_agent(workspace=…)` takes a basename alone.
 
 `--relation top` (the default) starts an independent thread that does not report back. `--relation child` is a same-workspace spawn with a callback: the child reports to the calling thread when it finishes.
@@ -1420,9 +1422,9 @@ write. A key the catalog keeps for the owner, such as `command_guard` or
 Manage *triggers*: scheduled (cron) and/or event-driven automations. Generated
 from the manifest. The rich fields (`run`, `on`, `cron_expressions`,
 `side_effect_grant`, `mcp_servers`, `continue_key`) are passed as JSON strings.
-`actor` is a plain payload path string. `permission_wait` is a plain string:
-`deny`, whole minutes from 1 to 1440, or `indefinite` (see `triggers.md`
-§ Permission wait).
+`actor` is a plain payload path string. Run from an agent's own process, a
+`--side-effect-grant` or `--coding-agent-grant` that widens the trigger's grants
+answers with a refusal: only the owner grants a trigger.
 
 ```bash
 $ lucidos triggers list
@@ -1468,8 +1470,11 @@ back rather than assuming the schedule means what you intended.
 
 `create`/`update` accept `--name`, `--run`, `--cron-expressions`, `--on`,
 `--app-id`, `--go-to-review`, `--group-id`, `--side-effect-grant`,
-`--mcp-servers`, `--slug`, `--model`, `--reasoning-effort`, `--provider`;
-`update`/`delete`/`run` take `--id <uuid>`. The chat agent's in-process
+`--coding-agent-grant`, `--mcp-servers`, `--slug`, `--model`,
+`--reasoning-effort`, `--provider`; `update`/`delete`/`run` take `--id <uuid>`.
+`--coding-agent-grant true` is refused from inside a Lucidos thread, since only
+the user grants it (`triggers.md` § "Coding-agent grant"). `false` always
+passes. The chat agent's in-process
 equivalent is the grouped `triggers` tool (`action: create | list | update |
 delete | pause | resume | run`). Pause/resume are tool-only there; the CLI
 pauses via `update --paused`.
@@ -1602,18 +1607,20 @@ The routes answer in any workspace, from whatever summary trees exist; a
 Classic workspace has none. The Lucidos Agent reaches the same four through its
 `recall` tool, offered only once a Tree workspace's trees are ready.
 
-### `lucidos widgets list | size --app-id <ID> --size S [--thread-id T] [--params JSON] | make-reusable --app-id <ID> | stop-reusing --app-id <ID> | dashboard [--dashboard D] | dashboard-add --app-id <ID> [--dashboard D] [--params JSON] [--label L] [--size S] | dashboard-remove --app-id <ID> [--dashboard D] [--params JSON] | arrange [--dashboard D] --tiles JSON`
+### `lucidos widgets list | size --app-id <ID> --size S [--thread-id T] [--params JSON] | fit --app-id <ID> [--thread-id T] | make-reusable --app-id <ID> | stop-reusing --app-id <ID> | dashboard [--dashboard D] | dashboard-add --app-id <ID> [--dashboard D] [--params JSON] [--label L] [--size S] | dashboard-remove --app-id <ID> [--dashboard D] [--params JSON] | arrange [--dashboard D] --tiles JSON`
 
 *Reusable widgets*, a thread's widget card sizes, and the two *dashboards*. A
 widget is an app folder whose app manifest says `"kind": "widget"`. A reply
 embeds it, `![Name](app:<id>)`, and it shows there as an *inline widget*, never
 in the apps list. A widget the user wants in view goes on a dashboard.
-`size --thread-id` defaults to `$LUCIDOS_THREAD_ID`, the session's own thread.
+`size` and `fit` default `--thread-id` to `$LUCIDOS_THREAD_ID`, the session's
+own thread.
 
 ```bash
 $ lucidos widgets size --app-id fare-grid --size large
 $ lucidos widgets size --app-id lucidos-sound-player \
     --params '{"clip":"artifacts/voices/marin.mp3"}' --size medium
+$ lucidos widgets fit --app-id fare-grid
 $ lucidos widgets make-reusable --app-id fare-grid
 $ lucidos widgets list
 $ lucidos widgets dashboard --dashboard desktop
@@ -1635,6 +1642,18 @@ $ lucidos widgets arrange --dashboard phone \
   A card with none starts at the widget's default size. Another thread's
   widget must be reusable first, and set one only when the user named it.
   `POST /api/v1/widgets/size`, which answers `{"ok": true}`.
+- `fit` runs the *widget fit check*, and writes nothing. An open Lucidos
+  window renders every declared size on the desk tile and on a 360 px phone
+  column. It uses the largest UI scale any device uses. It prints a
+  `[WIDGET FIT]` note: a pass on one line, or each box that cuts content off,
+  with its size, surface, frame px and the cut text. With no visible window,
+  or no answer in time (6 s per size, plus 6 s), it prints `not checked` and
+  the reason.
+
+  A coding agent that writes widget files with its own tools runs it after
+  each change. The thread names where the request rides. A calling device's
+  window renders it when visible, else the most recently seen visible window.
+  `POST /api/v1/widgets/fit`, which answers `{"note": "<text>"}`.
 - `make-reusable` and `stop-reusing` flip the `reusable` flag in the app
   manifest and commit it. A widget that stops being reusable belongs to its
   origin thread again, so Delete (a thread) on that thread removes it. When
@@ -1715,7 +1734,7 @@ $ lucidos models update --id z-ai/glm-5.2 --vision true
 ```
 
 A provider is one of `vertex`, `anthropic`, `openai`, `openrouter`, `xai`,
-`opencode-free`, `local`, `claude-gateway`.
+`opencode-free`, `local`, `claude-gateway`, `chatgpt-plan`.
 
 **A model has an ordered list of routes, one per backend that serves it.**
 Each route names a `provider`, an optional wire `id` (default: the model id),
@@ -2317,7 +2336,7 @@ The engine also validates the upstream's certificate, and refuses a credential o
 
 #### Builtin provider proxies (no `apis.json` entry)
 
-Every model provider the engine holds auth for is also a proxy, with no `apis.json` entry and no credential to request. The names are `anthropic`, `claude-gateway`, `local`, `openai`, `openrouter`, `typesafe`, `vertex` and `xai`. The engine injects the key it already uses for chat. So never ask the user for a key these already cover.
+Every model provider the engine holds auth for is also a proxy, with no `apis.json` entry and no credential to request. The names are `anthropic`, `claude-gateway`, `local`, `openai`, `openrouter`, `typesafe`, `vertex` and `xai`. The engine injects the key it already uses for chat. So never ask the user for a key these already cover. The ChatGPT plan (`chatgpt-plan`) has no proxy: apps and scripts never spend it.
 
 **Each default base URL already includes `/v1`.** Send the path after it. A `local` base you configure may lack it, and the agent's context says which. `/v1/models` against `openai` reaches `https://api.openai.com/v1/v1/models` and answers 404.
 
@@ -2546,6 +2565,57 @@ lucidos claude-gateway sign-out
 - Starting is `POST /api/v1/providers/claude-gateway/sign-in` with a JSON body,
   `{}` or `{"url": "<U>"}`. Stopping is
   `POST /api/v1/providers/claude-gateway/sign-out`. Both need a person's
+  credential, and an app cannot reach either.
+
+### `lucidos chatgpt-plan status [--json]` / `sign-in` / `sign-out [--forget-account]`
+
+Sign Lucidos in with ChatGPT, for the *ChatGPT plan provider*: GPT models on
+the user's own ChatGPT subscription. Settings → Providers does the
+same through the same routes, so a sign-in started here shows there too.
+
+```bash
+lucidos chatgpt-plan sign-in
+# Open this page in a browser on this computer:
+# https://auth.openai.com/oauth/authorize?...
+# Waiting for ChatGPT. Press Ctrl-C to stop waiting; the sign-in keeps running.
+# Signed in with ChatGPT as user@example.com.
+
+lucidos chatgpt-plan status
+# Signed in with ChatGPT as user@example.com.
+
+lucidos chatgpt-plan sign-out
+# Signed out of ChatGPT.
+
+lucidos chatgpt-plan sign-out --forget-account
+# Forgot the ChatGPT account. Any ChatGPT account may sign in next.
+```
+
+- Open the page in a browser on the computer running Lucidos. ChatGPT sends
+  the browser back to `http://127.0.0.1:14981/oauth/callback`, which only that
+  computer's Lucidos gateway answers. A browser on another device is refused
+  before any page is made. An engine started without the gateway refuses too.
+- The sign-in waits ten minutes for the browser to come back.
+- The engine keeps the tokens and refreshes them. No command prints one.
+- `status --json` prints the engine's own answer from
+  `GET /api/v1/providers/chatgpt-plan`: `account` (`email`, `signed_in_at`),
+  `sign_in`, `sign_in_again`, `registered`, `paused_until` and
+  `pause_remaining_ms`.
+- `sign_in_again` is true when OpenAI refused the stored sign-in and none has
+  been made since. Run `sign-in` again.
+- `paused_until` is set while the plan's usage limit pauses plan requests.
+  Lucidos sends none until then, and never moves the call to the `openai`
+  route.
+- `sign-out` also asks OpenAI to revoke the refresh token, best effort.
+- After the first sign-in, only that ChatGPT account may sign in again, and
+  `registered` is true. `sign-out --forget-account` forgets the account, so
+  the next sign-in registers Lucidos with OpenAI afresh and may use any account.
+  A usage limit set for the old registration in ChatGPT does not carry over.
+  Settings → Providers offers the same as **Use another account**.
+- Starting is `POST /api/v1/providers/chatgpt-plan/sign-in`, which answers
+  `authorize_url` and `expires_at`. Stopping is
+  `POST /api/v1/providers/chatgpt-plan/sign-out`, with `?forget_account=true`
+  to forget the account. It answers `signed_out` and `account_forgotten`.
+  Both need a person's
   credential, and an app cannot reach either.
 
 ### `lucidos pair` (mint a code that lets a device in)

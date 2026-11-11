@@ -83,6 +83,9 @@ cron = "0.15"
 sha2 = "0.10"
 sha1 = "0.10"
 hmac = "0.12"
+# Verifies the ChatGPT plan sign-in's RS256 `id_token`. The same features as
+# web-push's copy, so the tree gains no crate.
+jwt-simple = { version = "0.12", default-features = false, features = ["pure-rust"] }
 rand = "0.8"
 tempfile = "3"
 glob = "0.3"

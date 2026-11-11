@@ -505,6 +505,7 @@ async fn an_agents_cancel_of_its_own_child_still_reports_a_cancellation() {
             user_agent: None,
             mode: ActorMode::Agent,
             source_thread_id: Some(parent_id),
+            emitting_trigger_id: None,
         })),
     })
     .await

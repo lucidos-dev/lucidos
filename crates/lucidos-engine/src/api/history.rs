@@ -1267,6 +1267,7 @@ mod tests {
                     model_registry: Default::default(),
                     not_served: Default::default(),
                     claude_gateway_access: None,
+                    chatgpt_plan_access: None,
                 },
             )
             .await

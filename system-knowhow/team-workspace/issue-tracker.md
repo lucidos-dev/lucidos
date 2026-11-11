@@ -16,11 +16,11 @@ Read `system-knowhow/team-workspace` first. This page is one source of work for 
 |---|---|---|
 | 1 | Webhook `issue-tracker` | Verifies the tracker's signature and emits `IssueTrackerDelivered` |
 | 2 | Script trigger `issue-tracker-translate` | Maps the author to a teammate's email, skips the bot and strangers, emits `IssueActivityReceived` |
-| 3 | Intent trigger `issue-tracker-intake` | Starts or continues the work item, keyed by repository and issue number |
+| 3 | Intent trigger `issue-tracker-intake` | Starts or continues the root thread, keyed by repository and issue number |
 | 4 | Script trigger `issue-tracker-questions` | Mirrors each gate question to the issue as a comment |
 | 5 | Script trigger `issue-tracker-outcomes` | Posts the root thread's answer to the issue, short, with a link back |
 
-A comment on the issue arrives through steps 1 to 3 again. Its key matches the open thread, so it continues the work item. When that thread waits on a question, the comment answers it.
+A comment on the issue arrives through steps 1 to 3 again. Its key matches the open thread, so it continues the root thread. When that thread waits on a question, the comment answers it.
 
 ## 1. The bot account and the API entry
 
@@ -77,9 +77,10 @@ lucidos triggers create --name "Issue tracker intake" --slug issue-tracker-intak
   --run '{"type":"intent","intent":"Work on this issue for the team, and follow the team gate policy."}'
 ```
 
-- The key starts with `source`, the literal `issue-tracker` the script wrote. The outbound scripts read it to know the work item is theirs.
+- The key starts with `source`, the literal `issue-tracker` the script wrote. The outbound scripts read it to know the root thread is theirs.
 - `actor` credits the teammate whose email it is. An answer from the issue sets them as driver.
-- Ask the user to tick the side-effect grant the work needs (`triggers.md` § "Side-effect grant"). Pushing and opening pull requests need *Call external APIs* and *cloud CLI*.
+- Its runs start coding agents, so ask the user to tick *Allow coding agents* on it (`triggers.md` § "Coding-agent grant"). Only the listed teammates steer those agents, since the translate script drops strangers.
+- The coding agent pushes and opens pull requests under the workspace's grants, not the trigger's side-effect grant. A push those grants do not cover shows a card and waits for a human.
 
 ## 5. The outbound script triggers
 
@@ -94,11 +95,11 @@ lucidos triggers create --name "Issue tracker outcomes" --slug issue-tracker-out
   --run '{"type":"script","path":"triggers/issue-tracker-outcomes/scripts/run.py"}'
 ```
 
-Both skip any thread whose work item the tracker did not start. The outcome script posts only the root thread's answers, never a sub-thread's. Both stay short and link back: the issue is a ramp into the workspace, never a mirror of it.
+Both skip any thread whose root thread the tracker did not start. The outcome script posts only the root thread's answers, never a sub-thread's. Both stay short and link back: the issue is a ramp into the workspace, never a mirror of it.
 
 ## Check it end to end
 
 1. Open a test issue as a teammate. A thread starts, named by the issue, with no driver.
 2. Ask the agent to ask a question. A comment with the question appears on the issue.
 3. Reply on the issue. The question card shows answered, and the factory app names the teammate as driver.
-4. Archive the thread. The next comment on that issue starts a fresh work item.
+4. Archive the thread. The next comment on that issue starts a fresh root thread.

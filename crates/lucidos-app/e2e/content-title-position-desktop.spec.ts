@@ -42,13 +42,14 @@ import { createIframeAppFixture, ensureHomeThread } from './db-helpers';
 import { assertHealthy, gotoWithRetry, clickVisibleElement, hideDashboardRail, watchPreferenceReads, openSettingsView } from './helpers';
 
 const APP_ID = 'e2e-desktop-title-position';
-const APP_NAME = 'Half Marathon';
+const APP_NAME = 'Trip countdown';
 // The same view type under a title long enough to outgrow --desktop-nav-span
 // (20rem), so it is the ellipsis case rather than merely a wider one.
 const APP_ID_LONG = 'e2e-desktop-title-position-long';
 const APP_NAME_LONG = 'Half Marathon Training Plan and Weekly Readiness Review';
 let fixture: { cleanup: () => void };
 let fixtureLong: { cleanup: () => void };
+let widgetFixture: { cleanup: () => void };
 
 test.use({ viewport: { width: 1280, height: 800 } });
 
@@ -172,6 +173,11 @@ test.describe('the desktop content title holds its position across views', () =>
       html: `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${APP_NAME}</title></head><body><div id="ready">ready</div></body></html>`,
       js: '',
     });
+    widgetFixture = createIframeAppFixture(`${APP_ID}-widget`, {
+      manifest: { name: APP_NAME, kind: 'widget', reusable: true },
+      html: '<!DOCTYPE html><html><body>Trip countdown widget</body></html>',
+      js: '',
+    });
     fixtureLong = createIframeAppFixture(APP_ID_LONG, {
       manifest: { id: APP_ID_LONG, name: APP_NAME_LONG, description: 'e2e fixture' },
       html: `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${APP_NAME_LONG}</title></head><body><div id="ready">ready</div></body></html>`,
@@ -182,6 +188,7 @@ test.describe('the desktop content title holds its position across views', () =>
   test.afterAll(() => {
     fixture.cleanup();
     fixtureLong.cleanup();
+    widgetFixture.cleanup();
   });
 
   test.beforeEach(async ({ page }) => {
@@ -190,6 +197,26 @@ test.describe('the desktop content title holds its position across views', () =>
     // before this one may have truncated the threads, home included.
     ensureHomeThread();
     await hideDashboardRail(page);
+  });
+
+  test('a real widget preview at 175% keeps its name whole without a widget suffix', async ({ page }) => {
+    await page.setViewportSize({ width: 1920, height: 1080 });
+    await page.addInitScript((id) => {
+      localStorage.setItem('app-window-open', id);
+      localStorage.setItem('lucidos-thread-drawer-open', 'true');
+      localStorage.setItem('lucidos-split-ratio', '0.6');
+    }, `${APP_ID}-widget`);
+    const preferencesReady = watchPreferenceReads(page);
+    await gotoWithRetry(page, '/');
+    await preferencesReady();
+    await page.evaluate(() => document.documentElement.style.setProperty('--user-ui-scale', '175%'));
+    await expect(page.locator('iframe[data-role="app-ui-frame"]:visible')).toBeVisible();
+    await settled(page);
+    const title = page.locator('.desktop-header .pane-header-title-text');
+    await expect(title).toBeVisible();
+    expect.soft(await title.evaluate(el => el.scrollWidth <= el.clientWidth), 'widget name fits').toBe(true);
+    await expect.soft(title).not.toContainText('(widget)');
+    await expect(title).toHaveText(APP_NAME);
   });
 
   test('reported 1920 by 1080 at 175% keeps real destinations whole', async ({ page }) => {

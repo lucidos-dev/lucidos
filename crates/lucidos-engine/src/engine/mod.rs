@@ -1,4 +1,5 @@
 pub(crate) mod agent_context;
+pub mod agent_pause;
 pub(crate) mod agent_question;
 pub mod agent_recovery;
 pub(crate) mod agent_session;
@@ -18,6 +19,7 @@ mod change_ops;
 pub mod change_summary_consumer;
 pub mod changelog;
 pub(in crate::engine) mod chat;
+pub mod chatgpt_plan_sign_in;
 // Scheduler boot recovery shares the turn boundary list with chat sweeps.
 pub(crate) use chat::recovery::turn_terminal_events;
 pub(crate) mod claude_code;
@@ -69,6 +71,7 @@ pub mod mcp_permission;
 pub(crate) mod memory;
 pub mod memory_consumer;
 pub mod model_call;
+pub(crate) mod pending_answers;
 mod pending_apply_actors;
 pub mod pending_change_watch;
 pub(crate) mod preferences;
@@ -105,13 +108,14 @@ pub use turn_end::{
     AnsweredQuestion, EvalReadDecision, EvalWakeDecision, InFlight, OpeningSource, ParentView,
     PushedNotification, TurnRead,
 };
+pub mod thread_people;
 pub mod types;
 pub(crate) mod until_restored;
 pub(crate) mod user_profile;
 pub mod widget_embed;
+pub(crate) mod widget_fit;
 pub mod widget_guidance;
 pub mod widgets;
-pub mod work_item;
 pub mod worktree_cleanup;
 
 pub(crate) use agentic_loop::{
@@ -685,9 +689,18 @@ pub struct LucidosEngine {
     /// App UI captures waiting for an answer. `capture_app` / `refresh_app`
     /// insert one; `POST /api/v1/app-capture` resolves it.
     pub(crate) pending_captures: Arc<tools::app_capture::PendingCaptures>,
+    /// Widget fit checks waiting for a page's answer. The fit check inserts
+    /// one; `POST /api/v1/widgets/fit-report` resolves it.
+    pub(crate) pending_widget_fits: Arc<widget_fit::PendingWidgetFits>,
     /// The Claude gateway sign-in in progress, if any. Allowed-ephemeral: a
     /// restart mid-sign-in only means starting again.
     pub(crate) claude_gateway_sign_in: Arc<claude_gateway_sign_in::ClaudeGatewaySignIn>,
+    /// The Sign in with ChatGPT attempt in progress, if any. Allowed-ephemeral
+    /// like the gateway slot above.
+    pub(crate) chatgpt_plan_sign_in: Arc<chatgpt_plan_sign_in::ChatGptPlanSignIn>,
+    /// The ChatGPT plan access every provider build shares, held here so the
+    /// status route reads the same limit pause the provider observes.
+    pub(crate) chatgpt_plan_access: crate::llm::chatgpt_plan::ChatGptPlanAccess,
     /// Plugin installs awaiting user confirmation in the install panel.
     /// Key: install_id (UUID). Value: staged plugin tree + manifest. Inserted
     /// when `install_plugin` returns the `[PLUGIN_INSTALL_REQUEST]` sentinel;
@@ -1184,6 +1197,9 @@ fn provider_config_trigger(event: &event_bus::BusEvent) -> Option<String> {
         BusEvent::System(
             SystemEvent::ClaudeGatewaySignedIn { .. } | SystemEvent::ClaudeGatewaySignedOut { .. },
         ) => Some("the Claude gateway sign-in".to_string()),
+        BusEvent::System(
+            SystemEvent::ChatGptPlanSignedIn { .. } | SystemEvent::ChatGptPlanSignedOut { .. },
+        ) => Some("the ChatGPT plan sign-in".to_string()),
         _ => None,
     }
 }
@@ -1207,8 +1223,8 @@ fn provider_config_read(
 /// Three kinds of change qualify, because a provider is configured three ways.
 /// A `Credential{Created,Updated,Deleted}` for a service in
 /// [`crate::llm::PROVIDER_CREDENTIAL_SERVICES`], a `PreferencesChanged` for a
-/// key in [`crate::llm::PROVIDER_PREFERENCE_KEYS`], and a Claude gateway
-/// sign-in or sign-out. The keyless OpenCode Free tier has no credential at
+/// key in [`crate::llm::PROVIDER_PREFERENCE_KEYS`], and a Claude gateway or
+/// ChatGPT plan sign-in or sign-out. The keyless OpenCode Free tier has no credential at
 /// all, so a credential-only watch would leave its toggle needing a restart.
 ///
 /// Each way, re-resolve `select_provider` against current DB state via
@@ -1257,6 +1273,24 @@ pub(crate) fn claude_gateway_access_factory(
             ),
         )
     })
+}
+
+/// The ChatGPT plan's token source and limit pause, made once so every
+/// provider build shares one refresh lock and one pause.
+pub(crate) fn chatgpt_plan_access(
+    pool: sqlx::PgPool,
+    event_bus: event_bus::EventBus,
+) -> crate::llm::chatgpt_plan::ChatGptPlanAccess {
+    use crate::llm::chatgpt_plan::{AuthServer, LimitPause, StoredChatGptPlanTokens};
+    crate::llm::chatgpt_plan::ChatGptPlanAccess {
+        pause: Arc::new(LimitPause::new(event_bus.clone())),
+        tokens: Arc::new(StoredChatGptPlanTokens::new(
+            pool,
+            event_bus,
+            AuthServer::openai(),
+            Arc::default(),
+        )),
+    }
 }
 
 /// Rebuild the active LLM provider and search chain, and swap both in place.

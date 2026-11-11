@@ -1175,46 +1175,122 @@ fn apply_update_replaces_and_clears_side_effect_grant() {
     assert!(config.side_effect_grant.is_empty());
 }
 
-// --- Permission wait ---
+// --- Coding-agent grant ---
 
+/// Absent reads as no grant, so a trigger stored before the field existed
+/// never starts a coding agent until its owner grants it.
 #[test]
-fn permission_wait_reads_each_wire_form_and_survives_a_payload_round_trip() {
-    use crate::core::permission_wait::PermissionWait;
-    assert_eq!(created_with(json!({})).permission_wait, None);
-    for (wire, wait) in [
-        (json!("deny"), PermissionWait::Deny),
-        (json!(45), PermissionWait::Minutes(45)),
-        (json!("indefinite"), PermissionWait::Indefinite),
-    ] {
-        let config = created_with(json!({ "permission_wait": wire }));
-        assert_eq!(config.permission_wait, Some(wait));
-        let again = TriggerConfig::from_created_payload(&config.to_created_payload()).unwrap();
-        assert_eq!(again.permission_wait, Some(wait));
-    }
-}
-
-/// A stored value the parser refuses reads as unset, so one bad row cannot
-/// wedge the in-memory config.
-#[test]
-fn a_refused_permission_wait_reads_as_unset() {
-    for bad in [json!(0), json!(1441), json!("forever"), json!(true)] {
-        assert_eq!(
-            created_with(json!({ "permission_wait": bad })).permission_wait,
-            None
-        );
-    }
+fn coding_agent_grant_defaults_false_and_survives_a_payload_round_trip() {
+    assert!(!created_with(json!({})).coding_agent_grant);
+    assert!(!created_with(json!({ "coding_agent_grant": "yes" })).coding_agent_grant);
+    let config = created_with(json!({ "coding_agent_grant": true }));
+    assert!(config.coding_agent_grant);
+    let again = TriggerConfig::from_created_payload(&config.to_created_payload()).unwrap();
+    assert!(again.coding_agent_grant);
 }
 
 #[test]
-fn apply_update_replaces_and_clears_permission_wait() {
-    use crate::core::permission_wait::PermissionWait;
-    let mut config = created_with(json!({ "permission_wait": 10 }));
-    config.apply_update(&json!({ "trigger_id": "t-model", "permission_wait": "indefinite" }));
-    assert_eq!(config.permission_wait, Some(PermissionWait::Indefinite));
+fn apply_update_sets_and_revokes_coding_agent_grant() {
+    let mut config = created_with(json!({}));
+    config.apply_update(&json!({ "trigger_id": "t-model", "coding_agent_grant": true }));
+    assert!(config.coding_agent_grant);
     config.apply_update(&json!({ "trigger_id": "t-model", "name": "renamed" }));
-    assert_eq!(config.permission_wait, Some(PermissionWait::Indefinite));
-    config.apply_update(&json!({ "trigger_id": "t-model", "permission_wait": null }));
-    assert_eq!(config.permission_wait, None);
+    assert!(config.coding_agent_grant);
+    config.apply_update(&json!({ "trigger_id": "t-model", "coding_agent_grant": false }));
+    assert!(!config.coding_agent_grant);
+}
+
+/// The owner granted this trigger's work. An agent that changes the work, its
+/// events or its MCP servers drops both grants; a rename or a pause does not.
+#[test]
+fn an_unowned_edit_to_the_work_clears_the_grants() {
+    for grants in [
+        json!({ "coding_agent_grant": true }),
+        json!({ "side_effect_grant": ["email"] }),
+    ] {
+        let granted = created_with(grants.clone());
+        let edited = |update: serde_json::Value| {
+            let mut next = granted.clone();
+            next.apply_update(&update);
+            next
+        };
+        for rewrite in [
+            json!({ "run": { "type": "intent", "intent": "start a coding agent" } }),
+            json!({ "on": [{ "event_type": "MailReceived" }] }),
+            json!({ "mcp_servers": ["slack"] }),
+        ] {
+            assert!(
+                granted.unowned_edit_clears_grants(&edited(rewrite.clone())),
+                "{grants} {rewrite}"
+            );
+        }
+        let mut with_servers = granted.clone();
+        with_servers.apply_update(&json!({ "mcp_servers": ["github", "slack"] }));
+        let mut reordered = with_servers.clone();
+        reordered.apply_update(&json!({ "mcp_servers": ["slack", "github"] }));
+        assert!(!with_servers.unowned_edit_clears_grants(&reordered));
+        for harmless in [json!({ "name": "renamed" }), json!({ "paused": true })] {
+            assert!(
+                !granted.unowned_edit_clears_grants(&edited(harmless.clone())),
+                "{grants} {harmless}"
+            );
+        }
+    }
+    let ungranted = created_with(json!({}));
+    let mut next = ungranted.clone();
+    next.apply_update(&json!({ "mcp_servers": ["slack"] }));
+    assert!(!ungranted.unowned_edit_clears_grants(&next));
+}
+
+/// The clear payload drops both grants through `apply_update`.
+#[test]
+fn clear_grants_in_drops_both_grants() {
+    let mut granted = created_with(json!({
+        "coding_agent_grant": true, "side_effect_grant": ["email"],
+    }));
+    let mut payload = json!({ "trigger_id": "t-model" });
+    TriggerConfig::clear_grants_in(&mut payload);
+    granted.apply_update(&payload);
+    assert!(!granted.holds_a_grant());
+    assert!(granted
+        .grants_cleared_notice()
+        .contains("allowed side-effects"));
+}
+
+/// A new category, or the coding-agent grant, widens. A subset, the same set
+/// or a revoke does not.
+#[test]
+fn widens_a_grant_compares_both_grants() {
+    let held = created_with(json!({ "side_effect_grant": ["email", "cloud_cli"] }));
+    let next = |update: serde_json::Value| {
+        let mut next = held.clone();
+        next.apply_update(&update);
+        next
+    };
+    assert!(held.widens_a_grant(&next(json!({ "side_effect_grant": ["external_api"] }))));
+    assert!(held.widens_a_grant(&next(json!({ "coding_agent_grant": true }))));
+    for narrower in [
+        json!({ "side_effect_grant": ["cloud_cli", "email"] }),
+        json!({ "side_effect_grant": ["email"] }),
+        json!({ "side_effect_grant": [] }),
+        json!({ "coding_agent_grant": false }),
+    ] {
+        assert!(!held.widens_a_grant(&next(narrower.clone())), "{narrower}");
+    }
+}
+
+// --- Retired permission wait ---
+
+/// A trigger created with the retired permission wait still replays.
+/// The field is ignored.
+#[test]
+fn a_retired_permission_wait_is_ignored() {
+    let config = created_with(json!({ "permission_wait": 45 }));
+    assert!(!config
+        .to_created_payload()
+        .as_object()
+        .unwrap()
+        .contains_key("permission_wait"));
 }
 
 // --- MCP servers (ADR 0430) ---

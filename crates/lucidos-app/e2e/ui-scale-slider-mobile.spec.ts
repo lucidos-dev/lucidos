@@ -16,6 +16,7 @@
  */
 import { test, expect, Page } from './fixtures';
 import { apiRequest, assertHealthy, isMobileViewport, navigateToApp, waitForEventStream, waitForPaneAtRest } from './helpers';
+import { psql } from './db-helpers';
 
 const UI_SCALE_BUTTON = '[data-search-anchor="appearance:ui-scale"] .settings-option';
 
@@ -54,9 +55,34 @@ async function tapRowAt(page: Page, fraction: number): Promise<void> {
 }
 
 test.describe('Mobile UI-scale slider', () => {
+  let savedScale = false;
+
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
     test.skip(!isMobileViewport(page), 'Touch behavior only, so the desktop project skips it');
+    savedScale = false;
+    page.on('request', (request) => {
+      const url = new URL(request.url());
+      if (request.method() === 'PUT' && url.pathname.endsWith('/api/v1/preferences')
+        && url.searchParams.get('key') === 'ui-scale') {
+        savedScale = true;
+      }
+    });
+  });
+
+  // Each tap persists the scale for this device. The widget fit check renders at
+  // the largest scale any device holds, so a leftover 200% reaches later specs.
+  // The slider saves without awaiting, one write at a time, so the cleanup waits
+  // for the last one to commit. A DELETE before it would see the row come back.
+  test.afterEach(async ({ page }) => {
+    if (savedScale) {
+      const last = (await appliedScale(page)).replace(/%$/, '');
+      await expect.poll(
+        () => psql(`SELECT count(*) FROM preferences WHERE key = 'ui-scale' AND value = '${last}'`),
+        { message: `the last ui-scale save (${last}) never committed`, timeout: 10_000 },
+      ).not.toBe('0');
+    }
+    psql(`DELETE FROM preferences WHERE key = 'ui-scale'`);
   });
 
   /**

@@ -48,8 +48,8 @@ test.describe('Thread title and rename: mobile', () => {
     // by any scroll that is not their own gesture. This test parks the reader at
     // the top and drags down from there, so it starts them disarmed.
     await disarmFollowSeed(page);
-    // Dynamic bars default OFF, which pins the header. This test asserts the
-    // header (and sticky title bar) scroll off, so turn them on before the page
+    // The e2e baseline pins the header. This test asserts the header (and
+    // sticky title bar) scroll off, so turn dynamic bars on before the page
     // boots.
     await enableMobileDynamicBars(page);
     await navigateToApp(page);

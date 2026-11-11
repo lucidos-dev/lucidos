@@ -33,13 +33,21 @@ use super::context_build::summarize_user_topics;
 /// so two models echo each other into agreement. Print it as `User` and the
 /// doer obeys an instruction nobody gave.
 ///
+/// On a team gateway a person's typed message reads under its operator's
+/// name from `operators`, so the agent can tell Sam from Alex (ADR 0649).
+///
 /// A free function rather than a line inside the formatter, so the rule has one
 /// definition that a test can reach.
-pub(super) fn speaker_label(m: &crate::core::store::SessionMessage) -> &str {
+pub(super) fn speaker_label<'a>(
+    m: &'a crate::core::store::SessionMessage,
+    operators: &crate::gateway_operators::OperatorSnapshot,
+) -> std::borrow::Cow<'a, str> {
     match (m.role.as_str(), m.agent.as_ref()) {
-        ("user", _) => "User",
-        (_, Some(agent)) => agent.speaker_label(),
-        _ => "Assistant",
+        ("user", _) => operators
+            .speaker_of_device(m.sender_device_id.as_deref())
+            .into(),
+        (_, Some(agent)) => agent.speaker_label().into(),
+        _ => "Assistant".into(),
     }
 }
 
@@ -207,16 +215,17 @@ impl LucidosEngine {
 
             match messages_result {
                 Ok((messages, image_walk)) => {
-                    // All messages except the one we just appended (last one)
-                    let all_prior: Vec<_> = if messages
-                        .last()
-                        .map(|m| m.role == "user" && m.content == user_message)
-                        .unwrap_or(false)
-                    {
-                        messages[..messages.len().saturating_sub(1)].to_vec()
-                    } else {
-                        messages
-                    };
+                    // All messages except the one that woke this turn. It is
+                    // the newest message the agent reads, though people-only
+                    // messages posted since may follow it.
+                    let mut all_prior = messages;
+                    let woke_at = all_prior
+                        .iter()
+                        .rposition(|m| m.role == "user" && m.content == user_message)
+                        .filter(|&at| all_prior[at + 1..].iter().all(|m| m.role == "user"));
+                    if let Some(at) = woke_at {
+                        all_prior.remove(at);
+                    }
 
                     let prior_image_hashes: Vec<Vec<String>> =
                         filter_recent_history_image_hashes(&all_prior, MAX_HISTORY_IMAGE_MESSAGES);
@@ -258,6 +267,7 @@ impl LucidosEngine {
                         .iter()
                         .map(|d| d.body.as_str())
                         .collect();
+                    let operators = crate::gateway_operators::current();
 
                     // Format a message for history context with tiered truncation.
                     // - Last HISTORY_VERBATIM_TAIL messages: fully verbatim (only 15K safety net)
@@ -268,7 +278,7 @@ impl LucidosEngine {
                                               is_verbatim: bool,
                                               msg_idx: usize|
                      -> String {
-                        let role = speaker_label(m);
+                        let role = speaker_label(m, &operators);
                         let content = format_history_content(
                             &m.content,
                             &m.role,

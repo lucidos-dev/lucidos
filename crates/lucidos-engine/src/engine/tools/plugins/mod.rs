@@ -1586,7 +1586,7 @@ pub async fn propose_local_patch_upstream(
     };
     let request =
         build_upstream_patch_thread_request(thread_id, &plugin, &patch_path, actor.as_ref());
-    engine.thread_queue.submit(request, actor, None).await;
+    engine.thread_queue.submit(request, actor).await;
 
     Ok(ProposedUpstream {
         patch_path,
@@ -1684,7 +1684,7 @@ async fn spawn_plugin_setup_thread(
     actor: Option<MessageOrigin>,
 ) {
     let request = build_setup_thread_request(thread_id, plugin, occasion, actor.as_ref());
-    engine.thread_queue.submit(request, actor, None).await;
+    engine.thread_queue.submit(request, actor).await;
 }
 
 /// Build the Thread Queue request for a plugin setup thread. Pure (no engine,

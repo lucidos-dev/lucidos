@@ -61,6 +61,7 @@ const TYPE_SOURCES: &[(&str, &str)] = &[
     ("ThreadDirection", "engine/thread_events/actor.rs"),
     ("CaptureFormat", "engine/thread_events/capture.rs"),
     ("AbortCause", "engine/thread_events/cause.rs"),
+    ("AgentPauseCause", "engine/thread_events/cause.rs"),
     ("CancelCause", "engine/thread_events/cause.rs"),
     ("EventWaitCancelCause", "engine/thread_events/cause.rs"),
     ("UnproposedReason", "engine/thread_events/cause.rs"),

@@ -2127,3 +2127,105 @@ async fn only_a_coding_agent_restart_abort_names_a_restart() {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 }
+
+fn people_message(text: &str, device_id: &str) -> ThreadEvent {
+    ThreadEvent::PeopleMessagePosted {
+        text: text.into(),
+        user_image_hashes: vec![],
+        device_id: Some(device_id.into()),
+        mentioned_operator_ids: vec![],
+    }
+}
+
+/// Emit a people-only message with its device as the actor, as `chat_submit`
+/// records it.
+async fn emit_people_message(bus: &EventBus, thread_id: Uuid, text: &str, device_id: &str) {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: people_message(text, device_id),
+        meta: EventMeta::with_actor(Some(crate::engine::thread_events::MessageOrigin::Device {
+            device_id: device_id.into(),
+        })),
+    })
+    .await
+    .unwrap()
+    .expect("emit produced no EmitResult");
+}
+
+/// I8: people-only messages ride the next woken prompt in order, and the wake
+/// after it does not repeat them (ADR 0649).
+#[tokio::test]
+async fn people_only_messages_reach_the_next_woken_prompt_once() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+    emit_message_received(&bus, thread_id, "turn 1").await;
+
+    emit_people_message(&bus, thread_id, "the copy feels long", "dev-alex").await;
+    emit_people_message(&bus, thread_id, "agreed, cut it", "dev-sam").await;
+    let woken = emit_message_received(&bus, thread_id, "cut the copy").await;
+    let note = compute_turn_gap_note(&pool, thread_id, woken, Some(BRANCH))
+        .await
+        .expect("the paused talk must reach the woken prompt")
+        .note;
+    let first = note.find("the copy feels long").expect(&note);
+    let second = note.find("agreed, cut it").expect(&note);
+    assert!(first < second, "oldest first: {note}");
+    assert!(note.contains("[People-only messages"), "{note}");
+
+    let next = emit_message_received(&bus, thread_id, "and the title").await;
+    assert!(
+        compute_turn_gap_note(&pool, thread_id, next, Some(BRANCH))
+            .await
+            .is_none(),
+        "the woken prompt carried the talk, so the next one must not"
+    );
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// On a team gateway each line carries its sender's operator name; a long
+/// paused conversation keeps only its newest messages.
+#[test]
+fn the_people_block_names_each_speaker_and_keeps_the_newest() {
+    use crate::gateway_operators::{Operator, OperatorSnapshot};
+    let operator = |id: &str, name: &str, device: &str| Operator {
+        id: id.into(),
+        name: name.into(),
+        emails: vec![],
+        device_ids: vec![device.into()],
+    };
+    let team = OperatorSnapshot {
+        operators: vec![
+            operator("op-sam", "Sam", "dev-sam"),
+            operator("op-alex", "Alex", "dev-alex"),
+        ],
+        relayed: vec![],
+    };
+    let payload = |text: &str, device: &str| {
+        serde_json::json!({
+            "text": text,
+            "actor": {"kind": "device", "device_id": device},
+        })
+    };
+    let block = super::people_talk_block(
+        &[
+            payload("too long", "dev-alex"),
+            payload("cut it", "dev-sam"),
+        ],
+        &team,
+    )
+    .expect("two messages make a block");
+    assert!(block.contains("\nAlex: too long\nSam: cut it]"), "{block}");
+
+    let many: Vec<_> = (0..super::MAX_PEOPLE_MESSAGES + 2)
+        .map(|i| payload(&format!("line {i}"), "dev-sam"))
+        .collect();
+    let block = super::people_talk_block(&many, &team).expect("a block");
+    assert!(block.contains("2 earlier message(s) not shown"), "{block}");
+    assert!(!block.contains("Sam: line 1\n"), "{block}");
+    assert!(block.contains(&format!("Sam: line {}]", super::MAX_PEOPLE_MESSAGES + 1)));
+    assert!(super::people_talk_block(&[], &team).is_none());
+}

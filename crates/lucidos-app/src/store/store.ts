@@ -433,7 +433,8 @@ export function aliasRetiredSettingsSubview(raw: string): string {
 
 /** Where a retired search id or scroll anchor now lives. The provider blocks
  *  left Models for their own Providers page, and their anchors took the page's
- *  name with them (`providerAnchor`).
+ *  name with them (`providerAnchor`). The command judge moved to Models, and
+ *  auto-answer to coding-agent permissions.
  *
  *  A `Map` for the same reason as `RETIRED_SETTINGS_SUBVIEWS`: persisted Search
  *  recents are an untrusted key source. */
@@ -441,6 +442,8 @@ const RETIRED_SETTINGS_ANCHORS = new Map<string, string>([
   ['models:providers', 'providers'],
   ['models:vertex-ai', 'providers:vertex'],
   ['models:region', 'providers:vertex-region'],
+  ['command-safety:judge-model', 'models:command-judge'],
+  ['command-safety:coding-agents', 'permissions:coding-agent-auto-answer'],
   ...[
     'anthropic', 'openai', 'openrouter', 'xai', 'opencode-free', 'local', 'claude-gateway',
     'typesafe', 'cloudflare-workers-ai', 'system-one-custom',

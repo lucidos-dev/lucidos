@@ -246,6 +246,23 @@ describe('getContentTitleShort: the header bar’s form of the title', () => {
     expect(getContentTitle()).toBe('Notification - Lucidos is asking');
   });
 
+  it.each([undefined, 'unknown', PENDING_TITLE_PLACEHOLDER, 'Plan the trip'])(
+    'keeps widget details out of the compact title with origin %s', (origin) => {
+      if (origin && origin !== 'unknown') seedThread('origin', origin);
+      const overlay = { type: 'app-ui' as const, app: {
+        ...fakeApp, name: 'Trip countdown', kind: 'widget' as const,
+        origin_thread_id: origin ? 'origin' : undefined,
+      } };
+      panelOverlay.value = overlay;
+      expect(getContentTitleShort()).toBe('Trip countdown');
+      const full = origin === 'Plan the trip'
+        ? 'Trip countdown (widget from Plan the trip)' : 'Trip countdown (widget)';
+      expect(getContentTitle()).toBe(full);
+      expect(navEntryTitle({ menuItem: 'apps', settingsSubview: 'main', overlay,
+        wipPreviewThreadId: null })).toBe(full);
+    },
+  );
+
   it('names the app previewing work in progress, not the thread doing the work', () => {
     seedThread('thread-1', 'Fix the streak counter');
     panelOverlay.value = { type: 'app-ui', app: fakeApp };

@@ -49,6 +49,7 @@ function trigger(over: Partial<TriggerInfo> = {}): TriggerInfo {
     cron_expressions: ['0 0 9 * * *'],
     timezone: 'UTC',
     paused: false,
+    coding_agent_grant: false,
     run: { type: 'intent', intent: 'check CI' },
     ...over,
   };

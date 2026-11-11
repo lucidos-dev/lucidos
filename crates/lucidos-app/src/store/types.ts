@@ -18,7 +18,7 @@ import type {
   PluginSetupOccasion,
   RecalledMemory,
 } from '../generated/thread-event-wire';
-import type { PermissionWait, Tap } from '@lucidos/sdk';
+import type { Tap } from '@lucidos/sdk';
 
 // Generated from the Rust payload types. Re-exported so a consumer reaching
 // for the wire shape and one reaching for a view model share one spelling.
@@ -571,9 +571,6 @@ export type SideEffectCategory =
  *  different payload shapes without one filter constraining the others. */
 export type { EventSubscription };
 
-/** A trigger's *permission wait*. Re-exported so the SDK holds the one wire form. */
-export type { PermissionWait };
-
 // A trigger config (event-sourced).
 // Configs may be schedule-only, event-only, or hybrid; `deriveTriggerType()`
 // classifies the config shape. The actual invocation that fired a given run
@@ -615,9 +612,9 @@ export interface TriggerInfo {
    *  side-effect categories it may perform unattended. Engine omits the field
    *  when empty, so readers must tolerate absence (= no grant). */
   side_effect_grant?: SideEffectCategory[];
-  /** The trigger's *permission wait*. Engine omits the field when the trigger
-   *  uses the workspace preference `unattended_permission_wait`. */
-  permission_wait?: PermissionWait;
+  /** The trigger's *coding-agent grant*: whether its runs may start
+   *  coding-agent threads. Always present. */
+  coding_agent_grant: boolean;
   /** Plugin provenance (ADR 0019) — the id of the *plugin* that auto-registered
    *  this trigger. Absent for user-created triggers. Drives the "from <plugin>"
    *  chip in the triggers panel. */

@@ -79,12 +79,6 @@ export function draggedRung(rungs: readonly ServedIntelligenceRung[], from: numb
   return current;
 }
 
-/** The row a drag at `y` is over: the first whose bottom edge is below `y`,
- *  else the last. `rows` run top to bottom. */
-export function rowUnder(rows: readonly { index: number; bottom: number }[], y: number): number {
-  return (rows.find((row) => y < row.bottom) ?? rows[rows.length - 1]).index;
-}
-
 /** `rungs` with the rung at `index` switched on or off. */
 export function toggledRung(rungs: readonly ServedIntelligenceRung[], index: number): ServedIntelligenceRung[] {
   return rungs.map((r, i) => (i === index ? { ...r, on: !r.on } : r));

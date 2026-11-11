@@ -4,7 +4,8 @@
 //!
 //! 1. The trigger **side-effect grant** (Phase 5) round-trips through
 //!    `POST/PUT/GET /api/v1/triggers` as a typed `SideEffectCategory` set, and an
-//!    unknown category is rejected at the serde boundary.
+//!    unknown category is rejected at the serde boundary. An app frame may not
+//!    widen it. The coding-agent grant round-trips beside it.
 //! 2. The command-checkpoint **undo** and **diff** endpoints (Phase 4) fail
 //!    closed on an unknown or malformed checkpoint id.
 //! 3. The guard itself, end to end (Phase 4 and the 2026-08-06 addendum): a
@@ -164,11 +165,85 @@ async fn trigger_side_effect_grant_round_trips() {
     delete_trigger(&client, &trigger_id).await;
 }
 
+/// Send a trigger write stamped as an app frame and return the JSON answer.
+async fn app_frame_trigger_write(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    query: &str,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    client
+        .request(method, format!("{}/api/v1/triggers{query}", base_url()))
+        .header("x-lucidos-app-id", "habit-tracker")
+        .json(&body)
+        .send()
+        .await
+        .expect("trigger write failed")
+        .json()
+        .await
+        .expect("Invalid JSON")
+}
+
+/// Only the owner widens a side-effect grant (ADR 0641). An app frame is
+/// refused a new category on create and update, and may still narrow it.
+#[tokio::test]
+async fn an_app_frame_cannot_widen_a_side_effect_grant() {
+    let client = user_client().await;
+    set_timezone_utc(&client).await;
+    let name = unique_marker("e2e-app-grant");
+
+    let refused = app_frame_trigger_write(
+        &client,
+        reqwest::Method::POST,
+        "",
+        json!({
+            "name": name,
+            "run": { "type": "intent", "intent": "noop" },
+            "cron_expressions": ["0 0 8 * * *"],
+            "side_effect_grant": ["email"],
+        }),
+    )
+    .await;
+    assert_eq!(refused["success"], false, "{refused:?}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("Only the owner")),
+        "{refused:?}"
+    );
+
+    create_trigger_with_grant(&client, &name, &["email", "cloud_cli"]).await;
+    let trigger_id = poll_trigger_grant(&client, &name, &["cloud_cli", "email"]).await;
+    let query = format!("?id={trigger_id}");
+
+    let widened = app_frame_trigger_write(
+        &client,
+        reqwest::Method::PUT,
+        &query,
+        json!({ "side_effect_grant": ["email", "external_api"] }),
+    )
+    .await;
+    assert_eq!(widened["success"], false, "{widened:?}");
+
+    let narrowed = app_frame_trigger_write(
+        &client,
+        reqwest::Method::PUT,
+        &query,
+        json!({ "side_effect_grant": ["email"] }),
+    )
+    .await;
+    assert_eq!(narrowed["success"], true, "{narrowed:?}");
+    poll_trigger_grant(&client, &name, &["email"]).await;
+
+    delete_trigger(&client, &trigger_id).await;
+}
+
 /// Poll `GET /api/v1/triggers` until the trigger named `name` lists `expected`
-/// as its `permission_wait` (`Null` = absent, the workspace preference).
-async fn poll_permission_wait(
+/// as its `field` (`Null` = absent).
+async fn poll_trigger_field(
     client: &reqwest::Client,
     name: &str,
+    field: &str,
     expected: &serde_json::Value,
 ) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -188,27 +263,26 @@ async fn poll_permission_wait(
             .find(|t| t["name"].as_str() == Some(name))
             .cloned();
         if let Some(ref t) = found {
-            if &t["permission_wait"] == expected {
+            if &t[field] == expected {
                 return t["id"].as_str().unwrap().to_string();
             }
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "Trigger '{name}' permission_wait did not become {expected} within 5s \
+            "Trigger '{name}' {field} did not become {expected} within 5s \
              (last saw {found:?})",
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
-/// The *permission wait* round-trips in its one wire form: minutes as a
-/// number, the others as strings. Null clears it, and a refused value saves
-/// nothing.
+/// The owner's client grants and revokes the *coding-agent grant*, and the list
+/// always carries the field, so a missing one never reads as granted.
 #[tokio::test]
-async fn trigger_permission_wait_round_trips() {
+async fn trigger_coding_agent_grant_round_trips() {
     let client = user_client().await;
     set_timezone_utc(&client).await;
-    let name = unique_marker("e2e-permission-wait");
+    let name = unique_marker("e2e-coding-agent-grant");
 
     let created: serde_json::Value = client
         .post(format!("{}/api/v1/triggers", base_url()))
@@ -216,7 +290,6 @@ async fn trigger_permission_wait_round_trips() {
             "name": name,
             "run": { "type": "intent", "intent": "noop" },
             "cron_expressions": ["0 0 8 * * *"],
-            "permission_wait": 15,
         }))
         .send()
         .await
@@ -225,35 +298,22 @@ async fn trigger_permission_wait_round_trips() {
         .await
         .expect("Invalid JSON");
     assert_eq!(created["success"], true, "{created:?}");
-    let trigger_id = poll_permission_wait(&client, &name, &json!(15)).await;
+    let field = "coding_agent_grant";
+    let trigger_id = poll_trigger_field(&client, &name, field, &json!(false)).await;
 
-    let put = |body: serde_json::Value| {
-        let client = client.clone();
-        let url = format!("{}/api/v1/triggers?id={}", base_url(), trigger_id);
-        async move {
-            client
-                .put(url)
-                .json(&body)
-                .send()
-                .await
-                .expect("PUT /triggers failed")
-                .json::<serde_json::Value>()
-                .await
-                .expect("Invalid JSON")
-        }
-    };
-
-    let res = put(json!({ "permission_wait": "indefinite" })).await;
-    assert_eq!(res["success"], true, "{res:?}");
-    poll_permission_wait(&client, &name, &json!("indefinite")).await;
-
-    let refused = put(json!({ "permission_wait": "forever" })).await;
-    assert_ne!(refused["success"], true, "{refused:?}");
-    poll_permission_wait(&client, &name, &json!("indefinite")).await;
-
-    let res = put(json!({ "permission_wait": null })).await;
-    assert_eq!(res["success"], true, "{res:?}");
-    poll_permission_wait(&client, &name, &serde_json::Value::Null).await;
+    for grant in [true, false] {
+        let res: serde_json::Value = client
+            .put(format!("{}/api/v1/triggers?id={}", base_url(), trigger_id))
+            .json(&json!({ field: grant }))
+            .send()
+            .await
+            .expect("PUT /triggers failed")
+            .json()
+            .await
+            .expect("Invalid JSON");
+        assert_eq!(res["success"], true, "{res:?}");
+        poll_trigger_field(&client, &name, field, &json!(grant)).await;
+    }
 
     delete_trigger(&client, &trigger_id).await;
 }

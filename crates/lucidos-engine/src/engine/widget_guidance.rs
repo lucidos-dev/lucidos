@@ -34,7 +34,9 @@ pub fn widgets_rules(audience: WidgetAudience) -> String {
             "\n\n## Widgets\n\n{}{EMBED_RULE}",
             making_guidance(automatic)
         ),
-        WidgetAudience::CodingAgent => format!("\n\n## Widget embeds\n\n{EMBED_RULE}"),
+        WidgetAudience::CodingAgent => {
+            format!("\n\n## Widget embeds\n\n{EMBED_RULE}{CODING_AGENT_FIT_RULE}")
+        }
     }
 }
 
@@ -58,8 +60,9 @@ fn making_guidance(automatic: bool) -> String {
     });
     text.push_str(
         "Lead with one shape, not a table: a .ring, a .bar-run, or \
-         a .choice-row to pick from. Skip the title, since its bar shows the name, and draw no \
-         border inside the widget. Keep the accent for the one thing that matters. Animate what \
+         a .choice-row to pick from. Draw no border inside the widget. Keep the accent for the \
+         one thing that matters. Fix every cut a [WIDGET FIT] note names; never ellipsize data \
+         text. Animate what \
          a tap changes, on the --duration-* tokens, and stay calm under data-motion=\"reduce\". \
          Read data through lucidos.* and listen on lucidos.sse instead of baking it into the \
          HTML. It takes small, medium and large unless create_app sizes changes them or adds \
@@ -76,6 +79,10 @@ const EMBED_RULE: &str = "EMBED A WIDGET WHERE A PICTURE DRAWS: `![label](app:<i
      listed names. Embed one when the user must hear, see or try something to decide, such as \
      a voice sample or a video clip in each option. Put an option's sample only in it, never above the card. \
      One embed per option. A bad embed refuses the card: fix it and ask again.\n";
+
+/// A coding agent's own file tools carry no fit note, so it asks for one.
+const CODING_AGENT_FIT_RULE: &str = "After you change a widget's files, run `lucidos widgets fit \
+     --app-id <id>` and fix every cut it names.\n";
 
 /// What opens the widgets list. Every workspace lists the built-in widgets,
 /// so it is *system prompt footprint* (ADR 0413).
@@ -168,7 +175,11 @@ mod tests {
             assert!(chat.ends_with(&shared), "{chat}");
         }
         let coding = build_widgets_section(&widgets, WidgetAudience::CodingAgent);
-        assert!(coding.ends_with(&shared), "{coding}");
+        let coding_tail = format!(
+            "{EMBED_RULE}{CODING_AGENT_FIT_RULE}{}",
+            widgets_list(&widgets)
+        );
+        assert!(coding.ends_with(&coding_tail), "{coding}");
         assert!(
             !coding.contains("create_app"),
             "a coding agent makes no widget: {coding}"
@@ -251,6 +262,21 @@ mod tests {
                 assert!(chat.contains(class), "{class}: {chat}");
                 assert!(!coding.contains(class), "{class}: {coding}");
             }
+        }
+    }
+
+    /// Both agents learn the widget fit check: the chat agent reads its note,
+    /// and a coding agent, whose own file tools get none, runs the CLI verb.
+    /// ADR 0632 removed the card's bar, so nothing says a bar shows the name.
+    #[test]
+    fn both_agents_learn_the_widget_fit_check() {
+        let coding = build_widgets_section(&[player()], WidgetAudience::CodingAgent);
+        assert!(coding.contains("lucidos widgets fit --app-id"), "{coding}");
+        for automatic in [true, false] {
+            let chat = build_widgets_section(&[player()], WidgetAudience::Chat { automatic });
+            assert!(chat.contains("[WIDGET FIT]"), "{chat}");
+            assert!(chat.contains("never ellipsize data text"), "{chat}");
+            assert!(!chat.contains("bar shows the name"), "{chat}");
         }
     }
 

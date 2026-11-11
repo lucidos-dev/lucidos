@@ -1271,23 +1271,45 @@ fn token_error_truncates_a_huge_body_on_a_char_boundary() {
 #[test]
 fn callback_query_extracts_the_code_without_mangling_it() {
     assert_eq!(
-        parse_callback_query("code=abc123&session_state=xyz").unwrap(),
+        parse_callback_query("code=abc123&session_state=xyz")
+            .unwrap()
+            .code,
         "abc123"
     );
     // Percent escapes decode; a literal `+` in an opaque code must NOT become a
     // space (RFC 3986 query semantics, unlike form encoding).
     assert_eq!(
-        parse_callback_query("code=a%2Fb%2Bc&state=s").unwrap(),
+        parse_callback_query("code=a%2Fb%2Bc&state=s").unwrap().code,
         "a/b+c"
     );
     assert_eq!(
-        parse_callback_query("state=s&code=trailing").unwrap(),
+        parse_callback_query("state=s&code=trailing").unwrap().code,
         "trailing"
     );
     // A key that merely starts with "code" must not be mistaken for it.
     assert_eq!(
-        parse_callback_query("code_verifier=v&code=real").unwrap(),
+        parse_callback_query("code_verifier=v&code=real")
+            .unwrap()
+            .code,
         "real"
+    );
+}
+
+#[test]
+fn callback_query_carries_an_issued_client_id_beside_the_code() {
+    let grant = parse_callback_query("code=c&client_id=app_1%2Bx&state=s").unwrap();
+    assert_eq!(
+        grant,
+        AuthorizationGrant {
+            code: "c".into(),
+            client_id: Some("app_1+x".into()),
+        }
+    );
+    assert_eq!(parse_callback_query("code=c").unwrap().client_id, None);
+    assert_eq!(
+        parse_callback_query("code=c&client_id=").unwrap().client_id,
+        None,
+        "an empty client id is no client id"
     );
 }
 

@@ -1865,6 +1865,31 @@ impl EventBus {
                 .await?;
                 a_call_makes_the_thread_real(tx, thread_id).await?
             }
+            // A people-only message starts no turn, so it moves no column a
+            // turn owns. It is still a person writing in the thread, so it
+            // carries recency and lists the thread like a typed message does.
+            //
+            // It can be a thread's first event: a thread started with a
+            // teammate. So it upserts, and it makes a draft a real chat thread.
+            ThreadEvent::PeopleMessagePosted { text, .. } => {
+                sqlx::query(&format!(
+                    r#"INSERT INTO thread_summaries (thread_id, first_message, source, initiator, created_at, last_activity, last_user_action, message_count, status, state, has_response)
+                       VALUES ($1, $2, 'chat', 'user', NOW(), NOW(), NOW(), 0, {IDLE}, 'active', TRUE)
+                       ON CONFLICT (thread_id) DO UPDATE
+                       SET last_activity = NOW(),
+                           last_user_action = NOW(),
+                           has_response = TRUE,
+                           first_message = COALESCE(thread_summaries.first_message, EXCLUDED.first_message),
+                           source = CASE WHEN thread_summaries.state = 'composing' THEN 'chat' ELSE thread_summaries.source END,
+                           state = 'active'
+                       WHERE thread_summaries.state != 'discarded'"#
+                ))
+                .bind(thread_id)
+                .bind(text)
+                .execute(&mut **tx)
+                .await?;
+                Vec::new()
+            }
             // Events that don't affect thread_summaries metadata or status.
             // Exhaustive match — adding a new ThreadEvent variant forces you to decide
             // whether it needs a projection update. Never use `_ =>` here.
@@ -1878,13 +1903,16 @@ impl EventBus {
             | ThreadEvent::OAuthAuthorizationRequested { .. }
             | ThreadEvent::FormRequestResolved { .. }
             | ThreadEvent::McpConsentRequested { .. }
-            // Work item roles resolve operators at read time, so no summary
-            // column can hold them (`engine::work_item`).
+            // Thread people resolve operators at read time, so no summary
+            // column can hold them (`engine::thread_people`).
             | ThreadEvent::WorkItemDriverTaken
             | ThreadEvent::WorkItemDriverReleased
             | ThreadEvent::WorkItemGateEscalated { .. }
-            | ThreadEvent::WorkItemWatched
+            | ThreadEvent::WorkItemWatched { .. }
             | ThreadEvent::WorkItemUnwatched
+            // The pause folds from events at read time (`engine::agent_pause`).
+            | ThreadEvent::AgentPaused { .. }
+            | ThreadEvent::AgentResumed { .. }
             // Transient events (never persisted, never reach this function)
             | ThreadEvent::CumulativeTextUpdated { .. }
             | ThreadEvent::LlmCallRetried { .. }
@@ -1892,6 +1920,7 @@ impl EventBus {
             | ThreadEvent::PushNotificationRequested
             | ThreadEvent::AppUiRefreshRequested { .. }
             | ThreadEvent::AppUiCaptureRequested { .. }
+            | ThreadEvent::WidgetFitRequested { .. }
             | ThreadEvent::NavigationRequested { .. }
             | ThreadEvent::CodingAgentThreadSpawned { .. }
             | ThreadEvent::CodingAgentDiffChanged { .. }

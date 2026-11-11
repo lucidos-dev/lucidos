@@ -139,10 +139,11 @@ pub(super) async fn list_mcp_servers(
     // The window the resolved model actually has, so the page can state the
     // share of it these tools occupy.
     let (model, context_window) = state.engine.chat_model_and_window().await;
+    let budget_model = state.engine.request_budget_model_for(&model, None);
     let budget = state
         .engine
         .mcp_manager
-        .budget(context_window)
+        .budget(&budget_model, context_window)
         .await
         .map_err(|e| ApiError::internal(format!("Failed to cost MCP servers: {e}")))?;
 

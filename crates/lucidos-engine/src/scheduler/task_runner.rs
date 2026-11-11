@@ -15,11 +15,10 @@ use super::{trigger_id_to_uuid, MISSED_TASK_GRACE_MINUTES};
 
 /// Information about a tracked task.
 ///
-/// `cancel_token` is observed by the task runner (between scheduled executions)
-/// and by the agentic loop (between iterations). Signaling cancel lets the task
-/// finish its current operation cleanly and emit terminal events; callers must
-/// not abort the `JoinHandle` directly, or the thread is left without a
-/// `ResponseGenerated`/`ResponseCanceled` event and shows as stuck "running".
+/// `cancel_token` governs scheduling only: the runner observes it between
+/// fires and while it waits on one. It never reaches a run, so stopping a
+/// runner leaves a run already executing alone. Callers must not abort the
+/// `JoinHandle` directly: the runner then cannot drop its queued fire.
 pub(super) struct TrackedTask {
     pub(super) handle: JoinHandle<()>,
     pub(super) task_name: String,
@@ -45,9 +44,8 @@ fn track(tracked: &mut HashMap<uuid::Uuid, TrackedTask>, task_id: uuid::Uuid, ta
 /// Spawn a task runner that executes on schedule.
 ///
 /// Returns the `JoinHandle` (for liveness checks) and a `CancellationToken` the
-/// task observes between executions and inside the agentic loop. Cancel the
-/// token instead of aborting the handle to let the task emit its terminal
-/// events before exiting.
+/// runner observes between fires. Cancel the token instead of aborting the
+/// handle, so a still-queued fire is dropped before the runner exits.
 fn spawn_task_runner(
     trigger_id: String,
     task_name: String,
@@ -232,51 +230,70 @@ async fn run_task_loop(
             );
         }
 
-        // Execute through the Thread Queue: admission control may hold the
-        // fire until capacity frees. Awaiting completion preserves the
-        // loop's semantics (next occurrence computed after the run ends) —
-        // saturation back-pressures this trigger's schedule instead of
-        // stacking unbounded concurrent runs. Execution bookkeeping
-        // (ACTIVE_TASK_COUNT, record_trigger_executed, failure logging)
-        // lives in the queue executor.
-        let outcome = engine
-            .thread_queue
-            .submit(
-                crate::engine::thread_queue::ThreadQueueRequest::Cron {
-                    retry_of: None,
-                    trigger_id: trigger_id.clone(),
-                },
-                None,
-                Some(cancel_token.clone()),
-            )
-            .await;
-        if !outcome.admitted {
-            log!(
-                "[Scheduler] Task '{}' queued at position {} (system at capacity)",
-                task_name,
-                outcome.position
-            );
+        if fire_scheduled_slot(&engine.thread_queue, &trigger_id, &task_name, &cancel_token).await
+            == SlotEnd::RunnerStopped
+        {
+            return Ok("cancelled".to_string());
         }
-        tokio::select! {
-            _ = outcome.completion => {}
-            _ = cancel_token.cancelled() => {
-                // Trigger updated/deleted mid-wait. A still-queued entry is
-                // dropped here; an admitted run observes the token itself
-                // (execute_user_task carries it), so a drop failure just
-                // means the run is already in flight.
-                if let Err(e) = engine
-                    .thread_queue
-                    .drop_entry(outcome.entry_id, "trigger cancelled", None)
-                    .await
-                {
-                    log!(
-                        "[Scheduler] Task '{}' cancelled while running: {}",
-                        task_name,
-                        e
-                    );
-                }
-                return Ok("cancelled".to_string());
+    }
+}
+
+/// How one on-time fire ended, as seen by the runner that submitted it.
+#[derive(Debug, PartialEq, Eq)]
+enum SlotEnd {
+    /// The run finished, or the queue coalesced the fire away.
+    Finished,
+    /// The runner was stopped while it waited, so it must not fire again.
+    RunnerStopped,
+}
+
+/// Submit one on-time cron fire through the Thread Queue and wait for it.
+///
+/// Admission control may hold the fire until capacity frees. Awaiting
+/// completion preserves the loop's semantics: the next occurrence is computed
+/// after the run ends, so saturation back-pressures this trigger's schedule
+/// instead of stacking unbounded concurrent runs. Execution bookkeeping
+/// (`ACTIVE_TASK_COUNT`, `record_trigger_executed`, failure logging) lives in
+/// the queue executor.
+async fn fire_scheduled_slot(
+    queue: &Arc<crate::engine::thread_queue::ThreadQueue>,
+    trigger_id: &str,
+    task_name: &str,
+    cancel_token: &CancellationToken,
+) -> SlotEnd {
+    let outcome = queue
+        .submit(
+            crate::engine::thread_queue::ThreadQueueRequest::Cron {
+                retry_of: None,
+                trigger_id: trigger_id.to_string(),
+            },
+            None,
+        )
+        .await;
+    if !outcome.admitted {
+        log!(
+            "[Scheduler] Task '{}' queued at position {} (system at capacity)",
+            task_name,
+            outcome.position
+        );
+    }
+    tokio::select! {
+        _ = outcome.completion => SlotEnd::Finished,
+        _ = cancel_token.cancelled() => {
+            // Trigger updated/deleted mid-wait. A still-queued entry never
+            // started, so it is dropped here. An admitted run is left alone:
+            // a drop failure just means the run is already in flight.
+            if let Err(e) = queue
+                .drop_entry(outcome.entry_id, "trigger cancelled", None)
+                .await
+            {
+                log!(
+                    "[Scheduler] Runner for task '{}' stopped; admitted run left alone (entry already running or gone): {}",
+                    task_name,
+                    e
+                );
             }
+            SlotEnd::RunnerStopped
         }
     }
 }
@@ -532,8 +549,7 @@ async fn catch_up_missed_slot(
     );
 
     // Same Thread Queue routing as the on-time path; the executor owns
-    // record_trigger_executed and failure logging. No cancel token, which
-    // matches the pre-queue missed-grace call.
+    // record_trigger_executed and failure logging.
     let outcome = engine
         .thread_queue
         .submit(
@@ -541,7 +557,6 @@ async fn catch_up_missed_slot(
                 retry_of: None,
                 trigger_id: trigger_id.to_string(),
             },
-            None,
             None,
         )
         .await;
@@ -579,7 +594,6 @@ async fn catch_up_missed_slot(
 pub(super) async fn handle_trigger_event(
     event_type: &str,
     trigger_id: &str,
-    payload: &serde_json::Value,
     trigger_configs: &Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
     tracked_tasks: &Arc<RwLock<HashMap<uuid::Uuid, TrackedTask>>>,
     engine: &SharedEngine,
@@ -627,20 +641,8 @@ pub(super) async fn handle_trigger_event(
         "TriggerDeleted" => {
             // Unconditional: the chokepoint may already have removed the
             // registry entry, but the cron job is still armed until we say so.
-            let self_deleting = payload
-                .get("self_deleting")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if self_deleting {
-                detach_tracked_task(tracked_tasks, task_uuid).await;
-                crate::log!(
-                    "[Scheduler] Deleted trigger: {} (self-delete, task left running)",
-                    trigger_id
-                );
-            } else {
-                cancel_tracked_task(tracked_tasks, task_uuid).await;
-                crate::log!("[Scheduler] Deleted trigger: {}", trigger_id);
-            }
+            cancel_tracked_task(tracked_tasks, task_uuid).await;
+            crate::log!("[Scheduler] Deleted trigger: {}", trigger_id);
         }
         "TriggerEnabled" => {
             if let Some(config) = config.as_ref() {
@@ -802,11 +804,6 @@ fn event_trigger_skip_reason(
     }
 }
 
-/// Whether dispatch fires no event trigger at all for an event at `depth`.
-pub(crate) fn event_dispatch_skipped(is_shutting_down: bool, depth: u32, ceiling: u32) -> bool {
-    event_trigger_skip_reason(is_shutting_down, depth, ceiling).is_some()
-}
-
 /// The event type the cap report itself is carried on.
 ///
 /// A persisted frame is subscribable (ADR 0113), so the report is a triggerable
@@ -891,6 +888,7 @@ async fn report_depth_cap(
                     tap: crate::scheduler::notifications::Tap::Modal,
                     actor: None,
                     audience: None,
+                    push_group: None,
                 },
             ))
             .await
@@ -1018,7 +1016,6 @@ pub(super) async fn fire_matching_triggers(
                     source_event_id: Some(source_event_id),
                 },
                 None,
-                None,
             )
             .await;
         if !outcome.admitted {
@@ -1031,12 +1028,11 @@ pub(super) async fn fire_matching_triggers(
     }
 }
 
-/// Signal a tracked task to exit cooperatively, then drop its handle.
+/// Signal a tracked runner to stop scheduling, then drop its handle.
 ///
-/// Aborting the `JoinHandle` would tear the agentic loop down mid-tool, leaving
-/// the thread without a `ResponseGenerated`/`ResponseCanceled` event so it
-/// shows as stuck "running" until engine restart. Cancelling the token instead
-/// lets the loop exit cleanly between iterations and emit its terminal event.
+/// A run already executing is not touched: a save, pause or delete applies to
+/// the next fire. Cancelling the token, rather than aborting the `JoinHandle`,
+/// lets the runner drop a fire that is still queued.
 async fn cancel_tracked_task(
     tracked_tasks: &Arc<RwLock<HashMap<uuid::Uuid, TrackedTask>>>,
     task_id: uuid::Uuid,
@@ -1045,18 +1041,6 @@ async fn cancel_tracked_task(
     if let Some(task) = tracked.remove(&task_id) {
         task.cancel_token.cancel();
     }
-}
-
-/// Drop the tracked entry without cancelling. Used for self-deletion: the
-/// trigger's own LLM has called `delete_trigger` and is mid-flight; cancelling
-/// would interrupt the in-progress tool call. The task's natural loop end
-/// (where it re-reads the config and finds it gone) will exit it cleanly.
-async fn detach_tracked_task(
-    tracked_tasks: &Arc<RwLock<HashMap<uuid::Uuid, TrackedTask>>>,
-    task_id: uuid::Uuid,
-) {
-    let mut tracked = tracked_tasks.write().await;
-    tracked.remove(&task_id);
 }
 
 /// What the health monitor does with a tracked runner whose task has finished.
@@ -1313,9 +1297,8 @@ mod tests {
     #[tokio::test]
     async fn cancel_tracked_task_signals_cancel_and_removes_entry() {
         // Regression: aborting the JoinHandle (the previous behavior) would
-        // tear the agentic loop down mid-tool and leave the thread without a
-        // terminal event, showing as stuck "running". Cooperative cancel via
-        // the token gives the loop a chance to emit ResponseCanceled.
+        // strand a still-queued fire. Cooperative cancel via the token lets
+        // the runner drop it.
         let tracked = Arc::new(RwLock::new(HashMap::new()));
         let (task_id, observed) = insert_observed_task(&tracked, "test-cancel").await;
 
@@ -1333,30 +1316,6 @@ mod tests {
         assert!(
             tracked.read().await.get(&task_id).is_none(),
             "tracked entry should be removed"
-        );
-    }
-
-    #[tokio::test]
-    async fn detach_tracked_task_does_not_signal_cancel() {
-        // Self-deletion path: the trigger's own LLM called delete_trigger on
-        // itself. Cancelling here would interrupt the in-flight tool call;
-        // the natural agentic-loop completion will clean up.
-        let tracked = Arc::new(RwLock::new(HashMap::new()));
-        let (task_id, observed) = insert_observed_task(&tracked, "test-detach").await;
-
-        detach_tracked_task(&tracked, task_id).await;
-
-        // Give the cancel signal time to wrongly fire if the implementation
-        // regressed.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        assert!(
-            !observed.load(Ordering::SeqCst),
-            "task must NOT observe cancel signal on detach"
-        );
-        assert!(
-            tracked.read().await.get(&task_id).is_none(),
-            "tracked entry should still be removed"
         );
     }
 
@@ -1456,8 +1415,8 @@ mod tests {
         runner.handle.abort();
     }
 
-    /// A runner already on the current schedule may be mid-run, and re-arming
-    /// it would cancel that run for nothing.
+    /// A runner already on the current schedule may be mid-fire, and re-arming
+    /// it would drop a queued fire for nothing.
     #[tokio::test]
     async fn a_runner_on_the_current_schedule_is_left_running() {
         let config = scheduled_trigger(&["0 0 8 * * *"], false);
@@ -2001,6 +1960,137 @@ mod tests {
             next_engine_decision(&pool, "cut-fire", slot + chrono::Duration::minutes(15)).await,
             CatchUp::Fire
         );
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// Executor that parks on a gate, as a real run parks on the model, and
+    /// reports when the run finishes.
+    struct ParkedRunExecutor {
+        gate: tokio::sync::Semaphore,
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        finished: tokio::sync::mpsc::UnboundedSender<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::engine::thread_queue::ThreadQueueExecutor for ParkedRunExecutor {
+        async fn execute(&self, _entry: crate::engine::thread_queue::ExecutableEntry) {
+            let _ = self.entered.send(());
+            self.gate.acquire().await.expect("gate open").forget();
+            let _ = self.finished.send(());
+        }
+    }
+
+    #[tokio::test]
+    async fn stopping_runners_drops_a_queued_fire_and_leaves_an_admitted_run_alone() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let (entered_tx, mut entered) = tokio::sync::mpsc::unbounded_channel();
+        let (finished_tx, mut finished) = tokio::sync::mpsc::unbounded_channel();
+        let executor = Arc::new(ParkedRunExecutor {
+            gate: tokio::sync::Semaphore::new(0),
+            entered: entered_tx,
+            finished: finished_tx,
+        });
+        let queue = Arc::new(crate::engine::thread_queue::ThreadQueue::new(
+            pool.clone(),
+            bus,
+            Arc::new(std::sync::RwLock::new(HashMap::new())),
+            workspace.path().to_path_buf(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            crate::engine::thread_queue::CapacityPolicy {
+                max_concurrent_total: 1,
+                ..Default::default()
+            },
+            Arc::new(AtomicBool::new(false)),
+        ));
+        queue.set_executor(executor.clone());
+
+        let runner_token = CancellationToken::new();
+        let (slot_tx, slot) = tokio::sync::oneshot::channel();
+        let slot_handle = tokio::spawn({
+            let (queue, token) = (queue.clone(), runner_token.clone());
+            async move {
+                slot_tx
+                    .send(fire_scheduled_slot(&queue, "save-mid-run", "Save mid run", &token).await)
+                    .unwrap();
+            }
+        });
+        entered.recv().await.expect("the run was admitted");
+
+        // Saturate the queue with the admitted run, then submit another slot.
+        let queued_token = CancellationToken::new();
+        let (queued_tx, queued_slot) = tokio::sync::oneshot::channel();
+        let queued_handle = tokio::spawn({
+            let (queue, token) = (queue.clone(), queued_token.clone());
+            async move {
+                queued_tx
+                    .send(fire_scheduled_slot(&queue, "queued-save", "Queued save", &token).await)
+                    .unwrap();
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if queue.snapshot().await.unwrap().entries.iter().any(|entry| {
+                    entry.trigger_id.as_deref() == Some("queued-save") && entry.status == "queued"
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second fire must be queued before stopping its runner");
+
+        // Exercise the same tracked-runner stop used by a trigger write.
+        let tracked = Arc::new(RwLock::new(HashMap::new()));
+        for (token, slot_handle) in [(runner_token, slot_handle), (queued_token, queued_handle)] {
+            let task_id = uuid::Uuid::new_v4();
+            tracked.write().await.insert(
+                task_id,
+                TrackedTask {
+                    handle: slot_handle,
+                    task_name: "Saved trigger".to_string(),
+                    cancel_token: token,
+                    schedule: vec![],
+                    timezone: "UTC".to_string(),
+                },
+            );
+            cancel_tracked_task(&tracked, task_id).await;
+        }
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), queued_slot)
+                .await
+                .expect("the queued runner stops promptly")
+                .unwrap(),
+            SlotEnd::RunnerStopped
+        );
+        assert!(
+            queue
+                .snapshot()
+                .await
+                .unwrap()
+                .entries
+                .iter()
+                .all(|entry| { entry.trigger_id.as_deref() != Some("queued-save") }),
+            "stopping the runner must drop its queued scheduled fire"
+        );
+
+        let slot_end = tokio::time::timeout(std::time::Duration::from_secs(5), slot)
+            .await
+            .expect("the runner stops waiting promptly")
+            .unwrap();
+        assert_eq!(slot_end, SlotEnd::RunnerStopped);
+
+        assert!(
+            finished.try_recv().is_err(),
+            "the run is still in flight after its runner stopped"
+        );
+        executor.gate.add_permits(1);
+        finished.recv().await.expect("the run finished");
+
         pool.close().await;
         teardown_test_db(&db).await;
     }

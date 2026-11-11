@@ -45,6 +45,10 @@ import { publishScrollbarGutter } from '../../utils/scrollbarGutter';
 import { FindBar } from '../shared/FindBar';
 import { isEngineUnreachable } from '../../utils/connectionNotice';
 import { transcriptRenderRequest } from '../../store/actions/transcriptRenderRequest';
+import { lazyComponent } from '../../utils/lazyComponent';
+
+// Team-only: a personal gateway never draws it, so the first frame skips it.
+const ThreadPeopleRow = lazyComponent(() => import('./ThreadPeopleRow').then((m) => m.ThreadPeopleRow));
 
 /** Only sample a grouping fold this slow (ms) — keeps cheap incremental folds
  *  (streaming tokens) out of the perf log; we only want the expensive full
@@ -1977,6 +1981,7 @@ export function ThreadView() {
     return (
         <div class="thread-view">
             <DesktopThreadTitleBar threadId={eventThread.meta.id} />
+            <ThreadPeopleRow threadId={eventThread.meta.id} />
             <FindBar key="find" surface="thread" scope={`thread:${eventThread.meta.id}`} placeholder="Find in thread" />
             {/* `has-scroll-indicator` is what licenses the CSS to hide the
                 native scrollbar on this scroller: the suppression is scoped to

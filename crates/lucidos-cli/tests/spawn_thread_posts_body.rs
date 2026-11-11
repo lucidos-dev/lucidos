@@ -7,6 +7,26 @@ use std::sync::{Arc, Mutex};
 
 type Captured = Arc<Mutex<Option<serde_json::Value>>>;
 
+#[test]
+fn human_mode_from_agent_fails_before_workspace_resolution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_lucidos"))
+        .args(["spawn-thread", "--to"])
+        .arg(tmp.path().join("missing-workspace"))
+        .args(["--message", "Start a task", "--mode", "human"])
+        .env("LUCIDOS_AGENT_ORIGIN_TOKEN", "test-origin-token")
+        .output()
+        .expect("spawn cli");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--mode human cannot be used from an agent subprocess"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Omit --mode"), "{stderr}");
+    assert!(!stderr.contains("HTTP"), "{stderr}");
+}
+
 /// Spawn an axum server on a random port that captures the JSON body of any
 /// POST to `/api/v1/chat/stream` and replies with a stub `event_id`. Returns the
 /// port and the shared slot the test inspects after running the CLI.

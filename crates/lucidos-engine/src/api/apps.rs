@@ -675,7 +675,7 @@ pub(super) async fn submit_app_capture(
     headers: HeaderMap,
     Json(body): Json<AppCaptureRequest>,
 ) -> Result<StatusCode, super::error::ApiError> {
-    use crate::engine::tools::app_capture::{resolve_capture, CaptureRefusal};
+    use crate::engine::pending_answers::{resolve_answer, AnswerRefusal};
     let claimed = body.device_id.as_deref();
     let answering = match super::actor::require_user_actor(&headers, &state.pool, claimed).await? {
         crate::engine::thread_events::MessageOrigin::Device { device_id } => Some(device_id),
@@ -685,18 +685,18 @@ pub(super) async fn submit_app_capture(
         screenshot: body.screenshot,
         dom: body.dom,
     };
-    match resolve_capture(
+    match resolve_answer(
         &state.engine.pending_captures,
         &body.request_id,
         answering.as_deref(),
         result,
     ) {
         Ok(()) => Ok(StatusCode::OK),
-        Err(CaptureRefusal::Unknown) => Err(super::error::ApiError::new(
+        Err(AnswerRefusal::Unknown) => Err(super::error::ApiError::new(
             StatusCode::NOT_FOUND,
             format!("No capture is waiting under request {}", body.request_id),
         )),
-        Err(CaptureRefusal::OtherDevice) => Err(super::error::ApiError::new(
+        Err(AnswerRefusal::OtherDevice) => Err(super::error::ApiError::new(
             StatusCode::CONFLICT,
             format!("Capture request {} is for another device", body.request_id),
         )

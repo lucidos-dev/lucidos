@@ -18,8 +18,26 @@ import { DEVICE_ID_KEY } from './deviceIdKey';
 
 export { DEVICE_ID_KEY };
 
-/** This browser's device id, or null if none has been minted yet. */
+let relayedDeviceId: string | null = null;
+
+/**
+ * Name the id this page sends, in memory only, for a page a remote gateway
+ * relays. The relaying gateway namespaces the id it asserts, so the engine
+ * sees that id whatever we send. Holding it here keeps `lucidos-device-id`
+ * for the page's own direct routes.
+ */
+export function setRelayedDeviceId(id: string | null): void {
+  relayedDeviceId = id;
+}
+
+/** The id a relayed route holds, or null on a direct route. */
+export function getRelayedDeviceId(): string | null {
+  return relayedDeviceId;
+}
+
+/** This page's device id, or null if none has been minted yet. */
 export function readDeviceId(): string | null {
+  if (relayedDeviceId) return relayedDeviceId;
   if (typeof localStorage === 'undefined') return null;
   return localStorage.getItem(DEVICE_ID_KEY);
 }

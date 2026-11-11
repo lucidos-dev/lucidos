@@ -26,7 +26,7 @@ import {
   draggedRung, keepPricesCurrentTrigger, KEEP_PRICES_CURRENT_SLUG, LADDER_SURFACES, ladderAnchor, ladderOverride,
   movedRung, percent, toggledRung, type PriceCheckCadence,
 } from './intelligenceLadder';
-import { useRungDrag } from './rungDrag';
+import { useRowDrag } from '../../hooks/useRowDrag';
 
 interface PageData {
   ladders: Record<LadderSurface, IntelligenceLadder>;
@@ -280,6 +280,13 @@ function LongPromptShareRow({ share }: { share: LongPromptShare }) {
 }
 
 /** What a ladder's explainer says its rungs decide. */
+/** Whether the ladder is in its compact layout, where a held row drags. The
+ *  stylesheet decides it with a container query and sets a custom property on
+ *  each row, so the breakpoint lives in the CSS alone. */
+function isCompact(row: Element): boolean {
+  return getComputedStyle(row).getPropertyValue('--ladder-compact').trim() === '1';
+}
+
 function ladderPurpose(surface: LadderSurface, name: string): string {
   return surface === 'chat'
     ? 'The models and efforts for Lucidos Agent threads, least to most intelligent. The model '
@@ -386,10 +393,10 @@ function LadderBlock({
     if (!saved) setLadder(ladder);
   };
 
-  const { listRef, drag, rowProps, gripProps } = useRungDrag((from, to) => {
+  const { listRef, drag, rowProps, gripProps } = useRowDrag((from, to) => {
     const next = draggedRung(ladder.rungs, from, to);
     if (next) void saveRungs(next);
-  });
+  }, isCompact);
 
   /** Make `rung` the default. The star on the default does nothing. */
   const star = async (rung: ServedIntelligenceRung) => {
@@ -551,8 +558,8 @@ function LadderRow({
 }: {
   rung?: ServedIntelligenceRung;
   index?: number;
-  dragProps?: ReturnType<typeof useRungDrag>['rowProps'];
-  gripProps?: ReturnType<typeof useRungDrag>['gripProps'];
+  dragProps?: ReturnType<typeof useRowDrag>['rowProps'];
+  gripProps?: ReturnType<typeof useRowDrag>['gripProps'];
   lift?: number;
   dropAt?: 'before' | 'after';
   onStar?: () => void;
@@ -566,7 +573,7 @@ function LadderRow({
   return (
     <div
       class={`list-row ladder-row${rung && !rung.on ? ' ladder-row-off' : ''}${lift !== undefined ? ' ladder-row-lifted' : ''}${dropAt ? ` ladder-row-drop-${dropAt}` : ''}`}
-      data-rung-index={index}
+      data-row-index={index}
       style={lift !== undefined ? { '--ladder-drag-dy': `${lift}px` } : undefined}
       {...dragProps}
     >

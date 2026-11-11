@@ -16,6 +16,19 @@
     color: var(--text-primary);
 }
 
+/* Continue with ChatGPT: OpenAI's logo before the label, in the text colour. */
+.chatgpt-sign-in-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-xs);
+}
+
+.chatgpt-logo {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+    flex: none;
+}
+
 /* A Search-Everywhere jump to a settings item scrolls to it and applies the
    shared NAVIGATION FOCUS MARKER (.nav-focus-stuck,
    styles/global/host-components.css, via components/shared/focusMarker.ts) — same

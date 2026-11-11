@@ -12,6 +12,7 @@ use super::history::{
 use crate::core::store::{newest_conversation_summary, CachedSummary, SessionMessage};
 use crate::core::EventRow;
 use crate::engine::thread_events::AgentParticipant;
+use crate::gateway_operators::{Operator, OperatorSnapshot};
 use chrono::{TimeZone, Utc};
 use serde_json::json;
 use uuid::Uuid;
@@ -36,6 +37,7 @@ fn msg(role: &str, content: &str, event_id: Option<&str>) -> SessionMessage {
         event_id: event_id.map(str::to_string),
         thread_id: None,
         agent: None,
+        sender_device_id: None,
     }
 }
 
@@ -43,7 +45,11 @@ fn msg(role: &str, content: &str, event_id: Option<&str>) -> SessionMessage {
 /// speaker name comes from the real `speaker_label`, so this double cannot
 /// drift from what a turn actually prints.
 fn format_msg(m: &SessionMessage, _verbatim: bool, _idx: usize) -> String {
-    format!("{}: {}", speaker_label(m), m.content)
+    format!(
+        "{}: {}",
+        speaker_label(m, &OperatorSnapshot::default()),
+        m.content
+    )
 }
 
 fn render(older: &[SessionMessage], covered: Option<CoveredSummary<'_>>) -> String {
@@ -621,7 +627,54 @@ fn a_user_turn_is_never_relabelled_by_an_agent_actor() {
     spoken.agent = Some(AgentParticipant::Guest {
         label: "Voice".into(),
     });
-    assert_eq!(speaker_label(&spoken), "User");
+    assert_eq!(speaker_label(&spoken, &OperatorSnapshot::default()), "User");
+}
+
+fn operator(id: &str, name: &str, device: &str) -> Operator {
+    Operator {
+        id: id.into(),
+        name: name.into(),
+        emails: vec![],
+        device_ids: vec![device.into()],
+    }
+}
+
+fn team() -> OperatorSnapshot {
+    OperatorSnapshot {
+        operators: vec![
+            operator("op-sam", "Sam", "dev-sam"),
+            operator("op-alex", "Alex", "dev-alex"),
+        ],
+        relayed: vec![],
+    }
+}
+
+/// On a team gateway each person's message reads under their name, from the
+/// snapshot, so the agent can tell who asked (ADR 0649).
+#[test]
+fn a_team_gateway_labels_each_person_by_operator_name() {
+    let mut from_sam = msg("user", "use the blue one", None);
+    from_sam.sender_device_id = Some("dev-sam".into());
+    let mut from_alex = msg("user", "no, the red one", None);
+    from_alex.sender_device_id = Some("dev-alex".into());
+    assert_eq!(speaker_label(&from_sam, &team()), "Sam");
+    assert_eq!(speaker_label(&from_alex, &team()), "Alex");
+}
+
+/// A personal gateway keeps "User", and so does a sender no operator holds.
+#[test]
+fn a_personal_gateway_or_an_unknown_sender_keeps_user() {
+    let mut from_sam = msg("user", "hi", None);
+    from_sam.sender_device_id = Some("dev-sam".into());
+    let personal = OperatorSnapshot {
+        operators: vec![operator("op-sam", "Sam", "dev-sam")],
+        relayed: vec![],
+    };
+    assert_eq!(speaker_label(&from_sam, &personal), "User");
+    let mut stranger = msg("user", "hi", None);
+    stranger.sender_device_id = Some("dev-gone".into());
+    assert_eq!(speaker_label(&stranger, &team()), "User");
+    assert_eq!(speaker_label(&msg("user", "hi", None), &team()), "User");
 }
 
 // ------------------------------------------------------------------

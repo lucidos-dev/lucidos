@@ -63,7 +63,7 @@ async fn the_default_follows_the_configured_providers() {
     let sonnet = "claude-sonnet-5-5";
     // Per install: most purposes, the judge, extraction, the summary, the read
     // decision, and the wake decision. `None` means the chat model: no model
-    // the judge or the wake decision may run on is reachable.
+    // the wake decision may run on is reachable.
     type Row<'a> = (
         &'a [ProviderKind],
         Served,
@@ -83,12 +83,13 @@ async fn the_default_follows_the_configured_providers() {
             (flash38, Vertex),
             Some((flash38, Vertex)),
         ),
+        // A signed-in ChatGPT plan leads every GPT row, background work too.
         (
             &ProviderKind::ALL,
             (haiku, Vertex),
             Some((lite, Vertex)),
-            (luna, OpenAi),
-            (sol, OpenAi),
+            (luna, ChatGptPlan),
+            (sol, ChatGptPlan),
             (flash38, Vertex),
             Some((flash38, Vertex)),
         ),
@@ -122,7 +123,7 @@ async fn the_default_follows_the_configured_providers() {
         (
             &[Anthropic],
             (haiku, Anthropic),
-            None,
+            Some((haiku, Anthropic)),
             (haiku, Anthropic),
             (sonnet, Anthropic),
             (haiku, Anthropic),
@@ -162,6 +163,28 @@ async fn the_default_follows_the_configured_providers() {
                 ),
             }
         }
+    }
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Every provider family reaches a measured judge model, the ChatGPT plan
+/// and the Claude gateway included.
+#[tokio::test]
+async fn every_provider_family_reaches_a_measured_judge_model() {
+    use ProviderKind::*;
+    let (pool, db_name) = setup_test_db().await;
+    let registry: ModelRegistry = Arc::new(RwLock::new(load_from_db(&pool).await));
+    for (kinds, expected) in [
+        (&[ChatGptPlan][..], ("gpt-6-luna", ChatGptPlan)),
+        (&[ClaudeGateway], ("claude-haiku-5-5", ClaudeGateway)),
+    ] {
+        let (model, source, provider) = resolved(&registry, ContextPurpose::CommandJudge, kinds);
+        assert_eq!(
+            (model.as_str(), source, provider),
+            (expected.0, ModelSource::Default, Some(expected.1)),
+            "{kinds:?}"
+        );
     }
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -340,9 +363,9 @@ async fn a_stored_text_only_pick_stays_the_pick() {
     teardown_test_db(&db_name).await;
 }
 
-/// The env override leads every purpose but the command judge, which never
-/// read it, and the wake decision, which runs only on measured models. It
-/// goes ahead of a purpose's measured lead too.
+/// The env override leads every purpose but the command judge and the wake
+/// decision, which run only on measured models. It goes ahead of a purpose's
+/// measured lead too.
 #[test]
 fn the_extraction_override_leads_all_but_the_judge_and_the_wake_decision() {
     let with_env = |purpose| recommended_with(purpose, Some("gemini-3.8-flash"));
@@ -388,7 +411,11 @@ fn the_lead_then_the_catalog_default_head_the_list_and_nothing_repeats() {
         unique.dedup();
         assert_eq!(unique.len(), list.len(), "{purpose:?} repeats a model");
         if measured_only(*purpose) {
-            assert_eq!(list.len(), lead.len() + 1, "{purpose:?}: {list:?}");
+            assert_eq!(
+                list[lead.len() + 1..],
+                *measured_tail(*purpose),
+                "{purpose:?}: {list:?}"
+            );
             continue;
         }
         for fallback in AUX_FALLBACKS {
@@ -410,7 +437,10 @@ fn only_a_measured_only_purpose_on_the_chat_model_asks_no_model() {
         ] {
             assert_eq!(
                 asks_no_model(*purpose, source),
-                *purpose == ContextPurpose::WakeDecision && source == ModelSource::ChatModel,
+                matches!(
+                    purpose,
+                    ContextPurpose::WakeDecision | ContextPurpose::CommandJudge
+                ) && source == ModelSource::ChatModel,
                 "{purpose:?} from {source:?}"
             );
         }
@@ -443,8 +473,8 @@ fn the_description_names_the_lead_and_every_fallback() {
         if !matches!(pair.model.spec.default, PrefDefault::Value(_)) {
             continue;
         }
-        let fallbacks: &[&str] = if measured_only(*purpose) {
-            &[]
+        let fallbacks = if measured_only(*purpose) {
+            measured_tail(*purpose)
         } else {
             AUX_FALLBACKS
         };
@@ -493,6 +523,11 @@ async fn every_default_names_a_current_model() {
         ])
         .chain(AUX_FALLBACKS.iter().copied())
         .chain(CHAT_MODEL_PURPOSES.iter().flat_map(|p| purpose_lead(*p)))
+        .chain(
+            CHAT_MODEL_PURPOSES
+                .iter()
+                .flat_map(|p| measured_tail(*p).iter().copied()),
+        )
         .chain(COMPACTOR_DEFAULTS.iter().map(|entry| entry.model))
         .collect();
     for model in named {

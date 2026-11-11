@@ -188,11 +188,11 @@ impl LucidosEngine {
         };
         let capture_window = self.context_window_for(capture_seed.model, selection.provider);
 
-        // Command guard (ADR 0002): off unless the workspace turned on the
-        // `command_guard` preference. Read once per response — the toggles can't
-        // change mid-response — and consulted before each bash/python dispatch
-        // below. The judge sub-toggle + model are only read when the guard is on
-        // (no DB cost on the common off path). `command_guard_ctx` carries the
+        // Command guard (ADR 0002): on unless the workspace stored `false` for
+        // the `command_guard` preference. Read once per response, since the
+        // toggles cannot change mid-response, and consulted before each
+        // bash/python dispatch below. The judge sub-toggle and model are read
+        // only while the guard is on. `command_guard_ctx` carries the
         // per-response judge-verdict cache so a re-emitted identical command
         // doesn't re-pay the LLM call.
         let command_guard_enabled = crate::core::prefs::COMMAND_GUARD
@@ -202,6 +202,32 @@ impl LucidosEngine {
             && crate::core::prefs::COMMAND_GUARD_JUDGE
                 .try_read(&self.pool)
                 .await?;
+        // An on judge with no model refuses the turn before any tool can run.
+        // It never judges on the chat model or the static lists in silence.
+        if let Some(error) = crate::engine::aux_purpose::guarded_turn_refusal(
+            &self.pool,
+            &self.model_registry,
+            provider.as_ref(),
+            command_guard_judge_enabled,
+        )
+        .await
+        {
+            self.event_bus
+                .emit_or_log(
+                    crate::engine::event_bus::BusEvent::Thread {
+                        thread_id,
+                        event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
+                            error: error.clone(),
+                            agent_exit: None,
+                        },
+                        meta: meta.clone(),
+                    },
+                    "[AgenticLoop] ResponseFailed (no command judge model)",
+                )
+                .await;
+            *terminator_settled = true;
+            return Err(error.into());
+        }
         let mut command_guard_judge_cache: std::collections::HashMap<
             String,
             crate::engine::command_guard::JudgedClassification,

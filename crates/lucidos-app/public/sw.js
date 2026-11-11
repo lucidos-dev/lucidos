@@ -450,6 +450,10 @@ async function networkFirstShell(request) {
 // replaces the OS-level notification instead of stacking duplicates.
 const DEFAULT_NOTIFICATION_TAG = 'lucidos-notification';
 
+// The push action that stops watching a thread (ADR 0649). The engine names
+// the thread in `data.unwatch_thread_id`. Pinned to the engine's copy by a test.
+const UNWATCH_PUSH_ACTION = 'unwatch';
+
 // Resolve the engine-built relative navigate URL against the SW's origin so
 // `clients.openWindow()` (which requires an absolute URL in Chrome) gets a
 // fully-qualified URL. The push handler also resolves it for the
@@ -554,6 +558,8 @@ self.addEventListener('push', (event) => {
     renotify: !isWake,
     requireInteraction: true,
     silent: isWake,
+    // Buttons beside the banner, where the browser draws them. iOS draws none.
+    actions: Array.isArray(notification.actions) ? notification.actions : [],
     // `navigate` is the spec-level bypass for the macOS-Chrome partial-wedge
     // bug (Safari 18.5+ honors it; Chrome ignores it until #382298314 ships
     // and falls through to notificationclick). This is the engine's QUERY
@@ -627,6 +633,19 @@ self.addEventListener('notificationclick', (event) => {
   // keeps the SW alive until both finish. Without that await, iOS terminates
   // the SW the moment navigation resolves and cancels the in-flight POST
   // (unread badge stays stuck).
+  // Unwatch leaves the thread from the banner and opens nothing.
+  if (event.action === UNWATCH_PUSH_ACTION && data.unwatch_thread_id) {
+    const headers = { 'x-lucidos-restore-generation': generation };
+    const url = (path) => `${self.location.origin}${SCOPE_PATH}api/v1/${path}`;
+    const threadId = encodeURIComponent(data.unwatch_thread_id);
+    const unwatch = fetch(url(`threads/${threadId}/people/unwatch`), { method: 'POST', headers });
+    const read = notificationId
+      ? fetch(url(`notification/read?id=${encodeURIComponent(notificationId)}`), { method: 'POST', headers })
+      : Promise.resolve();
+    event.waitUntil(Promise.all([unwatch, read]).catch(() => {}));
+    return;
+  }
+
   const markReadPromise = notificationId
     ? fetch(`${self.location.origin}${SCOPE_PATH}api/v1/notification/read?id=${encodeURIComponent(notificationId)}`, {
         method: 'POST',
