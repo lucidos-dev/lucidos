@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Factory</title>
+    <script src="/api/v1/sdk-prefs.js"></script>
+    <link rel="stylesheet" href="/api/v1/sdk-iframe.css">
+    <script src="/api/v1/sdk.js"></script>
+    <style>
+      main { padding: var(--space-lg) var(--space-lg) var(--space-xl) 2.5rem; max-width: 48rem; }
+      .views { margin-bottom: var(--space-lg); }
+      .item { display: flex; flex-wrap: wrap; gap: var(--space-sm) var(--space-md); align-items: center; }
+      .item-open { flex: 1 1 14rem; min-width: 0; text-align: left; background: none; border: 0; padding: 0;
+                   color: var(--text-primary); cursor: pointer; overflow-wrap: break-word; }
+      .chips { display: flex; flex-wrap: wrap; gap: var(--space-xs); margin-top: var(--space-xs); }
+      .meta { color: var(--text-muted); font-size: var(--font-size-xs); }
+      .notice { color: var(--text-secondary); margin-bottom: var(--space-md); }
+      @media (pointer: coarse) {
+        .action-btn { position: relative; }
+        .action-btn::before { content: ''; position: absolute; inset: -0.375rem -0.25rem; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="pill-bar views" role="tablist" aria-label="View">
+        <button class="pill-bar-btn" role="tab" data-view="mine">Mine</button>
+        <button class="pill-bar-btn" role="tab" data-view="team">Team</button>
+        <button class="pill-bar-btn" role="tab" data-view="all">All</button>
+      </div>
+      <p class="notice" id="notice" hidden></p>
+      <div class="list-rows" id="items"></div>
+    </main>
+    <script>
+      lucidos.ui.applyPreferences();
+      lucidos.ui.watchPreferences();
+
+      const EMPTY = {
+        mine: 'Nothing you drive or watch is open.',
+        team: 'No gate is waiting on the team.',
+        all: 'No open threads.',
+      };
+      let view = 'team';
+      let list = null;
+
+      const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+
+      function shown() {
+        if (view === 'mine') return list.items.filter((i) => i.yours);
+        if (view === 'team') return list.items.filter((i) => i.needs_team);
+        return list.items;
+      }
+
+      function chips(item) {
+        const out = [];
+        out.push(item.driver
+          ? `<span class="label label-neutral">Driver: ${esc(item.driver.name)}</span>`
+          : '<span class="label label-neutral">No driver</span>');
+        if (item.escalated) out.push('<span class="label label-error">Escalated</span>');
+        else if (item.gate_open) out.push('<span class="label label-warning">Gate open</span>');
+        if (item.watchers.length) {
+          out.push(`<span class="label label-neutral">Watching: ${esc(item.watchers.map((w) => w.name).join(', '))}</span>`);
+        }
+        return out.join('');
+      }
+
+      function actions(item) {
+        if (!list.user) return '';
+        const me = list.user.id;
+        const drives = item.driver && item.driver.id === me;
+        const watches = item.watchers.some((w) => w.id === me);
+        const out = [];
+        if (drives) out.push(`<button class="action-btn action-btn-secondary" data-act="release">Release</button>`);
+        else out.push(`<button class="action-btn" data-act="take">${item.driver ? 'Take over' : 'Take'}</button>`);
+        if (!drives) {
+          out.push(watches
+            ? `<button class="action-btn action-btn-secondary" data-act="unwatch">Unwatch</button>`
+            : `<button class="action-btn action-btn-secondary" data-act="watch">Watch</button>`);
+        }
+        return `<div class="button-group">${out.join('')}</div>`;
+      }
+
+      function render() {
+        for (const tab of document.querySelectorAll('[data-view]')) {
+          tab.setAttribute('aria-selected', String(tab.dataset.view === view));
+        }
+        const notice = document.getElementById('notice');
+        notice.hidden = Boolean(list.user);
+        notice.textContent = 'This device belongs to no user yet, so Mine is empty and Take and Watch are off. Add it to a user in Settings, Users.';
+        const items = shown();
+        document.getElementById('items').innerHTML = items.length
+          ? items.map((item) => `
+              <div class="list-row item" data-id="${esc(item.root_thread_id)}">
+                <button class="item-open" data-act="open">
+                  <div class="list-row-name">${esc(item.title || 'Untitled thread')}</div>
+                  <div class="chips">${chips(item)}</div>
+                  <div class="meta">${esc(new Date(item.last_activity).toLocaleString())}</div>
+                </button>
+                ${actions(item)}
+              </div>`).join('')
+          : `<div class="empty-state">${EMPTY[view]}</div>`;
+      }
+
+      async function load() {
+        try {
+          list = await lucidos.threads.users.list();
+          render();
+        } catch (e) {
+          document.getElementById('items').innerHTML =
+            `<div class="empty-state">Could not load the threads: ${esc(e.message || e)}</div>`;
+        } finally {
+          lucidos.ui.ready();
+        }
+      }
+
+      document.querySelector('.views').addEventListener('click', (e) => {
+        const tab = e.target.closest('[data-view]');
+        if (!tab || !list) return;
+        view = tab.dataset.view;
+        render();
+      });
+
+      document.getElementById('items').addEventListener('click', async (e) => {
+        const button = e.target.closest('[data-act]');
+        if (!button) return;
+        const id = button.closest('[data-id]').dataset.id;
+        const act = button.dataset.act;
+        if (act === 'open') {
+          await lucidos.ui.navigate('thread', { id });
+          return;
+        }
+        try {
+          await lucidos.threads.users[act](id);
+          await load();
+        } catch (err) {
+          lucidos.ui.toast(err.message || String(err), 'error');
+        }
+      });
+
+      // Each event can change a driver, a watcher, a gate or the open set.
+      for (const type of [
+        'WorkItemDriverTaken', 'WorkItemDriverReleased', 'WorkItemWatched',
+        'WorkItemUnwatched', 'WorkItemGateEscalated', 'UserQuestionAsked',
+        'UserQuestionAnswered', 'ThreadArchived', 'ThreadUnarchived', 'TriggerStarted',
+        'MessageReceived', 'UserOnlyMessagePosted', 'UsersChanged',
+      ]) {
+        lucidos.sse.on(type, load);
+      }
+      lucidos.sse.onOpen(load);
+    </script>
+  </body>
+</html>

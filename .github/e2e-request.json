@@ -1,0 +1,17 @@
+{
+  "run_id": "20261113-195207-8ad1",
+  "coverage": false,
+  "suites": [
+    "browser"
+  ],
+  "api_args": [],
+  "browser": {
+    "projects": [
+      "mobile-webkit"
+    ],
+    "specs": [
+      "agent-sandbox-setting-all.spec.ts"
+    ],
+    "pw_args": []
+  }
+}
