@@ -1,0 +1,114 @@
+import type { Ref, VNode } from 'preact';
+import { useEffect, useRef } from 'preact/hooks';
+import { activeProgressDialog } from '../../store/store';
+import type { ProgressDialogState } from '../../store/types';
+import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
+import { DialogMessage } from './DialogMessage';
+import { Overlay } from './Overlay';
+import { SurfaceHead } from './Surface';
+import { progressFillWidth } from './progressBar';
+
+/** The modal for an operation that takes the workspace away and brings it back.
+ *
+ *  Third surface in the taxonomy, beside the toast and the banner: a toast is
+ *  for something ignorable and a banner is for a condition you can work around,
+ *  and this is for neither. Nothing behind it is usable while it runs, so it
+ *  says so instead of leaving the user to discover it.
+ *
+ *  NOT dismissable, and deliberately so. The operation continues whatever the
+ *  user presses, so an X would hide the only account of what is happening. The
+ *  one control is Cancel, and only while cancelling is still possible.
+ *
+ *  See docs/plans/2026-08-13-toast-banner-dialog-taxonomy.md. */
+
+/** Pure markup, hook-free so the tests can call it directly.
+ *  The `backupReminderBody` / `connectionBannerBody` idiom. */
+export function progressDialogBody(props: {
+  state: ProgressDialogState;
+  panelRef?: Ref<HTMLDivElement>;
+}): VNode {
+  const { title, message, progress, cancel } = props.state;
+  return (
+    // `tabIndex={-1}` makes the panel programmatically focusable without
+    // becoming a Tab stop. A committed phase has no Cancel, so it has no
+    // focusable control at all. Focus goes here then, leaving whatever button
+    // opened the dialog.
+    //
+    // It paints no focus ring. The box is containment, not a control. The
+    // dialog also opens by itself while the user is typing, which is when
+    // Chrome carries :focus-visible into a programmatic focus. The suppression
+    // is in components.css, beside the confirm dialog's.
+    <div ref={props.panelRef} class="progress-dialog-body" tabIndex={-1}>
+      {/* Determinate only where the operation has an honest percentage. A
+          download does; a service restart does not, and a bar that invents one
+          is a lie the user waits on. The indeterminate case leads the title. */}
+      <SurfaceHead
+        title={title}
+        icon={
+          progress == null ? (
+            <span class="surface-icon" aria-hidden="true"><span class="mini-spinner" /></span>
+          ) : undefined
+        }
+      />
+      <div class="surface-body progress-dialog-readout">
+        <DialogMessage message={message} />
+        {/* `progressFillWidth` clamps, so a bad fraction paints an empty track
+            rather than running past its box. */}
+        {progress != null && (
+          <div class="progress-bar progress-dialog-bar">
+            <div class="progress-bar-fill" style={{ width: progressFillWidth(progress) }} />
+          </div>
+        )}
+      </div>
+      {cancel && (
+        <div class="surface-foot">
+          <button class="action-btn action-btn-secondary" data-role="progress-cancel" onClick={cancel.onClick}>
+            {cancel.label}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The container: owns the slot and the overlay, so the body stays pure.
+ *
+ *  `onClose` returns false, which is the `<Overlay>` contract's way of saying
+ *  the dismiss was a no-op. That keeps the user's click from being swallowed on
+ *  a surface that cannot be dismissed anyway. */
+export function ProgressDialog() {
+  const state = activeProgressDialog.value;
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  useHidePanelWebviewWhile(state.visible);
+
+  // Take focus. Without this the dialog declares `aria-modal` while focus
+  // stays on whatever button opened it, and Enter re-fires that button from
+  // behind the modal. With no Cancel the panel itself holds focus, and the
+  // overlay Tab rule keeps it there.
+  useEffect(() => {
+    if (!state.visible) return;
+    const panel = panelRef.current;
+    if (!panel) return;
+    const cancelBtn = panel.querySelector<HTMLButtonElement>('[data-role="progress-cancel"]');
+    (cancelBtn ?? panel).focus();
+    // Whether a Cancel EXISTS, never the object itself. Each phase builds a
+    // fresh one. Depending on its identity would re-run this every tick and
+    // yank focus back to the button several times per operation.
+  }, [state.visible, state.cancel !== undefined]);
+
+  if (!state.visible) return null;
+
+  return (
+    <Overlay
+      open
+      onClose={() => false}
+      overlayClass="protected-surface"
+      panelClass="surface surface-raised confirm-dialog progress-dialog protected-surface"
+      panelRole="dialog"
+      ariaModal
+    >
+      {progressDialogBody({ state, panelRef })}
+    </Overlay>
+  );
+}

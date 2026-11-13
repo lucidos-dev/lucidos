@@ -1,0 +1,154 @@
+[
+  {
+    "expected": {
+      "coverage": 1.0,
+      "level": "exact"
+    },
+    "query": "settings",
+    "title": "Settings"
+  },
+  {
+    "expected": {
+      "coverage": 1.0,
+      "level": "exact"
+    },
+    "query": " fix search ",
+    "title": "Fix  Search"
+  },
+  {
+    "expected": {
+      "coverage": 0.4444444444444444,
+      "level": "word-start"
+    },
+    "query": "settings",
+    "title": "Open settings (⌘,)"
+  },
+  {
+    "expected": {
+      "coverage": 0.36363636363636365,
+      "level": "word-start"
+    },
+    "query": "settings",
+    "title": "settings-system-v2.png"
+  },
+  {
+    "expected": {
+      "coverage": 0.3333333333333333,
+      "level": "word-start"
+    },
+    "query": "settings",
+    "title": "test_capture_settings.py"
+  },
+  {
+    "expected": {
+      "coverage": 0.4,
+      "level": "phrase"
+    },
+    "query": "settings",
+    "title": "TimeoutSettings.d.ts"
+  },
+  {
+    "expected": {
+      "coverage": 0.2857142857142857,
+      "level": "word-start"
+    },
+    "query": "SEARCH",
+    "title": "Thread search ranking"
+  },
+  {
+    "expected": {
+      "coverage": 0.42857142857142855,
+      "level": "phrase"
+    },
+    "query": "search",
+    "title": "Research notes"
+  },
+  {
+    "expected": {
+      "coverage": 0.3157894736842105,
+      "level": "word-start"
+    },
+    "query": "search",
+    "title": "Research and search"
+  },
+  {
+    "expected": {
+      "coverage": 0.0,
+      "level": "none"
+    },
+    "query": "search ranking",
+    "title": "Ranking for search"
+  },
+  {
+    "expected": {
+      "coverage": 0.0,
+      "level": "none"
+    },
+    "query": "settings",
+    "title": "Habit Tracker"
+  },
+  {
+    "expected": {
+      "coverage": 0.0,
+      "level": "none"
+    },
+    "query": "   ",
+    "title": "Anything"
+  },
+  {
+    "expected": {
+      "coverage": 0.23529411764705882,
+      "level": "word-start"
+    },
+    "query": "über",
+    "title": "Ümlaut über alles"
+  },
+  {
+    "expected": {
+      "coverage": 0.4444444444444444,
+      "level": "phrase"
+    },
+    "query": "über",
+    "title": "naïveÜber"
+  },
+  {
+    "expected": {
+      "coverage": 0.16666666666666666,
+      "level": "word-start"
+    },
+    "query": "2",
+    "title": "Café 2"
+  },
+  {
+    "expected": {
+      "coverage": 0.5,
+      "level": "phrase"
+    },
+    "query": "a-a",
+    "title": "xa-a-a"
+  },
+  {
+    "expected": {
+      "coverage": 0.3333333333333333,
+      "level": "phrase"
+    },
+    "query": "म",
+    "title": "राम"
+  },
+  {
+    "expected": {
+      "coverage": 1.0,
+      "level": "exact"
+    },
+    "query": "a b",
+    "title": "ab"
+  },
+  {
+    "expected": {
+      "coverage": 0.0,
+      "level": "none"
+    },
+    "query": "a b",
+    "title": "a﻿b"
+  }
+]

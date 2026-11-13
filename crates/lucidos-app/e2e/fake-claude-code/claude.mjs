@@ -1,0 +1,282 @@
+#!/usr/bin/env node
+// A fake Claude Code CLI for e2e runs on GitHub runners, which have no
+// logged-in Claude Code. It speaks the stream-json lines the engine parses
+// (runtime/claude_code_parse.rs) and answers `Say exactly: "X"` with X.
+// `claude --version` answers with FAKE_VERSION.
+// `Fail to start: "X"` makes the first turn die the way a CLI that cannot reach
+// its gateway does: X on stderr, exit code 1, and no `system/init` line.
+// `Name your session's branch` answers with the branch the message's session
+// context names (ADR 0491), or NO_SESSION_CONTEXT_REPLY.
+// A turn naming `your reasoning effort` answers `effort: X`, X being the
+// CLAUDE_CODE_EFFORT_LEVEL it was spawned with, so a spec sees what the
+// process runs at.
+// FAKE_CLAUDE_CODE_RESTRICTED_MODELS (a comma list of model ids) plays an
+// account that may not use those models: a pick of one runs the default model,
+// and the next turn prints the CLI's warning line after its init.
+// `Take N seconds` makes that turn last N seconds. An interrupt ends the
+// turn in flight at once, with an error result and no reply.
+// A fresh session's first message carries the thread history ahead of the
+// turn, so the other rules read only what follows the session context.
+// Any other prompt gets NO_RULE_REPLY, so a spec that needs a real model
+// fails loudly instead of passing by luck. Such a spec carries the
+// @real-claude-code tag and stays on the local leg.
+//
+// drift-check.mjs keeps these lines in step with the real CLI.
+
+import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { realpathSync } from 'node:fs';
+import { createInterface } from 'node:readline';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+export const FAKE_VERSION = '2.1.311';
+export const NO_RULE_REPLY = 'fake-claude-code: no rule for this prompt';
+export const NO_SESSION_CONTEXT_REPLY = 'fake-claude-code: no session context';
+export const NO_EFFORT = 'none';
+
+// A real turn takes seconds, and the engine stops the process at its result.
+// Specs that poll for a live session mid-turn need the turn to last that long.
+// FAKE_CLAUDE_CODE_TURN_MS overrides it.
+export const DEFAULT_TURN_MS = 3000;
+
+// What `initialize` lists, in Claude Code's order. `resolvedModel` is what
+// `system/init` and each assistant frame report for the alias.
+export const MODELS = [
+  { value: 'default', resolvedModel: 'claude-opus-5-5', displayName: 'Default', description: 'Use the default model', supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+  { value: 'sonnet', resolvedModel: 'claude-sonnet-5', displayName: 'Sonnet 5', description: 'Sonnet 5', supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+  { value: 'opus', resolvedModel: 'claude-opus-5-5', displayName: 'Opus 5.5', description: 'Opus 5.5', supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+  { value: 'haiku', resolvedModel: 'claude-haiku-4-5', displayName: 'Haiku 4.5', description: 'Haiku 4.5' },
+];
+
+const SLASH_COMMANDS = ['compact', 'context', 'cost', 'init', 'review'];
+
+export function resolveModel(alias) {
+  return MODELS.find((m) => m.value === alias)?.resolvedModel ?? alias;
+}
+
+// Closes the session context block (`SessionContext::render`).
+const SESSION_CONTEXT_END = '---\nEnd of session context.';
+
+/** The prompt without its session context block: what this turn says. */
+function turnText(prompt) {
+  return prompt.split(SESSION_CONTEXT_END).at(-1);
+}
+
+export function replyTo(prompt, effort = NO_EFFORT) {
+  const turn = turnText(prompt);
+  if (turn.includes('your reasoning effort')) return `effort: ${effort}`;
+  if (turn.includes("Name your session's branch")) {
+    const branch = /BRANCH: Your worktree is on branch `([^`]+)`/.exec(prompt)?.[1];
+    return prompt.includes(SESSION_CONTEXT_END) && branch ? branch : NO_SESSION_CONTEXT_REPLY;
+  }
+  const match = /Say exactly:\s*"([^"]*)"/.exec(turn);
+  return match ? match[1] : NO_RULE_REPLY;
+}
+
+/** How long a turn lasts: its own `Take N seconds`, else `turnMs`. */
+export function turnDurationMs(prompt, turnMs) {
+  const seconds = /Take (\d+) seconds/.exec(turnText(prompt))?.[1];
+  return seconds === undefined ? turnMs : Number(seconds) * 1000;
+}
+
+export function failToStartText(prompt) {
+  return /[Ff]ail to start:\s*"([^"]*)"/.exec(turnText(prompt))?.[1];
+}
+
+/** A model id without its `[1m]` context suffix or `@` pin. */
+export function modelBase(id) {
+  return id.replace(/\[1m\]$/, '').split('@')[0];
+}
+
+/** The ids FAKE_CLAUDE_CODE_RESTRICTED_MODELS names, by base. */
+export function restrictedModels(list = '') {
+  return new Set(list.split(',').map((id) => id.trim()).filter(Boolean).map(modelBase));
+}
+
+/** The warning Claude Code prints when it runs `served` in place of `requested`. */
+export function restrictionWarning(requested, served) {
+  return {
+    type: 'system', subtype: 'informational', level: 'warning',
+    content: `Model "${requested}" is restricted by your organization's settings. Using ${served} instead.`,
+  };
+}
+
+function promptText(content) {
+  if (typeof content === 'string') return content;
+  return (content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('\n');
+}
+
+function flagValue(argv, name) {
+  const at = argv.indexOf(name);
+  return at >= 0 ? argv[at + 1] : undefined;
+}
+
+/** One session: turns each stdin line into the lines Claude Code would print. */
+export function createSession(argv, cwd, turnMs = DEFAULT_TURN_MS, effort = NO_EFFORT, answer = replyTo, restricted = new Set()) {
+  const sessionId = flagValue(argv, '--resume') ?? randomUUID();
+  let model;
+  let warning;
+  const pick = (requested) => {
+    if (restricted.has(modelBase(requested))) {
+      model = resolveModel('default');
+      warning = restrictionWarning(requested, model);
+    } else {
+      model = resolveModel(requested);
+      warning = undefined;
+    }
+  };
+  pick(flagValue(argv, '--model') ?? 'default');
+  let initSent = false;
+  const usage = { input_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 3 };
+
+  const controlResponse = (requestId, response) => ({
+    type: 'control_response',
+    response: { subtype: 'success', request_id: requestId, ...(response && { response }) },
+  });
+
+  function control(line) {
+    const { request_id: id, request } = line;
+    switch (request?.subtype) {
+      case 'initialize':
+        return [controlResponse(id, { models: MODELS, commands: [] })];
+      case 'set_model':
+        pick(request.model);
+        return [controlResponse(id)];
+      case 'cancel_async_message':
+        return [controlResponse(id, { cancelled: false })];
+      case 'interrupt':
+        return [controlResponse(id, { still_queued: [] })];
+      default:
+        // The real CLI refuses set_reasoning_effort this way too: effort
+        // reaches it only through CLAUDE_CODE_EFFORT_LEVEL at spawn.
+        return [{ type: 'control_response', response: { subtype: 'error', request_id: id, error: `Unsupported control request subtype: ${request?.subtype}` } }];
+    }
+  }
+
+  function turn(line) {
+    const out = [];
+    const failure = initSent ? undefined : failToStartText(promptText(line.message?.content));
+    if (failure !== undefined) return { now: [], later: [], isTurn: false, failToStart: failure };
+    if (!initSent) {
+      initSent = true;
+      out.push({
+        type: 'system', subtype: 'init', session_id: sessionId, model, cwd,
+        claude_code_version: FAKE_VERSION, slash_commands: SLASH_COMMANDS, skills: [],
+        tools: [], mcp_servers: [], permissionMode: flagValue(argv, '--permission-mode') ?? 'default',
+        apiKeySource: 'none', uuid: randomUUID(),
+      });
+    }
+    if (warning) {
+      out.push(warning);
+      warning = undefined;
+    }
+    out.push({ ...line, session_id: sessionId, timestamp: new Date().toISOString(), isReplay: true });
+    const prompt = promptText(line.message?.content);
+    const text = answer(prompt, effort);
+    const id = `msg_fake_${randomUUID().replaceAll('-', '')}`;
+    const message = { model, id, type: 'message', role: 'assistant', usage };
+    const reply = [
+      { type: 'stream_event', session_id: sessionId, parent_tool_use_id: null, event: { type: 'message_start', message: { ...message, content: [] } } },
+      { type: 'assistant', session_id: sessionId, parent_tool_use_id: null, message: { ...message, content: [{ type: 'text', text }] } },
+      { type: 'stream_event', session_id: sessionId, parent_tool_use_id: null, event: { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage } },
+      { type: 'stream_event', session_id: sessionId, parent_tool_use_id: null, event: { type: 'message_stop' } },
+      {
+        type: 'result', subtype: 'success', is_error: false, result: text, session_id: sessionId,
+        duration_ms: turnMs, num_turns: 1, stop_reason: 'end_turn', usage, uuid: randomUUID(),
+      },
+    ];
+    const interrupted = [{
+      type: 'result', subtype: 'error_during_execution', is_error: true, session_id: sessionId,
+      duration_ms: 0, num_turns: 1, stop_reason: null, usage, uuid: randomUUID(),
+    }];
+    return { now: out, later: reply, interrupted, isTurn: true, delayMs: turnDurationMs(prompt, turnMs) };
+  }
+
+  return {
+    sessionId,
+    /** `now` prints at once; `later` prints `delayMs` after, once earlier turns
+     *  finished, or `interrupted` does if an interrupt lands first. */
+    handle(raw) {
+      let line;
+      try {
+        line = JSON.parse(raw);
+      } catch {
+        return { now: [], later: [], isTurn: false };
+      }
+      if (line.type === 'control_request') {
+        return { now: control(line), later: [], isTurn: false, interrupt: line.request?.subtype === 'interrupt' };
+      }
+      if (line.type === 'user') return turn(line);
+      return { now: [], later: [], isTurn: false };
+    },
+  };
+}
+
+function main(argv) {
+  if (argv.includes('--version')) {
+    process.stdout.write(`${FAKE_VERSION} (Claude Code)\n`);
+    return;
+  }
+  const turnMs = Number(process.env.FAKE_CLAUDE_CODE_TURN_MS ?? DEFAULT_TURN_MS);
+  const answer = (prompt, effort) => {
+    const fitRenderer = turnText(prompt).match(/Probe fit renderer: (\{[^\n]*\})/);
+    if (fitRenderer) {
+      const request = JSON.parse(fitRenderer[1]);
+      const result = spawnSync(process.execPath, [fileURLToPath(new URL('./fit-renderer-probe.mjs', import.meta.url)), JSON.stringify(request.widgets), request.browser], {
+        encoding: 'utf8', timeout: 180000, maxBuffer: 131072,
+      });
+      const proof = result.status === 0 ? result.stdout.trim() : '{"verified":false,"stage":"launcher"}';
+      return '```json\n' + proof + '\n```';
+    }
+    const restoreCli = turnText(prompt).match(/Probe snapshot CLI restore: (\{[^\n]*\})/);
+    if (restoreCli) {
+      const request = JSON.parse(restoreCli[1]);
+      const result = spawnSync(request.cli, ['snapshot', 'restore', request.handle,
+        '--workspace', request.workspace, '--expected-workspace-id', request.workspace,
+        '--port', String(request.port), '--wait', '--json'], {
+        encoding: 'utf8', timeout: 120000, maxBuffer: 65536,
+      });
+      let status = null;
+      try { status = JSON.parse(result.stdout); } catch { /* No untrusted stderr in the proof. */ }
+      return JSON.stringify({ code: result.status ?? 4, status });
+    }
+    const selfRestore = turnText(prompt).includes('Probe snapshot self-restore refusal.');
+    const gateway = turnText(prompt).match(/Probe snapshot gateway restore origin: (http:\/\/127\.0\.0\.1:[0-9]+)\./)?.[1];
+    if (!gateway && !selfRestore && !turnText(prompt).includes('Probe snapshot restore origin.')) return replyTo(prompt, effort);
+    const result = spawnSync(process.execPath, [fileURLToPath(new URL('./restore-origin-probe.mjs', import.meta.url)), ...(gateway ? ['--gateway', gateway, ...(turnText(prompt).includes('Spend snapshot approval.') ? ['--approval'] : [])] : selfRestore ? ['--self-restore'] : [])], {
+      encoding: 'utf8', timeout: 55000, maxBuffer: 8192,
+    });
+    return result.status === 0 ? result.stdout.trim() : '{"verified":false}';
+  };
+  const session = createSession(argv, process.cwd(), turnMs, process.env.CLAUDE_CODE_EFFORT_LEVEL ?? NO_EFFORT, answer,
+    restrictedModels(process.env.FAKE_CLAUDE_CODE_RESTRICTED_MODELS));
+  const print = (lines) => { for (const line of lines) process.stdout.write(`${JSON.stringify(line)}\n`); };
+  let turns = Promise.resolve();
+  let interruptTurn = () => {};
+  const input = createInterface({ input: process.stdin });
+  input.on('line', (raw) => {
+    const { now, later, interrupted, isTurn, failToStart, interrupt, delayMs } = session.handle(raw);
+    if (failToStart !== undefined) {
+      process.stderr.write(`${failToStart}\n`, () => process.exit(1));
+      return;
+    }
+    if (!isTurn) {
+      print(now);
+      if (interrupt) interruptTurn();
+      return;
+    }
+    turns = turns.then(async () => {
+      print(now);
+      const wasInterrupted = await new Promise((done) => {
+        const timer = setTimeout(() => done(false), delayMs);
+        interruptTurn = () => { clearTimeout(timer); done(true); };
+      });
+      interruptTurn = () => {};
+      print(wasInterrupted ? interrupted : later);
+    });
+  });
+}
+
+// The runner starts this through a symlink, so compare real paths.
+const invokedAs = process.argv[1] && pathToFileURL(realpathSync(process.argv[1])).href;
+if (import.meta.url === invokedAs) main(process.argv.slice(2));

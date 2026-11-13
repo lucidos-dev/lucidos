@@ -1,0 +1,182 @@
+/** Pending sends and explicit ordering refusals, kept on this device
+ *  so a page reload does not lose it. A record is written when the send
+ *  starts and deleted once the engine takes it or a refusal restores its draft. One found at
+ *  startup is therefore an *unsent message*. The live ones are in
+ *  `store/unsentMessages.ts`; the restore is `actions/unsentMessageRestore.ts`.
+ *
+ *  Plan: `docs/plans/2026-10-03-unsent-messages-survive-a-reload.md`. */
+
+import { sourceGeneration, type RestoreSourceOrigin } from '../utils/restoreSourceGeneration';
+import type { AnswerKind } from './thread-events';
+import type { AnswerPlacement } from '../api/client/chat';
+import type { ChatRequestBody } from '../api/types';
+import { WORKSPACE_ID } from '../utils/basePath';
+import { deviceDatabaseName, openDeviceDatabase } from './deviceDatabase';
+import { pageOwnerId } from './pageOwner';
+import { showToast } from './store';
+import type { SendSettlement, UnsentMessage } from './unsentMessages';
+
+export interface UnsentMessageRecord extends RestoreSourceOrigin {
+  /** The send's client event id: the key, and the exchange's starter id. */
+  eventId: string;
+  threadId: string;
+  /** The exact request, so a Retry after the reload re-posts it unchanged. */
+  body: ChatRequestBody;
+  settlement: SendSettlement;
+  /** When it was sent, so the restored card sorts where it was. */
+  sentAt: string;
+  /** `sending` while the attempt is in flight; `unsent` after an unknown
+   *  outcome or an explicit ordering refusal. */
+  phase: 'sending' | 'unsent';
+  /** Retries that also failed to send. */
+  failedRetries: number;
+  /** An explicit refusal retained for Retry. Absent on legacy records and
+   *  sends whose outcome the page could not learn. */
+  refusal?: UnsentMessage['refusal'];
+  /** The page load that owns the record (`store/pageOwner.ts`). */
+  ownerId: string;
+  /** The question card the text was typed to answer, by tool-use id. It
+   *  brings the unsent answer back onto that card after a reload. */
+  answersQuestion?: string;
+  /** A card answer retries through its own endpoint, with this exact payload. */
+  questionPick?: { toolUseId: string; answer: AnswerKind; placement: AnswerPlacement };
+}
+
+type UnsentPatch = Pick<UnsentMessageRecord, 'phase' | 'failedRetries' | 'refusal'> | Pick<UnsentMessageRecord, 'ownerId'>;
+
+export interface UnsentMessageBackend {
+  put(record: UnsentMessageRecord): Promise<void>;
+  /** Changes a record that exists, and never creates one. */
+  patch(eventId: string, patch: UnsentPatch): Promise<void>;
+  delete(eventId: string): Promise<void>;
+  list(): Promise<UnsentMessageRecord[]>;
+}
+
+export function unsentMessageDbName(workspaceId: string | null): string {
+  return deviceDatabaseName('lucidos-unsent-messages', workspaceId);
+}
+
+const MESSAGES = 'messages';
+
+function createIndexedDbBackend(name: string): UnsentMessageBackend {
+  const { transact } = openDeviceDatabase(name, (db) => {
+    db.createObjectStore(MESSAGES, { keyPath: 'eventId' });
+  });
+  return {
+    put: async (record) => { await transact(MESSAGES, 'readwrite', (s) => s.put(record)); },
+    patch: async (eventId, patch) => {
+      await transact(MESSAGES, 'readwrite', (s) => {
+        const get = s.get(eventId);
+        get.onsuccess = () => {
+          if (get.result) s.put({ ...get.result, ...patch });
+        };
+      });
+    },
+    delete: async (eventId) => { await transact(MESSAGES, 'readwrite', (s) => s.delete(eventId)); },
+    list: async () => (await transact<UnsentMessageRecord[]>(MESSAGES, 'readonly', (s) => s.getAll())) ?? [],
+  };
+}
+
+/** The same contract over a map, for tests. Vitest runs under Node, which has
+ *  no IndexedDB. */
+export function createMemoryUnsentMessageBackend(): UnsentMessageBackend {
+  const records = new Map<string, UnsentMessageRecord>();
+  return {
+    put: async (record) => { records.set(record.eventId, structuredClone(record)); },
+    patch: async (eventId, patch) => {
+      const record = records.get(eventId);
+      if (record) records.set(eventId, { ...record, ...patch });
+    },
+    delete: async (eventId) => { records.delete(eventId); },
+    list: async () => [...records.values()].map((r) => structuredClone(r)),
+  };
+}
+
+/** Every operation fails, so a browser without IndexedDB hears that its
+ *  unsent messages will not survive a reload. */
+function createUnavailableBackend(): UnsentMessageBackend {
+  const fail = async (): Promise<never> => {
+    throw new Error('this browser has no IndexedDB');
+  };
+  return { put: fail, patch: fail, delete: fail, list: fail };
+}
+
+let backend: UnsentMessageBackend | null = null;
+const live = new Map<string, UnsentMessageRecord>();
+
+/** Includes requests still building/waiting/posting even if persistence failed.
+ * Restore capture copies these before it acknowledges the old page's intent. */
+export function liveUnsentMessageRecords(): UnsentMessageRecord[] {
+  return [...live.values()];
+}
+
+function store(): UnsentMessageBackend {
+  backend ??= typeof indexedDB === 'undefined'
+    ? createUnavailableBackend()
+    : createIndexedDbBackend(unsentMessageDbName(WORKSPACE_ID));
+  return backend;
+}
+
+/** Writes run one at a time, in order, so a delete never overtakes its put. */
+let writes: Promise<void> = Promise.resolve();
+let warned = false;
+
+export function unsentMessageStorageFailureMessage(err: unknown): string {
+  const reason = err instanceof Error ? err.message : String(err);
+  return `Unsent messages will not survive a page reload: this browser could not save them (${reason}).`;
+}
+
+/** Never awaited by a send: storage must not hold up or fail one. A failure is
+ *  said once per page, and the send carries on in memory. */
+function enqueue(write: () => Promise<void>): void {
+  writes = writes.then(write).catch((err) => {
+    if (warned) return;
+    warned = true;
+    showToast(unsentMessageStorageFailureMessage(err), 'warning');
+  });
+}
+
+/** Keep a send that is about to post. */
+export function persistSendingMessage(
+  record: Omit<UnsentMessageRecord, 'phase' | 'failedRetries' | 'ownerId' | 'sourceGeneration'>,
+): void {
+  const stored: UnsentMessageRecord = { ...record, phase: 'sending', failedRetries: 0, ownerId: pageOwnerId, sourceGeneration: sourceGeneration() };
+  live.set(record.eventId, stored);
+  enqueue(() => store().put(stored));
+}
+
+/** Keep an unanswered send or an explicit refusal available for Retry. */
+export function markUnsentMessageRecordUnsent(eventId: string, failedRetries: number, refusal?: UnsentMessageRecord['refusal']): void {
+  const record = live.get(eventId);
+  if (record) live.set(eventId, { ...record, phase: 'unsent', failedRetries, refusal });
+  enqueue(() => store().patch(eventId, { phase: 'unsent', failedRetries, refusal }));
+}
+
+/** Take over a record a previous page load left. */
+export function adoptUnsentMessageRecord(record: UnsentMessageRecord): void {
+  live.set(record.eventId, { ...record, ownerId: pageOwnerId });
+  enqueue(() => store().patch(record.eventId, { ownerId: pageOwnerId }));
+}
+
+/** The send was decided, or the user discarded it. */
+export function forgetUnsentMessageRecord(eventId: string): void {
+  live.delete(eventId);
+  enqueue(() => store().delete(eventId));
+}
+
+/** Everything stored, after every write this page has queued. A failed read
+ *  rejects, so the caller can tell "nothing stored" from "could not look". */
+export async function readUnsentMessageStore(): Promise<UnsentMessageRecord[]> {
+  await writes;
+  return store().list();
+}
+
+/** `null` puts back the backend this runtime would pick on its own. */
+export function _resetUnsentMessageRecordsForTesting(
+  next: UnsentMessageBackend | null = createMemoryUnsentMessageBackend(),
+): void {
+  backend = next;
+  live.clear();
+  writes = Promise.resolve();
+  warned = false;
+}

@@ -1,0 +1,203 @@
+# The completion probes: one per task, asking whether the job got done.
+#
+# Delivery and fidelity are separate axes, and they are in separate files
+# because mixing them makes both unreadable. A probe in `probes.toml` asks
+# whether a fact the task needed survived. A completion probe asks whether the
+# deliverable exists and is right. A completion outcome therefore carries no
+# fact and no tier, and it reaches no fidelity rate.
+#
+# `deliverable` replaces `wrong_default`. A fidelity probe has to name the
+# tempting wrong answer or it is measuring loudness. A completion probe has
+# nothing to be tempted by, so what it owes the reader instead is one line
+# saying what the deliverable IS, in the task's own terms.
+#
+# Same scorer rule as a probe (I9): exactly one `assert` or one `judge`, and the
+# loader refuses the fixture otherwise.
+#
+# WRITE THE ASSERTION AGAINST THE PROMPT, never against what a run produced.
+# T06 is the worked example: one run did the job it was asked and then a second
+# one it invented, so treating its tree as the specification would bake the
+# invented half into the criterion.
+#
+# The harness scores each of these the moment its own task finishes, against
+# the workspace as that task left it. Scoring them beside the retention probes
+# would read a world every later task had rewritten.
+
+[[completion]]
+id = "C01"
+task = "T01"
+deliverable = "a conventions.md under the project folder recording both stated conventions"
+assert = { kind = "all", of = [
+  { kind = "file_matches", path = "artifacts/build-health/conventions.md", regex = 'YYYY-MM-DD-health\.md' },
+  { kind = "file_matches", path = "artifacts/build-health/conventions.md", regex = '(?i)four columns|4 columns' },
+] }
+
+# The report has to carry the day's builds, not just be named correctly. An
+# empty file with the right name is the failure this whole file exists for, and
+# three durations spread across the eight rows is what tells them apart.
+[[completion]]
+id = "C02"
+task = "T02"
+deliverable = "eight BuildObserved events, and a report for the stated date carrying the day's builds"
+assert = { kind = "all", of = [
+  { kind = "event_count", event_type = "BuildObserved", count = 8 },
+  { kind = "file_matches", path = "artifacts/build-health/2026-01-05-health.md", regex = '\b412s?\b' },
+  { kind = "file_matches", path = "artifacts/build-health/2026-01-05-health.md", regex = '\b121s?\b' },
+  { kind = "file_matches", path = "artifacts/build-health/2026-01-05-health.md", regex = '\b409s?\b' },
+] }
+
+[[completion]]
+id = "C03"
+task = "T03"
+deliverable = "an app under the requested id, with a UI document rather than a manifest alone"
+assert = { kind = "all", of = [
+  { kind = "file_exists", path = "apps/build-health/manifest.json" },
+  { kind = "file_matches", path = "apps/build-health/**", regex = '(?i)<body' },
+] }
+
+# Half the deliverable is the reply: the prompt asks for the row count of each
+# project by name. The other half is on disk.
+[[completion]]
+id = "C04"
+task = "T04"
+deliverable = "both named projects collected, and the reply stating a row count for each"
+assert = { kind = "all", of = [
+  { kind = "glob_count", path = "artifacts/build-health/*-collected.json", min = 2 },
+  { kind = "response_matches", regex = '(?i)example-repo' },
+  { kind = "response_matches", regex = '(?i)example-org/api' },
+  { kind = "response_matches", regex = '\b8\b' },
+  { kind = "response_matches", regex = '\b5\b' },
+] }
+
+# Whether the schedule and the threshold are the RIGHT ones is P05.1 and P05.2,
+# which is retention. This asks only whether a trigger was set up at all.
+[[completion]]
+id = "C05"
+task = "T05"
+deliverable = "a scheduled trigger, recorded as an event and present on disk"
+assert = { kind = "all", of = [
+  { kind = "event_exists", event_type = "TriggerCreated" },
+  { kind = "file_exists", path = "triggers/**/trigger.toml" },
+] }
+
+# The gap that started this. T06's three probes all pass for an arm that
+# collected nothing, because none of them reads whether web arrived.
+[[completion]]
+id = "C06"
+task = "T06"
+deliverable = "the third project collected, and named in the report"
+assert = { kind = "all", of = [
+  { kind = "glob_count", path = "artifacts/build-health/*-collected.json", min = 3 },
+  { kind = "file_matches", path = "artifacts/build-health/*-health.md", regex = '(?i)example-org/web' },
+] }
+
+# The app half of this task is unassertable: the app reads its numbers from
+# events, so widening it leaves no project name in its source. P07.3 covers the
+# app not being duplicated. What is left here is the sub-thread's deliverable.
+[[completion]]
+id = "C07"
+task = "T07"
+deliverable = "a weekly summary covering all three projects, written where the prompt asked"
+assert = { kind = "all", of = [
+  { kind = "file_matches", path = "artifacts/build-health/weekly.md", regex = '(?i)example-repo' },
+  { kind = "file_matches", path = "artifacts/build-health/weekly.md", regex = '(?i)example-org/api' },
+  { kind = "file_matches", path = "artifacts/build-health/weekly.md", regex = '(?i)example-org/web' },
+] }
+
+[[completion]]
+id = "C08"
+task = "T08"
+deliverable = "a background collection that landed, and a report refreshed after it did"
+assert = { kind = "all", of = [
+  { kind = "tool_call_count", tool = "run_bash_background", min = 1 },
+  { kind = "event_exists", event_type = "BackgroundBashCompleted" },
+  # "the daily report" and "the report" both exist on disk by T08, so an agent
+  # can legitimately refresh weekly.md instead. The deliverable is a refresh
+  # AFTER the collection landed, whichever report the prompt was read as naming.
+  { kind = "any", of = [
+    { kind = "file_modified_after_event", path = "artifacts/build-health/*-health.md", event_type = "BackgroundBashCompleted" },
+    { kind = "file_modified_after_event", path = "artifacts/build-health/weekly.md", event_type = "BackgroundBashCompleted" },
+  ] },
+] }
+
+# Which grouping was chosen is P09.2, which is retention. This asks whether a
+# breakdown section arrived at all, and whether it covers the projects.
+[[completion]]
+id = "C09"
+task = "T09"
+deliverable = "a breakdown section in the daily report, covering the projects that report carries"
+# example-org/api is deliberately NOT asserted here. It is collected in T04 but
+# does not enter the daily report until T10 regenerates it, so requiring it at
+# T09 fails a run that did exactly what T09 asked. Scored 2026-08-21: both arms
+# failed C09 on that regex alone, having produced a correct breakdown.
+assert = { kind = "all", of = [
+  { kind = "file_matches", path = "artifacts/build-health/*-health.md", regex = '(?i)breakdown' },
+  { kind = "file_matches", path = "artifacts/build-health/*-health.md", regex = '(?i)example-repo' },
+  { kind = "file_matches", path = "artifacts/build-health/*-health.md", regex = '(?i)example-org/web' },
+] }
+
+# Six jobs in one prompt. The two with an unambiguous artifact are the summary
+# event and the changelog, and an arm that skipped the pass produces neither.
+[[completion]]
+id = "C10"
+task = "T10"
+deliverable = "the nightly pass leaving its summary event and starting the changelog"
+assert = { kind = "all", of = [
+  { kind = "event_exists", event_type = "BuildHealthSummarised" },
+  { kind = "file_exists", path = "artifacts/build-health/CHANGELOG.md" },
+] }
+
+# The whole deliverable is the reply, so this is the one completion probe with
+# no file in it. Whether the rate is formatted right is P11.1.
+[[completion]]
+id = "C11"
+task = "T11"
+deliverable = "a one-line status carrying a rate"
+assert = { kind = "response_matches", regex = '\d+(\.\d+)? ?%' }
+
+[[completion]]
+id = "C12"
+task = "T12"
+deliverable = "a handover at the requested path, covering the conventions and what runs when"
+assert = { kind = "all", of = [
+  { kind = "file_matches", path = "artifacts/build-health/HANDOVER.md", regex = '(?i)convention' },
+  { kind = "file_matches", path = "artifacts/build-health/HANDOVER.md", regex = '(?i)trigger|every morning|daily|06:00' },
+] }
+
+# The last two are the ceiling tasks, and their completion probes deliberately
+# ask nothing about the planted numbers. Whether PLAN.md carries 26 hours is
+# P13.1, and whether the register carries 45 minutes is P14.1. What is left for
+# a completion probe is whether the agent got through five long documents and
+# produced the shape it was asked for.
+
+# One event per document, so an arm that stopped reading part way through is
+# visible here rather than only in the retention probes. The three files are
+# the housekeeping the prompt asks for after the reading is done.
+[[completion]]
+id = "C13"
+task = "T13"
+deliverable = "five documents reviewed, an inventory, a status file and the cutover plan"
+assert = { kind = "all", of = [
+  { kind = "event_payloads_cover", event_type = "LedgerDocReviewed", regexes = [
+    '01-vendor-replay-api', '02-ci-log', '03-incident-postmortem',
+    '04-cutover-runbook', '05-field-dictionary',
+  ] },
+  { kind = "file_exists", path = "artifacts/ledger-migration/INVENTORY.md" },
+  { kind = "file_exists", path = "artifacts/ledger-migration/STATUS.md" },
+  { kind = "file_exists", path = "artifacts/ledger-migration/cutover/PLAN.md" },
+] }
+
+# A row per document, then the section the follow-up asks for. The section
+# heading is checked and its content is not, because the content is P14.1.
+[[completion]]
+id = "C14"
+task = "T14"
+deliverable = "a risk register with a row per document, plus the cutover-hold section"
+assert = { kind = "all", of = [
+  { kind = "file_matches", path = "artifacts/ledger-migration/RISKS.md", regex = '01-vendor-replay-api' },
+  { kind = "file_matches", path = "artifacts/ledger-migration/RISKS.md", regex = '02-ci-log' },
+  { kind = "file_matches", path = "artifacts/ledger-migration/RISKS.md", regex = '03-incident-postmortem' },
+  { kind = "file_matches", path = "artifacts/ledger-migration/RISKS.md", regex = '04-cutover-runbook' },
+  { kind = "file_matches", path = "artifacts/ledger-migration/RISKS.md", regex = '05-field-dictionary' },
+  { kind = "file_matches", path = "artifacts/ledger-migration/RISKS.md", regex = '(?i)cutover hold' },
+] }
