@@ -1,0 +1,12 @@
+[package]
+name = "lucidos-update-address"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# One rule for which update address Lucidos accepts, shared by the gateway,
+# the packaged app and the CLI. ADR 0014 §1 keeps the gateway off the engine,
+# so the rule lives in its own crate.
+
+[dependencies]
+url = "2.5"

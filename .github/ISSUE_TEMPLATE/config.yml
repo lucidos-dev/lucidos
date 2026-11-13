@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions / discussion
+    url: https://github.com/lucidos-dev/lucidos/discussions
+    about: Ask questions, share ideas, and talk with the community in GitHub Discussions.
+  - name: Security vulnerability
+    url: https://github.com/lucidos-dev/lucidos/security/advisories/new
+    about: Report a security issue privately — please do not open a public issue. See SECURITY.md.

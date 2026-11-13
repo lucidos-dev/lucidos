@@ -1,0 +1,16 @@
+[package]
+name = "lucidos-owner-lock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The owner lock: an exclusive flock a process holds for its whole life, so
+# holding it is the liveness signal. The engine, the gateway, the app and the
+# eval harness all decide "is it alive" through this one crate. None of them may
+# depend on the engine (ADR 0014 §1), hence a crate of its own.
+
+[dependencies]
+fs2 = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

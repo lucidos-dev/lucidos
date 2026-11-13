@@ -1,0 +1,17 @@
+[package]
+name = "lucidos-gateway-stamp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The gateway stamp: the signature the starter of an engine puts on a claim it
+# vouches for, such as "this request comes from paired device D".
+#
+# The gateway signs and the engine verifies, and they must agree byte for byte.
+# So this is the `lucidos-frame-capability` shape: one crate small enough for
+# both to take, rather than two halves pinned together by a source scan.
+
+[dependencies]
+hmac = "0.12"
+sha2 = "0.10"
+lucidos-local-token = { path = "../lucidos-local-token" }
