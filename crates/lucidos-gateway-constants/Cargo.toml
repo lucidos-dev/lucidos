@@ -1,0 +1,10 @@
+[package]
+name = "lucidos-gateway-constants"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The gateway constants a client must agree with. The gateway owns them. They
+# live in this leaf crate so the engine's codegen can render
+# `gateway-constants.ts` from them, and ADR 0014 keeps the gateway and the
+# engine from depending on each other. No dependencies, and it stays that way.

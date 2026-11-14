@@ -1,0 +1,26 @@
+# path-glob	kind	context-regex	reason
+CHANGELOG.md	history	-	Published release history stays byte-identical; new entries use current terms.
+release-notices.toml	history	-	Versioned migration notices describe the releases that introduced them.
+docs/adr/*	history	-	Decision records preserve the original terminology and supersession context.
+docs/plans/*	history	-	Dated plans preserve decisions and the wording they commissioned us to replace.
+docs/investigations/*	history	-	Dated investigations preserve the evidence and terminology they measured.
+docs/audits/2026-10-23-system-knowhow-audit.md	history	-	The original audit findings remain evidence of drift before the corrections.
+crates/lucidos-engine/migrations/*.sql	history	-	Applied migrations are immutable and retain their original checksums and filenames.
+system-knowhow/glossary.md	literal	^### (Successor thread|Build chain|Handoff consent|Owner approval)$	Retired glossary headings retain the searchable spelling; their bodies explain retirement.
+crates/lucidos-app/src/generated/thread-event-wire.ts	literal	^\s*\| 'spawn-successor';$	The retired owner-approval verb must still parse from stored cards; codegen owns this union.
+crates/lucidos-gateway/src/gateway_event_log.rs	literal	operator_id	The one-time log rewrite names the stored key it renames (ADR 0655).
+crates/lucidos-gateway/src/gateway_event_log_tests.rs	literal	^\{"at":"2026-08-17T00:00:\d\dZ","event":\{"type".*	The fixture is a log as an older gateway wrote it, to test the rewrite (ADR 0655).
+packages/lucidos-sdk/src/threads.ts	literal	temporary-measures\.md, "SDK threadPeople alias"	The deprecated SDK alias points at its registry row.
+packages/lucidos-sdk/src/threadUsers.ts	literal	temporary-measures\.md, "SDK threadPeople alias"	The deprecated SDK alias points at its registry row.
+docs/temporary-measures.md	literal	^### SDK threadPeople alias$	The registry row names the alias it tracks.
+crates/lucidos-engine/src/migration_tests.rs	literal	"(PeopleMessagePosted|mentioned_operator_ids|operator_id|people_messages)"	The migration test seeds rows as an older engine stored them, to test the rename (ADR 0655).
+crates/lucidos-engine/src/gateway_users.rs	literal	operator_id|/auth/operators	Wire adapters and fixtures preserve identity from older gateways; tracked by User rename wire aliases.
+crates/lucidos-gateway/src/auth_api.rs	literal	operator_id	The device response retains the previous wire field; tracked by User rename wire aliases.
+crates/lucidos-gateway/src/users_api.rs	literal	operator_id	Legacy HTTP response and request adapters preserve older clients; tracked by User rename wire aliases.
+crates/lucidos-gateway/src/users_api_tests.rs	literal	operator_id|/auth/operators	Fixtures exercise older clients; tracked by User rename wire aliases.
+crates/lucidos-app/src/api/client/control.ts	literal	operator_id	Browser adapters normalize an older local gateway; tracked by User rename wire aliases.
+crates/lucidos-app/src/api/client/gateway-users-compat.test.ts	literal	operator_id|/auth/operators	Fixtures exercise an older local gateway; tracked by User rename wire aliases.
+crates/lucidos-app/src/api/client/gatewayUsersCompat.ts	literal	operator_id	Lazy browser adapter preserves the older wire contract; tracked by User rename wire aliases.
+docs/glossary.md	literal	^### Owner approval$	The retired glossary heading keeps the searchable spelling; its body explains the retirement (ADR 0688).
+crates/lucidos-cli/src/main.rs	literal	alias = "ask-owner-approval"	The hidden alias keeps the retired spelling working for one release (docs/temporary-measures.md).
+docs/generated/agent-surface.json	literal	^\s*"ask-owner-approval"$	The generated CLI surface lists the hidden alias of the retired spelling (docs/temporary-measures.md).

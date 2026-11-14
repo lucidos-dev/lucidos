@@ -1,0 +1,61 @@
+//! `lucidos ask-permission <action> --thread <id> --reason "<why>"`: ask the
+//! workspace owner for a *permission* to do one act outside this thread's own
+//! authority (ADR 0664).
+//!
+//! The engine records the request on the thread the origin token names, and
+//! words the card itself. A question card lives inside the turn that asks it.
+//! So the agent then asks its question tool with the printed id alone. The
+//! engine shows its own card in that question's place. The action list lives
+//! in the engine, which refuses an unknown or unaskable action.
+
+use serde_json::json;
+
+use crate::http::{client as http_client, send_expect_json};
+use crate::workspace::{BoxError, Workspace};
+
+pub(crate) fn cmd_ask(
+    ws: &Workspace,
+    action: &str,
+    thread: Option<&str>,
+    target_workspace: Option<&str>,
+    snapshot: Option<&str>,
+    reason: &str,
+) -> Result<(), BoxError> {
+    let url = format!("{}/api/v1/permission-requests", ws.base_url());
+    let body = json!({
+        "action": action,
+        "target_thread_id": thread,
+        "target_workspace_id": target_workspace,
+        "snapshot_handle": snapshot,
+        "reason": reason,
+    });
+    let resp = send_expect_json("POST", &url, http_client()?.post(&url).json(&body))?;
+    println!(
+        "{}",
+        outcome_text(resp["request_id"].as_str().unwrap_or("?"))
+    );
+    Ok(())
+}
+
+/// What the agent reads back: the request id, and the one way to ask with it.
+pub(crate) fn outcome_text(id: &str) -> String {
+    format!(
+        "Requested {id}.\n\
+         Now ask the owner: call AskUserQuestion (Codex: ask_user_question) with exactly \
+         one question whose text is `{id}`, and any two options. Lucidos shows its own \
+         card, naming the act, in that question's place. If the owner allows it, do the act \
+         next, in this turn. Don't allow, or any other answer, allows nothing."
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_agent_is_told_to_ask_with_the_request_id() {
+        let text = outcome_text("permission-request:abc");
+        assert!(text.contains("`permission-request:abc`"), "{text}");
+        assert!(text.contains("AskUserQuestion"), "{text}");
+    }
+}

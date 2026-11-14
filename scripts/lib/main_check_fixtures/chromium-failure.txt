@@ -1,0 +1,74 @@
+  ✓  104 [chromium] › e2e/error-states.spec.ts:32:3 › Error display states › non-existent API endpoint returns 404 (103ms)
+  ✓  105 [chromium] › e2e/error-states.spec.ts:39:3 › Error display states › changes API with invalid change ID returns error (106ms)
+  ✓  106 [chromium] › e2e/error-states.spec.ts:46:3 › Error display states › engine-restart-then-recovered turn does NOT show "Response interrupted" (1.7s)
+  ✓  107 [chromium] › e2e/error-states.spec.ts:125:3 › Resume after restart — boundary panels › chat thread aborted by engine: System chip + Continue button (1.7s)
+  ✓  108 [chromium] › e2e/error-states.spec.ts:170:3 › Resume after restart — boundary panels › chat thread aborted by /api/v1/restart: iconless action label, no Continue button (1.7s)
+  ✓  109 [chromium] › e2e/error-states.spec.ts:226:3 › Resume after restart — boundary panels › Continue button hides after a ContinuationStarted lands (1.7s)
+  ✓  110 [chromium] › e2e/error-states.spec.ts:286:3 › Resume after restart — boundary panels › ContinuationStarted with engine note: subline counts tool entries (1.7s)
+  ✓  111 [chromium] › e2e/error-states.spec.ts:367:3 › Question-parked thread preserved across restart › answerable card, no Aborted/Restarted/Continue boundary (1.7s)
+
+
+  1) [chromium] › e2e/dashboard-desktop.spec.ts:256:3 › dashboard on desktop › the Home icon opens only the chat, and the rail toggle hides and shows the rail 
+
+    TimeoutError: locator.click: Timeout 15000ms exceeded.
+    Call log:
+      - waiting for locator('.desktop-header .home-thread-btn')
+
+
+      258 |     await openDashboard(page);
+      259 |     const loaded = await frame(page, ids.small).locator('#load').textContent();
+    > 260 |     await page.locator('.desktop-header .home-thread-btn').click();
+          |                                                            ^
+      261 |     await expect(page.locator('.thread-title-menu:visible')).toHaveText('Home');
+      262 |     await expect(rail(page)).toBeVisible();
+      263 |
+        at /home/user/work/lucidos/lucidos/crates/lucidos-app/e2e/dashboard-desktop.spec.ts:260:60
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/targeted/pinned/dashboard-desktop-dashboar-2096f-le-hides-and-shows-the-rail-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/targeted/pinned/dashboard-desktop-dashboar-2096f-le-hides-and-shows-the-rail-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/targeted/pinned/dashboard-desktop-dashboar-2096f-le-hides-and-shows-the-rail-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/targeted/pinned/dashboard-desktop-dashboar-2096f-le-hides-and-shows-the-rail-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Retry #1 ───────────────────────────────────────────────────────────────────────────────────────
+
+    TimeoutError: locator.click: Timeout 15000ms exceeded.
+    Call log:
+      - waiting for locator('.desktop-header .home-thread-btn')
+
+
+      258 |     await openDashboard(page);
+      259 |     const loaded = await frame(page, ids.small).locator('#load').textContent();
+    > 260 |     await page.locator('.desktop-header .home-thread-btn').click();
+          |                                                            ^
+      261 |     await expect(page.locator('.thread-title-menu:visible')).toHaveText('Home');
+      262 |     await expect(rail(page)).toBeVisible();
+      263 |
+        at /home/user/work/lucidos/lucidos/crates/lucidos-app/e2e/dashboard-desktop.spec.ts:260:60
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/targeted/pinned/dashboard-desktop-dashboar-2096f-le-hides-and-shows-the-rail-chromium-retry1/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/targeted/pinned/dashboard-desktop-dashboar-2096f-le-hides-and-shows-the-rail-chromium-retry1/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/targeted/pinned/dashboard-desktop-dashboar-2096f-le-hides-and-shows-the-rail-chromium-retry1/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/targeted/pinned/dashboard-desktop-dashboar-2096f-le-hides-and-shows-the-rail-chromium-retry1/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › e2e/dashboard-desktop.spec.ts:256:3 › dashboard on desktop › the Home icon opens only the chat, and the rail toggle hides and shows the rail 
+  109 passed (7.4m)
+
