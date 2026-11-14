@@ -1,0 +1,21 @@
+.retained-restore-sources pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: inherit;
+  font-size: inherit;
+}
+.retained-restore-body {
+  padding-block: var(--space-md);
+}
+.retained-restore-summary {
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.retained-restore-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-sm);
+  margin-block: var(--space-md);
+}

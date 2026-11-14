@@ -1,0 +1,1965 @@
+use super::*;
+use axum::body::Body;
+use tokio::io::AsyncWriteExt;
+
+/// SSE keep-alive cadence. Clients derive their stall threshold from it
+/// (`generated/engine-constants`), so a stream silent for several intervals
+/// reads as dropped.
+pub(crate) const SSE_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Name of the keep-alive SSE event. A named event reaches only a listener
+/// registered for it, so `onmessage` consumers never see it (ADR 0146).
+pub(crate) const SSE_KEEPALIVE_EVENT: &str = "keepalive";
+
+/// Inter-task pipe size between the gzip encoder writer and the response body
+/// reader. Large enough that a burst of small events need not round-trip
+/// through the writer per frame. Small enough to bound memory if a client
+/// stalls.
+const GZIP_PIPE_BUF_BYTES: usize = 64 * 1024;
+
+pub(super) async fn global_events(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    // Register this connection in the live SSE-connection count. The guard is
+    // moved into the stream's map closure below, so the count decrements
+    // exactly when the stream is dropped. The push fan-out reads this count to
+    // decide whether to run the PresenceCheck (system-knowhow/notifications.md
+    // §3): a connected page can pong even when its device_presence heartbeat
+    // has gone stale.
+    let conn_guard = state.engine.sse_connections.connect();
+    let rx = state.engine.event_bus.subscribe();
+    // Subscribe first, then read the durable generation. Every event buffered
+    // during this read follows the hello, including on the gzip transport.
+    // An unreadable boundary must never look like a workspace without restores.
+    let boundary = match crate::core::snapshot::boundary::read(state.engine.pool()).await {
+        Ok(boundary) => boundary,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let hello = stream_hello(boundary.as_ref().map(|boundary| boundary.restore_id));
+    let json_stream = BroadcastStream::new(rx).map(move |r| {
+        // `move` captures `conn_guard` by value; it lives as long as this
+        // closure (i.e. as long as the stream), then Drop decrements the count.
+        let _hold = &conn_guard;
+        match r {
+            Ok(emitted) => emitted.to_sse_json(),
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                log!("[SSE] Event stream lagged by {} events", n);
+                lagged_event_json(n)
+            }
+        }
+    });
+    let json_stream = tokio_stream::once(hello).chain(json_stream);
+
+    if accepts_gzip(&headers) {
+        gzipped_sse_response(json_stream)
+    } else {
+        plain_sse_response(json_stream)
+    }
+}
+
+/// Connection metadata, not a domain event: never persisted or replayed.
+fn stream_hello(generation: Option<uuid::Uuid>) -> String {
+    serde_json::json!({
+        "type": "StreamHello",
+        "data": { "restore_generation": generation }
+    })
+    .to_string()
+}
+
+/// One frame on the wire. `data:` frames carry an event; the keep-alive frame
+/// is a named event with an empty payload.
+enum Frame {
+    Data(String),
+    Keepalive,
+}
+
+impl Frame {
+    /// The frame's wire bytes, as slices so a writer needs no per-event
+    /// allocation. A `data:` line with no payload is what makes an
+    /// EventSource dispatch the keep-alive.
+    fn chunks(&self) -> [&[u8]; 3] {
+        match self {
+            Frame::Data(json) => [b"data: ", json.as_bytes(), b"\n\n"],
+            Frame::Keepalive => [b"event: ", SSE_KEEPALIVE_EVENT.as_bytes(), b"\ndata:\n\n"],
+        }
+    }
+}
+
+/// The events, with a keep-alive frame in each quiet interval. The first
+/// keep-alive fires at once, so the stream announces itself on open.
+///
+/// Load-bearing on WebKit, which fires `EventSource.onopen` only once body
+/// BYTES arrive, where Chromium fires it on the response headers. Without an
+/// open frame, Safari and the iOS PWA sat at `connecting` for up to
+/// `SSE_KEEPALIVE_INTERVAL` after every page load. Gzip also buffers its own
+/// header until a flush.
+fn with_keepalives<S>(json_stream: S) -> impl Stream<Item = Frame> + Send + 'static
+where
+    S: Stream<Item = String> + Send + 'static,
+{
+    let mut ticks = tokio::time::interval(SSE_KEEPALIVE_INTERVAL);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    futures::stream::unfold(
+        (Box::pin(json_stream), ticks),
+        |(mut json, mut ticks)| async {
+            let frame = tokio::select! {
+                item = json.next() => Frame::Data(item?),
+                _ = ticks.tick() => Frame::Keepalive,
+            };
+            Some((frame, (json, ticks)))
+        },
+    )
+}
+
+/// Plain (uncompressed) SSE response, for clients that don't advertise `gzip`
+/// in `Accept-Encoding`.
+fn plain_sse_response<S>(json_stream: S) -> Response
+where
+    S: Stream<Item = String> + Send + 'static,
+{
+    let body = with_keepalives(json_stream)
+        .map(|frame| Ok::<_, Infallible>(axum::body::Bytes::from(frame.chunks().concat())));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(body))
+        .expect("static SSE response builder is infallible")
+}
+
+/// Gzip-compressed SSE response. The streaming `GzipEncoder` gets an explicit
+/// per-event `flush()` (Z_SYNC_FLUSH). Each event therefore reaches the client
+/// as it is emitted, rather than when the encoder fills its window.
+///
+/// The wire format is identical to the plain response. Only the transport
+/// bytes are compressed, so every EventSource parser sees the same events.
+fn gzipped_sse_response<S>(json_stream: S) -> Response
+where
+    S: Stream<Item = String> + Send + 'static,
+{
+    use async_compression::tokio::write::GzipEncoder;
+    use async_compression::Level;
+    use tokio_util::io::ReaderStream;
+
+    let (writer, reader) = tokio::io::duplex(GZIP_PIPE_BUF_BYTES);
+    let body_stream = ReaderStream::new(reader);
+
+    tokio::spawn(async move {
+        let mut encoder = GzipEncoder::with_quality(writer, Level::Fastest);
+        let frames = with_keepalives(json_stream);
+        tokio::pin!(frames);
+        while let Some(frame) = frames.next().await {
+            // Sequential `?` short-circuits on the first IO error (client
+            // gone), avoiding extra writes into a half-broken encoder.
+            let write_result: std::io::Result<()> = async {
+                for chunk in frame.chunks() {
+                    encoder.write_all(chunk).await?;
+                }
+                // flush() emits a Z_SYNC_FLUSH block: bytes leave the
+                // encoder immediately so latency stays close to plain SSE.
+                encoder.flush().await
+            }
+            .await;
+            if write_result.is_err() {
+                break;
+            }
+        }
+        // Best-effort gzip trailer; client may have already disconnected.
+        let _ = encoder.shutdown().await;
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CONTENT_ENCODING, "gzip")
+        .header(header::CACHE_CONTROL, "no-cache")
+        // Hint to reverse proxies (e.g. nginx) not to buffer the body.
+        .header("X-Accel-Buffering", "no")
+        .body(Body::from_stream(body_stream))
+        .expect("static SSE response builder is infallible")
+}
+
+/// Returns true iff `Accept-Encoding` advertises gzip with a non-zero
+/// quality. Honors RFC 7231 §5.3.5: a `q=0` weight on `gzip` is an
+/// explicit opt-out (e.g. for clients with broken decompressors), so
+/// callers must skip compression even though the token is present.
+/// Strict on the token name — `x-gzip` (a distinct historical encoding)
+/// is not accepted.
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    let Some(val) = headers.get(header::ACCEPT_ENCODING) else {
+        return false;
+    };
+    let Ok(s) = val.to_str() else {
+        return false;
+    };
+    s.split(',').any(|piece| {
+        let mut params = piece.split(';');
+        let token = params.next().unwrap_or("").trim();
+        if !token.eq_ignore_ascii_case("gzip") {
+            return false;
+        }
+        // Default weight is 1.0 when no q parameter is present.
+        params.all(|param| {
+            let Some((name, value)) = param.split_once('=') else {
+                return true;
+            };
+            if !name.trim().eq_ignore_ascii_case("q") {
+                return true;
+            }
+            // Treat unparseable / explicitly-zero weights as opt-out.
+            // (Per RFC, valid q is in [0, 1] with up to 3 decimals; any
+            // strictly positive value keeps gzip acceptable.)
+            value
+                .trim()
+                .parse::<f32>()
+                .map(|q| q > 0.0)
+                .unwrap_or(false)
+        })
+    })
+}
+
+/// The frame the SSE route writes when a subscriber falls behind.
+pub(crate) const LAGGED_FRAME: &str = "Lagged";
+
+/// Every frame type the SSE route writes itself rather than relays. A domain
+/// event may not take one of these names, or any app could make every client
+/// act on a frame it forged.
+pub(crate) const ROUTE_FRAMES: &[&str] = &[LAGGED_FRAME];
+
+/// Wire frame the frontend sees when its broadcast subscriber falls behind the
+/// 4096-event buffer. Without this, lagged events vanish silently and the UI
+/// keeps a "Thinking" spinner forever waiting for a `ResponseGenerated` that
+/// already happened. The frontend treats this as a signal to resync loaded
+/// thread state from `/api/v1/threads/<id>/events`.
+fn lagged_event_json(count: u64) -> String {
+    serde_json::json!({
+        "type": LAGGED_FRAME,
+        "data": { "count": count },
+    })
+    .to_string()
+}
+
+/// The status an engine reports while it is `shutting_down` or not.
+///
+/// An engine in teardown still answers for up to its whole drain window. A 2xx
+/// then would let a gateway adopt it and route a page to it seconds before it
+/// exits. `probe_health` in the gateway needs a 2xx to adopt.
+fn health_status(shutting_down: bool) -> (StatusCode, &'static str) {
+    if shutting_down {
+        (StatusCode::SERVICE_UNAVAILABLE, "shutting_down")
+    } else {
+        (StatusCode::OK, "ok")
+    }
+}
+
+pub(super) async fn health(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    let (code, status) = health_status(state.engine.is_shutting_down());
+    let workspace_name = state
+        .workspace_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let engine_version = include_str!("../../VERSION").trim();
+    // Read fresh from disk on each request so version bumps from applied
+    // changes are picked up without an engine restart.
+    let latest_engine_version = read_engine_version();
+    let latest_tauri_app_version = read_app_version();
+    let database = state.engine.database_health();
+    let agent_sandbox_unavailable = crate::runtime::agent_sandbox::unavailable_reason().await;
+    let body = Json(serde_json::json!({
+        // Deliberately still "ok" (and a 200) when `database_reachable` is false:
+        // this half is about the engine PROCESS, which is answering. Failing the
+        // endpoint would recruit the gateway's respawn machinery against a
+        // condition respawning cannot fix, and ADR 0014 forbids culling an alive
+        // engine. See `engine::db_health` and ADR 0037.
+        "status": status,
+        "workspace": workspace_name,
+        "workspace_path": state.workspace_path.to_string_lossy(),
+        "started_at": state.started_at.to_rfc3339(),
+        // A gateway spawned this engine, so a restarted gateway takes it back
+        // as its own and re-keys it (`api::gateway_stamp`).
+        "started_by_gateway": crate::api::gateway_stamp::started_by_gateway(),
+        // Is the workspace database answering? An engine outlives its database,
+        // and a client that cannot tell holds a black boot splash and reports
+        // the outage once per failed load. Read from an atomic the background
+        // probe writes, so this never puts database latency on the endpoint.
+        "database_reachable": database.is_reachable(),
+        // Why it is not: `true` when the database answers but no pooled
+        // connection is free. Only ever true while `database_reachable` is
+        // false, so the slowness warning can name the right fix (ADR 0301).
+        "database_pool_exhausted": database.is_pool_exhausted(),
+        "release": crate::LUCIDOS_RELEASE,
+        "release_dirty": crate::LUCIDOS_RELEASE_DIRTY,
+        "engine_version": engine_version,
+        "latest_engine_version": latest_engine_version,
+        "latest_tauri_app_version": latest_tauri_app_version,
+        // True in a PACKAGED desktop build (runs as the launchd service / behind
+        // the bundled gateway; no source checkout). The frontend reads this to
+        // route the "Restart" control: packaged → restart the LaunchAgent
+        // (`launchctl kickstart -k`) or POST the bundled gateway; dev → the
+        // /restart script (`web-dev.sh --engine-only`, which rebuilds first).
+        "packaged": is_packaged(),
+        // False when the engine booted without any LLM provider configured (the
+        // UnconfiguredProvider sentinel — packaged first run). The frontend
+        // reads this to show first-run provider onboarding (→ Settings →
+        // Providers) instead of letting the user chat into a guaranteed error.
+        "llm_configured": state.engine.llm_configured(),
+        // Which provider backends are actually configured, so the frontend can
+        // filter the model picker to providers the user has set up. `null` means
+        // "don't filter" (mock / no routing); an array enumerates live backends.
+        // Reflects a runtime credential swap (read from the live provider).
+        "configured_providers": state.engine.configured_providers(),
+        // Why agent-steered spawns cannot run sandboxed on this machine, or
+        // null when they can. The client pairs it with `agents_unsandboxed`
+        // for the standing sandbox banner (ADR 0645).
+        "agent_sandbox_unavailable": agent_sandbox_unavailable,
+        // True when the sandbox runs but cannot stop an agent emptying a
+        // protected file: Linux below Landlock ABI 3 (ADR 0645).
+        "agent_sandbox_truncation_unguarded":
+            crate::runtime::agent_sandbox::truncation_unguarded().await,
+    }));
+    (code, body)
+}
+
+/// True in a packaged desktop build, detected by the ABSENCE of a Lucidos source
+/// checkout above the running binary. A packaged `.app` engine has no
+/// `scripts/web-dev.sh` ancestor, so [`crate::paths::repo_root`] errs. A dev
+/// engine resolves it, under the gateway (ADR 0014) or the legacy single-engine
+/// model.
+///
+/// Delegates to [`crate::paths::has_lucidos_source`] so this flag and the chat
+/// agent's own "can I edit Lucidos here?" answer cannot drift. The compose
+/// destination picker hides "Lucidos source" on the strength of THIS field, and
+/// `run_coding_agent` refuses a source spawn on that one.
+fn is_packaged() -> bool {
+    !crate::paths::has_lucidos_source()
+}
+
+/// launchd label of the always-on engine service (matches
+/// `crates/lucidos-app/src/desktop.rs` `SERVICE_AGENT_LABEL`). The client's own
+/// login agent is a separate job and is deliberately NOT restarted from here:
+/// restarting the service must not disturb the window the user is looking at.
+const LAUNCH_AGENT_LABEL: &str = "com.lucidos.engine";
+
+/// Read a VERSION file from disk, returning "unknown" if missing.
+fn read_version_file(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path)
+        .map(|v| v.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Read the engine VERSION from disk (picks up bumps without restart).
+fn read_engine_version() -> String {
+    let path = crate::paths::repo_root()
+        .ok()
+        .map(|r| r.join("crates/lucidos-engine/VERSION"))
+        .unwrap_or_default();
+    read_version_file(&path)
+}
+
+/// Read the Tauri app VERSION from disk.
+fn read_app_version() -> String {
+    let path = crate::paths::repo_root()
+        .ok()
+        .map(|r| r.join("crates/lucidos-app/VERSION"))
+        .unwrap_or_default();
+    read_version_file(&path)
+}
+
+/// Switch the engine onto the new version, the disruptive step of the
+/// new-version-available flow. The new binary is ALREADY on disk, rebuilt by
+/// dev's *Apply* or installed by the packaged updater, so this only RESPAWNS.
+///
+/// It does NOT pre-emit boundary events. It stashes the device actor and
+/// returns; the boundary aborts are emitted at real teardown by
+/// `main.rs::shutdown_signal`. Nothing then shows "Switched" while the old
+/// engine is still alive. A device actor also marks the shutdown as a
+/// user-initiated switch, which recovery uses to auto-resume in-flight
+/// coding-agent threads. A crash leaves no such actor, so those threads keep a
+/// manual Continue.
+pub(super) async fn restart_engine(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let actor = super::actor::user_actor(&headers, None);
+    // Stash the device actor for the teardown-time boundary emit (Phase 3) and the
+    // recovery auto-resume signal (Phase 4). No pre-emit here. First writer wins,
+    // and this IS the first writer: the gateway's restart-intent notify fires on
+    // the respawn we are about to ask for, and must not overwrite the click's own
+    // actor (see `stash_first_restart_actor`).
+    let stashed = state.engine.stash_restart_actor(actor);
+
+    let outcome = respawn_this_engine(&state).await;
+
+    // Nothing asked this engine to go down after all. Every arm in
+    // `respawn_this_engine` fails BEFORE the process is signalled, so the stash
+    // now describes a restart that never happened. Left in place it would attach
+    // to whatever teardown came next, and under first-writer-wins it would
+    // REFUSE that teardown's own actor. That is the case that bites: a stale
+    // non-device actor here would block a later picker Restart from attributing
+    // itself, costing its threads the pause and the auto-resume. Only clear what
+    // THIS call stashed, so a concurrent notify's actor is never dropped for us.
+    if outcome.is_err() && stashed {
+        state.engine.take_restart_actor();
+        log!("[Restart] Respawn request failed, cleared the stashed restart actor");
+    }
+    outcome
+}
+
+/// Ask something to respawn this engine, by whichever route exists. Split out of
+/// [`restart_engine`] so its several failure exits meet the stash-cleanup above
+/// at one place instead of each having to remember it.
+///
+/// Prefer the gateway control API whenever the gateway spawned us, in dev and
+/// packaged alike, since it injects `LUCIDOS_GATEWAY_PORT` and
+/// `LUCIDOS_WORKSPACE_ID`. Fall back to launchd (packaged, no gateway) or
+/// `web-dev.sh --engine-only` (legacy `LUCIDOS_NO_GATEWAY` dev).
+///
+/// `Ok` means the teardown is under way, not merely requested. The gateway
+/// signals the engine inside the call it answers. When it moves to a newer
+/// binary first, its new image signals it a moment later (ADR 0461). launchctl and
+/// `web-dev.sh` have been spawned by then. Every `Err` leaves this process
+/// running.
+async fn respawn_this_engine(
+    state: &AppState,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    // The gateway (dev or packaged) respawns this workspace's stack in place onto
+    // the already-on-disk binary — no rebuild here.
+    if let (Ok(port), Ok(id)) = (
+        std::env::var("LUCIDOS_GATEWAY_PORT"),
+        std::env::var("LUCIDOS_WORKSPACE_ID"),
+    ) {
+        return restart_via_gateway(&port, &id).await;
+    }
+
+    if is_packaged() {
+        // Packaged, no gateway (legacy single-engine): launchd restarts the
+        // service onto the updater-installed binary.
+        return restart_via_launchd();
+    }
+
+    // Legacy `LUCIDOS_NO_GATEWAY` dev: no gateway to respawn the engine, so drive
+    // it via `web-dev.sh --engine-only`. Apply already rebuilt the binary, so the
+    // build step here is a fast near-noop; the respawn is what matters.
+    let script = crate::paths::script("web-dev.sh").map_err(|e| {
+        log!("[Restart] {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+    let ws = state.workspace_path.to_string_lossy().to_string();
+    let log_path = state.workspace_path.join(".lucidos/engine.log");
+    log!(
+        "[Restart] Running {} --engine-only -w {}",
+        script.display(),
+        ws
+    );
+    let mut cmd = tokio::process::Command::new(&script);
+    cmd.args(["-w", &ws, "--engine-only"]);
+    let exe = crate::engine::engine_version::published_engine_exe().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "Cannot resolve the published engine path." })),
+        )
+    })?;
+    let dir = crate::engine::engine_version::published_launch_dir(&exe).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Launch the engine from the checkout's published .launch/<profile>/<variant>/ path before switching versions." })),
+        )
+    })?;
+    cmd.arg("--publish-to").arg(dir);
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(log_file) => {
+            let stderr_file = log_file.try_clone().or_else(|_| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+            });
+            cmd.stdout(log_file);
+            match stderr_file {
+                Ok(f) => {
+                    cmd.stderr(f);
+                }
+                Err(_) => {
+                    cmd.stderr(std::process::Stdio::null());
+                }
+            }
+        }
+        Err(e) => {
+            log!(
+                "[Restart] Failed to open log file for restart: {} — spawning with no output",
+                e
+            );
+            cmd.stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+        }
+    }
+    match cmd.spawn() {
+        Ok(_) => Ok(StatusCode::OK),
+        Err(e) => {
+            let msg = format!("Failed to spawn {}: {}", script.display(), e);
+            log!("[Restart] {}", msg);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": msg })),
+            ))
+        }
+    }
+}
+
+/// `GET /api/v1/engine/version-status`. Reports the running engine's build id
+/// and whether a newer version is ready to switch onto. Also reports whether
+/// the build is packaged, and the dev background-rebuild state. Drives the "New
+/// version available" surface; packaged routes to the release updater instead.
+/// See `crates/lucidos-engine/src/engine/engine_version.rs`.
+pub(super) async fn engine_version_status(
+    State(state): State<AppState>,
+) -> Json<crate::engine::engine_version::VersionStatus> {
+    Json(state.engine.version_status().await)
+}
+
+/// Build output only, bounded to its last 64 KiB. Kept separate from the
+/// engine log so diagnostics do not disclose unrelated chat or runtime output.
+async fn engine_build_log(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let output = read_build_log(
+        &state
+            .workspace_path
+            .join(crate::engine::engine_version::ENGINE_BUILD_LOG_PATH),
+    )
+    .await?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], output))
+}
+
+const BUILD_LOG_BYTES: u64 = 64 * 1024;
+
+async fn read_build_log(path: &std::path::Path) -> Result<String, (StatusCode, String)> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let unavailable = |_| {
+        (
+            StatusCode::NOT_FOUND,
+            "Build output is not available yet.".to_string(),
+        )
+    };
+    let mut file = tokio::fs::File::open(path).await.map_err(unavailable)?;
+    let len = file.metadata().await.map_err(unavailable)?.len();
+    file.seek(std::io::SeekFrom::Start(
+        len.saturating_sub(BUILD_LOG_BYTES),
+    ))
+    .await
+    .map_err(unavailable)?;
+    let mut bytes = Vec::new();
+    file.take(BUILD_LOG_BYTES)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(unavailable)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// `GET /api/v1/engine/diagnostic-log`: a bounded query over this engine's
+/// own sanitized `log!` lines, for its own agents only (ADR 0667).
+async fn engine_diagnostic_log(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+) -> Result<impl IntoResponse, ApiError> {
+    /// Scans in flight. Each holds the whole matching window in memory.
+    static SCANS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    let source = DiagnosticLogSource {
+        dir: crate::diagnostic_log::dir_for(&state.workspace_path),
+        started: crate::diagnostic_log::started(),
+        scans: &SCANS,
+    };
+    let result = query_diagnostic_log(&headers, raw.as_deref(), source).await?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(result)))
+}
+
+/// Where a diagnostic log query reads, and what bounds its concurrency.
+struct DiagnosticLogSource {
+    dir: std::path::PathBuf,
+    started: bool,
+    scans: &'static tokio::sync::Semaphore,
+}
+
+/// Only an agent subprocess this engine minted a token for may read, and
+/// never through an app frame's stamp.
+fn diagnostic_log_reader_allowed(headers: &HeaderMap) -> bool {
+    !headers.contains_key(super::app_reach::APP_ID_HEADER)
+        && matches!(
+            super::actor::subprocess_origin(headers),
+            super::actor::SubprocessOrigin::Subprocess { .. }
+        )
+}
+
+async fn query_diagnostic_log(
+    headers: &HeaderMap,
+    raw: Option<&str>,
+    source: DiagnosticLogSource,
+) -> Result<crate::diagnostic_log::query::QueryResult, ApiError> {
+    use crate::diagnostic_log::query;
+    if !diagnostic_log_reader_allowed(headers) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "The diagnostic log answers only this workspace's agents.",
+        )
+        .with_reason("diagnostic_log_agent_only"));
+    }
+    let query = query::parse(raw, chrono::Utc::now())
+        .map_err(|e| ApiError::bad_request(e).with_reason("diagnostic_log_bad_query"))?;
+    let unavailable = |detail: String| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("The diagnostic log is unavailable: {detail}"),
+        )
+        .with_reason("diagnostic_log_unavailable")
+    };
+    if !source.started {
+        return Err(unavailable("this engine never started it".into()));
+    }
+    let permit = source.scans.try_acquire().map_err(|_| {
+        ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Two diagnostic log queries are already running. Try again shortly.",
+        )
+        .with_reason("diagnostic_log_busy")
+    })?;
+    let summary = query.summary();
+    let dir = source.dir;
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        query::run(&dir, &query)
+    })
+    .await
+    .map_err(|e| unavailable(e.to_string()))?
+    .map_err(|e| unavailable(e.to_string()))?;
+    log!(
+        "[DiagnosticLog] Served {} lines ({summary})",
+        result.returned
+    );
+    Ok(result)
+}
+
+/// `GET /api/v1/engine/changelog`: every published release's notes, newest
+/// first, for the *What's New* panel (Settings > System).
+///
+/// Takes no state and needs no database. It DOES read the checkout and may
+/// reach the network: a panel answering "what is new" cannot be limited to what
+/// shipped with this binary. `crate::engine::changelog` owns that and degrades
+/// to the baked copy, which is why this handler is the one request the fetch
+/// ever runs on.
+///
+/// Deliberately does NOT restate which release is running. `/health` already
+/// carries `release` and the frontend already holds it. One source of truth
+/// keeps the panel's "you are running this" mark from disagreeing with the
+/// Versions section two tabs away.
+pub(super) async fn engine_changelog() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "releases": crate::engine::changelog::changelog_releases().await,
+    }))
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum RebuildMode {
+    Join,
+    #[default]
+    Restart,
+}
+
+#[derive(Default, Deserialize)]
+pub(super) struct RebuildQuery {
+    #[serde(default)]
+    mode: RebuildMode,
+}
+
+/// Build source without switching. `mode=join` preserves the build in flight;
+/// omitting it retains the explicit restart escape hatch (ADR 0412).
+/// No-op packaged. Version-status and SSE report progress and readiness.
+pub(super) async fn engine_rebuild(
+    State(state): State<AppState>,
+    Query(query): Query<RebuildQuery>,
+) -> StatusCode {
+    match query.mode {
+        RebuildMode::Join => state.engine.join_or_start_background_rebuild(),
+        RebuildMode::Restart => state.engine.restart_background_rebuild(),
+    }
+    StatusCode::ACCEPTED
+}
+
+/// Gateway-mode restart (ADR 0014): POST the gateway's control API (behind the
+/// sigil namespace `/~/`) to respawn just this workspace's stack. The gateway
+/// kills the old engine and spawns a fresh one on the same loopback port. The
+/// frontend tolerates the brief network rejection after the 2xx.
+///
+/// Supports BOTH protocols. [`net_config::gateway_scheme_order`] puts the gateway's
+/// scheme first and the other one as a fallback, so a mismatch still restarts.
+/// A non-2xx RESPONSE is a real gateway error and returns immediately: only a
+/// failure to REACH the gateway falls through to the other scheme. Accepts the
+/// self-signed dev cert on this loopback call, the same posture as the gateway's
+/// own health client (`build_health_client`).
+async fn restart_via_gateway(
+    gateway_port: &str,
+    workspace_id: &str,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    // Loopback call to the co-located gateway; accept its self-signed dev cert
+    // (harmless for the plain-http packaged case) and bypass any ambient proxy.
+    let client = match crate::gateway_auth::client_builder().build() {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("gateway restart client build failed: {e}");
+            log!("[Restart] {}", msg);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": msg })),
+            ));
+        }
+    };
+
+    let schemes = crate::net_config::gateway_scheme_order();
+    let mut last_err: Option<String> = None;
+    for (i, scheme) in schemes.iter().enumerate() {
+        let url = format!(
+            "{scheme}://127.0.0.1:{gateway_port}/~/api/v1/control/workspaces/{workspace_id}/restart"
+        );
+        log!("[Restart] Gateway mode: POST {}", url);
+        match client.post(&url).send().await {
+            Ok(resp) if resp.status().is_success() => return Ok(StatusCode::OK),
+            Ok(resp) => {
+                // The gateway answered but rejected the request — a real error,
+                // not a protocol mismatch. Don't retry the other scheme.
+                let msg = format!("gateway restart returned {}", resp.status());
+                log!("[Restart] {}", msg);
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": msg })),
+                ));
+            }
+            Err(e) => {
+                // Couldn't reach the gateway on this scheme (e.g. plain http
+                // against a TLS listener) — try the other protocol before giving
+                // up.
+                let msg = format!("gateway restart request failed: {e}");
+                let more = i + 1 < schemes.len();
+                log!(
+                    "[Restart] {}{}",
+                    msg,
+                    if more { ", retrying other scheme" } else { "" }
+                );
+                last_err = Some(msg);
+            }
+        }
+    }
+
+    let msg = last_err.unwrap_or_else(|| "gateway restart request failed".to_string());
+    Err((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": msg })),
+    ))
+}
+
+/// Packaged restart: the engine runs as the `com.lucidos.engine` launchd
+/// service, so it restarts itself with `launchctl kickstart -k`. launchd
+/// SIGTERMs the service supervisor, which sends the engine its graceful-stop
+/// SIGUSR1 and respawns a clean Postgres and engine. We spawn launchctl and
+/// return 200 at once: the response flushes during the drain window, and the
+/// frontend tolerates a network rejection after a 2xx.
+fn restart_via_launchd() -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    // `launchctl kickstart` targets `gui/<uid>/<label>`; resolve the uid of the
+    // user whose launchd domain the service was bootstrapped into (us).
+    let uid = unsafe { libc::getuid() };
+    let target = format!("gui/{uid}/{LAUNCH_AGENT_LABEL}");
+    log!("[Restart] Packaged mode: launchctl kickstart -k {}", target);
+    match std::process::Command::new("launchctl")
+        .args(["kickstart", "-k", &target])
+        .spawn()
+    {
+        Ok(_) => Ok(StatusCode::OK),
+        Err(e) => {
+            let msg = format!("Failed to restart service via launchctl: {e}");
+            log!("[Restart] {}", msg);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": msg })),
+            ))
+        }
+    }
+}
+
+/// Get conversation history up to a specific event
+pub(super) async fn get_history(
+    State(state): State<AppState>,
+    Query(query): Query<EventQuery>,
+) -> Result<Json<ConversationSnapshot>, (StatusCode, String)> {
+    let event_id = query.event;
+    match state
+        .event_store
+        .get_conversation_at_event(event_id, &state.workspace_path)
+        .await
+    {
+        Ok(snapshot) => Ok(Json(snapshot)),
+        Err(e) => Err((StatusCode::NOT_FOUND, format!("Error: {}", e))),
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct MessagesQuery {
+    #[serde(default = "default_messages_limit")]
+    limit: i64,
+    #[serde(default)]
+    before: Option<String>,
+}
+
+fn default_messages_limit() -> i64 {
+    20
+}
+
+/// Parse an optional RFC 3339 timestamp into `DateTime<Utc>`, for the
+/// `since` / `until` / `before` cursors the query endpoints accept.
+///
+/// A present-but-unparseable value is refused, never dropped. The stores read
+/// `None` as "no bound", so dropping one widens the query. A bare date in
+/// `since` turns a windowed count into the all-time one. A dropped `before`
+/// makes every `/messages` page return the newest rows, which loops a client
+/// paging by cursor.
+///
+/// `param` names the field so the 400 says which value was wrong. Same shape
+/// as the `event_id` refusal in `query_events`.
+fn parse_optional_rfc3339(
+    param: &str,
+    raw: Option<&str>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match chrono::DateTime::parse_from_rfc3339(raw) {
+        Ok(dt) => Ok(Some(dt.with_timezone(&chrono::Utc))),
+        Err(e) => Err(format!(
+            "{param} '{raw}' is not an RFC 3339 timestamp \
+             (e.g. 2026-09-01T00:00:00Z): {e}"
+        )),
+    }
+}
+
+/// Get recent messages across all history (flat timeline)
+pub(super) async fn get_recent_messages(
+    State(state): State<AppState>,
+    Query(query): Query<MessagesQuery>,
+) -> Result<Json<Vec<SessionMessage>>, (StatusCode, String)> {
+    let before = parse_optional_rfc3339("before", query.before.as_deref())
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    let limit = query.limit.clamp(1, 500);
+    let messages = state
+        .event_store
+        .get_recent_messages(limit, before)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load messages: {}", e),
+            )
+        })?;
+    Ok(Json(messages))
+}
+
+/// Get all messages for a specific session (for history time travel)
+pub(super) async fn get_session_messages(
+    State(state): State<AppState>,
+    Query(query): Query<SessionMessagesQuery>,
+) -> Result<Json<Vec<SessionMessage>>, (StatusCode, String)> {
+    let request_id = query.id;
+    let messages = state
+        .event_store
+        .get_request_messages_by_id(&request_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load messages: {}", e),
+            )
+        })?;
+    Ok(Json(messages))
+}
+
+#[derive(Deserialize)]
+pub(super) struct EventsQueryParams {
+    #[serde(default, alias = "type")]
+    event_type: Option<String>,
+    #[serde(default)]
+    since: Option<String>,
+    #[serde(default)]
+    until: Option<String>,
+    #[serde(default)]
+    before_event_id: Option<uuid::Uuid>,
+    #[serde(default)]
+    after_event_id: Option<uuid::Uuid>,
+    /// Restrict to one thread. Absent is every thread, which is what every
+    /// pre-existing caller sends, so the filter can only ever narrow.
+    #[serde(default)]
+    thread_id: Option<uuid::Uuid>,
+    /// Resolve one event by primary key. A `String` rather than a `Uuid`,
+    /// unlike the two cursors above. This is the address an agent noted from
+    /// a tool result, so it arrives in the `evt-<32 hex>` form.
+    #[serde(default)]
+    event_id: Option<String>,
+    #[serde(default = "default_events_limit")]
+    limit: i64,
+}
+
+fn default_events_limit() -> i64 {
+    100
+}
+
+/// Reject paging requests that pin both ends of the cursor at once: there's
+/// no coherent semantics for "strictly older than X AND strictly newer than
+/// Y" in a paging API. Returned as a 400 by the HTTP handler.
+fn validate_cursor_pair(
+    before_event_id: Option<uuid::Uuid>,
+    after_event_id: Option<uuid::Uuid>,
+) -> Result<(), String> {
+    if before_event_id.is_some() && after_event_id.is_some() {
+        return Err("before_event_id and after_event_id are mutually exclusive".into());
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+pub(super) struct EventsCountParams {
+    #[serde(default, alias = "type")]
+    event_type: Option<String>,
+    #[serde(default)]
+    since: Option<String>,
+    #[serde(default)]
+    until: Option<String>,
+    /// Restrict to one thread. A value that is not a uuid is a 400, never a
+    /// workspace-wide count under a thread's name.
+    #[serde(default)]
+    thread_id: Option<uuid::Uuid>,
+}
+
+/// REST endpoint that mirrors the `count_events` LLM tool: per-type counts +
+/// byte totals over the given time window. With `event_type`, returns
+/// `{count, byte_total}` for that type; without, returns
+/// `{by_type:[...], total_count, total_byte_total}` sorted by count desc.
+///
+/// Use this to size a sweep before drilling with `/events/query` — same
+/// design rationale as the LLM tool (see `crate::engine::tools::execute_count_events`).
+pub(super) async fn count_events(
+    State(state): State<AppState>,
+    Query(q): Query<EventsCountParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let since = parse_optional_rfc3339("since", q.since.as_deref())
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    let until = parse_optional_rfc3339("until", q.until.as_deref())
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    if let Some(et) = q.event_type.as_deref() {
+        let (count, byte_total) = state
+            .event_store
+            .count_events(Some(et), since, until, q.thread_id)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to count events: {}", e),
+                )
+            })?;
+        Ok(Json(serde_json::json!({
+            "count": count,
+            "byte_total": byte_total,
+        })))
+    } else {
+        let rows = state
+            .event_store
+            .count_events_by_type(since, until, q.thread_id)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to count events: {}", e),
+                )
+            })?;
+        let total_count: i64 = rows.iter().map(|(_, c, _)| *c).sum();
+        let total_byte_total: i64 = rows.iter().map(|(_, _, b)| *b).sum();
+        let by_type: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|(et, count, byte_total)| {
+                serde_json::json!({
+                    "event_type": et,
+                    "count": count,
+                    "byte_total": byte_total,
+                })
+            })
+            .collect();
+        Ok(Json(serde_json::json!({
+            "by_type": by_type,
+            "total_count": total_count,
+            "total_byte_total": total_byte_total,
+        })))
+    }
+}
+
+/// REST endpoint to query stored events by type/time (not SSE)
+pub(super) async fn query_events(
+    State(state): State<AppState>,
+    Query(q): Query<EventsQueryParams>,
+) -> Result<Json<Vec<crate::core::EventRow>>, (StatusCode, String)> {
+    let since = parse_optional_rfc3339("since", q.since.as_deref())
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    let until = parse_optional_rfc3339("until", q.until.as_deref())
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    let limit = q.limit.clamp(1, 1000);
+    if let Err(msg) = validate_cursor_pair(q.before_event_id, q.after_event_id) {
+        return Err((StatusCode::BAD_REQUEST, msg));
+    }
+    // Refused rather than ignored: a malformed address silently dropped would
+    // widen a one-row lookup into the newest 100 events of every type.
+    let event_id = match q.event_id.as_deref() {
+        None => None,
+        Some(raw) => match crate::core::store::parse_event_address(raw) {
+            Some(id) => Some(id),
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("event_id '{raw}' is not a uuid or an 'evt-<32 hex>' address"),
+                ))
+            }
+        },
+    };
+    let result = state
+        .event_store
+        .query_events_paged(
+            crate::core::store::EventQueryFilters {
+                event_type: q.event_type.as_deref(),
+                since,
+                until,
+                before_event_id: q.before_event_id,
+                after_event_id: q.after_event_id,
+                thread_id: q.thread_id,
+                event_id,
+            },
+            limit,
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to query events: {}", e),
+            )
+        })?;
+    match result {
+        crate::core::store::QueryEventsResult::Events(mut events) => {
+            crate::engine::mask_stored_events(&state.pool, &mut events)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("events withheld, since they could not be masked: {e}"),
+                    )
+                })?;
+            Ok(Json(events))
+        }
+        crate::core::store::QueryEventsResult::CursorNotFound => Err((
+            StatusCode::NOT_FOUND,
+            "cursor event_id not found".to_string(),
+        )),
+    }
+}
+
+/// The engine's own event names merged with every type this workspace's store
+/// has seen, sorted. Feeds the trigger form's `on_event:` dropdown.
+///
+/// The engine half is **derived**, never restated. `event_type_catalog` builds
+/// it from the two enumerations the engine keeps. So a rename reaches this list
+/// and the subscription validator in one commit, and every engine name offered
+/// here validates. A hand-copied constant was the previous shape, and it had
+/// drifted: 32 names, no `SystemEvent` at all, though the scheduler routes
+/// every persisted system frame to the trigger matcher.
+///
+/// The store half carries the workspace's own domain events, which no
+/// enumeration can know about. `event_type_catalog` runs it through the
+/// validator too, so a retired engine name still holding rows is dropped. The
+/// dropdown offers no name the next subscription refuses.
+pub(super) async fn event_types(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    let catalog = crate::core::event_subscription::event_type_catalog(
+        &state.event_store,
+        crate::core::event_subscription::SubscriptionSurface::Trigger,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let mut all: Vec<String> = catalog.engine.into_iter().map(str::to_string).collect();
+    all.extend(catalog.workspace);
+    all.sort();
+    Ok(Json(all))
+}
+
+pub(super) async fn emit_event(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<EmitEventRequest>,
+) -> Response {
+    if let Err(msg) =
+        crate::core::event_subscription::validate_emittable_event_type(&body.event_type)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response();
+    }
+
+    // The caller's identity, never the payload's: `to_payload` replaces any
+    // `actor` the caller wrote. An app frame's emit carries its registered
+    // device, so it reads `device`. A thread's subprocess carries its origin
+    // token, so the `lucidos` CLI and a script trigger read as the agent.
+    let actor = match super::actor::require_user_actor_response(&headers, &state.pool).await {
+        Ok(actor) => actor,
+        Err(refusal) => return refusal,
+    };
+
+    // Re-establish the caller's event-trigger chain depth on this request task.
+    //
+    // A script trigger's `lucidos events emit` lands here on an axum task. It
+    // shares nothing with the fire that spawned the script, so the emit used to
+    // stamp 0 and restart the chain. That is why a script trigger subscribed to
+    // the event its own script emits never stopped. The depth comes off the
+    // HMAC-signed origin token, so it is authenticated and a caller cannot
+    // declare a lower one to escape the cap.
+    //
+    // The fire comes off the same token, for the same reason. The scope cannot
+    // carry it either, so the emit states it (ADR 0137).
+    let (depth, emitting_trigger_id) = emit_chain_and_trigger(&headers);
+    let emit = async {
+        if body.transient {
+            state
+                .engine
+                .broadcast_transient_domain_event(
+                    &body.event_type,
+                    body.payload,
+                    actor,
+                    emitting_trigger_id,
+                )
+                .await
+                .map(|()| None)
+        } else {
+            state
+                .engine
+                .emit_domain_event(&body.event_type, body.payload, actor, emitting_trigger_id)
+                .await
+                .map(Some)
+        }
+    };
+    match crate::scheduler::user_tasks::EVENT_TRIGGER_DEPTH
+        .scope(depth, emit)
+        .await
+    {
+        Ok(Some(id)) => Json(serde_json::json!({
+            "success": true,
+            "event_id": id.to_string(),
+        }))
+        .into_response(),
+        Ok(None) => Json(serde_json::json!({ "success": true })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to emit event: {}", e) })),
+        )
+            .into_response(),
+    }
+}
+
+/// The chain depth and the emitting trigger an inbound emit belongs to.
+///
+/// A Lucidos-spawned subprocess presents a signed origin token carrying both.
+/// Every other caller (a browser, an app UI, an external API client) roots its
+/// own chain at 0 and claims no trigger. That is an ordinary user action.
+///
+/// Both come off ONE verify. They ride the same token, so reading them apart
+/// would check the same MAC twice on every emit.
+fn emit_chain_and_trigger(headers: &HeaderMap) -> (u32, Option<String>) {
+    match super::actor::subprocess_origin(headers) {
+        super::actor::SubprocessOrigin::Subprocess {
+            chain_depth,
+            emitting_trigger_id,
+            ..
+        } => (chain_depth, emitting_trigger_id),
+        super::actor::SubprocessOrigin::NotSubprocess => (0, None),
+    }
+}
+
+/// Routes for the engine-level surfaces this module's handlers own:
+/// `/health`, `/restart`, `/workspaces`, `/history`, `/messages`,
+/// `/session/messages`, the `/engine/*` routes (version-status,
+/// changelog, rebuild, build-log, diagnostic-log), and the `/events*` surface (global SSE stream +
+/// event-store queries).
+///
+/// Four `/events/:event_id/*` routes join them: `context`, `tool-result`,
+/// `tool-args` and `location`. They are part of the events URL surface, so
+/// they register here even though their handlers live in `api::threads`.
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route("/health", get(health))
+        .route("/restart", post(restart_engine))
+        .route("/engine/version-status", get(engine_version_status))
+        .route("/engine/changelog", get(engine_changelog))
+        .route("/engine/rebuild", post(engine_rebuild))
+        .route("/engine/build-log", get(engine_build_log))
+        .route("/engine/diagnostic-log", get(engine_diagnostic_log))
+        .route("/events", get(global_events))
+        .route("/history", get(get_history))
+        .route("/messages", get(get_recent_messages))
+        .route("/session/messages", get(get_session_messages))
+        .route("/events/query", get(query_events))
+        .route("/events/count", get(count_events))
+        .route("/events/types", get(event_types))
+        .route("/events/emit", post(emit_event))
+        .route(
+            "/events/:event_id/context",
+            get(super::threads::get_context_capture),
+        )
+        .route(
+            "/events/:event_id/tool-result",
+            get(super::threads::get_tool_result),
+        )
+        .route(
+            "/events/:event_id/tool-args",
+            get(super::threads::get_tool_args),
+        )
+        .route(
+            "/events/:event_id/location",
+            get(super::threads::get_event_location),
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rebuild_query_defaults_to_restart_and_accepts_join() {
+        let query = |uri: &str| Query::<RebuildQuery>::try_from_uri(&uri.parse().unwrap());
+        assert!(matches!(
+            query("/engine/rebuild").unwrap().mode,
+            RebuildMode::Restart
+        ));
+        assert!(matches!(
+            query("/engine/rebuild?mode=join").unwrap().mode,
+            RebuildMode::Join
+        ));
+        assert!(matches!(
+            query("/engine/rebuild?mode=restart").unwrap().mode,
+            RebuildMode::Restart
+        ));
+        assert!(query("/engine/rebuild?mode=invalid").is_err());
+    }
+
+    #[tokio::test]
+    async fn build_log_is_bounded_and_missing_output_is_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("build.log");
+        assert_eq!(
+            read_build_log(&path).await.unwrap_err().0,
+            StatusCode::NOT_FOUND
+        );
+        let mut bytes = vec![b'x'; usize::try_from(BUILD_LOG_BYTES).unwrap() + 16 * 1024];
+        bytes.extend_from_slice(b"publish failed");
+        tokio::fs::write(&path, bytes).await.unwrap();
+        let text = read_build_log(&path).await.unwrap();
+        assert_eq!(text.len(), usize::try_from(BUILD_LOG_BYTES).unwrap());
+        assert!(text.ends_with("publish failed"));
+    }
+
+    fn diagnostic_headers(pairs: &[(&'static str, String)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(*name, value.parse().unwrap());
+        }
+        headers
+    }
+
+    /// A token this engine minted, exactly as a spawn hands it out.
+    fn agent_token() -> String {
+        super::super::actor::init_agent_origin_secret("subprocess-test-secret".to_string());
+        super::super::actor::mint_agent_origin_token(None, 0, None).expect("secret installed")
+    }
+
+    /// The refusal a query met, as status and reason slug.
+    async fn diagnostic_refusal(
+        headers: &HeaderMap,
+        raw: Option<&str>,
+        dir: std::path::PathBuf,
+        started: bool,
+        scans: &'static tokio::sync::Semaphore,
+    ) -> (StatusCode, Option<&'static str>) {
+        let source = DiagnosticLogSource {
+            dir,
+            started,
+            scans,
+        };
+        let refusal = query_diagnostic_log(headers, raw, source)
+            .await
+            .expect_err("the query is refused");
+        (refusal.status, refusal.reason)
+    }
+
+    #[tokio::test]
+    async fn diagnostic_log_answers_only_this_engines_agents() {
+        static SCANS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+        let dir = tempfile::tempdir().unwrap();
+        let token = super::super::actor::HEADER_AGENT_ORIGIN_TOKEN;
+        let app = super::super::app_reach::APP_ID_HEADER;
+        let refused = [
+            diagnostic_headers(&[]),
+            diagnostic_headers(&[(token, "-.0.-.deadbeef".to_string())]),
+            diagnostic_headers(&[(app, "habit-tracker".to_string())]),
+            diagnostic_headers(&[(token, agent_token()), (app, "habit-tracker".to_string())]),
+        ];
+        for headers in &refused {
+            assert_eq!(
+                diagnostic_refusal(headers, None, dir.path().into(), true, &SCANS).await,
+                (StatusCode::FORBIDDEN, Some("diagnostic_log_agent_only")),
+                "{headers:?}"
+            );
+        }
+        let agent = diagnostic_headers(&[(token, agent_token())]);
+        let source = DiagnosticLogSource {
+            dir: dir.path().into(),
+            started: true,
+            scans: &SCANS,
+        };
+        let answer = query_diagnostic_log(&agent, Some("since=2h"), source)
+            .await
+            .expect("an agent of this engine gets an answer");
+        assert_eq!(answer.returned, 0);
+    }
+
+    #[tokio::test]
+    async fn diagnostic_log_refusals_carry_their_reason() {
+        static SCANS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+        static FULL: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+        let dir = tempfile::tempdir().unwrap();
+        let agent = diagnostic_headers(&[(
+            super::super::actor::HEADER_AGENT_ORIGIN_TOKEN,
+            agent_token(),
+        )]);
+        assert_eq!(
+            diagnostic_refusal(&agent, Some("since=8d"), dir.path().into(), true, &SCANS).await,
+            (StatusCode::BAD_REQUEST, Some("diagnostic_log_bad_query"))
+        );
+        assert_eq!(
+            diagnostic_refusal(&agent, None, dir.path().into(), false, &SCANS).await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("diagnostic_log_unavailable")
+            )
+        );
+        assert_eq!(
+            diagnostic_refusal(&agent, None, dir.path().into(), true, &FULL).await,
+            (StatusCode::TOO_MANY_REQUESTS, Some("diagnostic_log_busy"))
+        );
+        let outside = tempfile::tempdir().unwrap();
+        let linked = dir.path().join("diagnostic-log");
+        std::os::unix::fs::symlink(outside.path(), &linked).unwrap();
+        assert_eq!(
+            diagnostic_refusal(&agent, None, linked, true, &SCANS).await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("diagnostic_log_unavailable")
+            )
+        );
+    }
+
+    /// Real construction and handlers, isolated from the user's HOME and keys.
+    #[tokio::test]
+    async fn providerless_boot_health_chat_and_live_configuration() {
+        use crate::{core::prefs, llm::ProviderBuildContext, test_support::*};
+        const CHILD: &str = "LUCIDOS_TEST_PROVIDERLESS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let output = tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                tokio::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "api::history::tests::providerless_boot_health_chat_and_live_configuration",
+                        "--nocapture",
+                    ])
+                    // Match the engine runtime stack for the chat orchestrator future.
+                    .env("RUST_MIN_STACK", "16777216")
+                    .env(CHILD, "1")
+                    .env("GIT_AUTHOR_NAME", "Test User")
+                    .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                    .env("GIT_COMMITTER_NAME", "Test User")
+                    .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                    .env("HOME", home.path())
+                    .env_remove("LUCIDOS_GATEWAY_DATA")
+                    .env_remove("LUCIDOS_BOOT_WITHOUT_PROVIDER")
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (pool, db) = setup_test_db().await;
+        for pref in crate::llm::provider_build::PROVIDER_ENABLED_SWITCHES {
+            seed_preference(&pool, pref.key(), "false").await.unwrap();
+        }
+        seed_preference(&pool, prefs::OPENCODE_FREE_ENABLED.key(), "false")
+            .await
+            .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            crate::engine::LucidosEngine::new(
+                workspace.path().to_path_buf(),
+                &test_db_url(&db),
+                ProviderBuildContext {
+                    default_model: prefs::CHAT_MODEL.default_text().into(),
+                    model_is_mock: false,
+                    vertex_project_id: String::new(),
+                    vertex_location: crate::llm::vertex::location_handle(String::new()),
+                    vertex_token_cache: None,
+                    model_registry: Default::default(),
+                    not_served: Default::default(),
+                    claude_gateway_access: None,
+                    chatgpt_plan_access: None,
+                },
+            )
+            .await
+            .expect("engine boots without provider or opt-in"),
+        );
+        engine.set_self_arc(&engine);
+        let scheduler = crate::scheduler::SchedulerManager::new(engine.clone(), pool.clone())
+            .await
+            .unwrap();
+        let state = AppState {
+            engine: engine.clone(),
+            pool: pool.clone(),
+            event_store: engine.event_store().clone(),
+            embedder: crate::memory::EmbedderSlot::empty(),
+            memory_index: None,
+            workspace_path: workspace.path().to_path_buf(),
+            app_manager: engine.shared_app_manager(),
+            scheduler: Arc::new(tokio::sync::Mutex::new(scheduler)),
+            started_at: chrono::Utc::now(),
+            pending_oauth_flows: Default::default(),
+            reveal_tokens: Default::default(),
+            call_tickets: Default::default(),
+            door_router: Default::default(),
+        };
+        let (status, Json(body)) = health(State(state.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["llm_configured"], false);
+        let thread = uuid::Uuid::new_v4();
+        let _result = engine
+            .process_message_with_steps(
+                "Hello",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+                None,
+                Some(thread),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                crate::engine::thread_events::ActorMode::Human,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                crate::engine::FollowUpUrgency::Normal,
+                None,
+            )
+            .await;
+        let failure: serde_json::Value = sqlx::query_scalar("SELECT payload FROM events WHERE thread_id = $1 AND event_type = 'ResponseFailed' ORDER BY sequence DESC LIMIT 1")
+            .bind(thread).fetch_one(&pool).await.expect("chat emits visible failure");
+        assert!(
+            failure.to_string().contains("No LLM provider configured"),
+            "{failure}"
+        );
+        assert!(
+            failure.to_string().contains(providers_settings!()),
+            "{failure}"
+        );
+        // A local URL needs no credential or network call to exercise hot-swap.
+        for (key, value) in [
+            (prefs::LOCAL_BASE_URL.key(), "http://127.0.0.1:1/v1"),
+            (prefs::PROVIDER_ENABLED_LOCAL.key(), "true"),
+        ] {
+            crate::core::PreferenceStore::set(&pool, &engine.event_bus, key, value, None)
+                .await
+                .unwrap();
+        }
+        async fn wait_configured(engine: &crate::engine::LucidosEngine, expected: bool) {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while engine.llm_configured() != expected {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("provider subscriber updates live handle");
+        }
+        wait_configured(&engine, true).await;
+        crate::core::PreferenceStore::set(
+            &pool,
+            &engine.event_bus,
+            prefs::PROVIDER_ENABLED_LOCAL.key(),
+            "false",
+            None,
+        )
+        .await
+        .unwrap();
+        wait_configured(&engine, false).await;
+        assert_eq!(health(State(state)).await.1 .0["llm_configured"], false);
+        engine.mark_shutting_down();
+        drop(engine);
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[test]
+    fn stream_hello_exposes_only_the_durable_generation() {
+        let generation = uuid::Uuid::new_v4();
+        let hello: serde_json::Value =
+            serde_json::from_str(&stream_hello(Some(generation))).unwrap();
+        assert_eq!(
+            hello,
+            serde_json::json!({
+                "type": "StreamHello", "data": { "restore_generation": generation }
+            })
+        );
+        let hello: serde_json::Value = serde_json::from_str(&stream_hello(None)).unwrap();
+        assert!(hello["data"]["restore_generation"].is_null());
+    }
+
+    #[tokio::test]
+    async fn restore_generation_precedes_domain_frames_on_both_transports() {
+        use async_compression::tokio::bufread::GzipDecoder;
+        use tokio::io::{AsyncReadExt, BufReader};
+        use tokio_util::io::StreamReader;
+
+        for gzip in [false, true] {
+            let generation = uuid::Uuid::new_v4();
+            let hello = stream_hello(Some(generation));
+            let domain = "{\"type\":\"ThreadEvent\",\"data\":{}}".to_owned();
+            let frames = tokio_stream::once(hello.clone())
+                .chain(tokio_stream::once(domain.clone()))
+                .chain(futures::stream::pending());
+            let response = if gzip {
+                gzipped_sse_response(frames)
+            } else {
+                plain_sse_response(frames)
+            };
+            let body = response
+                .into_body()
+                .into_data_stream()
+                .map(|chunk| chunk.map_err(std::io::Error::other));
+            let reader = StreamReader::new(body);
+            let mut reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead>> = if gzip {
+                Box::pin(GzipDecoder::new(BufReader::new(reader)))
+            } else {
+                Box::pin(reader)
+            };
+            let expected = format!("data: {hello}\n\ndata: {domain}\n\n");
+            let mut wire = Vec::new();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !String::from_utf8_lossy(&wire).contains(&format!("data: {domain}\n\n")) {
+                    let mut chunk = [0; 1024];
+                    let count = reader.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    wire.extend_from_slice(&chunk[..count]);
+                }
+            })
+            .await
+            .unwrap();
+            let wire = String::from_utf8(wire)
+                .unwrap()
+                .replace("event: keepalive\ndata:\n\n", "");
+            assert_eq!(wire, expected);
+        }
+    }
+
+    /// A draining engine must not read as healthy, or a gateway adopts it.
+    #[test]
+    fn an_engine_in_teardown_reports_unavailable() {
+        assert_eq!(
+            health_status(true),
+            (StatusCode::SERVICE_UNAVAILABLE, "shutting_down")
+        );
+        assert_eq!(health_status(false), (StatusCode::OK, "ok"));
+    }
+
+    /// The emit surface reads both facts off the token, and neither off a
+    /// header a caller could set (ADR 0137, ADR 0138).
+    ///
+    /// A trigger's script posts here from its own process, so the fire's
+    /// task-local reaches nothing. The token is what carries the fire across.
+    #[test]
+    fn an_emit_takes_its_depth_and_its_fire_from_the_signed_token() {
+        use super::super::actor::{
+            init_agent_origin_secret, mint_agent_origin_token, HEADER_AGENT_ORIGIN_TOKEN,
+        };
+        init_agent_origin_secret("history-emit-secret".to_string());
+
+        let with = |token: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(token) = token {
+                headers.insert(
+                    HEADER_AGENT_ORIGIN_TOKEN,
+                    HeaderValue::from_str(token).expect("a minted token is header safe"),
+                );
+            }
+            emit_chain_and_trigger(&headers)
+        };
+
+        let fire = mint_agent_origin_token(None, 2, Some("nightly-scan")).expect("secret is set");
+        assert_eq!(with(Some(&fire)), (2, Some("nightly-scan".to_string())));
+
+        let plain = mint_agent_origin_token(None, 1, None).expect("secret is set");
+        assert_eq!(
+            with(Some(&plain)),
+            (1, None),
+            "a spawn outside any fire claims no trigger"
+        );
+
+        assert_eq!(
+            with(None),
+            (0, None),
+            "an untrusted caller roots its own chain and suppresses nobody"
+        );
+    }
+
+    const KEEPALIVE_WIRE: &[u8] = b"event: keepalive\ndata:\n\n";
+
+    /// A browser must not wait for an event to learn the stream is open.
+    ///
+    /// WebKit fires `EventSource.onopen` on the first body BYTES, where
+    /// Chromium fires it on the response headers. Nothing was written until the
+    /// first event or the first keep-alive tick. So Safari and the iOS PWA sat
+    /// at `connecting` for up to 30 seconds after every page load.
+    #[tokio::test]
+    async fn the_gzipped_stream_writes_its_first_bytes_before_any_event() {
+        use async_compression::tokio::bufread::GzipDecoder;
+        use tokio::io::{AsyncReadExt, BufReader};
+        use tokio_util::io::StreamReader;
+
+        // A stream that never yields: exactly the common case, a page that
+        // connects while nothing is happening in the workspace.
+        let silent = futures::stream::pending::<String>();
+        let response = gzipped_sse_response(silent);
+        let body = response
+            .into_body()
+            .into_data_stream()
+            .map(|chunk| chunk.map_err(std::io::Error::other));
+        let mut wire = GzipDecoder::new(BufReader::new(StreamReader::new(body)));
+
+        // Generously under SSE_KEEPALIVE_INTERVAL, and far under the 10s a
+        // browser test waits. The open frame makes this immediate.
+        let mut first = vec![0u8; KEEPALIVE_WIRE.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wire.read_exact(&mut first),
+        )
+        .await
+        .expect("the stream must announce itself without waiting for an event")
+        .expect("the first frame must decode");
+        assert_eq!(first, KEEPALIVE_WIRE);
+    }
+
+    /// The plain response opens with the same keep-alive event, then relays
+    /// events as bare `data:` frames. A comment line would never reach JS.
+    #[tokio::test]
+    async fn the_plain_stream_opens_with_the_keepalive_event_and_relays_data() {
+        let events = futures::stream::iter(["{\"a\":1}".to_string()])
+            .chain(futures::stream::pending::<String>());
+        let response = plain_sse_response(events);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+        let mut body = response.into_body().into_data_stream();
+
+        let mut wire = Vec::new();
+        let want = KEEPALIVE_WIRE.len() + b"data: {\"a\":1}\n\n".len();
+        while wire.len() < want {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
+                .await
+                .expect("both frames are ready at once")
+                .expect("the stream must not end")
+                .expect("a frame must not be an error");
+            wire.extend_from_slice(&chunk);
+        }
+        let wire = String::from_utf8(wire).unwrap();
+        assert!(wire.contains("event: keepalive\ndata:\n\n"), "{wire:?}");
+        assert!(wire.contains("data: {\"a\":1}\n\n"), "{wire:?}");
+        assert!(
+            wire.lines().all(|line| !line.starts_with(':')),
+            "a comment line never reaches JS: {wire:?}"
+        );
+    }
+
+    /// A quiet stream keeps sending keep-alives, one per interval.
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_stream_sends_a_keepalive_every_interval() {
+        let frames = with_keepalives(futures::stream::pending::<String>());
+        tokio::pin!(frames);
+        for _ in 0..3 {
+            assert!(matches!(frames.next().await, Some(Frame::Keepalive)));
+        }
+    }
+
+    /// The generated client constant and the wire agree on the event name.
+    #[test]
+    fn the_keepalive_frame_names_the_exported_event() {
+        let wire = Frame::Keepalive.chunks().concat();
+        assert_eq!(
+            wire,
+            format!("event: {SSE_KEEPALIVE_EVENT}\ndata:\n\n").into_bytes()
+        );
+    }
+
+    /// Regression: `read_app_version` must read fresh from disk on every call.
+    /// A cached value makes a version bump from an applied change invisible to
+    /// the health endpoint until an engine restart.
+    ///
+    /// One test rather than three, because all three mutate the same file.
+    #[test]
+    fn read_app_version_reads_fresh_from_disk() {
+        let engine_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let version_file = engine_dir
+            .parent()
+            .unwrap()
+            .join("lucidos-app")
+            .join("VERSION");
+        let original = std::fs::read_to_string(&version_file).ok();
+
+        // Drop guard ensures cleanup even if an assertion panics.
+        struct Restore(std::path::PathBuf, Option<String>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(content) => {
+                        let _ = std::fs::write(&self.0, content);
+                    }
+                    None => {
+                        let _ = std::fs::remove_file(&self.0);
+                    }
+                }
+            }
+        }
+        let _guard = Restore(version_file.clone(), original);
+
+        // Picks up initial write.
+        std::fs::write(&version_file, "1.0.0-test\n").unwrap();
+        assert_eq!(read_app_version(), "1.0.0-test");
+
+        // Picks up version bump without restart.
+        std::fs::write(&version_file, "2.0.0-test\n").unwrap();
+        assert_eq!(read_app_version(), "2.0.0-test");
+
+        // Returns "unknown" when the file is missing.
+        std::fs::remove_file(&version_file).unwrap();
+        assert_eq!(read_app_version(), "unknown");
+    }
+
+    /// Regression (ADR 0014): an engine built from a source checkout must report
+    /// as NOT packaged. Keying off `LUCIDOS_STATIC_DIR` made a dev engine look
+    /// packaged, because ADR 0014 has the dev engine set that var too. Detection
+    /// is the `scripts/web-dev.sh` source marker, so this test binary, living
+    /// inside the repo, classifies as dev.
+    #[test]
+    fn is_packaged_false_for_source_build() {
+        assert!(
+            !is_packaged(),
+            "a source-built engine must not be classified as packaged"
+        );
+    }
+
+    /// `Accept-Encoding` parser must recognise gzip in any of its standard
+    /// shapes: a bare token, a q-value, anywhere in a comma-separated list, and
+    /// case-insensitive. It must reject look-alikes like `x-gzip`, which is a
+    /// distinct historical encoding.
+    #[test]
+    fn accepts_gzip_recognises_standard_offers() {
+        fn h(value: &str) -> axum::http::HeaderMap {
+            let mut m = axum::http::HeaderMap::new();
+            m.insert(
+                axum::http::header::ACCEPT_ENCODING,
+                axum::http::HeaderValue::from_str(value).unwrap(),
+            );
+            m
+        }
+        assert!(accepts_gzip(&h("gzip")));
+        assert!(accepts_gzip(&h("GZIP")));
+        assert!(accepts_gzip(&h("gzip;q=1.0")));
+        assert!(accepts_gzip(&h("deflate, gzip")));
+        assert!(accepts_gzip(&h("br, gzip;q=0.9, deflate;q=0.5")));
+        assert!(!accepts_gzip(&h("deflate")));
+        assert!(!accepts_gzip(&h("br")));
+        assert!(!accepts_gzip(&h("x-gzip")));
+        assert!(!accepts_gzip(&h("")));
+        assert!(!accepts_gzip(&axum::http::HeaderMap::new()));
+
+        // RFC 7231 §5.3.5: a quality of 0 means "not acceptable" — clients
+        // use this to explicitly opt OUT of an encoding (e.g. broken
+        // intermediaries, decompression bugs). Compressing the response
+        // anyway forces gzip on a client that asked us not to.
+        assert!(!accepts_gzip(&h("gzip;q=0")));
+        assert!(!accepts_gzip(&h("gzip; q=0")));
+        assert!(!accepts_gzip(&h("gzip;q=0.0")));
+        assert!(!accepts_gzip(&h("gzip;q=0.000")));
+        assert!(!accepts_gzip(&h("deflate, gzip;q=0")));
+        // Other encodings at q=0 don't change gzip's acceptability.
+        assert!(accepts_gzip(&h("gzip, deflate;q=0")));
+    }
+
+    /// What the dropdown offers on a workspace whose store is empty. Every
+    /// name in it has to be one a trigger can actually fire on.
+    ///
+    /// The old hand-written constant needed a containment check here, since
+    /// nothing tied it to the enums. The list is derived now, and its own
+    /// module proves every entry validates. What is left to pin is the two
+    /// gates the derivation applies, and one name the dropdown lost once.
+    #[test]
+    fn the_dropdown_seed_offers_only_names_a_trigger_can_fire_on() {
+        use crate::core::event_subscription::{known_names, SubscriptionSurface};
+        let seed = known_names::subscribable_event_type_names(SubscriptionSurface::Trigger);
+
+        for name in &seed {
+            assert!(
+                crate::engine::thread_lifecycle::classify_event(name).is_some()
+                    || crate::engine::event_bus::SystemEvent::is_persisted_type_name(name),
+                "'{name}' is neither a ThreadEvent nor a persisted SystemEvent, so \
+                 the matcher never sees it and the dropdown would offer a \
+                 subscription that can never fire.",
+            );
+        }
+
+        // The one gate a persisted name can still fail: a per-token streaming
+        // variant is dropped before the matcher.
+        for streaming in crate::core::event_subscription::PER_TOKEN_STREAMING_EVENT_TYPES {
+            assert!(!seed.contains(streaming), "'{streaming}' never reaches it");
+        }
+
+        // Regression: with this name absent, a workspace could only subscribe
+        // to a child thread's outcome after one had already completed. Being
+        // told when a child finishes is what you wire up beforehand.
+        assert!(seed.contains(&"ChildThreadCompleted"));
+    }
+
+    /// A cursor the engine cannot parse is refused, not dropped. Dropping it
+    /// leaves `None`, which the stores read as "no bound", so the query
+    /// silently widens to every row.
+    #[test]
+    fn a_malformed_timestamp_cursor_is_refused_rather_than_dropped() {
+        // The shape a CLI or an LLM caller naturally sends for a day window.
+        let err = parse_optional_rfc3339("since", Some("2026-09-01"))
+            .expect_err("a bare date is not RFC 3339");
+        assert!(
+            err.contains("since") && err.contains("2026-09-01"),
+            "the refusal names the parameter and the value, got: {err}"
+        );
+
+        for bad in ["", "yesterday", "2026-09-01 00:00:00", "1757030400"] {
+            assert!(
+                parse_optional_rfc3339("before", Some(bad)).is_err(),
+                "{bad:?} must not pass as a cursor"
+            );
+        }
+    }
+
+    /// Absent stays absent, and a real RFC 3339 value still parses to UTC.
+    #[test]
+    fn an_absent_cursor_is_no_bound_and_a_valid_one_lands_in_utc() {
+        assert_eq!(parse_optional_rfc3339("since", None), Ok(None));
+
+        let parsed = parse_optional_rfc3339("since", Some("2026-09-01T02:00:00+02:00"))
+            .expect("a well-formed offset timestamp")
+            .expect("present");
+        assert_eq!(parsed.to_rfc3339(), "2026-09-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn validate_cursor_pair_allows_zero_or_one_cursor() {
+        assert!(validate_cursor_pair(None, None).is_ok());
+        assert!(validate_cursor_pair(Some(uuid::Uuid::new_v4()), None).is_ok());
+        assert!(validate_cursor_pair(None, Some(uuid::Uuid::new_v4())).is_ok());
+    }
+
+    #[test]
+    fn validate_cursor_pair_rejects_both_cursors_set() {
+        let err = validate_cursor_pair(Some(uuid::Uuid::new_v4()), Some(uuid::Uuid::new_v4()))
+            .unwrap_err();
+        assert!(
+            err.contains("mutually exclusive"),
+            "error should mention mutual exclusion: {err}"
+        );
+    }
+
+    /// The frontend's SSE handler keys off `type` and reads `data.count`.
+    /// If the wire shape drifts, lagged tabs lose their resync signal and
+    /// stuck "Thinking" spinners come back.
+    #[test]
+    fn lagged_event_json_has_stable_wire_shape() {
+        let parsed: serde_json::Value = serde_json::from_str(&lagged_event_json(42)).unwrap();
+        assert_eq!(parsed["type"], "Lagged");
+        assert_eq!(parsed["data"]["count"], 42);
+    }
+
+    /// read_engine_version reads the engine VERSION from disk on each call,
+    /// allowing the health endpoint to detect newer engine versions on disk
+    /// without an engine restart.
+    #[test]
+    fn read_engine_version_reads_fresh_from_disk() {
+        let engine_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let version_file = engine_dir.join("VERSION");
+        let original = std::fs::read_to_string(&version_file).ok();
+
+        struct Restore(std::path::PathBuf, Option<String>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(content) => {
+                        let _ = std::fs::write(&self.0, content);
+                    }
+                    None => {
+                        let _ = std::fs::remove_file(&self.0);
+                    }
+                }
+            }
+        }
+        let _guard = Restore(version_file.clone(), original);
+
+        std::fs::write(&version_file, "2026.04.13.1\n").unwrap();
+        assert_eq!(read_engine_version(), "2026.04.13.1");
+
+        std::fs::write(&version_file, "2026.04.13.2\n").unwrap();
+        assert_eq!(read_engine_version(), "2026.04.13.2");
+
+        std::fs::remove_file(&version_file).unwrap();
+        assert_eq!(read_engine_version(), "unknown");
+    }
+}

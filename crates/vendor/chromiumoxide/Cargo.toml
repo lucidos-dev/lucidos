@@ -1,0 +1,164 @@
+# chromiumoxide 0.7.0, vendored from crates.io (upstream commit
+# ef98533b26444164fe0a0cfa7ba84dd57d9dfea9) so Lucidos can launch Chrome with
+# CDP over a pipe instead of a TCP port that every local user can reach.
+#
+# The first commit adding this directory is the published crate unchanged,
+# less its examples and dev-dependencies. Every Lucidos change after it is in
+# git history, so `git log -p crates/vendor/chromiumoxide` is the whole patch.
+# Upstream's LICENSE-MIT and LICENSE-APACHE travel with it.
+#
+# A temporary measure: see docs/temporary-measures.md, "chromiumoxide is
+# vendored for a pipe transport". Design:
+# docs/plans/2026-10-12-other-local-users-cannot-reach-postgres-or-devtools.md.
+
+[package]
+edition = "2021"
+rust-version = "1.70"
+name = "chromiumoxide"
+version = "0.7.0"
+build = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Library for interacting with a chrome instance with the chrome devtools protocol"
+homepage = "https://github.com/mattsse/chromiumoxide"
+keywords = [
+    "chrome",
+    "chromedriver",
+    "puppeteer",
+    "automation",
+]
+categories = [
+    "web-programming",
+    "api-bindings",
+    "development-tools::testing",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mattsse/chromiumoxide"
+
+[lib]
+name = "chromiumoxide"
+path = "src/lib.rs"
+
+[dependencies.async-std]
+version = "1.5"
+features = [
+    "attributes",
+    "unstable",
+]
+optional = true
+
+[dependencies.async-tungstenite]
+version = "0.27.0"
+
+[dependencies.base64]
+version = "0.22"
+
+[dependencies.bytes]
+version = "1"
+features = ["serde"]
+optional = true
+
+[dependencies.cfg-if]
+version = "1"
+
+[dependencies.chromiumoxide_cdp]
+version = "0.7"
+
+[dependencies.chromiumoxide_fetcher]
+version = "0.7"
+optional = true
+default-features = false
+
+[dependencies.chromiumoxide_types]
+version = "0.7"
+
+[dependencies.dunce]
+version = "1"
+
+[dependencies.fnv]
+version = "1"
+
+[dependencies.futures]
+version = "0.3"
+
+[dependencies.futures-timer]
+version = "3"
+
+[dependencies.pin-project-lite]
+version = "0.2"
+
+[dependencies.reqwest]
+version = "0.12"
+default-features = false
+
+[dependencies.serde]
+version = "1"
+features = ["derive"]
+
+[dependencies.serde_json]
+version = "1"
+
+[dependencies.thiserror]
+version = "1"
+
+[dependencies.tokio]
+version = "1"
+features = [
+    "rt",
+    "rt-multi-thread",
+    "time",
+    "fs",
+    "macros",
+    "process",
+]
+optional = true
+
+[dependencies.tracing]
+version = "0.1"
+
+[dependencies.url]
+version = "2"
+
+[dependencies.which]
+version = "6"
+
+[features]
+_fetcher-native-async-std = [
+    "fetcher",
+    "chromiumoxide_fetcher/_native-async-std",
+]
+_fetcher-native-tokio = [
+    "fetcher",
+    "chromiumoxide_fetcher/_native-tokio",
+]
+_fetcher-rustls-async-std = [
+    "fetcher",
+    "chromiumoxide_fetcher/_rustls-async-std",
+]
+_fetcher-rusttls-tokio = [
+    "fetcher",
+    "chromiumoxide_fetcher/_rustls-tokio",
+]
+async-std-runtime = [
+    "async-std",
+    "async-tungstenite/async-std-runtime",
+]
+bytes = ["dep:bytes"]
+default = [
+    "async-std-runtime",
+    "bytes",
+]
+fetcher = []
+serde0 = []
+tokio-runtime = [
+    "tokio",
+    "async-tungstenite/tokio-runtime",
+]
+
+[target."cfg(unix)".dependencies.libc]
+version = "0.2"
+
+[target."cfg(windows)".dependencies.winreg]
+version = "0.52"

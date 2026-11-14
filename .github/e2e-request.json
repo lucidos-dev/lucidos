@@ -1,0 +1,19 @@
+{
+  "run_id": "20261114-094347-e340",
+  "coverage": false,
+  "suites": [
+    "browser"
+  ],
+  "api_args": [],
+  "browser": {
+    "projects": [
+      "chromium",
+      "mobile"
+    ],
+    "specs": [
+      "codex-side-question-all.spec.ts",
+      "side-question-all.spec.ts"
+    ],
+    "pw_args": []
+  }
+}
