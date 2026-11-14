@@ -1,0 +1,18 @@
+-- Drops the `push_dispatched` column added in
+-- 20260518173257_add_push_dispatched_to_notifications.sql.
+--
+-- That column existed to gate the cross-device read-marker push fan-out
+-- (`send_mark_read_push_to_all` / `send_mark_all_read_push_to_all` in
+-- scheduler/push.rs). The whole fan-out was removed because on iOS PWAs it
+-- couldn't actually deliver the intended UX — Safari's per-push
+-- showNotification rule means the "✓ Read on another device" marker
+-- either tag-replaces the original banner (when present) or creates a NEW
+-- banner labelled "Read on another device" (when the original was already
+-- dismissed, or on devices whose subscription joined late or delivery
+-- failed). The marker became noise rather than a silent dismissal.
+--
+-- See work-tracker `pwa-read-on-another-device-noise` for the full
+-- rationale. With the fan-out gone, `push_dispatched` has no readers; drop
+-- the column to keep the schema honest. The row history loses one boolean
+-- — no downstream consumer depends on its value, so this is safe.
+ALTER TABLE notifications DROP COLUMN push_dispatched;

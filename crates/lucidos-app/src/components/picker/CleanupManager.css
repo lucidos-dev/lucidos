@@ -1,0 +1,50 @@
+.ws-cleanup {
+  margin-top: 1rem;
+  padding: 1rem;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-surface);
+  font-size: var(--font-size-sm);
+}
+
+.ws-cleanup h2,
+.ws-cleanup h3 {
+  margin: 1rem 0 0.5rem;
+  color: var(--text-primary);
+  font-size: var(--font-size-md);
+}
+
+.ws-cleanup p {
+  margin: 0.5rem 0;
+  color: var(--text-secondary);
+}
+
+.ws-cleanup ul {
+  margin: 0.5rem 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ws-cleanup .list-row {
+  gap: 0.5rem;
+  padding: 0.75rem 0;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.ws-cleanup .list-row-info {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.ws-cleanup .pill-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin: 0.5rem 0;
+}
+
+.ws-cleanup input[type='checkbox'] {
+  flex-shrink: 0;
+  accent-color: var(--accent);
+}
