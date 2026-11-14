@@ -1,0 +1,41 @@
+/**
+ * Where inside a workspace an opener asks that workspace to land.
+ *
+ * Opening a workspace is one thing and landing on a view inside it is another,
+ * and the second only ever travels as a URL fragment: the target page is a
+ * different document, often one that is not loaded yet.
+ * `store/actions/hash-deeplink-router.ts` is the receiving half.
+ *
+ * A leaf module, importing nothing, so every writer of the hash can share it.
+ * `utils/workspaceWindow.ts` already imports `api/client/control.ts`, so a
+ * constant living in either of those two would make the other one a cycle.
+ *
+ * A CLOSED SET, and that is load-bearing rather than tidy. Under the packaged
+ * client the name crosses into Rust. There it composes a URL loaded in a window
+ * holding the full `window-*` IPC grant (ADR 0028). So the page may name a
+ * channel and never supply a string. A thread id is the one value a name
+ * carries, and Rust accepts it only as a canonical UUID.
+ * `window_target::WorkspaceLanding` is the mirror, and its own tests pin the
+ * same fragments.
+ */
+
+/** A view inside a workspace that an opener can ask for. */
+export type WorkspaceLanding = 'notifications' | { thread: string };
+
+/** The only thread id a thread landing carries: a lowercase hyphenated UUID.
+ *  The same rule as `window_target::ThreadId::parse`, which refuses the rest. */
+export function isCanonicalThreadId(id: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id);
+}
+
+/** The fragment to append to a workspace URL, or `''` for no landing at all.
+ *  The one place the frontend writes `#notifications` and `#thread=`. */
+export function landingHash(landing?: WorkspaceLanding): string {
+  if (!landing) return '';
+  return landing === 'notifications' ? '#notifications' : `#thread=${landing.thread}`;
+}
+
+/** The name the packaged shell's `show_workspace_window` takes for a landing. */
+export function landingName(landing: WorkspaceLanding): string {
+  return landing === 'notifications' ? 'notifications' : `thread:${landing.thread}`;
+}

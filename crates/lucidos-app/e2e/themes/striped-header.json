@@ -1,0 +1,9 @@
+{
+  "name": "Striped header",
+  "description": "Browser test fixture: a header striped two rows black, one row green, on a black title-bar band. Not a shipped theme.",
+  "tokens": {
+    "--header-gradient": "repeating-linear-gradient(to bottom, #000000 0 2px, #00ff00 2px 3px)",
+    "--titlebar-strip-bg": "#000000",
+    "--focus-header-tint": "transparent"
+  }
+}
