@@ -1,0 +1,36 @@
+# term-regex	replacement	adr
+\bsuccessor\s+threads?\b	successor session, or legacy successor thread for old rows	docs/adr/0560-successor-session-in-the-same-thread.md
+\bbuild\s+chain\b	successor session in the planning thread	docs/adr/0560-successor-session-in-the-same-thread.md
+\bhandoff\s+consent\b	a handoff needs no consent	docs/adr/0560-successor-session-in-the-same-thread.md
+\bexecute_intent\b	load_knowhow, then perform the intent in the asking thread	docs/adr/0534-intents-run-in-the-asking-thread.md
+\bspawn-successor\b	successor start	docs/adr/0560-successor-session-in-the-same-thread.md
+\bImplement\s+in\s+a\s+new\s+thread\b	Implement in a fresh session	docs/adr/0560-successor-session-in-the-same-thread.md
+\bcache_warm_line\b	cache_cards	docs/adr/0563-cache-keep-alive-speaks-one-grammar.md
+\bobserved\s+TTL\b	cache TTL	docs/adr/0575-cache-ttls-from-evidence-only.md
+\bbreak-even\s+(?:budget|cap|mode|rule|point)s?\b	reread cap	docs/adr/0603-keep-alive-follows-the-expected-wake.md
+[`'"](?:break-even|workspace-data)[`'"]	cache_keep_alive_mode on (the mode is off or on)	docs/adr/0603-keep-alive-follows-the-expected-wake.md
+\bVertex\s+relay\b	nothing: Claude Code 2.1.311 asks for progress notes itself	docs/adr/0605-claude-code-notes-follow-the-claude-code-version.md
+\bgateway\s+pairing\s+codes?\b	gateway pairing secret	docs/adr/0615-pairing-secrets-are-long-and-a-typed-code-is-local-only.md
+\bwedged(?:\s+|-)rebuilds?\b	verified engine build, or a named build failure with Retry build	docs/adr/0617-engine-build-delivery-proof.md
+\bwidget\s+shelf\b	a dashboard tile, through Add to dashboard	docs/adr/0621-widgets-one-box-no-pin.md
+\b(?:un)?pin(?:ned)?\s+(?:to|from)\s+(?:the\s+)?shelf\b	Add to dashboard, or Remove from dashboard	docs/adr/0621-widgets-one-box-no-pin.md
+widgets\(action="(?:un)?pin"\)	widgets(action="add_to_dashboard"), or widgets(action="size") for a card	docs/adr/0621-widgets-one-box-no-pin.md
+\bthread\s+widgets\b	the thread's inline widgets, drawn from its replies	docs/adr/0621-widgets-one-box-no-pin.md
+\bpush\s+audience\b	notification audience	docs/adr/0623-team-workspace-factory.md
+\b(?-i:Models)(?:\s+(?:→|->|>)\s+Providers\b|,\s+Providers\b|\s+\(Providers\))	Settings → Providers (Providers is its own Settings page)	docs/adr/0637-providers-settings-page.md
+\battend(?:ed)?\s+modes?\b	nothing: every coding-agent session takes the workspace grants, and a trigger needs its coding-agent grant	docs/adr/0641-coding-agents-trust-by-provenance.md
+\bpermission\s+waits?\b	nothing: a card waits for a human, and a trigger needs its coding-agent grant to start a coding agent	docs/adr/0641-coding-agents-trust-by-provenance.md
+\bcommand_guard_coding_agents\b	coding_agent_auto_answer (coding-agent auto-answer), independent of command_guard	docs/adr/0644-command-guard-on-by-default.md
+\bwork[\s-]+items?\b	root thread (a root thread and its sub-threads); WorkItem* event types are legacy spellings	docs/adr/0649-people-only-messages.md
+\bworkItems\b	lucidos.threads.users	docs/adr/0649-people-only-messages.md
+\bpeople[\s-]+only[\s-]+messages?\b	user-only message	docs/adr/0655-user-rename-and-history-correction.md
+\bperson[\s-]+mentions?\b	user mention	docs/adr/0655-user-rename-and-history-correction.md
+\b(?:gateway_operators|thread_people|people_messages|operators_api)\b	gateway_users, thread_users, user_only_messages, users_api	docs/adr/0655-user-rename-and-history-correction.md
+\bOperator(?:Snapshot|Ref|sChanged|Added|Renamed|Removed|EmailAdded|EmailRemoved|sResponse|sLoadable)\b	the User* name	docs/adr/0655-user-rename-and-history-correction.md
+\b(?:operator_id|mentioned_operator_ids|operatorId)\b	user_id, mentioned_user_ids, userId	docs/adr/0655-user-rename-and-history-correction.md
+\bPeopleMessagePosted\b	UserOnlyMessagePosted	docs/adr/0655-user-rename-and-history-correction.md
+\b(?-i:ThreadPeople|threadPeople)\b	ThreadUsers, threads.users	docs/adr/0655-user-rename-and-history-correction.md
+Settings\s*(?:→|->|>|,)\s*People\b	Settings → Users	docs/adr/0655-user-rename-and-history-correction.md
+\bUnknown\s+person\b	Unknown user	docs/adr/0655-user-rename-and-history-correction.md
+/auth/operators\b	/auth/users	docs/adr/0655-user-rename-and-history-correction.md
+\bwaiting\s+child(ren)?\b(?!\s+reports?)	awaited child, or a child holding a wait	docs/adr/0672-a-parent-waits-on-what-will-wake-it.md

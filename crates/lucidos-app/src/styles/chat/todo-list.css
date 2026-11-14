@@ -1,0 +1,160 @@
+/* ───────────────────────────────────────────────────────────────────────
+   todoIndicator + TodoListPanel: chat-agent todo list.
+   Slot is the same as `.control-menu` for CC threads (see
+   PromptInput.tsx); the indicator is hidden when the chat agent
+   hasn't called `todo_write` yet (component returns null).
+   ─────────────────────────────────────────────────────────────────────── */
+
+/* Indicator button: sizing comes from .icon-btn.header-icon (2.25rem square,
+   1.25rem SVG via --icon-size-lg) — see global.css. Pixel-identical to the
+   adjacent ImageIcon button since both use the same SVG sizing rule. */
+
+/* Shell geometry, placement, the title bar and the close button all come
+   from `.anchored-popover*` in `styles/global/anchored-popover.css`, which
+   the waiting indicator beside it uses too, and which `chat.css` imports
+   FIRST so a surface's own width beats the shell's fit cap.
+
+   Both bounds go through that fit cap. A bare `min-width` outranks `max-width`
+   in CSS, so leaving it unwrapped would quietly reinstate the overflow the
+   shell was converted to prevent. */
+.todo-panel {
+    min-width: min(14rem, var(--anchored-popover-fit));
+    max-width: min(36rem, var(--anchored-popover-fit));
+}
+
+/* *Todo notes*: what the agent kept, above what it planned. Rendered only
+   under ADR 0085's context mode, which is where the block is load-bearing;
+   a list without notes renders exactly as it did before. Raised on
+   --bg-tertiary and separated by its own margin rather than a left stripe,
+   which `.claude/rules/frontend-css.md` forbids outright. */
+.todo-panel-notes {
+    margin: 0 0 var(--space-md);
+    padding: var(--space-sm) var(--space-md);
+    background: var(--bg-tertiary, var(--bg-primary));
+    border-radius: calc(var(--radius-surface) / 3);
+}
+
+.todo-panel-notes-label {
+    display: block;
+    margin-bottom: var(--space-sm);
+    font-size: var(--font-size-2xs);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+}
+
+/* Notes are prose the model wrote, so newlines are meaningful and the block
+   has to be free to be tall. `pre-wrap` keeps its line breaks; `break-word`
+   stops a pasted path or URL widening the popover past its fit cap. */
+.todo-panel-notes-body {
+    margin: 0;
+    font-size: var(--font-size-sm);
+    line-height: 1.4;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+}
+
+.todo-panel-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+}
+
+.todo-panel-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    padding: 0.375rem 0.5rem;
+    border-radius: calc(var(--radius-control) * 0.5);
+    font-size: var(--font-size-md);
+    line-height: 1.3;
+}
+
+/* Strikethrough marks the ITEM, never the row. It lives on `.todo-panel-text`
+   because a row-level `text-decoration` propagates into the row's flex items —
+   and a child CANNOT cancel an inherited decoration, so `text-decoration: none`
+   on the ⊘/✓ marker or the status tag would be inert and the line would
+   draw straight through them. Scoping it to the text span is the only way to
+   keep the row chrome unstruck. Solid = completed, dashed = abandoned. */
+.todo-panel-row[data-status="completed"] {
+    color: var(--text-secondary);
+}
+
+.todo-panel-row[data-status="completed"] .todo-panel-text {
+    text-decoration: line-through;
+}
+
+.todo-panel-row[data-status="in_progress"] {
+    background: var(--bg-tertiary, var(--bg-primary));
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+/* Parked, not dropped: the thread holds a live event wait and something will
+   wake it. So a waiting row keeps full-strength text and takes NO
+   strikethrough (the work is still going somewhere), and only its marker is
+   tinted. Deliberately the opposite treatment to abandoned, which is the whole
+   distinction the status exists to draw. */
+.todo-panel-row[data-status="waiting"] {
+    color: var(--text-primary);
+}
+
+.todo-panel-row[data-status="waiting"] .todo-panel-marker {
+    color: var(--accent-yellow);
+}
+
+.todo-panel-row[data-status="abandoned"] {
+    color: var(--text-secondary);
+    opacity: 0.7;
+}
+
+.todo-panel-row[data-status="abandoned"] .todo-panel-text {
+    text-decoration: line-through;
+    text-decoration-style: dashed;
+}
+
+/* Indicator glanceable signal, and the WHOLE of it: one rule, one lit state.
+   Both states render the same TodoListIcon ticked checkbox, so the button keeps
+   reading as "todo list" whatever the agent is doing. Never switch the shape:
+   the old two-glyph pair did, and its in-progress glyph read as nothing at all.
+   That glyph was a filled dome inside a checkbox, an SVG copy of the panel's ◐.
+
+   ACCENT MEANS SOMETHING IS LIVE RIGHT NOW. That is the composer row's
+   language, and every control in it speaks the same one: the follow toggle lit,
+   the waiting indicator present (chat/input-messages.css). Do not spend a
+   second colour or a motion here on a state that is not live.
+
+   A parked item and an abandoned one each had one, and both went. An item is
+   `waiting` only while the thread holds a live event wait, so the pulse
+   repeated the waiting indicator beside it. Abandoned's dim read as a disabled
+   button, for a fact that is history. Both survive in the tooltip, the
+   aria-label and the panel's own per-row markers and tags.
+
+   The glyph has to carry the live state because the tooltip is desktop-only per
+   the project rule, so on mobile colour is the whole signal. */
+.icon-btn[data-role="todo-indicator"][data-state="in-progress"] {
+    color: var(--accent);
+}
+
+.todo-panel-marker {
+    flex: 0 0 auto;
+    width: 1rem;
+    text-align: center;
+    font-size: var(--font-size-sm);
+}
+
+/* One tag for both engine-written statuses (`waiting`, `abandoned`): the shared
+   neutral label. The word is the differentiator, so a row wears the same shape
+   whichever way its work ended up. This rule only keeps it from shrinking. */
+.todo-panel-status-tag {
+    flex: 0 0 auto;
+}
+
+.todo-panel-text {
+    flex: 1 1 auto;
+    word-break: break-word;
+}
