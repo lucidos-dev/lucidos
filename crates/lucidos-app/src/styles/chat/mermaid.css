@@ -1,0 +1,39 @@
+/* The source and its trusted Copy target stay in the original code wrapper. */
+.markdown-content .mermaid-block .code-block-header {
+    position: static;
+    display: flex;
+    justify-content: space-between;
+    padding: 0.5rem;
+    background: var(--bg-secondary);
+}
+.mermaid-block {
+    position: relative;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-surface);
+    overflow: hidden;
+}
+.mermaid-block pre {
+    padding-top: 1rem;
+}
+.mermaid-block .mermaid-frame {
+    display: block;
+    width: 100%;
+    border: 0;
+    background: var(--bg-primary);
+}
+.mermaid-block [hidden] {
+    display: none !important;
+}
+/* Keep in-flight SVG measurements valid when the reader switches to Code. */
+.mermaid-block .mermaid-frame[hidden] {
+    display: block !important;
+    position: absolute;
+    top: 0;
+    visibility: hidden;
+    pointer-events: none;
+}
+.mermaid-block .mermaid-notice {
+    padding: 0.5rem 1rem;
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+}

@@ -1,0 +1,11 @@
+-- Drop the thread_presence projection table.
+--
+-- ThreadPresenceStore and the ThreadFocused / ThreadUnfocused
+-- SystemEvent variants that maintained it are removed in the same
+-- change. Their role — telling the OS push fan-out which device is
+-- looking at which thread — is now handled live by the PresenceCheck
+-- pong protocol: every page reports its own `focused_thread_id` and
+-- `event_in_viewport` in response to a SystemEvent::PresenceCheck
+-- broadcast, so the engine no longer needs a persisted thread-focus
+-- index. See system-knowhow/notifications.md §3.
+DROP TABLE IF EXISTS thread_presence;
