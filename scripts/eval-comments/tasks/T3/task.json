@@ -1,0 +1,14 @@
+{
+  "id": "T3",
+  "fix": "889735e6556f8ebe2932c61a0cd87b967a31f4c6",
+  "title": "fix(engine): stop the code-injecting env guard refusing ordinary commands",
+  "withheld_test": {
+    "file": "withheld_test.rs",
+    "dest": "crates/lucidos-engine/src/engine/eval_withheld_tests.rs",
+    "host": "crates/lucidos-engine/src/engine/command_guard.rs"
+  },
+  "needs_db": false,
+  "comment": "moderate",
+  "why": "The over-broad scan sat under 'the head walk is deliberately left alone', and the variable list under 'A miss costs a judge call that did not happen, so add rather than debate', which defends over-matching.",
+  "adaptation": "None beyond copying the two test helpers. Both directions are checked: the five false positives settle Safe, and ENV=, IFS= and LD_PRELOAD= still do not."
+}

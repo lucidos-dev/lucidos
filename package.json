@@ -1,0 +1,8 @@
+{
+  "name": "lucidos",
+  "private": true,
+  "workspaces": [
+    "crates/lucidos-app",
+    "packages/lucidos-sdk"
+  ]
+}

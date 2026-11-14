@@ -1,0 +1,184 @@
+//! Claude/Anthropic request dispatch for `VertexProvider`.
+//!
+//! The wire format (request building, cache-control, SSE parsing) is shared
+//! with the direct Anthropic provider and lives in [`crate::llm::anthropic_wire`].
+//! This file is the Vertex-specific transport: gcloud bearer auth, the
+//! `streamRawPredict` URL, the retry/auth-refresh loop, and the prefill beat
+//! on the same endpoint.
+
+use super::VertexProvider;
+use crate::llm::anthropic_wire::{
+    build_claude_request, parse_claude_stream, parse_context_suffix, WireTarget,
+};
+use crate::llm::claude_prefill;
+use crate::llm::prefill::{PrefillBody, TurnRoute};
+use crate::llm::provider::{LlmResponse, Message, TokenCallback, ToolDefinition};
+use crate::llm::{ModelNotServed, ModelSelection, ProviderError};
+
+impl VertexProvider {
+    pub(super) async fn chat_claude(
+        &self,
+        messages: Vec<Message>,
+        tools: Vec<ToolDefinition>,
+        selection: ModelSelection<'_>,
+        system_prompt: Option<&str>,
+        on_token: Option<TokenCallback>,
+    ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        crate::llm::metered::check_provider(crate::llm::ProviderKind::Vertex).await?;
+        let model = selection.model.unwrap_or(&self.model);
+        let reasoning_effort = selection.reasoning_effort;
+        // Vertex carries the model in the URL, so strip the [1m] suffix for the
+        // endpoint; the request builder folds the 1M beta into the body.
+        let (base_model, _) = parse_context_suffix(model);
+        let url = self.endpoint_for_model(base_model);
+
+        let (mut request, header_betas) = build_claude_request(
+            messages,
+            tools,
+            model,
+            system_prompt,
+            reasoning_effort,
+            WireTarget::Vertex { url: &url },
+            "Vertex",
+        );
+        if let Some(tool) = selection.forced_tool {
+            request.force_tool(tool, model)?;
+        }
+        let stable_prefix_fingerprint = crate::llm::stable_prefix::fingerprint(&request, model);
+        let prefill = claude_prefill::pair(
+            &request,
+            TurnRoute {
+                wire_model: model,
+                reasoning_effort,
+                betas: &header_betas,
+            },
+        );
+        let beta_header = (!header_betas.is_empty()).then(|| header_betas.join(","));
+        let display = request.thinking_display();
+
+        let mut access_token = self.get_access_token().await?;
+
+        // Retry loop for connection errors, retryable HTTP status codes, and
+        // mid-stream overload errors. Content is accumulated internally by
+        // parse_claude_stream, so retrying the full request is safe.
+        let mut attempt = 0u32;
+        let mut retried_auth = false;
+        loop {
+            attempt += 1;
+
+            let mut builder = self
+                .streaming_client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", access_token))
+                .header("Content-Type", "application/json");
+            if let Some(beta) = &beta_header {
+                builder = builder.header("anthropic-beta", beta);
+            }
+            let builder = builder.json(&request);
+            let resp = match crate::llm::send_streaming_request(
+                builder,
+                model,
+                attempt,
+                selection.attempt_timeout,
+            )
+            .await
+            {
+                crate::llm::StreamSend::Got(r) => r,
+                crate::llm::StreamSend::Retry => continue,
+                crate::llm::StreamSend::Failed(e) => return Err(e),
+            };
+
+            let status = resp.status();
+            if !status.is_success() {
+                let error_headers = resp.headers().clone();
+                let error_body = resp.text().await.unwrap_or_default();
+                if let Some(cap) = crate::llm::metered::http_spend_cap(
+                    crate::llm::ProviderKind::Vertex,
+                    status.as_u16(),
+                    &error_headers,
+                    &error_body,
+                )
+                .await
+                {
+                    return Err(cap.into());
+                }
+
+                if status.as_u16() == 401 && !retried_auth {
+                    if let Some(new_token) =
+                        self.handle_auth_refresh(model, &mut retried_auth).await
+                    {
+                        access_token = new_token;
+                        continue;
+                    }
+                    return Err(
+                        ProviderError::from_http("Vertex", status.as_u16(), &error_body).into(),
+                    );
+                }
+
+                if crate::llm::should_retry_http(status.as_u16(), &error_body, attempt) {
+                    let delay = crate::llm::retry_delay(attempt, 1);
+                    crate::llm::log_retry(model, &format!("HTTP {}", status), attempt, delay);
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+
+                // A publisher-model 404 is the shape a fresh Vertex setup hits,
+                // and Google's own sentence names no fix. The helper supplies
+                // one. Every other failure keeps its own wording.
+                //
+                // `model` carries the `[1m]` suffix the URL drops, and naming
+                // it is deliberate: that is the value the user picks in
+                // Settings, so that is what they would change.
+                if let Some(advice) =
+                    super::explain_publisher_model_404(status.as_u16(), &error_body, model, &url)
+                {
+                    return Err(Box::new(ModelNotServed::new(
+                        crate::llm::with_retry_context(advice, attempt),
+                    )));
+                }
+                return Err(
+                    ProviderError::from_http("Vertex", status.as_u16(), &error_body)
+                        .with_attempts(attempt)
+                        .into(),
+                );
+            }
+
+            // Parse SSE stream — retry on overload errors
+            match parse_claude_stream(resp, &on_token, display, "Vertex").await {
+                Ok(response) => {
+                    return Ok(LlmResponse {
+                        stable_prefix_fingerprint,
+                        prefill,
+                        ..response
+                    })
+                }
+                Err(e) => {
+                    if crate::llm::retry_after_stream_error(model, &*e, attempt).await {
+                        continue;
+                    }
+                    return Err(crate::llm::retry_failure(e, attempt));
+                }
+            }
+        }
+    }
+
+    /// Send one prefill beat to the endpoint the turn used.
+    pub(super) async fn prefill_claude(
+        &self,
+        body: &PrefillBody,
+    ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        if !Self::is_claude_model(&body.wire_model) {
+            return Err(crate::llm::prefill::cannot_prefill(body.provider));
+        }
+        let (base_model, _) = parse_context_suffix(&body.wire_model);
+        let url = self.claude_endpoint(base_model);
+        let mut builder = self.streaming_client.post(&url).header(
+            "Authorization",
+            format!("Bearer {}", self.get_access_token().await?),
+        );
+        if !body.betas.is_empty() {
+            builder = builder.header("anthropic-beta", body.betas.join(","));
+        }
+        crate::llm::prefill::send(builder, body, "Vertex").await
+    }
+}

@@ -1,0 +1,529 @@
+/**
+ * Gateway pairing on Settings → Access (ADR 0590): two sections.
+ *
+ * - **Pair a gateway** is this gateway as B. It mints a gateway pairing secret,
+ *   and lists the gateways that may open this one's workspaces, with Unpair.
+ * - **Remote gateways** is this gateway as A. It lists the gateways it has
+ *   paired with, with Remove, and takes the address, secret and short name of a
+ *   new one.
+ *
+ * Both live on the gateway's own surface, so off the gateway they render their
+ * shell and say what to run instead, like "Pair a device".
+ */
+
+import { headersFromDraft, type HeaderDraft, RemoteHeadersEditor } from './RemoteHeadersEditor';
+import { useCallback, useEffect, useState } from 'preact/hooks';
+import {
+  listPairedGateways,
+  listRemoteGateways,
+  mintGatewayPairingCode,
+  removeRemoteGateway,
+  updateRemoteGatewayHeaders,
+  rotateRemoteGateway,
+  setPairedGatewayMayManage,
+  unpairGateway,
+  type PairedGateway,
+  type RemoteGateway,
+} from '../../api/client/control';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
+import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { showConfirm, showToast } from '../../store/store';
+import { loadingIfFresh, toFailed, type Loadable } from '../../store/types';
+import { errorDetail } from '../../utils/errorDetail';
+import { Disclosure } from '../shared/Disclosure';
+import { Explainer } from '../shared/Explainer';
+import { LoadableError } from '../shared/LoadableError';
+import { LoadingFade } from '../shared/LoadingFade';
+import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
+import { CopyButton, PairCard, expiryLabel, type PairTarget } from './PairDeviceSection';
+import { timeAgo } from './pairedDevices';
+import {
+  AWAITING_OWNER_NOTE,
+  EMPTY_REMOTE_GATEWAY_DRAFT,
+  HTTPS_ONLY_NOTE,
+  TRUST_NOTE,
+  remoteGatewayBlocker,
+  shortNameInput,
+  submitRemoteGateway,
+  type RemoteGatewayDraft,
+} from './remoteGatewayForm';
+import { useCodeCountdown } from './useCodeCountdown';
+
+/** Pure: the https address another gateway should pair with, or `null`.
+ *
+ *  Only an `https` pairing origin qualifies, because gateways pair over https
+ *  only. A plain-http one would be refused on the other side. */
+export function gatewayPairingAddress(target: PairTarget): string | null {
+  return target.kind === 'origin' && target.url.startsWith('https://') ? target.url : null;
+}
+
+/** A list read this section owns, with its refresh. */
+function useGatewayList<T>(
+  available: boolean,
+  read: () => Promise<T[]>,
+  name: string,
+): [Loadable<T[]>, () => Promise<unknown>] {
+  const [list, setList] = useState<Loadable<T[]>>({ status: 'not-loaded' });
+  const reload = useCallback((): Promise<unknown> => {
+    if (!available) return Promise.resolve();
+    setList(loadingIfFresh);
+    return read().then(
+      (data) => setList({ status: 'loaded', data }),
+      (e) => setList(toFailed(e)),
+    );
+  }, [available, read]);
+  useEffect(() => { void reload(); }, [reload]);
+  usePanelRefresh(name, reload);
+  return [list, reload];
+}
+
+/** One row of either list: a name, a line under it, one action. With no
+ *  props, inside a skeleton, it is the loading placeholder. */
+function GatewayRow({
+  title,
+  detail,
+  action,
+}: {
+  title?: string;
+  detail?: string;
+  action?: preact.ComponentChildren;
+}) {
+  return (
+    <div class="list-row">
+      <div class="list-row-info">
+        <SkText class="title" as="div" w="9rem">{title}</SkText>
+        <SkText class="list-row-details list-row-details-prose" as="div" w="14rem">
+          {detail}
+        </SkText>
+      </div>
+      <div class="list-row-actions">
+        <SkBlock w="4.5rem" h="2rem" round>{action}</SkBlock>
+      </div>
+    </div>
+  );
+}
+
+/** A list under a delay-gated skeleton, its failure, or its rows. */
+function GatewayList<T>({
+  list,
+  noun,
+  empty,
+  row,
+}: {
+  list: Loadable<T[]>;
+  noun: string;
+  empty: string;
+  row: (item: T) => preact.VNode;
+}) {
+  const showLoading = useDelayedLoading(list);
+  if (list.status === 'failed') return <LoadableError noun={noun} error={list.error} />;
+  return (
+    <LoadingFade
+      showSkeleton={showLoading}
+      skeleton={<ListSkeletonOf row={() => <GatewayRow />} count={1} />}
+    >
+      {list.status === 'loaded' && (
+        list.data.length === 0
+          ? <div class="settings-section-desc">{empty}</div>
+          : list.data.map(row)
+      )}
+    </LoadingFade>
+  );
+}
+
+/** A minted gateway pairing secret and when it stops working. */
+interface MintedGatewayCode {
+  code: string;
+  expiresAt: number;
+}
+
+/** "Pair a gateway": this gateway lets another one in. */
+export function PairGatewaySection({
+  available,
+  target,
+}: {
+  available: boolean;
+  target: PairTarget;
+}) {
+  const [minted, setMinted] = useState<Loadable<MintedGatewayCode>>({ status: 'not-loaded' });
+  const [paired, reload] = useGatewayList<PairedGateway>(
+    available,
+    listPairedGateways,
+    'pair a gateway',
+  );
+  const left = useCodeCountdown(minted.status === 'loaded' ? minted.data.expiresAt : null);
+  const address = gatewayPairingAddress(target);
+
+  const mint = () => {
+    setMinted({ status: 'loading' });
+    mintGatewayPairingCode().then(
+      (body) => setMinted({
+        status: 'loaded',
+        data: { code: body.code, expiresAt: Date.now() + body.expires_in_secs * 1000 },
+      }),
+      (e) => setMinted(toFailed(e)),
+    );
+  };
+
+  const unpair = async (gateway: PairedGateway) => {
+    const ok = await showConfirm(
+      `${gateway.label} will no longer open this gateway's workspaces. Pairing again takes a new gateway secret.`,
+      'Unpair',
+      { variant: 'danger' },
+    );
+    if (!ok) return;
+    try {
+      await unpairGateway(gateway.id);
+      await reload();
+    } catch (e) {
+      showToast(`Couldn't unpair ${gateway.label}: ${errorDetail(e)}`, 'error');
+    }
+  };
+
+  /** Turn the manage grant on or off (ADR 0656). Turning it on says first
+   *  what it hands over. */
+  const setManage = async (gateway: PairedGateway, mayManage: boolean) => {
+    if (mayManage) {
+      const ok = await showConfirm(
+        `Every device paired with ${gateway.label} can then list, revoke and reassign this gateway's `
+          + 'devices, and add, rename and remove its users.\n\n'
+          + 'Pairing codes, gateway pairings and the rest of Settings stay on this gateway.',
+        'Allow',
+        { title: `Let ${gateway.label} manage users and devices?`, variant: 'default' },
+      );
+      if (!ok) return;
+    }
+    try {
+      await setPairedGatewayMayManage(gateway.id, mayManage);
+    } catch (e) {
+      showToast(`Couldn't change what ${gateway.label} may manage: ${errorDetail(e)}`, 'error');
+    }
+    await reload();
+  };
+
+  function codeBody() {
+    if (minted.status === 'failed') {
+      return (
+        <div class="list-row">
+          <div class="list-row-info">
+            <LoadableError noun="a gateway pairing secret" error={minted.error} />
+          </div>
+          <div class="list-row-actions">
+            <button class="action-btn" onClick={mint}>Try again</button>
+          </div>
+        </div>
+      );
+    }
+    if (minted.status !== 'loaded') {
+      return (
+        <div class="list-row">
+          <div class="list-row-info">
+            <div class="title">Let another gateway in</div>
+            <div class="list-row-details list-row-details-prose">
+              Creates a one-time secret. The other gateway pastes it under Remote gateways, and needs
+              this version of Lucidos or newer.
+            </div>
+          </div>
+          <div class="list-row-actions">
+            <button
+              class="action-btn action-btn-confirm"
+              disabled={minted.status === 'loading'}
+              onClick={mint}
+            >
+              {minted.status === 'loading' ? 'Creating…' : 'Create a gateway secret'}
+            </button>
+          </div>
+        </div>
+      );
+    }
+    const expired = left <= 0;
+    return (
+      <div class="add-device">
+        <div class="add-device-status">
+          <span class="add-device-expiry">{expiryLabel(left)}</span>
+          <button class="action-btn" onClick={mint}>{expired ? 'Create another' : 'New secret'}</button>
+        </div>
+        {!expired && (
+          <div class="add-device-cards">
+            <div class="add-device-alts">
+              <PairCard
+                kind="code"
+                label="Paste this secret on the other gateway"
+                action={<CopyButton text={minted.data.code} what="gateway pairing secret" />}
+              >
+                <div class="add-device-code add-device-secret">{minted.data.code}</div>
+              </PairCard>
+              {address ? (
+                <PairCard
+                  kind="url"
+                  label="With this address"
+                  action={<CopyButton text={address} what="gateway address" />}
+                >
+                  <div class="add-device-url">{address}</div>
+                </PairCard>
+              ) : (
+                <div class="add-device-note">{HTTPS_ONLY_NOTE}</div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div class="settings-section">
+      <div class="settings-section-title" data-search-anchor="access:pair-gateway">
+        Pair a gateway
+        <Explainer title="Pair a gateway">
+          <p>
+            Lets another Lucidos gateway open this gateway's workspaces, for every device
+            paired with it. The other gateway pastes the secret under Remote gateways.
+          </p>
+          <p>
+            It is one-way: this gateway gains nothing on the other one. Unpair ends it on
+            the other gateway's next request.
+          </p>
+        </Explainer>
+      </div>
+      {available ? (
+        <div class="list-rows">
+          {codeBody()}
+          <GatewayList
+            list={paired}
+            noun="paired gateways"
+            empty="No other gateway can open this gateway's workspaces."
+            row={(gateway) => (
+              <GatewayRow
+                key={gateway.id}
+                title={gateway.label}
+                detail={`Paired ${timeAgo(gateway.paired_at, Date.now())} · ${gateway.last_used_at ? `last used ${timeAgo(gateway.last_used_at, Date.now())}` : 'not used yet'} · ${gateway.may_manage ? "can open this gateway's workspaces and manage its users and devices" : "can open this gateway's workspaces"}`}
+                action={
+                  <>
+                    <label
+                      class="toggle-switch"
+                      data-tooltip={`Let devices on ${gateway.label} manage users and devices`}
+                    >
+                      <input
+                        type="checkbox"
+                        aria-label={`Let devices on ${gateway.label} manage users and devices`}
+                        checked={gateway.may_manage}
+                        onChange={(e) => {
+                          // The switch shows the stored grant, so it moves only
+                          // once the change lands and the list re-reads.
+                          const input = e.currentTarget as HTMLInputElement;
+                          const wanted = input.checked;
+                          input.checked = gateway.may_manage;
+                          void setManage(gateway, wanted);
+                        }}
+                      />
+                      <span class="toggle-slider" />
+                    </label>
+                    <button class="action-btn action-btn-danger" onClick={() => void unpair(gateway)}>
+                      Unpair
+                    </button>
+                  </>
+                }
+              />
+            )}
+          />
+        </div>
+      ) : (
+        <div class="settings-section-desc">
+          This page is served straight off the engine, so it cannot reach the pairing
+          service. Run <code>lucidos pair --gateway</code> in a terminal on the machine
+          running Lucidos.
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Editing replaces the complete header set; values are write-only. */
+function RemoteHeaderSettings({ gateway, reload }: { gateway: RemoteGateway; reload: () => Promise<unknown> }) {
+  const [editing, setEditing] = useState(false);
+  const [rows, setRows] = useState<HeaderDraft[]>([]);
+  const [saving, setSaving] = useState(false);
+  const rotate = async () => {
+    setSaving(true);
+    try {
+      await rotateRemoteGateway(gateway.name);
+      showToast(`Credential rotated for ${gateway.name}`, 'success');
+    } catch (e) {
+      showToast(`Couldn't rotate credential for ${gateway.name}: ${errorDetail(e)}`, 'error');
+    } finally {
+      await reload();
+      setSaving(false);
+    }
+  };
+  const save = async () => {
+    setSaving(true);
+    try {
+      await updateRemoteGatewayHeaders(gateway.name, headersFromDraft(rows));
+      setRows([]);
+      setEditing(false);
+      await reload();
+    } catch (e) {
+      showToast(`Couldn't update headers for ${gateway.name}: ${errorDetail(e)}`, 'error');
+    } finally { setSaving(false); }
+  };
+  return <div>
+    <div class="settings-row-note">{gateway.last_rotated_at ? `Credential rotated ${timeAgo(gateway.last_rotated_at, Date.now())}` : 'Credential rotates automatically every 30 days'}</div>
+    {gateway.rotation_error && <div class="settings-row-note" role="status">{gateway.rotation_error} · Retries automatically.</div>}
+    {!gateway.rotation_error && gateway.gateway_protocol < 2 && <div class="settings-row-note">Update the remote gateway to support credential rotation.</div>}
+    <button class="action-btn" disabled={saving} onClick={() => void rotate()}>Rotate credential</button>
+    <div class="settings-row-note">{gateway.header_names.length ? gateway.header_names.map(n => `${n}: set`).join(' · ') : 'No extra headers'}</div>
+    <button class="action-btn" aria-expanded={editing} disabled={saving} onClick={() => { setRows([]); setEditing(!editing); }}>Edit headers</button>
+    <Disclosure open={editing}>
+      <p class="settings-row-note">Re-enter every header you want to keep. Saving replaces the entire set; an empty set clears it.</p>
+      <RemoteHeadersEditor rows={rows} onChange={setRows} disabled={saving} />
+      <button class="action-btn" disabled={saving} onClick={() => void save()}>Save headers</button>
+    </Disclosure>
+  </div>;
+}
+
+/** "Remote gateways": this gateway opens another one's workspaces. */
+export function RemoteGatewaysSection({ available }: { available: boolean }) {
+  const [remotes, reload] = useGatewayList<RemoteGateway>(
+    available,
+    listRemoteGateways,
+    'remote gateways',
+  );
+  const [draft, setDraft] = useState<RemoteGatewayDraft>(EMPTY_REMOTE_GATEWAY_DRAFT);
+  const [pairing, setPairing] = useState(false);
+  const [awaitingOwner, setAwaitingOwner] = useState(false);
+  const blocker = remoteGatewayBlocker(draft);
+  const edit = (patch: Partial<RemoteGatewayDraft>) => setDraft((d) => ({ ...d, ...patch }));
+
+  const pair = async () => {
+    if (blocker !== null || pairing) return;
+    setPairing(true);
+    try {
+      const added = await submitRemoteGateway(draft, () => setAwaitingOwner(true));
+      setDraft(EMPTY_REMOTE_GATEWAY_DRAFT);
+      showToast(`Paired with ${added.name}`, 'success');
+      await reload();
+    } catch (e) {
+      showToast(`Couldn't pair with that gateway: ${errorDetail(e)}`, 'error');
+    } finally {
+      setPairing(false);
+      setAwaitingOwner(false);
+    }
+  };
+
+  const remove = async (gateway: RemoteGateway) => {
+    const ok = await showConfirm(
+      `This gateway will stop opening ${gateway.name}'s workspaces. Pairing again takes a new gateway secret from ${gateway.name}.`,
+      'Remove',
+      { variant: 'danger' },
+    );
+    if (!ok) return;
+    try {
+      const removed = await removeRemoteGateway(gateway.name);
+      if (!removed.remote_forgot) {
+        showToast(
+          `Removed ${gateway.name} here, but it did not answer: ${removed.detail ?? 'no reason given'}. Unpair this gateway there too.`,
+          'warning',
+        );
+      }
+      await reload();
+    } catch (e) {
+      showToast(`Couldn't remove ${gateway.name}: ${errorDetail(e)}`, 'error');
+    }
+  };
+
+  const field = (
+    label: string,
+    key: 'address' | 'code' | 'name',
+    placeholder: string,
+    extra?: preact.ComponentChildren,
+  ) => (
+    <div class="settings-row update-address-row">
+      <span class="settings-row-label">{label}</span>
+      <div class="update-address-controls">
+        <input
+          class="settings-text-input update-address-input"
+          value={draft[key]}
+          placeholder={placeholder}
+          aria-label={label}
+          spellcheck={false}
+          disabled={pairing}
+          onInput={(e) => {
+            const value = (e.currentTarget as HTMLInputElement).value;
+            edit({ [key]: key === 'name' ? shortNameInput(value) : value });
+          }}
+          onKeyDown={(e) => { if (e.key === 'Enter') void pair(); }}
+        />
+        {extra}
+      </div>
+    </div>
+  );
+
+  return (
+    <div class="settings-section">
+      <div class="settings-section-title" data-search-anchor="access:remote-gateways">
+        Remote gateways
+        <Explainer title="Remote gateways">
+          <p>
+            Opens another Lucidos gateway's workspaces from here, on every device paired
+            with this gateway. On the other gateway, use Pair a gateway to get a secret.
+          </p>
+          <p>
+            The other gateway needs an https address. The short name is how its
+            workspaces are named here, as <code>name@short-name</code>.
+          </p>
+        </Explainer>
+      </div>
+      {available ? (
+        <>
+          <div class="list-rows">
+            <GatewayList
+              list={remotes}
+              noun="remote gateways"
+              empty="No remote gateways yet."
+              row={(gateway) => (
+                <div key={gateway.name}>
+                  <GatewayRow
+                    title={gateway.name}
+                    detail={`${gateway.address} · added ${timeAgo(gateway.added_at, Date.now())}`}
+                    action={
+                      <button class="action-btn action-btn-danger" onClick={() => void remove(gateway)}>
+                        Remove
+                      </button>
+                    }
+                  />
+                  <RemoteHeaderSettings gateway={gateway} reload={reload} />
+                </div>
+              )}
+            />
+          </div>
+          <div class="settings-row-note" data-role="remote-gateway-trust">{TRUST_NOTE}</div>
+          {field('Address', 'address', 'https://lucidos.example.com')}
+          <RemoteHeadersEditor rows={draft.headers ?? []} onChange={headers => edit({ headers })} disabled={pairing} />
+          {field('Gateway pairing secret', 'code', 'lgp_…')}
+          {field(
+            'Short name',
+            'name',
+            'cloud',
+            <button
+              class="action-btn action-btn-confirm"
+              disabled={blocker !== null || pairing}
+              onClick={() => void pair()}
+            >
+              {awaitingOwner ? 'Waiting…' : pairing ? 'Pairing…' : 'Pair'}
+            </button>,
+          )}
+          {blocker?.kind === 'plain-http' && <div class="settings-row-note">{HTTPS_ONLY_NOTE}</div>}
+          <Disclosure open={awaitingOwner}>
+            <div class="settings-row-note" role="status">{AWAITING_OWNER_NOTE}</div>
+          </Disclosure>
+        </>
+      ) : (
+        <div class="settings-section-desc">
+          This page is served straight off the engine, so it cannot reach the gateway that
+          pairs with other gateways. Open Lucidos through its gateway to add one.
+        </div>
+      )}
+    </div>
+  );
+}
