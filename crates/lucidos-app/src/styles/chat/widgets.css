@@ -1,0 +1,267 @@
+/* --- Widgets (ADRs 0402, 0432, 0466) ---
+   A widget is an inline widget in its turn (.inline-widget): a bare widget
+   box, the same box a dashboard tile is. No frame scrolls inside the
+   transcript. */
+
+/* --- The widget box: a thread card's and a dashboard tile's (WidgetBox) ---
+   The size sets the box and the frame fills it. A report never sizes it, and
+   it never scrolls inside: content past it is clipped under a fade. */
+.widget-box {
+    --widget-box-border: 1px;
+    position: relative;
+    overflow: hidden;
+    border: var(--widget-box-border) solid var(--border-color);
+    border-radius: var(--radius-surface);
+    background: var(--bg-secondary);
+    isolation: isolate;
+}
+
+/* The frame takes the bottom layer and everything the box draws over it
+   stacks above. Tree order alone fails on iOS: a frame whose widget
+   composites, such as an animated transform, paints over later siblings. */
+.widget-box > .widget-box-scroll {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    /* A scrollbar that takes room would cut the bottom off the box. */
+    scrollbar-width: none;
+}
+
+.widget-box > .widget-box-scroll::-webkit-scrollbar {
+    display: none;
+}
+
+.widget-box > :not(.widget-box-scroll) {
+    z-index: 1;
+}
+
+/* The canvas is the frame's room. It fills the box, and an XL box a host
+   clamps keeps its true width inside it, so the scroller pans across it. The
+   box's border is outside the scroller's padding box, so it is taken off. */
+.widget-box-canvas {
+    height: 100%;
+}
+
+.widget-box[data-size="xl"] > .widget-box-scroll > .widget-box-canvas {
+    min-width: calc(var(--widget-box-true-width) - 2 * var(--widget-box-border));
+}
+
+.widget-box-canvas > .widget-frame {
+    height: 100%;
+}
+
+.widget-box .app-ui-iframe {
+    background: transparent;
+}
+
+.widget-box .app-ui-cover {
+    background: var(--bg-secondary);
+}
+
+/* A widget with its own shape, such as a round clock, draws on the surface
+   behind the box. */
+.widget-box.is-transparent {
+    border-color: transparent;
+    background: transparent;
+}
+
+.widget-box.is-transparent .app-ui-cover {
+    background: var(--bg-primary);
+}
+
+/* Marks the edge a box clips: the bottom, or the right for content that spills
+   sideways. Both edges share one reach. A tap or a scroll here reaches the
+   widget. */
+.widget-box-fade {
+    --widget-box-fade-reach: 3.5rem;
+    position: absolute;
+    pointer-events: none;
+}
+
+.widget-box-fade[data-edge="bottom"] {
+    inset: auto 0 0;
+    height: var(--widget-box-fade-reach);
+    background: linear-gradient(to bottom, transparent, var(--bg-secondary));
+}
+
+.widget-box-fade[data-edge="right"] {
+    inset: 0 0 0 auto;
+    width: var(--widget-box-fade-reach);
+    background: linear-gradient(to right, transparent, var(--bg-secondary));
+}
+
+/* Hides a resize until the widget has laid out for the new size. It comes up
+   at once and fades out. */
+.widget-box-cover {
+    position: absolute;
+    inset: 0;
+    background: var(--bg-secondary);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--duration-normal) ease;
+}
+
+.widget-box-cover.is-covering {
+    opacity: 1;
+    transition: none;
+}
+
+.widget-box.is-transparent .widget-box-cover {
+    background: var(--bg-primary);
+}
+
+/* A widget fit check's boxes. They sit in the viewport, unseen, because a
+   browser may stop rendering a frame scrolled off it. Each surface starts at
+   the corner, so a wide box never pushes the other surface away. */
+.widget-fit-probe {
+    position: fixed;
+    top: 0;
+    left: 0;
+    opacity: 0;
+    pointer-events: none;
+}
+
+.widget-fit-surface {
+    position: absolute;
+    top: 0;
+    left: 0;
+}
+
+/* --- An inline widget: its bare widget box ---
+   The card is the box's width (--widget-box-width, set from the size), with a
+   tile's border and radius and no shadow. It centres in the turn. On a phone
+   the box matches the phone dashboard's, which can be a hair wider than the
+   turn: the negative left margin then centres it rather than spilling it to
+   one side. */
+.inline-widget {
+    width: var(--widget-box-width);
+    max-width: none;
+    margin: var(--space-xl) 0 var(--space-xl) calc((100% - var(--widget-box-width)) / 2);
+    /* A hold opens the widget menu, so it selects no text. */
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+/* An XL card is wider than a narrow turn can be. It stops at the turn's
+   width, and its box scrolls the widget sideways at the true XL width. It
+   centres while the turn has room. */
+.inline-widget.inline-widget-xl {
+    max-width: 100%;
+    margin-left: max(0px, (100% - var(--widget-box-width)) / 2);
+}
+
+/* The card is a focus stop for its menu key. The transparent outline is the
+   forced-colors fallback, where box-shadow is stripped. */
+.inline-widget:focus-visible {
+    border-radius: var(--radius-surface);
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+.inline-widget > .widget-box {
+    height: var(--widget-box-height);
+}
+
+.inline-widget.inline-widget-gone {
+    width: auto;
+    margin: var(--space-sm) 0;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-surface);
+    background: var(--bg-secondary);
+    padding: var(--space-sm) var(--space-md);
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    -webkit-user-select: text;
+    user-select: text;
+}
+
+.inline-widget-gone-reason {
+    margin-top: var(--space-xs);
+    font-size: var(--font-size-xs);
+    overflow-wrap: anywhere;
+}
+
+/* The pill a card's widget menu and an edited tile draw. */
+.widget-size-pill {
+    display: flex;
+    flex-shrink: 0;
+    gap: 0.125rem;
+    padding: 0.125rem;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-round);
+    background: var(--bg-primary);
+}
+
+.widget-size-pill button {
+    min-width: 1.25rem;
+    padding: 0 0.25rem;
+    border: none;
+    border-radius: var(--radius-round);
+    background: none;
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.widget-size-pill button.is-current {
+    background: var(--accent);
+    color: var(--text-on-accent);
+}
+
+/* An option frame is sized to what the widget reports. */
+.widget-frame {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+}
+
+/* A flex item's automatic floor is its content height, and an iframe's is
+   150px. Without this, a frame sized shorter spills its iframe over whatever
+   sits below, such as the next question option. */
+.widget-frame > .app-ui-iframe {
+    min-height: 0;
+}
+
+/* An option frame takes its full reported height, so it never scrolls. The
+   cap stops a widget whose body tracks the viewport from feeding its own
+   height back without end. */
+.widget-frame-option {
+    max-height: 300dvh;
+}
+
+/* The widget menu's first row: the label, and the size pill at the end. It
+   takes a menu item's padding and type, so its label lines up with theirs. */
+.widget-menu-size {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-md);
+    padding: 0.5rem 0.625rem;
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+}
+
+.widget-menu-label {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    min-width: 0;
+}
+
+.widget-menu-hint {
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+}
+
+/* --- A reply's widget embed (ADRs 0415, 0466) ---
+   The renderer writes a slot holding the embed's label. Once the reply is
+   final, the slot holds an inline widget. */
+.widget-embed-slot {
+    display: block;
+    margin: var(--space-sm) 0;
+    color: var(--text-secondary);
+}

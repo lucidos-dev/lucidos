@@ -1,0 +1,258 @@
+use base64::Engine as _;
+
+use crate::core::blobs::resolve_blob;
+use crate::core::events::{image_handle, ImageRef};
+use crate::llm::{ContentBlock, MessageContent};
+
+/// Maximum total base64 bytes for all images included in a single LLM call.
+const MAX_TOTAL_IMAGE_BASE64: usize = 10_000_000;
+
+/// Maximum number of prior user messages whose images are included in LLM context.
+/// Only the N most recent image-bearing messages are kept; older ones appear in
+/// conversation history text as "[attached image]" but without the actual data.
+/// This prevents stale screenshots from misleading the model in long threads.
+pub(super) const MAX_HISTORY_IMAGE_MESSAGES: usize = 3;
+
+/// Compute the user-message cutoff index for image recency: user messages at
+/// index >= cutoff are "recent enough" to have their images included.
+/// Recency is measured by total user messages, not just image-bearing ones.
+pub(super) fn image_recency_cutoff(
+    all_prior: &[crate::core::store::SessionMessage],
+    max_messages: usize,
+) -> usize {
+    let user_count = all_prior.iter().filter(|m| m.role == "user").count();
+    user_count.saturating_sub(max_messages)
+}
+
+/// Old screenshots in long threads mislead the LLM into thinking they
+/// represent current state — keep only the most recent N user messages'
+/// hashes; older messages still appear as text references.
+pub(super) fn filter_recent_history_image_hashes(
+    all_prior: &[crate::core::store::SessionMessage],
+    max_messages: usize,
+) -> Vec<Vec<String>> {
+    let cutoff = image_recency_cutoff(all_prior, max_messages);
+    all_prior
+        .iter()
+        .filter(|m| m.role == "user")
+        .skip(cutoff)
+        .filter(|m| !m.user_image_hashes.is_empty())
+        .map(|m| m.user_image_hashes.clone())
+        .collect()
+}
+
+/// Build a base64 image content block for an LLM message. Single constructor so
+/// every chat image→LLM site (current message, history, the description pass)
+/// emits the identical block shape. Callers fit the image with
+/// [`crate::api::ChatImage::fit_for_llm`] first so the per-call byte budget is
+/// measured against the bytes actually sent.
+pub(super) fn image_content_block(img: crate::api::ChatImage) -> ContentBlock {
+    ContentBlock::Image {
+        source_type: "base64".to_string(),
+        media_type: img.mime_type,
+        data: img.base64,
+    }
+}
+
+/// The `img-` handle of each current-message image, in the same order, so
+/// the model can name it in a tool call.
+///
+/// `None` for an image whose blob is not on disk. `images_to_hashes` stores
+/// every image before the turn is built. A blob it failed to write never
+/// reached the thread, so its handle would resolve to nothing.
+pub(crate) fn current_image_handles(
+    workspace: &std::path::Path,
+    images: &[crate::api::ChatImage],
+) -> Vec<Option<String>> {
+    images
+        .iter()
+        .map(|img| {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&img.base64)
+                .ok()?;
+            let hash = crate::core::blobs::compute_hash(&bytes);
+            resolve_blob(workspace, &hash)?;
+            Some(image_handle(ImageRef::BlobHash(&hash)))
+        })
+        .collect()
+}
+
+/// The ` (img-a img-b)` that follows "attached to this message" in an image
+/// label, or nothing when there are no handles to state.
+pub(crate) fn handles_note(handles: &[String]) -> String {
+    if handles.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", handles.join(" "))
+    }
+}
+
+/// Build the user message content. History hashes resolve to bytes via
+/// the blob store; current images come in already-decoded from the HTTP
+/// body. Each image is fit to the LLM size target (compressed only if over)
+/// before it counts against the budget, so a large photo can't blow the
+/// provider's per-image limit. The hint text labels the two groups so the
+/// LLM can tell stale from current.
+///
+/// `current_handles` lines up with `current_images`, from
+/// [`current_image_handles`]. The label names the handle of each image the
+/// budget let through. History images already carry theirs in the
+/// `[CONVERSATION HISTORY]` note. Pass none when the images are not stored
+/// in the thread, as for a side question.
+///
+/// ADR 0109 retired the body region, so the message is one text block again
+/// plus its images. The tail the mode adds, the context panel and the working
+/// understanding, is appended by the agentic loop to whichever message is
+/// newest.
+pub(super) fn build_user_content_with_images(
+    user_message_text: String,
+    workspace: &std::path::Path,
+    history_image_hashes: &[Vec<String>],
+    current_images: Option<&[crate::api::ChatImage]>,
+    current_handles: &[Option<String>],
+) -> MessageContent {
+    let mut history_blocks: Vec<ContentBlock> = Vec::new();
+    let mut current_blocks: Vec<ContentBlock> = Vec::new();
+    let mut sent_handles: Vec<String> = Vec::new();
+    let mut total_image_bytes: usize = 0;
+
+    // History images: resolve each hash to its blob, read the bytes, and fit it
+    // to the LLM size target before counting it against the per-call budget.
+    // Blobs are stored at original resolution (so the UI shows full-res), so the
+    // fit happens here, on the way to the model. An image that still can't be
+    // shrunk under the remaining budget is skipped — the provider would reject
+    // it anyway — while smaller later images still get their chance.
+    for hashes in history_image_hashes.iter() {
+        for hash in hashes.iter() {
+            // A blob that will not resolve or will not read is dropped from the
+            // content, but the history text still says `[attached image ...]`.
+            // The model then answers about a picture it never received, so the
+            // two skips are logged rather than silent.
+            let Some(blob) = resolve_blob(workspace, hash) else {
+                log!(
+                    "[Chat] History image {} has no blob on disk, so the model sees the text without it",
+                    hash
+                );
+                continue;
+            };
+            let bytes = match std::fs::read(&blob.path) {
+                Ok(b) => b,
+                Err(e) => {
+                    log!(
+                        "[Chat] Cannot read history image blob {}: {}. The model sees the text without it",
+                        blob.path.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
+            let fitted = crate::api::ChatImage {
+                base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                mime_type: blob.mime,
+            }
+            .fit_for_llm();
+            if total_image_bytes + fitted.base64.len() > MAX_TOTAL_IMAGE_BASE64 {
+                continue;
+            }
+            total_image_bytes += fitted.base64.len();
+            history_blocks.push(image_content_block(fitted));
+        }
+    }
+
+    // Then: images attached to the current message — base64-decoded by the HTTP
+    // body decoder. Same fit + budget rule as history.
+    if let Some(imgs) = current_images {
+        for (i, img) in imgs.iter().enumerate() {
+            let fitted = img.clone().fit_for_llm();
+            if total_image_bytes + fitted.base64.len() > MAX_TOTAL_IMAGE_BASE64 {
+                continue;
+            }
+            total_image_bytes += fitted.base64.len();
+            current_blocks.push(image_content_block(fitted));
+            sent_handles.extend(current_handles.get(i).cloned().flatten());
+        }
+    }
+
+    let history_count = history_blocks.len();
+    let current_count = current_blocks.len();
+    let total = history_count + current_count;
+
+    if total == 0 {
+        return MessageContent::Text(user_message_text);
+    }
+
+    let read_instruction = "Read all text and content from every image. Do NOT ask the user to provide details visible in the images.";
+    let read_instruction_single = "Read all text and content from the image. Do NOT ask the user to provide details visible in the image.";
+
+    let stale_warning = "IMPORTANT: These images may not reflect current state — code, UI, or configuration may have changed since they were sent. Do NOT assume they show current state.";
+
+    let handles_note = handles_note(&sent_handles);
+
+    let hint = if history_count > 0 && current_count > 0 {
+        // Both history and current — total is always >= 2
+        format!(
+            "\n\n[{} images total: {} from earlier in the conversation, {} attached to current message{}. {} {}]",
+            total,
+            history_count,
+            current_count,
+            handles_note,
+            read_instruction,
+            stale_warning,
+        )
+    } else if current_count > 0 {
+        if current_count == 1 {
+            format!(
+                "\n\n[1 image attached to this message{}. {}]",
+                handles_note, read_instruction_single
+            )
+        } else {
+            format!(
+                "\n\n[{} images attached to this message{}. {}]",
+                current_count, handles_note, read_instruction
+            )
+        }
+    } else {
+        // history only
+        if history_count == 1 {
+            format!(
+                "\n\n[1 image from earlier in the conversation. {} {}]",
+                read_instruction_single, stale_warning
+            )
+        } else {
+            format!(
+                "\n\n[{} images from earlier in the conversation. {} {}]",
+                history_count, read_instruction, stale_warning
+            )
+        }
+    };
+
+    let mut blocks = vec![ContentBlock::Text {
+        text: format!("{}{}", user_message_text, hint),
+    }];
+
+    if history_count > 0 && current_count > 0 {
+        // History images first, then separator, then current
+        blocks.extend(history_blocks);
+        blocks.push(ContentBlock::Text {
+            text: format!(
+                "[Below: {} attached to current message{}]",
+                if current_count == 1 {
+                    "image"
+                } else {
+                    "images"
+                },
+                handles_note,
+            ),
+        });
+        blocks.extend(current_blocks);
+    } else {
+        blocks.extend(history_blocks);
+        blocks.extend(current_blocks);
+    }
+
+    MessageContent::Blocks(blocks)
+}
+
+#[cfg(test)]
+#[path = "images_tests.rs"]
+mod tests;

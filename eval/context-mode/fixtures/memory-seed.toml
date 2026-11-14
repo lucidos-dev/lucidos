@@ -1,0 +1,383 @@
+# The 40 seeded memory entries, as data rather than as vectors.
+#
+# ADR 0087 seeds roughly 40 fixture entries so the control arm's memory recall
+# has something to return in the early threads. A workspace built from scratch
+# has none, and the arms would then be identical exactly where the comparison
+# starts.
+#
+# Two rules bind every row here.
+#
+# **Nothing may touch the eval's own facts.** The fact register (F01 to F23) is
+# what the probes measure, so a seeded row naming a report convention, a
+# threshold, a timezone or a collector would hand the lean arm the answer
+# through a channel the eval is not measuring. Every row below is about
+# something else entirely.
+#
+# **The vectors are generated, never written by hand.** Run
+# `cargo run -p lucidos-eval --features fixture-gen -- generate-memory-fixture`
+# to embed these summaries with the pinned embedding model and rewrite the
+# generated block in `seed.sql`. Commit the result. The vectors are checked in
+# so the digest is reproducible and no run re-embeds anything.
+
+embedding_model = "multilingual-e5-small"
+extractor_version = 1
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000001"
+topic = "cooking"
+summary = "Sourdough starter is fed at a one to one to one ratio and lives in the fridge between bakes."
+importance = 0.4
+entities = ["sourdough", "starter"]
+source_path = "artifacts/kitchen/bread-notes.md"
+created = "2025-11-03T09:12:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000002"
+topic = "cooking"
+summary = "The oven runs about fifteen degrees hot, so every baking recipe is worth lowering."
+importance = 0.5
+entities = ["oven"]
+source_path = "artifacts/kitchen/bread-notes.md"
+created = "2025-11-03T09:18:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000003"
+topic = "reading"
+summary = "The reading list is kept as one markdown file with a line per book and a one-line verdict."
+importance = 0.3
+entities = ["reading list"]
+source_path = "artifacts/reading/list.md"
+created = "2025-11-05T20:41:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000004"
+topic = "reading"
+summary = "Books are abandoned at page fifty rather than finished out of duty."
+importance = 0.3
+entities = ["reading list"]
+source_path = "artifacts/reading/list.md"
+created = "2025-11-05T20:44:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000005"
+topic = "gardening"
+summary = "The balcony tomatoes are watered every second evening and never in full sun."
+importance = 0.3
+entities = ["tomatoes", "balcony"]
+source_path = "artifacts/garden/balcony.md"
+created = "2025-11-07T17:05:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000006"
+topic = "gardening"
+summary = "Basil is sown in March and the seed tray goes on the south windowsill."
+importance = 0.2
+entities = ["basil"]
+source_path = "artifacts/garden/balcony.md"
+created = "2025-11-07T17:09:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000007"
+topic = "languages"
+summary = "Vocabulary review runs as twenty cards a sitting, never a longer session."
+importance = 0.4
+entities = ["vocabulary"]
+source_path = "artifacts/languages/method.md"
+created = "2025-11-09T07:30:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000008"
+topic = "languages"
+summary = "New words are written into the deck with a whole example sentence, never bare."
+importance = 0.5
+entities = ["vocabulary", "deck"]
+source_path = "artifacts/languages/method.md"
+created = "2025-11-09T07:36:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000009"
+topic = "cycling"
+summary = "The commuter bike gets its chain cleaned every three hundred kilometres."
+importance = 0.3
+entities = ["bike", "chain"]
+source_path = "artifacts/cycling/maintenance.md"
+created = "2025-11-11T18:22:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000010"
+topic = "cycling"
+summary = "Winter tyres go on the commuter bike once the morning temperature stays below freezing."
+importance = 0.3
+entities = ["bike", "tyres"]
+source_path = "artifacts/cycling/maintenance.md"
+created = "2025-11-11T18:26:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000011"
+topic = "photography"
+summary = "Photos are culled the same evening they are taken, and the rejects are deleted outright."
+importance = 0.4
+entities = ["photos"]
+source_path = "artifacts/photos/workflow.md"
+created = "2025-11-13T21:15:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000012"
+topic = "photography"
+summary = "Every keeper is exported at long edge two thousand pixels for sharing."
+importance = 0.3
+entities = ["photos", "export"]
+source_path = "artifacts/photos/workflow.md"
+created = "2025-11-13T21:19:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000013"
+topic = "music"
+summary = "Practice starts with fifteen minutes of scales before anything else is played."
+importance = 0.4
+entities = ["practice", "scales"]
+source_path = "artifacts/music/practice.md"
+created = "2025-11-15T19:02:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000014"
+topic = "music"
+summary = "A piece is only called learned once it survives being played from memory twice."
+importance = 0.4
+entities = ["practice"]
+source_path = "artifacts/music/practice.md"
+created = "2025-11-15T19:08:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000015"
+topic = "travel"
+summary = "Trips are packed from a standing checklist rather than assembled from scratch."
+importance = 0.5
+entities = ["packing", "checklist"]
+source_path = "artifacts/travel/checklist.md"
+created = "2025-11-18T08:44:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000016"
+topic = "travel"
+summary = "Carry-on only, so nothing liquid over one hundred millilitres goes in the bag."
+importance = 0.4
+entities = ["packing"]
+source_path = "artifacts/travel/checklist.md"
+created = "2025-11-18T08:49:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000017"
+topic = "woodworking"
+summary = "Every cut is measured twice and the offcut is kept until the joint is dry."
+importance = 0.3
+entities = ["joinery"]
+source_path = "artifacts/workshop/notes.md"
+created = "2025-11-20T14:31:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000018"
+topic = "woodworking"
+summary = "The bench planes are sharpened at thirty degrees and stropped after each session."
+importance = 0.3
+entities = ["planes", "sharpening"]
+source_path = "artifacts/workshop/notes.md"
+created = "2025-11-20T14:37:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000019"
+topic = "running"
+summary = "Long runs happen on Sunday and everything else that week stays easy."
+importance = 0.4
+entities = ["training"]
+source_path = "artifacts/running/plan.md"
+created = "2025-11-23T10:05:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000020"
+topic = "running"
+summary = "Shoes are retired at eight hundred kilometres whatever they still look like."
+importance = 0.3
+entities = ["shoes"]
+source_path = "artifacts/running/plan.md"
+created = "2025-11-23T10:11:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000021"
+topic = "household"
+summary = "The water filter cartridge is replaced on the first weekend of every second month."
+importance = 0.3
+entities = ["filter"]
+source_path = "artifacts/household/upkeep.md"
+created = "2025-11-26T11:20:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000022"
+topic = "household"
+summary = "Anything unused for a year leaves the flat rather than moving to a cupboard."
+importance = 0.4
+entities = ["decluttering"]
+source_path = "artifacts/household/upkeep.md"
+created = "2025-11-26T11:26:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000023"
+topic = "coffee"
+summary = "Beans are weighed at eighteen grams for a double, and the grind is adjusted rather than the dose."
+importance = 0.4
+entities = ["espresso", "grind"]
+source_path = "artifacts/kitchen/coffee.md"
+created = "2025-11-28T06:55:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000024"
+topic = "coffee"
+summary = "Beans older than three weeks past roast are used for milk drinks only."
+importance = 0.2
+entities = ["espresso", "beans"]
+source_path = "artifacts/kitchen/coffee.md"
+created = "2025-11-28T07:01:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000025"
+topic = "board games"
+summary = "House rule: a game is taught by playing an open first round rather than reading rules aloud."
+importance = 0.3
+entities = ["teaching"]
+source_path = "artifacts/games/house-rules.md"
+created = "2025-12-01T19:40:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000026"
+topic = "board games"
+summary = "Anything over ninety minutes is kept for a weekend and never a weeknight."
+importance = 0.2
+entities = ["scheduling"]
+source_path = "artifacts/games/house-rules.md"
+created = "2025-12-01T19:45:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000027"
+topic = "writing"
+summary = "Drafts are written in one sitting and edited on a different day."
+importance = 0.5
+entities = ["drafting"]
+source_path = "artifacts/writing/method.md"
+created = "2025-12-04T08:12:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000028"
+topic = "writing"
+summary = "Adverbs are cut on the second pass, and the first pass never edits at all."
+importance = 0.4
+entities = ["editing"]
+source_path = "artifacts/writing/method.md"
+created = "2025-12-04T08:18:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000029"
+topic = "hiking"
+summary = "A route is only walked in winter when someone else knows the plan and the turnaround time."
+importance = 0.6
+entities = ["safety", "route"]
+source_path = "artifacts/outdoors/hiking.md"
+created = "2025-12-07T15:33:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000030"
+topic = "hiking"
+summary = "The paper map goes in the pack even when the route is familiar."
+importance = 0.5
+entities = ["map", "safety"]
+source_path = "artifacts/outdoors/hiking.md"
+created = "2025-12-07T15:38:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000031"
+topic = "budgeting"
+summary = "Subscriptions are reviewed each quarter and anything unopened since the last review is cancelled."
+importance = 0.5
+entities = ["subscriptions"]
+source_path = "artifacts/budget/review.md"
+created = "2025-12-10T12:02:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000032"
+topic = "budgeting"
+summary = "Large purchases wait a week, and most of them do not survive the wait."
+importance = 0.4
+entities = ["spending"]
+source_path = "artifacts/budget/review.md"
+created = "2025-12-10T12:08:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000033"
+topic = "sleep"
+summary = "Screens go away half an hour before bed and the phone charges in another room."
+importance = 0.5
+entities = ["routine"]
+source_path = "artifacts/health/sleep.md"
+created = "2025-12-13T22:15:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000034"
+topic = "sleep"
+summary = "A short walk after dinner works better than anything else tried for falling asleep."
+importance = 0.4
+entities = ["routine", "walking"]
+source_path = "artifacts/health/sleep.md"
+created = "2025-12-13T22:20:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000035"
+topic = "correspondence"
+summary = "Letters are answered in one batch on Friday rather than as they arrive."
+importance = 0.3
+entities = ["letters"]
+source_path = "artifacts/admin/correspondence.md"
+created = "2025-12-16T16:48:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000036"
+topic = "correspondence"
+summary = "Anything needing a decision gets a reply the same day, even if the reply is just a date."
+importance = 0.5
+entities = ["letters", "decisions"]
+source_path = "artifacts/admin/correspondence.md"
+created = "2025-12-16T16:53:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000037"
+topic = "knitting"
+summary = "Gauge is swatched before every project, and the swatch is washed before it is measured."
+importance = 0.3
+entities = ["gauge", "swatch"]
+source_path = "artifacts/crafts/knitting.md"
+created = "2025-12-19T20:26:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000038"
+topic = "knitting"
+summary = "Leftover yarn is kept only in lengths over five metres, and the rest is thrown out."
+importance = 0.2
+entities = ["yarn"]
+source_path = "artifacts/crafts/knitting.md"
+created = "2025-12-19T20:31:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000039"
+topic = "aquarium"
+summary = "A quarter of the tank water is changed every Sunday, and the gravel is vacuumed with it."
+importance = 0.4
+entities = ["tank", "water change"]
+source_path = "artifacts/aquarium/care.md"
+created = "2025-12-22T09:07:00+00:00"
+
+[[entry]]
+id = "e0a10001-0000-4000-8000-000000000040"
+topic = "aquarium"
+summary = "New fish are quarantined for two weeks in the small tank before they join the others."
+importance = 0.5
+entities = ["quarantine", "fish"]
+source_path = "artifacts/aquarium/care.md"
+created = "2025-12-22T09:13:00+00:00"
