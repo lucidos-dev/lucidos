@@ -1,0 +1,628 @@
+use super::*;
+
+const GB: u64 = 1024 * 1024 * 1024;
+
+fn pool(dir: &tempfile::TempDir, capacity: usize) -> BuildSlotPool {
+    BuildSlotPool::with_capacity(dir.path().to_path_buf(), capacity).expect("open pool")
+}
+
+// ── capacity resolution ─────────────────────────────────────────────────
+
+#[test]
+fn the_env_var_beats_the_file_and_the_file_beats_host_ram() {
+    let from_env = resolve_capacity(Some("7"), Some("3"), Some(48 * GB));
+    assert_eq!(from_env.value, 7);
+    assert_eq!(from_env.source, CapacitySource::EnvVar);
+
+    let from_file = resolve_capacity(None, Some("3"), Some(48 * GB));
+    assert_eq!(from_file.value, 3);
+    assert_eq!(from_file.source, CapacitySource::File);
+
+    let from_ram = resolve_capacity(None, None, Some(48 * GB));
+    assert_eq!(from_ram.value, 3);
+    assert_eq!(from_ram.source, CapacitySource::HostRam);
+}
+
+#[test]
+fn zero_and_junk_are_ignored_rather_than_honoured() {
+    // A capacity of 0 would freeze every build on the host, including the
+    // engine's own rebuild, with no way back. Each of these must fall through
+    // to the next source instead of being taken at face value.
+    for bad in ["0", "", "   ", "two", "-1", "3.5"] {
+        let resolved = resolve_capacity(Some(bad), None, Some(48 * GB));
+        assert_eq!(
+            resolved.source,
+            CapacitySource::HostRam,
+            "{bad:?} must not be honoured as a capacity"
+        );
+        assert_eq!(resolved.value, 3);
+    }
+}
+
+#[test]
+fn a_capacity_file_with_surrounding_whitespace_still_parses() {
+    // `set_capacity` writes a trailing newline, and a human editing the file
+    // by hand leaves whatever their editor leaves.
+    let resolved = resolve_capacity(None, Some(" 4\n"), Some(48 * GB));
+    assert_eq!(resolved.value, 4);
+    assert_eq!(resolved.source, CapacitySource::File);
+}
+
+#[test]
+fn host_ram_derivation_has_a_floor_of_one_and_a_ceiling() {
+    // A small laptop must still be able to build, so the floor is 1 rather
+    // than the 0 that the raw division yields.
+    assert_eq!(resolve_capacity(None, None, Some(4 * GB)).value, 1);
+    assert_eq!(resolve_capacity(None, None, Some(8 * GB)).value, 1);
+    assert_eq!(resolve_capacity(None, None, Some(16 * GB)).value, 1);
+    assert_eq!(resolve_capacity(None, None, Some(32 * GB)).value, 2);
+    assert_eq!(resolve_capacity(None, None, Some(48 * GB)).value, 3);
+    assert_eq!(resolve_capacity(None, None, Some(64 * GB)).value, 4);
+    // Past the ceiling, cores bind rather than memory.
+    assert_eq!(resolve_capacity(None, None, Some(512 * GB)).value, 8);
+}
+
+#[test]
+fn unreadable_host_ram_degrades_to_cautious_not_to_serial() {
+    let resolved = resolve_capacity(None, None, None);
+    assert_eq!(resolved.value, UNKNOWN_RAM_CAPACITY);
+    assert_eq!(resolved.source, CapacitySource::Fallback);
+    assert!(
+        resolved.value > 1,
+        "a guard that cannot measure must not serialise every build"
+    );
+}
+
+#[test]
+fn meminfo_total_parses_and_tolerates_a_missing_line() {
+    let text = "MemFree:  123 kB\nMemTotal:       16316108 kB\nBuffers: 4 kB\n";
+    assert_eq!(parse_meminfo_total(text), Some(16_316_108 * 1024));
+    assert_eq!(parse_meminfo_total("MemFree: 1 kB\n"), None);
+    assert_eq!(parse_meminfo_total("MemTotal:\n"), None);
+}
+
+#[test]
+fn set_capacity_writes_a_number_the_pool_reads_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 1);
+    p.set_capacity(5).expect("write capacity");
+    let contents = std::fs::read_to_string(dir.path().join(CAPACITY_FILE)).unwrap();
+    assert_eq!(resolve_capacity(None, Some(&contents), None).value, 5);
+}
+
+#[test]
+fn set_capacity_refuses_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(pool(&dir, 1).set_capacity(0).is_err());
+}
+
+// ── the ceiling ─────────────────────────────────────────────────────────
+
+#[test]
+fn never_more_than_n_slots_are_held_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 2);
+
+    let first = p.try_acquire("first").expect("first slot");
+    let second = p.try_acquire("second").expect("second slot");
+    assert_ne!(first.index(), second.index(), "two holders, two slots");
+    assert!(
+        p.try_acquire("third").is_none(),
+        "a third build must not get a slot on a two-slot pool"
+    );
+
+    drop(first);
+    let third = p.try_acquire("third").expect("a freed slot is reusable");
+    assert!(p.try_acquire("fourth").is_none());
+    drop(second);
+    drop(third);
+    assert!(p.try_acquire("later").is_some());
+}
+
+#[test]
+fn a_bounded_wait_gives_up_instead_of_blocking_forever() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 1);
+    let _held = p.try_acquire("holder").expect("slot");
+    let mut polls = 0;
+    let got = p.acquire(
+        "waiter",
+        Some(Duration::from_millis(600)),
+        SlotClass::Ordinary,
+        |_| polls += 1,
+    );
+    assert!(got.is_none(), "the pool was full for the whole wait");
+    assert!(polls > 0, "the caller must be told it is waiting");
+}
+
+#[test]
+fn a_waiter_acquires_once_the_holder_releases() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let held = BuildSlotPool::with_capacity(path.clone(), 1)
+        .unwrap()
+        .try_acquire("holder")
+        .expect("slot");
+
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        drop(held);
+    });
+
+    let p = BuildSlotPool::with_capacity(path, 1).unwrap();
+    let got = p.acquire(
+        "waiter",
+        Some(Duration::from_secs(10)),
+        SlotClass::Ordinary,
+        |_| {},
+    );
+    releaser.join().unwrap();
+    assert!(got.is_some(), "the waiter must take the freed slot");
+}
+
+// ── nothing stale can wedge the pool ────────────────────────────────────
+
+#[test]
+fn holder_metadata_from_a_dead_process_does_not_reserve_the_slot() {
+    // The kernel's flock is the only thing that says a slot is taken. Recorded
+    // metadata is forensics, never state we consult to decide freeness, which
+    // is exactly what the `mkdir` lock got wrong.
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 1);
+    std::fs::write(
+        dir.path().join("slot-0.lock"),
+        "PID=999999\nLABEL=a build that died\nSTARTED_EPOCH=1\n",
+    )
+    .unwrap();
+    assert!(
+        p.try_acquire("next").is_some(),
+        "a slot whose recorded holder is long gone must be free"
+    );
+}
+
+// ── waiting flag ────────────────────────────────────────────────────────
+
+#[test]
+fn nobody_waiting_on_an_idle_pool_and_somebody_waiting_while_a_flag_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 1);
+    assert!(!p.anyone_waiting(), "an idle pool has no waiters");
+
+    let flag = p.mark_waiting().expect("mark waiting");
+    assert!(p.anyone_waiting(), "a held flag means somebody is queued");
+
+    drop(flag);
+    assert!(!p.anyone_waiting(), "the flag is released with its holder");
+}
+
+#[test]
+fn two_waiters_can_hold_the_flag_at_once() {
+    // It is a shared lock, so a second waiter must not be excluded by the
+    // first: both are queued and both need the announcement.
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 1);
+    let first = p.mark_waiting().expect("first waiter");
+    let second = p.mark_waiting().expect("second waiter");
+    assert!(p.anyone_waiting());
+    drop(first);
+    assert!(p.anyone_waiting(), "the second waiter is still queued");
+    drop(second);
+    assert!(!p.anyone_waiting());
+}
+
+// ── priority ────────────────────────────────────────────────────────────
+
+#[test]
+fn an_ordinary_build_leaves_a_freed_slot_to_a_waiting_priority_build() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 1);
+    let held = p.try_acquire("agent build").expect("slot");
+    let flag = p.mark_priority_waiting().expect("priority waiter");
+    drop(held);
+
+    assert!(
+        p.try_acquire("another agent build").is_none(),
+        "an ordinary build must not take the slot a priority build waits for"
+    );
+    assert!(
+        p.try_acquire_as("engine build", SlotClass::Priority)
+            .is_some(),
+        "the priority build takes the freed slot"
+    );
+    drop(flag);
+}
+
+#[test]
+fn an_ordinary_attempt_holds_the_gate_so_no_priority_waiter_arrives_mid_attempt() {
+    // Check-then-acquire must be one step. While an ordinary build holds its
+    // turn, the priority flag cannot go up underneath it.
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 1);
+    let turn = match p.ordinary_turn() {
+        OrdinaryTurn::Open(held) => held.expect("the gate file opens"),
+        OrdinaryTurn::Yield => panic!("nobody is waiting"),
+    };
+    let probe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.path().join(PRIORITY_FILE))
+        .unwrap();
+    assert!(
+        fs2::FileExt::try_lock_shared(&probe).is_err(),
+        "a priority waiter must wait out the ordinary attempt"
+    );
+    drop(turn);
+    assert!(fs2::FileExt::try_lock_shared(&probe).is_ok());
+}
+
+#[test]
+fn raising_the_priority_flag_waits_out_a_concurrent_check_instead_of_failing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let checker = BuildSlotPool::with_capacity(path.clone(), 1).unwrap();
+    let OrdinaryTurn::Open(Some(turn)) = checker.ordinary_turn() else {
+        panic!("nobody is waiting");
+    };
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        drop(turn);
+    });
+    let p = BuildSlotPool::with_capacity(path, 1).unwrap();
+    let flag = p.mark_priority_waiting();
+    releaser.join().unwrap();
+    assert!(flag.is_some(), "a momentary check must not cost the flag");
+    assert!(checker.priority_waiting());
+}
+
+#[test]
+fn a_priority_waiter_that_is_gone_blocks_nobody() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 1);
+    let flag = p.mark_priority_waiting().expect("priority waiter");
+    assert!(p.priority_waiting());
+    drop(flag);
+    assert!(
+        !p.priority_waiting(),
+        "the flag is released with its holder"
+    );
+    assert!(
+        p.try_acquire("agent build").is_some(),
+        "no state may outlive the priority waiter"
+    );
+}
+
+#[test]
+fn priority_never_takes_a_slot_beyond_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 2);
+    let _a = p.try_acquire("a").expect("slot");
+    let _b = p.try_acquire("b").expect("slot");
+    assert!(
+        p.try_acquire_as("engine build", SlotClass::Priority)
+            .is_none(),
+        "priority jumps the line, it does not add a slot"
+    );
+}
+
+#[test]
+fn a_broken_priority_flag_reads_as_nobody_waiting() {
+    // Fail open: a flag that cannot be opened must not stall every build.
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 1);
+    std::fs::create_dir(dir.path().join(PRIORITY_FILE)).unwrap();
+    assert!(!p.priority_waiting());
+    assert!(p.try_acquire("agent build").is_some());
+}
+
+#[test]
+fn a_priority_wait_raises_the_flag_only_while_it_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let held = BuildSlotPool::with_capacity(path.clone(), 1)
+        .unwrap()
+        .try_acquire("agent build")
+        .expect("slot");
+
+    let observer = BuildSlotPool::with_capacity(path.clone(), 1).unwrap();
+    let mut seen_waiting = false;
+    let mut held = Some(held);
+    let p = BuildSlotPool::with_capacity(path, 1).unwrap();
+    let got = p.acquire(
+        "engine build",
+        Some(Duration::from_secs(10)),
+        SlotClass::Priority,
+        |_| {
+            seen_waiting |= observer.priority_waiting();
+            drop(held.take());
+        },
+    );
+    assert!(got.is_some(), "the priority build takes the freed slot");
+    assert!(
+        seen_waiting,
+        "the flag is up while the priority build waits"
+    );
+    assert!(
+        !observer.priority_waiting(),
+        "the flag comes down once the slot is taken"
+    );
+}
+
+#[test]
+fn an_ordinary_wait_raises_no_priority_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 1);
+    let _held = p.try_acquire("holder").expect("slot");
+    let mut seen = false;
+    let got = p.acquire(
+        "waiter",
+        Some(Duration::from_millis(400)),
+        SlotClass::Ordinary,
+        |_| seen |= p.priority_waiting(),
+    );
+    assert!(got.is_none());
+    assert!(!seen, "only a priority build raises the priority flag");
+}
+
+#[test]
+fn the_slot_class_comes_from_the_environment_value() {
+    assert_eq!(resolve_class(Some("1")), SlotClass::Priority);
+    assert_eq!(resolve_class(Some(" 1 ")), SlotClass::Priority);
+    for other in [None, Some(""), Some("0"), Some("yes"), Some("true")] {
+        assert_eq!(resolve_class(other), SlotClass::Ordinary, "{other:?}");
+    }
+}
+
+#[test]
+fn a_priority_build_runs_un_niced_unless_told_otherwise() {
+    assert_eq!(resolve_nice(None, SlotClass::Priority), 0);
+    assert_eq!(resolve_nice(None, SlotClass::Ordinary), DEFAULT_NICE);
+    assert_eq!(
+        resolve_nice(Some("5"), SlotClass::Priority),
+        5,
+        "an explicit value wins for every class"
+    );
+    assert_eq!(resolve_nice(Some("junk"), SlotClass::Priority), 0);
+}
+
+// ── status ──────────────────────────────────────────────────────────────
+
+#[test]
+fn status_reports_holders_without_taking_a_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 2);
+    let held = p.try_acquire("make lint").expect("slot");
+
+    let states = p.status();
+    assert_eq!(states.len(), 2, "one entry per slot");
+    let holder = states[held.index()]
+        .holder
+        .as_ref()
+        .expect("the held slot names its holder");
+    assert_eq!(holder.label, "make lint");
+    assert_eq!(holder.pid, Some(std::process::id()));
+    assert!(holder.held_secs().is_some());
+    assert_eq!(
+        states.iter().filter(|s| s.holder.is_some()).count(),
+        1,
+        "only the held slot reports a holder"
+    );
+
+    // Probing must not have consumed the free slot.
+    assert!(
+        p.try_acquire("second").is_some(),
+        "status must leave the remaining slot acquirable"
+    );
+}
+
+#[test]
+fn status_ignores_metadata_left_in_a_free_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 1);
+    std::fs::write(
+        dir.path().join("slot-0.lock"),
+        "PID=999999\nLABEL=long gone\n",
+    )
+    .unwrap();
+    assert!(
+        p.status()[0].holder.is_none(),
+        "an unlocked slot is free however its file reads"
+    );
+}
+
+#[test]
+fn holder_metadata_parses_and_tolerates_gaps() {
+    let full = SlotHolder::parse("PID=42\nLABEL=make test\nCWD=/tmp/x\nSTARTED_EPOCH=1700\n");
+    assert_eq!(full.pid, Some(42));
+    assert_eq!(full.label, "make test");
+    assert_eq!(full.cwd, "/tmp/x");
+    assert_eq!(full.started_epoch, Some(1700));
+
+    // An unknown key is ignored and a missing one leaves its field empty. A
+    // slot written by an older build still reports what it did record.
+    let partial = SlotHolder::parse("PID=7\nFUTURE_KEY=whatever\nnot a pair\n");
+    assert_eq!(partial.pid, Some(7));
+    assert_eq!(partial.label, "");
+    assert_eq!(partial.started_epoch, None);
+    assert_eq!(partial.held_secs(), None);
+}
+
+// ── the share of the host a slot carries ────────────────────────────────
+
+/// Pinned rather than read from the machine, so every expectation below is an
+/// exact number on any host that runs the suite.
+const TEST_NCPU: usize = 18;
+
+#[test]
+fn the_share_is_the_host_divided_by_its_holders() {
+    // The reported case: 18 cores, capacity 3. Solo keeps the machine, a
+    // second build gets half, and the third sits at the guaranteed share.
+    assert_eq!(cpu_share(TEST_NCPU, 1, 3), 18);
+    assert_eq!(cpu_share(TEST_NCPU, 2, 3), 9);
+    assert_eq!(cpu_share(TEST_NCPU, 3, 3), 6);
+}
+
+#[test]
+fn the_guaranteed_share_is_a_floor_a_holder_never_drops_below() {
+    // Holders are counted out of the pool's own slots, so the allocation can
+    // never fall under the guarantee on its own. The clamp is what keeps that
+    // true if a caller ever counts differently.
+    assert_eq!(cpu_share(TEST_NCPU, 9, 3), 6);
+}
+
+#[test]
+fn the_share_never_drops_below_one_core() {
+    // More holders than cores: the division floors to zero, and cargo rejects
+    // a job count of zero outright.
+    assert_eq!(cpu_share(2, 3, 4), 1);
+    assert_eq!(cpu_share(1, 1, 8), 1);
+    assert_eq!(cpu_share(0, 0, 0), 1);
+}
+
+#[test]
+fn a_solo_build_keeps_every_core_and_the_share_falls_as_the_pool_fills() {
+    // Against real locks, which is also what proves a holder counts itself:
+    // the probe opens its own descriptor, so `flock` reports our own slot as
+    // taken rather than free.
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 3);
+
+    let first = p.try_acquire("first").expect("first slot");
+    assert_eq!(
+        p.granted_limits(Some(TEST_NCPU), None, None, SlotClass::Ordinary)
+            .jobs,
+        Some(18),
+        "a lone build must not pay for contention that is not happening"
+    );
+
+    let second = p.try_acquire("second").expect("second slot");
+    assert_eq!(
+        p.granted_limits(Some(TEST_NCPU), None, None, SlotClass::Ordinary)
+            .jobs,
+        Some(9)
+    );
+
+    let third = p.try_acquire("third").expect("third slot");
+    assert_eq!(
+        p.granted_limits(Some(TEST_NCPU), None, None, SlotClass::Ordinary)
+            .jobs,
+        Some(6)
+    );
+
+    drop(third);
+    assert_eq!(
+        p.granted_limits(Some(TEST_NCPU), None, None, SlotClass::Ordinary)
+            .jobs,
+        Some(9),
+        "a freed slot widens the share the next build is granted"
+    );
+    drop(second);
+    drop(first);
+}
+
+#[test]
+fn an_explicit_caller_value_is_left_alone() {
+    // `scripts/lib/e2e.sh` caps its release build at half the cores, after a
+    // host hang. That number is the caller's, so the broker exports nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 3);
+    let _held = p.try_acquire("e2e release build").expect("slot");
+
+    let limits = p.granted_limits(Some(TEST_NCPU), Some("9"), None, SlotClass::Ordinary);
+    assert_eq!(limits.jobs, None, "the caller's value stands untouched");
+    assert!(
+        limits.nice > 0,
+        "opting out of the share is not opting out of the priority"
+    );
+
+    // Blank is not a value. `e2e.sh` reads its own variable the same way.
+    let blank = p.granted_limits(Some(TEST_NCPU), Some("  "), None, SlotClass::Ordinary);
+    assert_eq!(blank.jobs, Some(18));
+}
+
+#[test]
+fn an_unreadable_core_count_exports_nothing() {
+    // Fail open. The build then runs at cargo's own default, exactly as it did
+    // before a slot governed cores at all.
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 3);
+    let _held = p.try_acquire("holder").expect("slot");
+    assert_eq!(
+        p.granted_limits(None, None, None, SlotClass::Ordinary).jobs,
+        None
+    );
+}
+
+#[test]
+fn a_nested_acquisition_is_left_alone() {
+    // `test-engine.sh` runs inside `make test`'s slot. The outer wrapper
+    // already niced that tree and already divided its cores. A second pass
+    // would halve the share again and stack an increment nothing can undo.
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 3);
+    let _held = p.try_acquire("make test").expect("slot");
+    assert_eq!(
+        p.granted_limits(Some(TEST_NCPU), None, None, SlotClass::Ordinary)
+            .jobs,
+        Some(18),
+        "the outer build is the one that shapes the tree"
+    );
+
+    assert_eq!(
+        BuildLimits::NONE.jobs,
+        None,
+        "a nested run exports no share"
+    );
+    assert_eq!(BuildLimits::NONE.nice, 0, "and adds no second increment");
+}
+
+#[test]
+fn the_nice_increment_falls_back_rather_than_failing() {
+    assert_eq!(resolve_nice(None, SlotClass::Ordinary), DEFAULT_NICE);
+    assert_eq!(resolve_nice(Some(" 3 "), SlotClass::Ordinary), 3);
+    assert_eq!(
+        resolve_nice(Some("0"), SlotClass::Ordinary),
+        0,
+        "zero is how a foreground build opts out"
+    );
+    assert_eq!(resolve_nice(Some("99"), SlotClass::Ordinary), MAX_NICE);
+    assert_eq!(
+        resolve_nice(Some("-5"), SlotClass::Ordinary),
+        0,
+        "raising a build's priority needs privilege we do not have"
+    );
+    for bad in ["", "   ", "low", "3.5"] {
+        assert_eq!(
+            resolve_nice(Some(bad), SlotClass::Ordinary),
+            DEFAULT_NICE,
+            "{bad:?}"
+        );
+    }
+}
+
+// ── re-entrancy and pool location ───────────────────────────────────────
+
+#[test]
+fn an_inherited_slot_is_read_from_the_environment() {
+    // The value is whatever the wrapper exported; only presence decides that a
+    // nested acquisition passes through.
+    assert_eq!(ENV_HELD, "LUCIDOS_BUILD_SLOT_HELD");
+    assert!(
+        std::env::var(ENV_HELD).is_err() || inherited_slot().is_some(),
+        "a set variable must be reported, an unset one must not"
+    );
+}
+
+#[test]
+fn the_pool_dir_override_wins_over_home() {
+    let dir = tempfile::tempdir().unwrap();
+    // SAFETY: process-wide env mutation, and this is the only test that
+    // touches this variable.
+    unsafe {
+        std::env::set_var(ENV_POOL_DIR, dir.path());
+    }
+    let resolved = default_pool_dir().expect("resolve");
+    unsafe {
+        std::env::remove_var(ENV_POOL_DIR);
+    }
+    assert_eq!(resolved, dir.path());
+}

@@ -1,0 +1,19 @@
+{
+  "name": "Retro phosphor",
+  "description": "Browser test fixture: a green phosphor terminal with every retro part. Not a shipped theme.",
+  "tokens": {
+    "--bg-primary": "#050805",
+    "--text-primary": "#33ff33",
+    "--accent": "#33ff33"
+  },
+  "fonts": { "ui": "vt323", "mono": "vt323" },
+  "parts": {
+    "chat-text": { "text-shadow": "0 0 0.3em rgba(51, 255, 51, 0.5)" },
+    "composer-text": { "caret-shape": "block", "caret-color": "#33ff33" },
+    "screen": {
+      "background-image": "repeating-linear-gradient(transparent 0, transparent 2px, rgba(51, 255, 51, 0.1) 2px, rgba(51, 255, 51, 0.1) 3px)"
+    },
+    "surface": { "border-style": "double", "border-width": "3px", "border-color": "#33ff33" },
+    "card": { "border-style": "double", "border-width": "3px", "border-color": "#0f4d0f" }
+  }
+}

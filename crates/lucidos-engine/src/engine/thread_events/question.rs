@@ -1,0 +1,193 @@
+use serde::{Deserialize, Serialize};
+
+use crate::engine::permission::Action;
+
+use super::MessageOrigin;
+
+/// One option offered by CC's AskUserQuestion tool. Persisted inside
+/// `UserQuestionAsked` and looked up when the user picks one to send the
+/// matching `tool_result` back to CC.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct QuestionOption {
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Markdown the card shows under the option: a picture, or a short text
+    /// sample. Claude Code's native tool names it `preview`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    /// The widget the option draws under its label row, lifted out of a
+    /// *widget embed* in its description or preview (ADR 0415).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub widget: Option<WidgetEmbed>,
+    /// A *quiet option*: picking it records the answer and ends the turn
+    /// without waking the agent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quiet: bool,
+    /// The *quiet reply*: the fixed acknowledgement the thread shows when the
+    /// user picks this quiet option. Only a quiet option carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiet_reply: Option<String>,
+}
+
+/// A *widget embed*, `![label](app:<id>?params={...})`, as the engine reads
+/// it: the widget, its params, and the alt text as its label.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct WidgetEmbed {
+    pub app_id: String,
+    /// The instance's *widget params*. Absent means none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// The embed's alt text. Absent means the widget's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// How the user answered a `UserQuestionAsked`. Tagged so the JSON payload
+/// is `{ "kind": "Selected", "option_id": "..." }` etc.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind")]
+pub enum AnswerKind {
+    Selected {
+        option_id: String,
+    },
+    /// A reply typed in the composer. `image_hashes` names the blobs attached
+    /// to it, and `text` may be empty when the images are the answer.
+    FreeText {
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        image_hashes: Vec<String>,
+    },
+    /// Multi-select answer. `text` carries optional freetext typed alongside
+    /// the toggled options. The prompt textarea folds into the answer when a
+    /// multi-select question is pending, images included. Backend joins the
+    /// resolved labels and the freetext together when relaying to CC. Some
+    /// side must be present: see `validate_answer`.
+    MultiSelected {
+        option_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        image_hashes: Vec<String>,
+    },
+    Canceled,
+    /// A follow-up arrived that could not be the answer, so it replaced the
+    /// question instead. Two shapes reach here, both on coding-agent threads.
+    /// An agent-driven message (a parent's instruction, a child-completion
+    /// wake) is refused by the `mode == Human` guard. So is any message landing
+    /// on a question the agent already overtook. Resolving it is what unblocks
+    /// the parked agent, which cannot read the follow-up until its question
+    /// call returns.
+    ///
+    /// Distinct from `Canceled`, which means the question was torn down and
+    /// nothing is coming. Here the user did reply, just not to this question,
+    /// and the reply drives the very next turn.
+    Superseded,
+}
+
+/// The one clause-4 act the retired single-use Allow once card proposed
+/// (ADR 0387).
+///
+/// History only: nothing writes it now. It stays so stored
+/// `UserQuestionAsked` and `OwnerApprovalRequested` rows still read.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OwnerApproval {
+    pub verb: Action,
+    /// The thread the act aims at. Workspace-scoped snapshot approvals use
+    /// explicit workspace and snapshot fields instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_thread_id: Option<uuid::Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_handle: Option<String>,
+}
+
+/// An owner-only act an *unattested caller* asked for, parked on a permission
+/// request until the owner answers it (`api::owner_door`).
+///
+/// The engine writes the card. Allow once from a stamped device grants a
+/// permission for this one act, and `PermissionSpent` records its run.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct UnattestedAct {
+    /// Who asked: always an `UnattestedCaller`. The replayed act runs as it.
+    pub caller: MessageOrigin,
+    pub request: UnattestedRequest,
+}
+
+/// What an [`UnattestedAct`] runs on Allow once.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UnattestedRequest {
+    /// A request to an owner-only route, replayed as it arrived. `path`
+    /// carries its query and is relative to `/api/v1`.
+    Http {
+        method: String,
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+        /// The restore generation the caller sent, so a replay after a
+        /// snapshot restore is fenced as the live request would be.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restore_generation: Option<String>,
+    },
+    /// One coding-agent run in the card's own thread.
+    StartCodingAgent,
+}
+
+impl AnswerKind {
+    /// Whether someone actually answered, rather than the card being torn
+    /// down or replaced.
+    pub fn is_a_reply(&self) -> bool {
+        !matches!(self, AnswerKind::Canceled | AnswerKind::Superseded)
+    }
+
+    /// The blobs attached to this answer. Only a typed answer carries any.
+    pub fn image_hashes(&self) -> &[String] {
+        match self {
+            AnswerKind::FreeText { image_hashes, .. }
+            | AnswerKind::MultiSelected { image_hashes, .. } => image_hashes,
+            AnswerKind::Selected { .. } | AnswerKind::Canceled | AnswerKind::Superseded => &[],
+        }
+    }
+
+    /// What the user answered, as text: each picked option's label from
+    /// `options`, then any typed text. `None` when no answer came.
+    pub(crate) fn text(&self, options: &[QuestionOption]) -> Option<String> {
+        let label = |option_id: &str| -> String {
+            options
+                .iter()
+                .find(|o| o.id == option_id)
+                .map_or_else(|| option_id.to_string(), |o| o.label.clone())
+        };
+        match self {
+            AnswerKind::Selected { option_id } => Some(label(option_id)),
+            AnswerKind::FreeText { text, image_hashes } => {
+                Some(with_image_note(text, image_hashes.len()))
+            }
+            AnswerKind::MultiSelected {
+                option_ids,
+                text,
+                image_hashes,
+            } => {
+                let mut parts: Vec<String> = option_ids.iter().map(|o| label(o)).collect();
+                if let Some(text) = text.as_deref().filter(|t| !t.trim().is_empty()) {
+                    parts.push(text.to_string());
+                }
+                Some(with_image_note(&parts.join("; "), image_hashes.len()))
+            }
+            AnswerKind::Canceled | AnswerKind::Superseded => None,
+        }
+    }
+}
+
+/// A message's text, noting attached images so an image-only message still
+/// reads as something.
+pub(crate) fn with_image_note(text: &str, images: usize) -> String {
+    match images {
+        0 => text.to_string(),
+        1 => format!("{text} [1 image]").trim().to_string(),
+        n => format!("{text} [{n} images]").trim().to_string(),
+    }
+}

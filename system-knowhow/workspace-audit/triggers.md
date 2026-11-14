@@ -1,0 +1,197 @@
+---
+name: Workspace audit: triggers
+description: The triggers audit section. Procedure in intent, stale run.knowhow, subscriptions on retired event names, slugs, orphaned trigger knowhow, notification taps. Unlisted MCP servers a trigger uses. Grants: coding agents started without one, side effects outside one, and plugin-shipped side-effect grants.
+sources: ["docs/taxonomy.md", "crates/lucidos-engine/src/triggers/definition.rs", "system-knowhow/triggers.md", "system-knowhow/running-python.md", "system-knowhow/thread-events.md", "system-knowhow/coding-agent-events.md", "system-knowhow/plugins.md", "system-knowhow/js-sdk.md", "system-knowhow/best-practices.md", "crates/lucidos-engine/src/engine/chat/process/system_prompt.rs", "crates/lucidos-engine/src/engine/thread_events/*", "crates/lucidos-engine/src/scheduler/notifications.rs", "crates/lucidos-engine/src/engine/agent_session/spawn_gate.rs"]
+---
+
+# Workspace audit section: triggers
+
+One *audit section* of `system-knowhow/workspace-audit`. The root says how to
+run it alone or in a full pass, how to merge its receipts, and how to write
+the report. This file carries its scan, its checks and its fixes.
+
+## Scan
+
+Append these lines to the root's scan preamble, before its receipts tail:
+
+```bash
+scan tap-strings "[\\\"']*tap[\\\"']*[[:space:]]*:[[:space:]]*[\\\"']+(modal|none|open_app|open_thread)[\\\"']|kind[\\\"']*[[:space:]]*:[[:space:]]*[\\\"']+none[\\\"']|--tap[=[:space:]\\\"',]+(none|open[-_]app|open[-_]thread)" $all
+```
+
+## Checks
+
+- **Delegated device authority.** Check trigger authors against `system-knowhow/thread-events.md` § Session-device origins.
+  Flag claims that a session-device author grants the owner's standing instruction as **broken**.
+
+- **Billing observations counted as usage.** Check against `system-knowhow/coding-agent-events.md` § Billing evidence.
+  `CodingAgentBillingObserved` is passive evidence; sum usage from `ContextCaptured` only.
+  Unknown attribution must not inherit a provider from the model or current settings.
+
+- For trigger scripts that write the workspace database, apply `system-knowhow/workspace-audit/scripts`' origin-aware table-policy check.
+  Report a refused write once, under its trigger.
+
+- **Liveness treated as an event subscription.** Thread liveness is derived on read, rather than emitted as a thread event.
+  Read it through the SDK or CLI; see `system-knowhow/js-sdk.md` § `lucidos.threads`.
+
+- **Question compose reports treated as fresh user input.** `UserQuestionAnswered` may carry the compose state left by atomic acceptance.
+  Consult `system-knowhow/thread-events.md`; the report is replay evidence, not a second answer or authority grant.
+
+- **Saved-draft origin mistaken for owner authority.** Review origin filters against `system-knowhow/thread-events.md` § Saved-draft origins.
+  `saved_draft` content has Human mode, but its submitting agent and trigger provenance remain distinct from a Device origin.
+  Flag recipes treating Human mode alone as an owner-opened turn or an unrestricted spawn grant as **broken**.
+  Keep the acceptance event and submitting thread identities when recording provenance; never replace them with a synthetic device.
+
+- **A trigger retrying a provider billing refusal immediately.** Check against `system-knowhow/thread-events.md` § Provider spend-cap holds.
+  Background sends wait during an engine provider hold; coding-agent billing notices do not create those holds.
+  Flag recipes that clear the hold repeatedly as **drift**. Direct the owner to Settings → Providers after raising the cap.
+
+Model selectors in trigger-management apps follow `system-knowhow/js-sdk.md`'s
+`lucidos.ui.ModelPicker` contract. App selections do not change a trigger's stored configuration automatically.
+
+For each finding, capture: **location**, **what's wrong**, **which reference owns the rule** (link, don't quote), **suggested fix**.
+
+**Start from the live projection (`triggers(action="list")` / the trigger registry the scheduler uses), not from `TriggerCreated` events.** Anything off the live list was deleted (`TriggerDeleted`) or no longer fires, so walking events alone invents phantom "broken" triggers. Use `TriggerCreated`/`TriggerUpdated` only to rebuild `run` fields the projection hides (intent text, stale `run.knowhow:[...]`, slug) for live triggers.
+
+Per the engine prompt's taxonomy section and the worked example in `docs/taxonomy.md` (mirrored in best-practices). Trigger threads discover knowhow at fire time via `load_knowhow`, as chat does, with no per-trigger allow-list. For each *live* trigger, reduce its `TriggerCreated` and later `TriggerUpdated` events to the *latest* `run` (most recent payload by sequence), then apply these checks:
+
+- **Knowhow promising unlimited restart replays or no interruption report.** Read each trigger's knowhow against `system-knowhow/triggers.md` § "A fire due while the engine restarts". Flag instructions that assume scripts always requeue, or that tell a run to duplicate the engine's interruption notification. Severity: **stale**, since the recovery contract bounds retries and owns that report.
+
+- **Knowhow saying the `claude-gateway` proxy serves chat only.** Read each trigger's proxy instructions against `system-knowhow/js-sdk.md` § `lucidos.proxy`, which owns the supported callers and wire contract. Severity: **stale**.
+
+- **Imperative verbs about *how* in `run.intent`** (hit, parse, scan, fall back, retry, GET, POST, scrape) → procedure leaked into intent.
+
+- **Stale `run.knowhow: [...]` field.** Per `system-knowhow/triggers.md` § "Setup checklist" item 4: the deserializer silently drops legacy `run.knowhow:[...]`. The trigger keeps firing with no knowhow pre-loaded, so behavior depends on discovery finding the same files. Surface each trigger's id and the `knowhow` ids it requested, and recommend the rewrite the source file specifies. Severity: **stale** (silently broken).
+
+- **Subscription on a retired event name.** For each live trigger's `on` list, classify every `event_type` with the `events` tool's `event_types` action. One call returns all three buckets.
+
+  **A rename does not carry subscriptions with it.** The matcher compares the event type as an exact string, so a trigger on a retired name silently stops firing. Only an audit finds these.
+
+  | Bucket the name is in | Verdict |
+  |---|---|
+  | `engine` | fine, it is live |
+  | `retired` | **broken**, it silently stopped firing. Re-point it, see below |
+  | `workspace` | fine, it is a domain event this workspace emits itself |
+  | none of the three | **smell**, a subscription on a name nothing produces |
+
+  Domain-event names are arbitrary by design, so read the `workspace` bucket first, and never call one a misspelling.
+
+  Payload values are not event types. Keep-alive reasons belong to `CacheKeepAliveStatusChanged`, as `system-knowhow/thread-events.md` documents. Audit the subscription's event name separately from its payload filters.
+
+  **Ask the tool. Never assemble the retired set by hand.** `retired` comes from `ThreadEvent::LEGACY_TYPE_NAME_ALIASES`, which a test holds to the names serde still accepts. A list built by eye from `thread-events.md` misses about half, and adds frontend-only names that were never event renames.
+
+  **`retired` says a name is dead, not what replaced it.** For the successor, search `thread-events.md` for the old name. It sits on its successor's row, as a `Legacy alias:` note or in the row's prose. The whole `ClaudeCode*` family became `CodingAgent*`, as `system-knowhow/coding-agent-events.md` states. If neither resolves it, report the finding without a replacement. A guessed successor arms a second subscription that never fires.
+
+  The engine now refuses a new subscription on a dead name, so this check finds rows armed before that.
+
+- **A subscription on a history-only event.** `OwnerApprovalRequested`, `OwnerApprovalSpent` and `UnattestedActSpent` still read in the `engine` bucket, but nothing emits them since ADR 0688. A trigger on one silently stopped firing. Severity: **broken**. Re-point it to `PermissionRequestPrepared`, `PermissionGranted` or `PermissionSpent`, as their rows in `system-knowhow/thread-events.md` describe.
+
+- **A durable wait or trigger subscription on snapshot progress.**
+  `SnapshotProgress` is transient activity, not a persisted completion event.
+  Flag a trigger's `on` list or a durable `await_event` waiting for it as
+  **broken**. Use the terminal snapshot events documented in
+  `system-knowhow/thread-events.md` and read the durable job for the result;
+  do not infer success from a progress frame.
+
+- **Retired event names in workspace code.** Same list, different surface, because a stale recipe keeps minting dead subscriptions and the finding above returns after the fix. Grep for retired names in `await_event` calls, `on_event` payloads, and `lucidos triggers` invocations. Search `data/knowhow/**/*.md` (fenced `python` / `bash` / `js` / `ts` blocks), `data/scripts/**`, `data/apps/**`, and `data/triggers/**/scripts/**`. Surface path, line, the retired name and its current name, at severity **stale**.
+
+- **Keep-alive reasons are payload values, not event names.** A `CacheKeepAliveStatusChanged` may carry `provider_paused`, `pings_paused` or `uncacheable_provider` inside `status.reason`. Classify subscriptions by the event name alone. Use `thread-events.md` for each reason's meaning.
+
+- **Missing explicit `slug` field.** The tools, CLI and HTTP API store the slug on `TriggerCreated` (`system-knowhow/triggers.md` § "Setup checklist" item 4). An older event without one re-derives it from the *create-time* name on every read, with no collision check. Recommend an explicit `slug` when the trigger has, or will have, per-trigger knowhow files. Set it with `lucidos triggers update --slug` or the HTTP API, since the LLM tools take none. Severity: **nit** (preventive).
+
+- **Per-trigger knowhow dir orphaned from any live trigger**: for each directory under `data/triggers/<slug>/knowhow/`, confirm `<slug>` matches an active (non-deleted) trigger's slug. The system prompt scopes by exact slug match, so knowhow under an unreferenced slug is invisible. Recommend renaming the directory to a live slug or deleting it. If the trigger runs a **script**, moving its folder also needs `triggers(action="update", run.path=…)`, since the registered path does not follow the folder. Deleting the old folder before that event lands breaks the next fire (see `triggers.md` § "Renamed trigger → stale `run.path`"). Reference: `system-knowhow/triggers.md`.
+
+- **Notification routing: `tap` opt-ins for CTA-shaped triggers.** Take each trigger whose `run.intent` mentions `send_notification`, plus each `NotificationCreated` event traceable to a trigger. Look the body's shape up in the table under `system-knowhow/triggers.md` § "Notification routing". Report each trigger whose `app_id`, `tap` or `event_id` disagrees with its row, quoting the row as the fix. Severity: **drift**, since the default works and the opt-in only tightens UX. Skip a trigger that already sets `tap` to a non-default value.
+
+- **An MCP server a trigger uses but does not list.** A trigger's fires may call only the MCP servers in its `mcp_servers` (`system-knowhow/triggers.md` § "MCP servers the fires use: `mcp_servers`"). A trigger that used one before that rule, or whose fire enabled one mid-turn, now has those calls refused. Find each pair over the last 30 days:
+
+  ```bash
+  psql "$LUCIDOS_DATABASE_URL" -At -F ' ' -c "SELECT ts.trigger_id, coalesce(e.payload->>'server_id', split_part(e.payload->>'name', '__', 2)) AS server_id, count(DISTINCT e.thread_id) FROM events e JOIN thread_summaries ts ON ts.thread_id = e.thread_id WHERE ts.trigger_id IS NOT NULL AND e.created >= now() - interval '30 days' AND ((e.event_type = 'ToolCalled' AND e.payload->>'name' LIKE 'mcp\_\_%') OR (e.event_type = 'ThreadMcpServerEnabled' AND e.payload->>'by' = 'agent')) GROUP BY 1, 2"
+  ```
+
+  Compare each row with that live trigger's `mcp_servers` from `lucidos triggers list`. Report every server it used but does not list, with the fires that used it. Severity: **smell**, since each fire now fails that call loud, with a notification. This is the ADR 0214 migration check for ADR 0430.
+
+- **A trigger that starts coding agents without the coding-agent grant.** A trigger's runs may start a coding-agent thread only with that grant (`system-knowhow/triggers.md` § "Coding-agent grant"). Find each trigger whose runs have started one. The query follows each thread back to its cause, as the engine's check does, so top-level and CLI spawns count. It follows a saved draft to the thread that submitted it. It also follows the parent link, which older threads carry alone:
+
+  ```bash
+  psql "$LUCIDOS_DATABASE_URL" -At -F ' ' -c "WITH RECURSIVE origin AS (SELECT DISTINCT ON (thread_id) thread_id, payload->'origin' AS o, (payload->>'parent_thread_id')::uuid AS linkage FROM events WHERE event_type IN ('TriggerStarted', 'MessageReceived') AND payload ? 'origin' AND payload->'origin' != 'null'::jsonb ORDER BY thread_id, sequence), edge AS (SELECT thread_id, CASE o->>'kind' WHEN 'thread_link' THEN CASE WHEN o->>'direction' = 'parent' THEN coalesce(linkage, (o->>'thread_id')::uuid) END WHEN 'workspace' THEN (o->>'thread_id')::uuid WHEN 'api' THEN CASE WHEN o->>'mode' <> 'human' THEN (o->>'source_thread_id')::uuid END END AS caused_by FROM origin UNION SELECT thread_id, (payload->'origin'->>'submitted_by_thread_id')::uuid FROM events WHERE event_type IN ('MessageReceived', 'PromptInjected') AND payload->'origin'->>'kind' = 'saved_draft' UNION SELECT thread_id, parent_thread_id FROM thread_summaries WHERE parent_thread_id IS NOT NULL), fire AS (SELECT thread_id, o->'reason'->>'trigger_id' AS trigger_id FROM origin WHERE o->'reason'->>'kind' = 'scheduler' UNION SELECT thread_id, o->>'emitting_trigger_id' FROM origin WHERE o->>'kind' = 'api' AND o ? 'emitting_trigger_id' UNION SELECT thread_id, payload->'origin'->'reason'->>'trigger_id' FROM events WHERE event_type = 'MessageReceived' AND payload->'origin'->'reason'->>'kind' = 'scheduler' UNION SELECT thread_id, trigger_id FROM thread_summaries WHERE trigger_id IS NOT NULL), tree AS (SELECT thread_id, trigger_id, 0 AS depth FROM fire UNION SELECT e.thread_id, t.trigger_id, t.depth + 1 FROM edge e JOIN tree t ON e.caused_by = t.thread_id WHERE t.depth < 16) SELECT t.trigger_id, count(DISTINCT t.thread_id), max(s.last_activity) FROM tree t JOIN thread_summaries s USING (thread_id) WHERE s.is_coding_agent GROUP BY 1"
+  ```
+
+  Keep each row whose trigger is live with `coding_agent_grant` false in `lucidos triggers list`. For each one, read its `run.intent`, script and knowhow, and say what steers it. Name every outside source it reads, such as email, chat messages, web pages, issue trackers or webhooks, since that content steers its coding agents too. Link the trigger as `[Name](trigger:<id>)`, and tell the user to tick *Allow coding agents* there. Severity: **broken**, since each such run is now refused, with a notification.
+
+- **A plugin trigger holding a side-effect grant its plugin shipped.** Only the owner grants a trigger, and a plugin's `trigger.toml` never does (`system-knowhow/plugins.md` § "Shipping triggers"). A plugin installed before that rule could still ship one. In `lucidos triggers list`, find each live trigger with a `plugin_id` and a non-empty `side_effect_grant`. Report its link, its plugin, its categories and what steers its run. Severity: **smell**, since nobody chose that grant, though the owner may keep it.
+
+- **A trigger whose recent runs performed a side effect outside its grant.** With the command guard on, a run may perform an irreversible side effect only within the trigger's *side-effect grant* (`system-knowhow/triggers.md` § "Side-effect grant"). The guard now defaults on, so a trigger that ran unguarded may fail its next run. Find the commands its runs issued over the last 30 days:
+
+  ```bash
+  psql "$LUCIDOS_DATABASE_URL" -At -F ' ' -c "SELECT ts.trigger_id, e.payload->>'name', left(e.payload->>'args', 400) FROM events e JOIN thread_summaries ts ON ts.thread_id = e.thread_id WHERE ts.trigger_id IS NOT NULL AND e.created >= now() - interval '30 days' AND e.event_type = 'ToolCalled' AND e.payload->>'name' IN ('run_bash', 'run_bash_background', 'run_python', 'run_python_background')"
+  ```
+
+  Place each command in a category per `system-knowhow/running-python.md` § "The command guard". Compare the categories with that live trigger's `side_effect_grant` in `lucidos triggers list`. Report each trigger with its link as `[Name](trigger:<id>)`, the missing categories, and one example command for each. Severity: **broken** while the guard is on, since the next such run fails with a notification. Skip the check when the workspace turned the guard off.
+
+- **A trigger script that reaches the workspace database through libpq defaults.** The `scripts` section owns the check and its fix (`system-knowhow/workspace-audit/scripts.md`, the `db-defaults` scan). Its scan covers `data/triggers/**/scripts/**` too. Report those hits once, under the trigger. Severity: **broken**, since each fire now fails to connect.
+
+- **A trigger relying on knowhow a plugin removed, with no warning on record.** An update or uninstall now records its *affected triggers* and warns each fire (`system-knowhow/plugins.md` § "Affected triggers"). Two cases escape it: a removal from before that, and a trigger made after the removal. Find them by hand:
+
+  ```bash
+  psql "$LUCIDOS_DATABASE_URL" -At -F ' ' -c "SELECT e.event_type, e.aggregate_id, f FROM events e, jsonb_array_elements_text(coalesce(e.payload->'data'->'files_removed', e.payload->'data'->'files_deleted', '[]')) f WHERE e.event_type IN ('PluginInstalled', 'PluginUninstalled') AND e.payload->'data'->'affected_triggers' IS NULL"
+  ```
+
+  Keep each path still missing under `data/`. For each live trigger, report a kept path its `run.intent` or script path names, or knowhow under its own `apps/<app_id>/knowhow/` or `triggers/<slug>/knowhow/`. Skip triggers that plugin owns. Severity: **stale**, since each fire runs without its recipe. Fix per `system-knowhow/triggers.md` § "Know-how a plugin removed".
+
+- **Old-form `tap` strings.** The field was a four-string union and is now a discriminated union object. The engine rejects the strings with `400 Bad Request` at write time. Grep every code-bearing surface in the root's § "What to walk": trigger scripts, app code (`ui/`, `*.html`, inline `<script>`), shared scripts, and fenced `python` / `bash` / `js` / `ts` blocks in knowhow. Skip `data/artifacts/` and `data/postgres/`, which hold no code that calls the API.
+
+  Match each form whatever its quotes. The key is bare (`tap:` in JS, TS) or quoted (`"tap":` or `'tap':` in Python, shell, JSON bodies). The value takes either quote, and JSON inside a string escapes both (`\"tap\": \"modal\"`):
+
+  - `tap: 'modal'`
+  - `tap: 'none'`
+  - `tap: 'open_app'`
+  - `tap: 'open_thread'`
+  - `{ kind: 'none' }`, the retired object form
+  - `lucidos notify --tap none`, `--tap open-app` or `--tap open-thread`, bare or in an argv list. The CLI now takes only `modal` and `navigate`.
+
+  A `kind: 'none'` hit outside a notification `tap` is some other field, not this finding.
+
+  Surface path, line and the matched form. Severity: **broken**, because the next fire 400s. The one exception is the retired `{ kind: 'none' }` object. The engine coerces it to `{ kind: 'modal' }`, so it is **stale**: it runs, but still spreads by copy. Canonical `Tap` type: `system-knowhow/js-sdk.md` § `lucidos.notifications`.
+
+  URL-encoded and hash-form taps are **out of scope**. The engine and the service worker own that channel, not any workspace file.
+
+  § Remediation below carries the old-to-new mapping a fix needs.
+
+## Remediation
+
+For widget-fit recipes, require an open eligible window or an explicitly selected fit-only renderer (`docs/widget-fit-renderer.md`).
+A trigger's source-thread origin may register a renderer; it cannot supply a browser or owner authority.
+Flag recipes treating a timeout or `not checked` as success as **broken**.
+`WidgetFitRequested` remains transient and cannot trigger another run.
+
+Fixes run only on request, as the root's § Remediation says. A fix gets the
+table for its finding, and the root's § Inline or a coding agent picks its
+route.
+
+### Listing an MCP server a trigger uses
+
+**Route: inline**, one `triggers(action="update")` call. Add the server to the trigger's `mcp_servers`. The field is a full replacement, so send the existing list plus the new id. It is reversible, so it may join "Do all suggested fixes". A server the fire enabled once and never called is not worth listing: report it, and leave the choice to the user.
+
+### Granting a trigger its coding agents or side-effects
+
+**Route: the user only.** No agent may widen a trigger's grants, so never try the `triggers` tool or a trigger update through the CLI or the HTTP API. The report is the fix: one line per trigger with its link, what steers it, and a recommendation. When the user asks you to grant, raise one batch (`system-knowhow/lucidos-cli.md` § "`lucidos permissions batch`"), which only their **Run all** runs. Recommend against the coding-agent grant where outside content steers the trigger, and suggest an owner-started coding agent instead. An agent may narrow a side-effect grant the owner asks to drop.
+
+### Rewriting an old-form `tap`
+
+**Route: a coding agent, one per trigger.** The rewrite builds new fields from computed siblings and flags the sites it cannot fill, which takes judgment. Hand it this mapping:
+
+| Old | New |
+|---|---|
+| `tap: 'modal'` | `tap: { kind: 'modal' }` |
+| `tap: 'none'` | `tap: { kind: 'modal' }`, since the passive kind was retired and every notification is openable |
+| `tap: 'open_app'`, with a sibling `app_id: 'X'` | `tap: { kind: 'navigate', to: { target: 'app', app_id: 'X' } }` |
+| `tap: 'open_thread'`, with a sibling `thread_id: 'T'` and optional `event_id: 'E'` | `tap: { kind: 'navigate', to: { target: 'thread', id: 'T', event_id: 'E' } }` |
+| `{ kind: 'none' }` | `{ kind: 'modal' }` |
+| `--tap none` | drop the flag, since `modal` is the default |
+| `--tap open-app` or `--tap open-thread` | `--tap navigate`, keeping the call's `--app-id` or `--thread-id` |
+
+Three rules the rewrite has to follow:
+
+- **Build the new sub-fields from the call's own sibling fields, and keep those siblings.** They are notification-level context. The §4 in-app matrix and the inbox modal both read them, even when the tap navigates elsewhere.
+- **Reuse the expression when a sibling is computed.** Hoist the app-resolution call into a local, then pass that local to both `app_id` and `to.app_id`. Calling it twice risks two different answers.
+- **Flag a missing sibling, never guess one.** The old form let the engine fill the id in at write time; the new one does not. A navigate with no thread id raises the error toast `Navigation target missing thread id` on tap. Leave a `MIGRATION REVIEW` comment naming the two ways out: supply `to.id`, or fall back to `{ kind: 'modal' }`. List every such site in the report's `## Remediation` section.

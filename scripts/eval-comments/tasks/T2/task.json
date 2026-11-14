@@ -1,0 +1,14 @@
+{
+  "id": "T2",
+  "fix": "e5da20665f960fa04812ee43d0c1a1fc4deb8746",
+  "title": "fix(models): declare the 1M window on bare rows of 1M-default Claude families",
+  "withheld_test": {
+    "file": "withheld_test.rs",
+    "dest": "crates/lucidos-engine/src/llm/eval_withheld_tests.rs",
+    "host": "crates/lucidos-engine/src/llm/model_registry.rs"
+  },
+  "needs_db": true,
+  "comment": "strongest",
+  "why": "The prefix map's doc says bare 'claude-' at 200k 'is also correct, and deliberately so', and a unit test is documented as pinned 'so nobody corrects the bare rows to 1M'. The comment argues the bug is right.",
+  "adaptation": "The fix's test names its migration file, which an agent cannot guess. The withheld test checks the behaviour instead: after all migrations, context_window_for gives 1M for the four 1M-default bare ids and 200k for Sonnet 5 and Opus 4.x."
+}
