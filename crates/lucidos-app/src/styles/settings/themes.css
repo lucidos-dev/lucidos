@@ -1,0 +1,395 @@
+/* Settings → Appearance → Theme: a card per theme, each previewing itself.
+   The preview element carries the theme's tokens as its own custom properties
+   (components/settings/ThemePicker.tsx), so every var() inside it resolves to
+   that theme, not to the page's. */
+
+/* The skeleton's frame, drawn invisibly until the gallery loads, so the picker
+   holds its height from the first frame and under the skeleton. */
+.theme-carousel-reserve {
+    visibility: hidden;
+}
+
+.theme-carousel-frame {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    padding-top: var(--space-sm);
+}
+
+/* The settings row pads the frame, so the pill bar can hand back its side
+   ring room too, and the first pill stays on the cards' left edge. */
+.theme-carousel-frame > .pill-bar {
+    margin-inline: calc(-1 * var(--focus-ring-width));
+}
+
+/* Two half-transparent chevrons float over the strip's sides and page it.
+   The one at a reached end hides. */
+.theme-carousel-body {
+    position: relative;
+}
+
+.theme-carousel-step {
+    position: absolute;
+    top: 50%;
+    z-index: 1;
+    justify-content: center;
+    width: 2.25rem;
+    height: 2.25rem;
+    padding: 0;
+    border: 1px solid color-mix(in srgb, var(--border-color) 50%, transparent);
+    border-radius: var(--radius-round);
+    background: color-mix(in srgb, var(--surface-bg) 60%, transparent);
+    backdrop-filter: blur(0.25rem);
+    color: var(--text-primary);
+    box-shadow: var(--shadow-sm);
+    transform: translateY(-50%);
+    transition: opacity var(--duration-fast);
+}
+
+.theme-carousel-step svg {
+    width: var(--icon-size-lg);
+    height: var(--icon-size-lg);
+}
+
+.theme-carousel-prev {
+    left: var(--space-xs);
+}
+
+.theme-carousel-next {
+    right: var(--space-xs);
+}
+
+.theme-carousel-step:disabled {
+    opacity: 0;
+}
+
+/* On a phone the panes lay a touch strip over each screen edge, above the
+   content (.edge-swipe-zone in mobile.css), to reach an app iframe's touches
+   first. The carousel is lifted over it, as .list-section-actions is, or the
+   strip takes the first chip's taps, the left chevron's, and a swipe that
+   starts at the edge. */
+@media (--phone-layout) {
+    .theme-carousel-frame {
+        position: relative;
+        z-index: 2;
+    }
+}
+
+/* One grid that scrolls sideways a page at a time, with no scrollbar: a swipe
+   or a trackpad scrolls it, and the chevrons page it. ThemePicker sets
+   --theme-columns to the whole number of columns that fit, and the width below
+   fills the strip with exactly that many. Snapping on each column keeps a
+   swipe on whole cards. The inset padding keeps the selected outline and the
+   focus ring clear of the clip.
+
+   A family chip eases the strip to a new height (themeStripMotion.ts). Rows
+   pack at the top meanwhile, since a grid taller than its rows would stretch
+   them and every card with them. A growing strip clips its cards rather than
+   scrolling them. */
+.theme-carousel {
+    --theme-fade: 2.5rem;
+    position: relative;
+    display: grid;
+    grid-auto-rows: auto;
+    align-content: start;
+    grid-auto-columns: calc((100% - (var(--theme-columns, 3) - 1) * var(--space-sm)) / var(--theme-columns, 3));
+    gap: var(--space-sm);
+    padding: var(--space-xs);
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    scroll-snap-type: x mandatory;
+    scroll-padding-inline: var(--space-xs);
+    scrollbar-width: none;
+}
+
+.theme-carousel::-webkit-scrollbar {
+    display: none;
+}
+
+/* A phone: a card centred, its neighbours peeking in at both sides. The
+   first and the last card snap to their edge instead, so the strip opens and
+   ends with no empty side. ThemePicker sets the card width. */
+.theme-carousel-peek {
+    grid-auto-columns: var(--theme-card-width, 7rem);
+}
+
+.theme-carousel-peek .theme-card {
+    scroll-snap-align: center;
+}
+
+/* Of-type, since a card a chip dropped fades out as a strip child too. */
+.theme-carousel-peek .theme-family:first-of-type .theme-card:first-of-type {
+    scroll-snap-align: start;
+}
+
+.theme-carousel-peek .theme-family:last-of-type .theme-card:last-of-type {
+    scroll-snap-align: end;
+}
+
+/* A phone previews a portrait phone screen: the header on top, the panel
+   filling the middle, and the button and status dots along the bottom. */
+.theme-carousel-peek .theme-preview {
+    height: 11rem;
+}
+
+.theme-carousel-peek .theme-preview-body {
+    flex-direction: column;
+    align-items: stretch;
+}
+
+.theme-carousel-peek .theme-preview-panel {
+    flex: 1;
+}
+
+.theme-carousel-peek .theme-preview-side {
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+}
+
+/* A phone card is narrow enough that names wrap, and a grid row stretches to
+   its tallest card. So both lines are reserved, the skeleton's too, or one
+   wrapping name grows the strip as the cards replace the skeleton. */
+.theme-carousel-peek .theme-card-name {
+    min-height: 2lh;
+}
+
+/* A workspace theme's badge wraps above its mode label there, which can
+   outgrow those two lines. So the row reserves the taller of the two. The
+   factors are the line heights of the name, the badge and the label. */
+.theme-carousel-peek .theme-card-meta {
+    min-height: max(
+        2 * 1.3 * var(--font-size-sm),
+        1.4 * var(--font-size-2xs) + 0.25rem + var(--space-xs) + 1.3 * var(--font-size-2xs)
+    );
+}
+
+/* Fades the cards out at a side only where more of the strip waits past it.
+   The mask reads alpha alone, so black here is opacity, not a colour. */
+.theme-carousel[data-more-before] {
+    mask-image: linear-gradient(to right, transparent, black var(--theme-fade));
+}
+
+.theme-carousel[data-more-after] {
+    mask-image: linear-gradient(to left, transparent, black var(--theme-fade));
+}
+
+.theme-carousel[data-more-before][data-more-after] {
+    mask-image: linear-gradient(to right, transparent, black var(--theme-fade), black calc(100% - var(--theme-fade)), transparent);
+}
+
+.theme-family {
+    display: contents;
+}
+
+/* All names each family above its first card, on the strip's first row. */
+.theme-family-name {
+    grid-row: 1;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
+/* A card or family name a chip dropped, fading out where it stood. It sits
+   over the strip at the spot it held, outside the grid and the snap points.
+   It follows every rule above that could reach it, so it wins on a tie. */
+.theme-carousel > .theme-strip-ghost {
+    position: absolute;
+    grid-area: auto;
+    margin: 0;
+    pointer-events: none;
+    scroll-snap-align: none;
+}
+
+.theme-card {
+    scroll-snap-align: start;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+    padding: var(--space-xs);
+    background: none;
+    border: 1px solid transparent;
+    border-radius: var(--radius-surface);
+    color: var(--text-primary);
+    text-align: left;
+    cursor: pointer;
+}
+
+.theme-card.selected {
+    border-color: var(--accent);
+    outline: 1px solid var(--accent);
+}
+
+.theme-card:focus-visible {
+    outline: none;
+    box-shadow: var(--focus-ring);
+}
+
+@media (hover: hover) {
+    .theme-card:not(.selected):hover {
+        background: var(--bg-hover);
+    }
+}
+
+.theme-card-meta {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-xs);
+    padding-inline: var(--space-xs);
+    font-size: var(--font-size-sm);
+    /* The card sets both to its own theme's font (themeFontStyle), so each name
+       reads in the font that theme paints. */
+    font-family: var(--font-ui);
+    font-feature-settings: var(--font-features-text, normal);
+}
+
+.theme-card-name {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    min-width: 0;
+    overflow: hidden;
+    overflow-wrap: anywhere;
+    line-height: 1.3;
+}
+
+/* Reserves at least half the row for the name, so a single-mode workspace
+   theme's badge and its mode label together never crowd the name out on a
+   narrow card. */
+.theme-card-meta-trailing {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    flex-shrink: 0;
+    max-width: 50%;
+    align-items: baseline;
+    gap: var(--space-xs);
+}
+
+.theme-card-modes {
+    flex-shrink: 0;
+    font-size: var(--font-size-2xs);
+    line-height: 1.3;
+    color: var(--text-muted);
+}
+
+/* Marks a theme the workspace defines, so it reads apart from a built-in one.
+   Styled like the App Store's status chip (pages.css): badges.css centres the
+   word on its cap band inside --badge-height. */
+.theme-card-badge {
+    flex: 0 0 auto;
+    padding: 0.125rem 0.5rem;
+    border-radius: var(--radius-round);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-size: var(--font-size-2xs);
+    font-family: inherit;
+    font-weight: 600;
+    line-height: 1.4;
+    --badge-height: calc(1lh + 0.25rem);
+}
+
+.theme-preview {
+    display: flex;
+    flex-direction: column;
+    height: 5rem;
+    overflow: hidden;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-control);
+}
+
+.theme-preview-header {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    height: 1.25rem;
+    padding: 0 0.375rem;
+    background: var(--header-gradient);
+}
+
+.theme-preview-dot {
+    width: 0.3125rem;
+    height: 0.3125rem;
+    border-radius: var(--radius-round);
+    background: var(--header-fg-muted);
+}
+
+/* The focused pane's header segment: the wash and the underline, both cues a
+   theme can tune. */
+.theme-preview-focus {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 45%;
+    background-color: var(--focus-header-tint);
+    box-shadow: inset 0 calc(-1 * var(--focus-header-underline-width)) 0 0 var(--focus-header-underline);
+}
+
+.theme-preview-body {
+    display: flex;
+    flex: 1;
+    align-items: flex-start;
+    gap: 0.375rem;
+    padding: 0.375rem;
+}
+
+.theme-preview-panel {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: 0.25rem;
+    padding: 0.3125rem;
+    background: var(--bg-secondary);
+    border-radius: calc(var(--radius-control) / 2);
+}
+
+.theme-preview-line {
+    width: 70%;
+    height: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.25);
+    background: var(--text-secondary);
+}
+
+.theme-preview-line-strong {
+    width: 90%;
+    background: var(--text-primary);
+}
+
+.theme-preview-line-muted {
+    width: 45%;
+    background: var(--text-muted);
+}
+
+.theme-preview-side {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 0.375rem;
+}
+
+.theme-preview-button {
+    width: 1.75rem;
+    height: 0.625rem;
+    border-radius: calc(var(--radius-control) / 2);
+    background: var(--accent-action);
+}
+
+.theme-preview-status {
+    display: flex;
+    gap: 0.1875rem;
+}
+
+.theme-preview-status i {
+    width: 0.3125rem;
+    height: 0.3125rem;
+    border-radius: var(--radius-round);
+}
+
+.theme-preview-green { background: var(--accent-green); }
+.theme-preview-yellow { background: var(--accent-yellow); }
+.theme-preview-red { background: var(--accent-red); }

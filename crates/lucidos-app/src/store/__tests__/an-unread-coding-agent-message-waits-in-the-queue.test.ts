@@ -1,0 +1,394 @@
+/**
+ * A message sent to a coding agent mid-turn waits in the queue until the agent
+ * reads it. The turn that is running keeps its own steps, and the message takes
+ * the steps after the read. See
+ * docs/plans/2026-09-24-unread-coding-agent-messages-queue.md.
+ */
+import { describe, it, expect } from 'vitest';
+import {
+  computeExchanges,
+  exchangeResponseEvents,
+  exchangeStatus,
+  exchangeSteps,
+  groupIntoExchanges,
+  isThinking,
+  makeOptimisticThreadState,
+  queuedFollowupRun,
+  queuedMessagesFromExchanges,
+  type Exchange,
+  type StoredEvent,
+  type ThreadEvent,
+} from '../thread-events';
+
+function ev(seq: number, e: object, id?: string): readonly [number, StoredEvent] {
+  const created = `2026-09-24T06:13:${String(seq).padStart(2, '0')}Z`;
+  return [seq, { ...e, created, ...(id ? { _eventId: id } : {}) } as StoredEvent] as const;
+}
+
+const message = (text: string) => ({ type: 'MessageReceived', text, channel: 'claude_code' });
+const said = (text: string) => ({ type: 'CodingAgentTextStreamed', text, channel: 'claude_code' });
+const read = (id: string): ThreadEvent => ({ type: 'CodingAgentInputRead', input_event_id: id });
+const done = { type: 'ResponseGenerated', text: 'ok', channel: 'claude_code' };
+const idled = { type: 'CodingAgentIdled', channel: 'claude_code' };
+
+const texts = (ex: Exchange) =>
+  ex.steps.flatMap(s => s.event.type === 'CodingAgentTextStreamed' ? [s.event.text] : []);
+const byMessage = (exchanges: Exchange[], text: string) =>
+  exchanges.find(ex => ex.userEvent.type === 'MessageReceived' && ex.userEvent.text === text)!;
+
+describe('an unread coding-agent message', () => {
+  const running = [
+    ev(1, message('start'), 'm1'),
+    ev(2, read('m1')),
+    ev(3, said('working on it')),
+    ev(4, message('also check the totals'), 'm2'),
+    ev(5, said('still on the first job')),
+  ];
+
+  it('takes no steps before the agent reads it', () => {
+    const exchanges = groupIntoExchanges(new Map(running));
+    expect(texts(byMessage(exchanges, 'start'))).toEqual(['working on it', 'still on the first job']);
+    expect(texts(byMessage(exchanges, 'also check the totals'))).toEqual([]);
+    expect(byMessage(exchanges, 'also check the totals').awaitingRead).toBe(true);
+  });
+
+  it('takes the steps after the agent reads it', () => {
+    const exchanges = groupIntoExchanges(new Map([
+      ...running,
+      ev(6, read('m2')),
+      ev(7, said('checking the totals')),
+    ]));
+    expect(texts(byMessage(exchanges, 'start'))).toEqual(['working on it', 'still on the first job']);
+    const second = byMessage(exchanges, 'also check the totals');
+    expect(texts(second)).toEqual(['checking the totals']);
+    expect(second.awaitingRead).toBeUndefined();
+  });
+
+  // The engine hands the message over at once, and the prompt it records then
+  // carries the RUNNING turn's anchor. It is not a step of that turn.
+  describe('when the prompt handing it over is recorded mid-turn', () => {
+    const called = { type: 'CodingAgentToolCalled', name: 'Bash', args: { command: 'wait' }, tool_use_id: 't1', channel: 'claude_code' };
+    const result = { type: 'CodingAgentToolResult', name: '', result: 'done', tool_use_id: 't1', channel: 'claude_code' };
+    const handedOver = [
+      ev(1, message('start'), 'm1'),
+      ev(2, read('m1')),
+      ev(3, called),
+      ev(4, message('also check the totals'), 'm2'),
+      ev(5, { type: 'CodingAgentPromptSent', text: 'also check the totals', channel: 'claude_code' }),
+      ev(6, result),
+      ev(7, read('m2')),
+    ];
+    const thinkingRows = (ex: Exchange) =>
+      exchangeResponseEvents(ex, false).filter(e => e.type === 'step' && isThinking(e));
+
+    it('leaves no Thinking row in the turn it waited behind', () => {
+      const exchanges = groupIntoExchanges(new Map([...handedOver, ev(8, said('checking the totals'))]));
+      const first = byMessage(exchanges, 'start');
+      expect(thinkingRows(first)).toEqual([]);
+      expect(exchangeSteps(first, false).filter(isThinking)).toEqual([]);
+    });
+
+    it('keeps the running turn\'s own prompt while it waits', () => {
+      const exchanges = groupIntoExchanges(new Map([
+        ...handedOver.slice(0, 5),
+        ev(6, { type: 'CodingAgentPromptSent', text: '', channel: 'claude_code' }),
+      ]));
+      const first = byMessage(exchanges, 'start');
+      expect(first.steps.filter(s => s.event.type === 'CodingAgentPromptSent')).toHaveLength(1);
+    });
+
+    it('shows the agent thinking about it once read', () => {
+      const exchanges = groupIntoExchanges(new Map(handedOver));
+      const second = byMessage(exchanges, 'also check the totals');
+      expect(exchangeSteps(second, true).map(s => [s.description, s.outcome]))
+        .toEqual([['Thinking', 'pending']]);
+    });
+  });
+
+  // A long turn's own read sits pages back, so the loaded window holds none.
+  // The prompt naming the message is proof enough that reads get reported.
+  it.each([
+    ['in one load', false],
+    ['as each event arrives', true],
+  ])('queues behind a turn whose read is outside the loaded window, %s', (_, live) => {
+    const thread = makeOptimisticThreadState({
+      id: 't1',
+      title: 'A coding-agent thread',
+      channel: 'claude_code',
+      initiator: 'user',
+      eventsLoaded: true,
+    });
+    for (const [seq, event] of [
+      ev(1, message('start'), 'm1'),
+      ev(3, said('working on it')),
+      ev(4, message('also check the totals'), 'm2'),
+      ev(5, { type: 'CodingAgentPromptSent', text: 'also check the totals', input_event_id: 'm2', channel: 'claude_code' }),
+      ev(6, said('still on the first job')),
+    ]) {
+      thread.events.set(seq, event);
+      if (live) computeExchanges(thread);
+    }
+    const exchanges = computeExchanges(thread);
+    expect(texts(byMessage(exchanges, 'start'))).toEqual(['working on it', 'still on the first job']);
+    const queued = byMessage(exchanges, 'also check the totals');
+    expect(queued.awaitingRead).toBe(true);
+    expect(queued.steps).toEqual([]);
+  });
+
+  it('takes the next turn when the running one ends with it unread', () => {
+    const exchanges = groupIntoExchanges(new Map([
+      ev(1, message('start'), 'm1'),
+      ev(2, read('m1')),
+      ev(3, said('working on it')),
+      ev(4, message('also check the totals'), 'm2'),
+      ev(5, done),
+      ev(6, idled),
+      ev(7, said('checking the totals')),
+    ]));
+    const first = byMessage(exchanges, 'start');
+    expect(first.steps.map(s => s.event.type)).toContain('CodingAgentIdled');
+    expect(texts(byMessage(exchanges, 'also check the totals'))).toEqual(['checking the totals']);
+  });
+
+  it('queues behind messages already waiting, and reads in order', () => {
+    const exchanges = groupIntoExchanges(new Map([
+      ...running,
+      ev(6, message('and the dates'), 'm3'),
+      ev(7, read('m3')),
+      ev(8, said('both at once')),
+    ]));
+    expect(byMessage(exchanges, 'also check the totals').awaitingRead).toBeUndefined();
+    expect(texts(byMessage(exchanges, 'and the dates'))).toEqual(['both at once']);
+  });
+
+  it('takes the turn when sent in history from before read events', () => {
+    const exchanges = groupIntoExchanges(new Map([
+      ev(1, message('start'), 'm1'),
+      ev(2, said('working on it')),
+      ev(3, message('also check the totals'), 'm2'),
+      ev(4, said('checking the totals')),
+    ]));
+    expect(byMessage(exchanges, 'also check the totals').awaitingRead).toBeUndefined();
+    expect(texts(byMessage(exchanges, 'also check the totals'))).toEqual(['checking the totals']);
+  });
+
+  it('keeps waiting on a page that starts after the running turn read', () => {
+    const exchanges = groupIntoExchanges(new Map([
+      ev(3, said('working on it')),
+      ev(4, message('also check the totals'), 'm2'),
+      ev(5, said('still on the first job')),
+      ev(6, read('m2')),
+      ev(7, said('checking the totals')),
+    ]), true);
+    expect(texts(byMessage(exchanges, 'also check the totals'))).toEqual(['checking the totals']);
+  });
+
+  it('stops waiting once the agent goes idle and another message arrives', () => {
+    const exchanges = groupIntoExchanges(new Map([
+      ev(1, message('start'), 'm1'),
+      ev(2, read('m1')),
+      ev(3, message('also check the totals'), 'm2'),
+      ev(4, done),
+      ev(5, message('next'), 'm3'),
+      ev(6, said('on it')),
+    ]));
+    expect(byMessage(exchanges, 'also check the totals').awaitingRead).toBeUndefined();
+    expect(texts(byMessage(exchanges, 'next'))).toEqual(['on it']);
+  });
+
+  it('does not wait when the agent is idle', () => {
+    const exchanges = groupIntoExchanges(new Map([
+      ev(1, message('start'), 'm1'),
+      ev(2, read('m1')),
+      ev(3, said('working on it')),
+      ev(4, done),
+      ev(5, message('next'), 'm2'),
+      ev(6, said('on it')),
+    ]));
+    expect(byMessage(exchanges, 'next').awaitingRead).toBeUndefined();
+    expect(texts(byMessage(exchanges, 'next'))).toEqual(['on it']);
+  });
+
+  it('renders in the queue while the running turn keeps the live stream', () => {
+    const exchanges = groupIntoExchanges(new Map(running));
+    const run = queuedFollowupRun(exchanges, true, true);
+    expect(run.queuedOrder).toEqual([1]);
+    expect(run.activeIndex).toBe(0);
+  });
+
+  it('is never retracted by a Stop, since the agent already holds it', () => {
+    const exchanges = groupIntoExchanges(new Map(running));
+    expect(queuedMessagesFromExchanges(exchanges, true, true)).toEqual([]);
+  });
+
+  it('queues while still on its way, before the server confirms it', () => {
+    const thread = makeOptimisticThreadState({
+      id: 't1',
+      title: 'A coding-agent thread',
+      channel: 'claude_code',
+      initiator: 'user',
+      eventsLoaded: true,
+      pendingUserMessages: [
+        { text: 'also check the totals', eventId: 'm2', created: '2026-09-24T06:14:00Z' },
+      ],
+    });
+    for (const [seq, event] of running.slice(0, 3)) thread.events.set(seq, event);
+    computeExchanges({ ...thread, pendingUserMessages: [] });
+    const pending = byMessage(computeExchanges(thread), 'also check the totals');
+    expect(pending.awaitingRead).toBe(true);
+  });
+
+  // The reader typed a reply while the question was open, then pressed Cancel
+  // before the agent took it. The card must not jump below the reply, which
+  // would leave the reply above a tall card and out of view.
+  it('stays below a question card canceled while it waited', () => {
+    const asked = {
+      type: 'UserQuestionAsked',
+      tool_use_id: 'q1',
+      cc_session_id: '',
+      question: 'Which look?',
+      options: [{ id: 'opt-0', label: 'Soft' }],
+      channel: 'claude_code',
+    };
+    const canceled = { type: 'UserQuestionAnswered', tool_use_id: 'q1', answer: { kind: 'Canceled' } };
+    const stopped = { type: 'ResponseCanceled', cause: 'user_stop', channel: 'claude_code' };
+    const thread = makeOptimisticThreadState({
+      id: 't1',
+      title: 'A coding-agent thread',
+      channel: 'claude_code',
+      initiator: 'user',
+      eventsLoaded: true,
+      pendingUserMessages: [
+        { text: 'keep the font white', eventId: 'm2', created: '2026-09-24T06:13:04Z' },
+      ],
+    });
+    for (const [seq, event] of [
+      ev(1, message('start'), 'm1'),
+      ev(2, read('m1')),
+      ev(3, asked),
+      ev(5, canceled),
+      ev(6, stopped),
+      ev(7, idled),
+    ]) thread.events.set(seq, event);
+    const exchanges = computeExchanges(thread);
+    const card = exchanges.findIndex(ex => ex.userEvent.type === 'UserQuestionAsked');
+    const reply = exchanges.indexOf(byMessage(exchanges, 'keep the font white'));
+    expect(reply).toBeGreaterThan(card);
+    expect(reply).toBe(exchanges.length - 1);
+  });
+});
+
+describe('a withdrawn coding-agent message', () => {
+  // The session records the tombstone once Claude Code drops the message.
+  it('leaves the transcript on every device', () => {
+    const thread = makeOptimisticThreadState({
+      id: 't1',
+      title: 'A coding-agent thread',
+      channel: 'claude_code',
+      initiator: 'user',
+      eventsLoaded: true,
+    });
+    for (const [seq, event] of [
+      ev(1, message('start'), 'm1'),
+      ev(2, read('m1')),
+      ev(3, said('working on it')),
+      ev(4, message('also check the totals'), 'm2'),
+      ev(5, { type: 'QueuedMessageRemoved', removed_message_id: 'm2' }),
+    ]) thread.events.set(seq, event);
+    const exchanges = computeExchanges(thread);
+    expect(exchanges.map(ex => ex.userEvent.type === 'MessageReceived' && ex.userEvent.text))
+      .toEqual(['start']);
+  });
+
+  // Edit withdraws the message and the user resends it. A Stop then ends the
+  // turn, and the agent reads the resent copy. The withdrawn copy must stay
+  // gone: neither the read nor the idle turn may take it out of the queue.
+  it.each([
+    ['in one load', false],
+    ['as each event arrives', true],
+  ])('stays gone after an edit, a Stop and the read of the resent copy, %s', (_, live) => {
+    const thread = makeOptimisticThreadState({
+      id: 't1',
+      title: 'A coding-agent thread',
+      channel: 'claude_code',
+      initiator: 'user',
+      eventsLoaded: true,
+    });
+    for (const [seq, event] of [
+      ev(1, message('start'), 'm1'),
+      ev(2, read('m1')),
+      ev(3, said('working on it')),
+      ev(4, message('check the totals'), 'm2'),
+      ev(5, { type: 'QueuedMessageRemoved', removed_message_id: 'm2' }),
+      ev(6, message('check the totals'), 'm3'),
+      ev(7, { type: 'ResponseCanceled', cause: 'user_stop', channel: 'claude_code' }),
+      ev(8, idled),
+      ev(9, { type: 'CodingAgentSettingsChanged', model: 'opus', channel: 'claude_code' }),
+      ev(10, read('m3')),
+      ev(11, said('checking the totals')),
+    ]) {
+      thread.events.set(seq, event);
+      if (live) computeExchanges(thread);
+    }
+    const exchanges = computeExchanges(thread);
+    const resent = exchanges.filter(ex => ex.userEvent._eventId === 'm2' || ex.userEvent._eventId === 'm3');
+    expect(resent.map(ex => ex.userEvent._eventId)).toEqual(['m3']);
+    expect(texts(resent[0])).toEqual(['checking the totals']);
+  });
+});
+
+// Reported: the reader typed a follow-up under an open question card, then
+// pressed Cancel. The engine settled the stopped turn with a withheld proposal,
+// an idle and a settings row, then the agent read the follow-up. That
+// bookkeeping took the follow-up out of the queue, so the old turn's idle
+// closed the new one. It read Done with no Thinking row while the agent worked.
+describe('a follow-up read after the turn it waited behind is settled', () => {
+  const asked = {
+    type: 'UserQuestionAsked',
+    tool_use_id: 'q1#q0',
+    question: 'Which origin?',
+    options: [{ id: 'opt-0', label: 'Document the trust' }],
+    channel: 'claude_code',
+  };
+  const settled = [
+    ev(1, message('start'), 'm1'),
+    ev(2, read('m1')),
+    ev(3, said('working on it')),
+    ev(4, message('relay or pair?'), 'm2'),
+    ev(5, { type: 'CodingAgentPromptSent', text: 'relay or pair?', input_event_id: 'm2', channel: 'claude_code' }),
+    ev(6, asked, 'q1'),
+    ev(7, { type: 'UserQuestionAnswered', tool_use_id: 'q1#q0', answer: { kind: 'Canceled' }, channel: 'claude_code' }),
+    ev(8, { type: 'CodingAgentToolResult', name: 'AskUserQuestion', result: 'rejected', tool_use_id: 'q1', channel: 'claude_code' }),
+    ev(9, { type: 'ResponseCanceled', cause: 'user_stop', channel: 'claude_code' }),
+    ev(10, { type: 'ProposalWithheld', reason: 'turn_incomplete', files: ['src/a.rs'], branch_name: 'b', channel: 'claude_code' }),
+    ev(11, idled),
+    ev(12, { type: 'CodingAgentSettingsChanged', model: 'opus', channel: 'claude_code' }),
+    ev(13, { ...read('m2'), started_turn: true }),
+  ];
+
+  it.each([
+    ['in one load', false],
+    ['as each event arrives', true],
+  ])('leaves the settling rows with the stopped turn, %s', (_, live) => {
+    const thread = makeOptimisticThreadState({
+      id: 't1',
+      title: 'A coding-agent thread',
+      channel: 'claude_code',
+      initiator: 'user',
+      eventsLoaded: true,
+    });
+    for (const [seq, event] of settled) {
+      thread.events.set(seq, event);
+      if (live) computeExchanges(thread);
+    }
+    const exchanges = computeExchanges(thread);
+    const followUp = byMessage(exchanges, 'relay or pair?');
+    expect(exchanges.indexOf(followUp)).toBe(exchanges.length - 1);
+    expect(followUp.steps).toEqual([]);
+    const card = exchanges.find(ex => ex.userEvent.type === 'UserQuestionAsked')!;
+    expect(card.steps.map(s => s.event.type)).toEqual(expect.arrayContaining(['ProposalWithheld', 'CodingAgentIdled']));
+    expect(exchangeStatus(followUp, '', true, false, true)).toBe('pending');
+    expect(exchangeSteps(followUp, true).map(s => [s.description, s.outcome]))
+      .toEqual([['Thinking', 'pending']]);
+  });
+});
