@@ -1,0 +1,8 @@
+# This directory starts empty on purpose.
+#
+# Task T05 has to create the workspace's first knowhow entry, and task T06
+# measures whether it is found again. A seeded entry would answer both.
+#
+# Git cannot track an empty directory, so this file exists only to carry the
+# directory into the fixture. It is not a knowhow entry: the loader reads
+# `.md` files, and this is neither.

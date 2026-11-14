@@ -1,0 +1,13 @@
+{
+  "run_id": "20261114-124818-56fa",
+  "coverage": false,
+  "suites": [
+    "confinement"
+  ],
+  "api_args": [],
+  "browser": {
+    "projects": [],
+    "specs": [],
+    "pw_args": []
+  }
+}
